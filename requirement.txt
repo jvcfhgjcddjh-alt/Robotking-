@@ -1,1 +1,9 @@
+websocket-client
+matplotlib
+yfinance
+pandas
+numpy
+colorama
+flask
+requests
 
