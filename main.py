@@ -1,28 +1,23 @@
+
 """
 ╔══════════════════════════════════════════════════════════════════════════╗
-║      SMC SIGNAL ENGINE  v4  — Smart Money Concepts ELITE  DERIV         ║
+║         SMC SIGNAL ENGINE  v3  — Smart Money Concepts ELITE             ║
 ║                                                                          ║
-║  PRIORITÉS v4 :                                                          ║
-║  ★ TIER 0 — DERIV SYNTHÉTIQUES  (V10/V25/V50/V75/V100 + Boom/Crash)    ║
-║             → Priorité ABSOLUE · 24/7 · Score seuil 70 · RR min 2.5    ║
-║  ★ TIER 1 — GOLD (XAUUSD) + BTC  → Priorité HAUTE · Score 80           ║
-║  ★ TIER 2 — FOREX MAJEURES  → Scan secondaire                           ║
-║                                                                          ║
-║  STRATÉGIES DERIV ÉLITE :                                                ║
+║  NOUVEAUTÉS v3 :                                                         ║
 ║  ✦ AMD  Accumulation → Manipulation → Distribution  (H4)                ║
-║  ✦ SEPTUPLE TRACTION H4  — momentum institutionnel pur algo             ║
+║  ✦ SEPTUPLE TRACTION H4  — 7 bougies momentum institutionnel            ║
 ║  ✦ SUPPLY & DEMAND ZONES  — zones institutionnelles vraies              ║
 ║  ✦ LIQUIDITY MAP AVANCÉE  — EQH/EQL · BSL/SSL · intra-range            ║
-║  ✦ VOLATILITY SPIKE FILTER  — filtre spécifique Boom/Crash/Jump        ║
+║  ✦ BTC UNIQUEMENT pour le crypto                                        ║
 ║  ✦ CONFIRMATION H4 → M15 → M5  (3 TF institutionnels)                  ║
 ║  ✦ BREAKER BLOCK amélioré                                               ║
 ║  ✦ BOUGIES D'ENTRÉE institutionnelles  (Displacement · OFS · Imb.)     ║
 ║                                                                          ║
-║   DERIV 24/7  |  GOLD  |  BTC  |  FOREX  |  INDICES                    ║
+║   FOREX  |  BTC  |  GOLD  |  INDICES                                    ║
 ╚══════════════════════════════════════════════════════════════════════════╝
 
 Installation :
-    pip install yfinance pandas numpy colorama flask requests websocket-client>=1.6.0
+    pip install yfinance pandas numpy colorama flask requests
 
 Usage :
     python smc_signals_v3.py                    # scan complet live
@@ -49,26 +44,6 @@ import sys
 import numpy as np
 import pandas as pd
 import yfinance as yf
-import json as _json
-
-# Deriv WebSocket API — auto-install si manquant
-try:
-    import websocket as _websocket_lib
-    _WEBSOCKET_OK = True
-except ImportError:
-    import subprocess as _subprocess, sys as _sys
-    print("  [DERIV] websocket-client manquant — installation automatique…")
-    try:
-        _subprocess.check_call(
-            [_sys.executable, "-m", "pip", "install", "websocket-client", "--quiet"],
-            timeout=60
-        )
-        import websocket as _websocket_lib
-        _WEBSOCKET_OK = True
-        print("  [DERIV] ✅ websocket-client installé avec succès")
-    except Exception as _e:
-        print(f"  [DERIV] ❌ Impossible d'installer websocket-client : {_e}")
-        _WEBSOCKET_OK = False
 
 # ── Flask — serveur HTTP pour Render ─────────────────────────
 from flask import Flask, jsonify
@@ -96,7 +71,8 @@ def index():
         color    = "#e74c3c" if s["direction"] == "SHORT" else "#2ecc71"
         mode_col = {"AMD": "#9b59b6", "PRE-BOS": "#f39c12",
                     "SMC": "#58a6ff", "SWEEP_SHIFT": "#e67e22",
-                    "CHOCH_LIQ": "#1abc9c"}.get(s.get("mode", "SMC"), "#58a6ff")
+                    "CHOCH_LIQ": "#1abc9c", "BREAKER_HTF": "#e74c3c",
+                    "OFS": "#27ae60", "SMC_TRADER": "#f1c40f"}.get(s.get("mode", "SMC"), "#58a6ff")
         signals_html += (
             f"<tr>"
             f"<td>{s['ts']}</td>"
@@ -214,59 +190,8 @@ LTF             = "15m"   # M15 : entrée précise
 FVG_MIN_RATIO   = 0.0002
 OB_LOOKBACK     = 5
 LIQ_THRESHOLD   = 0.0004
-SCORE_THRESHOLD = 80      # Seuil général (Gold, BTC, Forex)
-MIN_RR          = 3.0     # RR minimum général
-
-# ── Seuils DERIV SYNTHÉTIQUES — marché algo pur, plus prévisible ────────
-DERIV_SCORE_THRESHOLD = 70   # ← seuil abaissé : synthétiques = moins de bruit news
-DERIV_MIN_RR          = 2.5  # ← RR légèrement assoupli (spreads très faibles)
-DERIV_MAX_SIGNALS_DAY = 8    # ← plus de signaux autorisés (marché 24/7 pur)
-DERIV_PRIORITY        = True  # ← Deriv scanné EN PREMIER à chaque cycle
-SMC_DEBUG       = os.environ.get("SMC_DEBUG", "0") == "1"   # export SMC_DEBUG=1 pour logs HTF détaillés
-
-# ─────────────────────────────────────────────────────────────
-#  DERIV / BINARY.COM  —  Indices Synthétiques
-#  App ID gratuit : https://developers.deriv.com
-# ─────────────────────────────────────────────────────────────
-DERIV_APP_ID = os.environ.get("DERIV_APP_ID", "1089")
-
-#  Préfixe interne → symbole API Deriv
-DERIV_SYMBOL_MAP: dict[str, str] = {
-    # Volatility indices (continus, 24/7)
-    "DERIV:R_10":       "R_10",
-    "DERIV:R_25":       "R_25",
-    "DERIV:R_50":       "R_50",
-    "DERIV:R_75":       "R_75",
-    "DERIV:R_100":      "R_100",
-    # Boom indices
-    "DERIV:BOOM300N":   "BOOM300N",
-    "DERIV:BOOM500":    "BOOM500",
-    "DERIV:BOOM1000":   "BOOM1000",
-    # Crash indices
-    "DERIV:CRASH300N":  "CRASH300N",
-    "DERIV:CRASH500":   "CRASH500",
-    "DERIV:CRASH1000":  "CRASH1000",
-    # Step Index
-    "DERIV:stpRNG":     "stpRNG",
-    # Jump indices
-    "DERIV:JD10":       "JD10",
-    "DERIV:JD25":       "JD25",
-    "DERIV:JD50":       "JD50",
-    "DERIV:JD75":       "JD75",
-    "DERIV:JD100":      "JD100",
-}
-BOOM_CRASH_SYMBOLS = {s for s in DERIV_SYMBOL_MAP if "BOOM" in s or "CRASH" in s}
-
-_DERIV_GRAN: dict[str, int] = {
-    "4h": 14400, "1h": 3600, "30m": 1800, "15m": 900, "5m": 300, "1m": 60,
-}
-
-_DERIV_PERIOD_COUNT: dict[str, dict[str, int]] = {
-    "2d":  {"4h": 12,  "1h": 48,  "15m": 192, "5m":  576},
-    "5d":  {"4h": 30,  "1h": 120, "15m": 480, "5m": 1440},
-    "10d": {"4h": 60,  "1h": 240, "15m": 960, "5m": 2880},
-    "30d": {"4h": 180, "1h": 720, "15m": 2880,"5m": 8640},
-}
+SCORE_THRESHOLD = 80
+MIN_RR          = 3.0
 RISK_USD        = 100.0
 
 # ── Septuple Traction : N bougies consécutives minimum ───────
@@ -298,13 +223,9 @@ def is_weekend() -> bool:
     return datetime.now(timezone.utc).weekday() >= 5   # 5=Sat, 6=Sun
 
 
-def is_deriv_symbol(symbol: str) -> bool:
-    """Indices synthétiques Deriv — tradent 24/7, pas de spread marché."""
-    return symbol.startswith("DERIV:")
-
 def is_crypto_symbol(symbol: str) -> bool:
     """BTC et autres crypto tradent 24/7, y compris le weekend."""
-    return symbol in ("BTC-USD", "ETH-USD", "BTC-USDT", "ETH-USDT") or is_deriv_symbol(symbol)
+    return symbol in ("BTC-USD", "ETH-USD", "BTC-USDT", "ETH-USDT")
 
 GOLD_SYMBOLS = {"GC=F", "SI=F", "CL=F", "BZ=F"}
 
@@ -335,17 +256,6 @@ ATR_MIN: dict[str, float] = {
     "^GSPC"   : 8.0,     "^NDX"    : 30.0,    "^DJI"    : 80.0,
     "^GDAXI"  : 40.0,
 }
-# ── ATR_MIN pour les synthétiques Deriv ──────────────────────────────────
-ATR_MIN.update({
-    "DERIV:R_10": 0.05,    "DERIV:R_25": 0.10,
-    "DERIV:R_50": 0.30,    "DERIV:R_75": 1.50,
-    "DERIV:R_100": 3.0,
-    "DERIV:BOOM300N": 0.5, "DERIV:BOOM500": 0.5,  "DERIV:BOOM1000": 0.5,
-    "DERIV:CRASH300N": 0.5,"DERIV:CRASH500": 0.5, "DERIV:CRASH1000": 0.5,
-    "DERIV:stpRNG": 0.001,
-    "DERIV:JD10": 0.10,    "DERIV:JD25": 0.20,    "DERIV:JD50": 0.50,
-    "DERIV:JD75": 1.00,    "DERIV:JD100": 2.00,
-})
 ATR_MIN_DEFAULT = 0.00050
 MAX_SPREAD_ATR_RATIO = 0.25
 
@@ -366,13 +276,6 @@ def check_volatility(symbol: str, df_ltf: pd.DataFrame) -> tuple[bool, str]:
             atr_min = close * 0.0012
         else:
             atr_min = ATR_MIN.get(symbol, ATR_MIN_DEFAULT) * 0.7
-
-    if atr < atr_min:
-        return False, f"ATR trop faible ({round(atr, 5)} < {round(atr_min, 5)})"
-
-    # ── Indices synthétiques : 24/7, pas de spread marché ────
-    if is_deriv_symbol(symbol):
-        return True, ""
 
     spread = get_spread(symbol)
     if atr < atr_min:
@@ -417,14 +320,6 @@ SPREAD_TABLE: dict[str, float] = {
     "^GSPC"   : 0.30,    "^NDX"    : 0.50,    "^DJI"    : 2.00,
     "^GDAXI"  : 1.00,    "^FCHI"   : 1.00,    "^FTSE"   : 1.00,
     "^N225"   : 5.00,    "^HSI"    : 5.00,
-    # Synthétiques Deriv — spread quasi nul (broker interne)
-    "DERIV:R_10": 0.001,  "DERIV:R_25": 0.002,  "DERIV:R_50":  0.003,
-    "DERIV:R_75": 0.005,  "DERIV:R_100":0.008,
-    "DERIV:BOOM300N":  0.5,  "DERIV:BOOM500":  0.5,  "DERIV:BOOM1000":  0.5,
-    "DERIV:CRASH300N": 0.5,  "DERIV:CRASH500": 0.5,  "DERIV:CRASH1000": 0.5,
-    "DERIV:stpRNG": 0.001,
-    "DERIV:JD10": 0.002,  "DERIV:JD25": 0.003,  "DERIV:JD50": 0.005,
-    "DERIV:JD75": 0.008,  "DERIV:JD100":0.010,
 }
 
 
@@ -447,14 +342,6 @@ _CORR_GROUPS: dict[str, str] = {
     "BTC-USD" : "BTC",
     "^GSPC"   : "US_IDX", "^NDX"  : "US_IDX", "^DJI"  : "US_IDX",
     "^GDAXI"  : "EU_IDX", "^FCHI" : "EU_IDX",
-    # Synthétiques Deriv — groupés par famille de volatilité
-    "DERIV:R_10":  "SYNTH_VOL", "DERIV:R_25":  "SYNTH_VOL",
-    "DERIV:R_50":  "SYNTH_VOL", "DERIV:R_75":  "SYNTH_VOL", "DERIV:R_100": "SYNTH_VOL",
-    "DERIV:BOOM300N":  "SYNTH_BOOM", "DERIV:BOOM500":  "SYNTH_BOOM", "DERIV:BOOM1000":  "SYNTH_BOOM",
-    "DERIV:CRASH300N": "SYNTH_CRASH","DERIV:CRASH500": "SYNTH_CRASH","DERIV:CRASH1000": "SYNTH_CRASH",
-    "DERIV:stpRNG":    "SYNTH_STEP",
-    "DERIV:JD10":  "SYNTH_JUMP", "DERIV:JD25":  "SYNTH_JUMP", "DERIV:JD50":  "SYNTH_JUMP",
-    "DERIV:JD75":  "SYNTH_JUMP", "DERIV:JD100": "SYNTH_JUMP",
 }
 
 _active_corr_groups: dict[str, float] = {}
@@ -587,15 +474,6 @@ def tg_format_signal(sig: "Signal", tier: str = "", mode: str = "SMC",
 
     risk = abs(sig.entry - sig.sl)
 
-    # Détection marché Deriv
-    is_deriv = is_deriv_symbol(sig.symbol)
-    deriv_api = DERIV_SYMBOL_MAP.get(sig.symbol, "")
-    is_boom   = "BOOM"  in deriv_api
-    is_crash  = "CRASH" in deriv_api
-    is_jump   = deriv_api.startswith("JD")
-    is_vol    = deriv_api.startswith("R_")
-    is_step   = deriv_api == "stpRNG"
-
     # RR réels calculés sur les cibles structurelles
     def _rr(tp_val: float) -> str:
         if risk <= 0:
@@ -618,11 +496,8 @@ def tg_format_signal(sig: "Signal", tier: str = "", mode: str = "SMC",
         v = (sig.sl - sig.entry) / sig.entry * 100
         return f"+{round(v,2)}%" if v > 0 else f"{round(v,2)}%"
 
-    # Lot : Deriv utilise compute_lot_deriv
-    if is_deriv:
-        base_lot = compute_lot_deriv(sig.symbol, sig.entry, sig.sl, risk_usd=100.0)
-    else:
-        base_lot = compute_lot(sig.symbol, sig.entry, sig.sl, risk_usd=100.0)
+    # Lot basé sur SL distance réelle pour $100 de risque
+    base_lot = compute_lot(sig.symbol, sig.entry, sig.sl, risk_usd=100.0)
 
     # TP2 et TP3 structurels (depuis sig, sinon fallback mathématique)
     tp2 = sig.tp2 if sig.tp2 and sig.tp2 != sig.tp else (
@@ -655,73 +530,17 @@ def tg_format_signal(sig: "Signal", tier: str = "", mode: str = "SMC",
     # Nom affichage
     sym_map = {"GC=F": "XAUUSD / GOLD", "SI=F": "XAGUSD / SILVER",
                "CL=F": "USOIL", "BZ=F": "UKOIL", "BTC-USD": "BTCUSD / Bitcoin",
-               "^GSPC": "S&P 500", "^NDX": "Nasdaq 100", "^DJI": "Dow Jones",
-               # Deriv synthétiques
-               "DERIV:R_10":      "Volatility 10 Index",
-               "DERIV:R_25":      "Volatility 25 Index",
-               "DERIV:R_50":      "Volatility 50 Index",
-               "DERIV:R_75":      "Volatility 75 Index",
-               "DERIV:R_100":     "Volatility 100 Index",
-               "DERIV:BOOM300N":  "Boom 300 Index",
-               "DERIV:BOOM500":   "Boom 500 Index",
-               "DERIV:BOOM1000":  "Boom 1000 Index",
-               "DERIV:CRASH300N": "Crash 300 Index",
-               "DERIV:CRASH500":  "Crash 500 Index",
-               "DERIV:CRASH1000": "Crash 1000 Index",
-               "DERIV:stpRNG":    "Step Index",
-               "DERIV:JD10":      "Jump 10 Index",
-               "DERIV:JD25":      "Jump 25 Index",
-               "DERIV:JD50":      "Jump 50 Index",
-               "DERIV:JD75":      "Jump 75 Index",
-               "DERIV:JD100":     "Jump 100 Index",
-               }
+               "^GSPC": "S&P 500", "^NDX": "Nasdaq 100", "^DJI": "Dow Jones"}
     sym_display = sym_map.get(sig.symbol,
-        sig.symbol.replace("=X", "").replace("-USD", "").replace("^", "").replace("DERIV:", ""))
+        sig.symbol.replace("=X", "").replace("-USD", "").replace("^", ""))
 
     dir_arrow = "🟢 BUY / LONG" if sig.direction == "LONG" else "🔴 SELL / SHORT"
     num_str   = f"#{signal_num}" if signal_num else ""
-
-    # ── Badge marché ──────────────────────────────────────────────────────
-    if is_deriv:
-        market_badge = "🤖 DERIV SYNTHÉTIQUE — 24/7"
-        deriv_tips   = ""
-        if is_boom:
-            deriv_tips = (
-                f"\n⚡ <b>BOOM INDEX</b> — Spikes haussiers aléatoires\n"
-                f"   → Direction <b>LONG uniquement recommandée</b>\n"
-                f"   → Fermer partiellement avant chaque spike potentiel"
-            )
-        elif is_crash:
-            deriv_tips = (
-                f"\n⚡ <b>CRASH INDEX</b> — Spikes baissiers aléatoires\n"
-                f"   → Direction <b>SHORT uniquement recommandée</b>\n"
-                f"   → Fermer partiellement avant chaque spike potentiel"
-            )
-        elif is_jump:
-            deriv_tips = (
-                f"\n⚡ <b>JUMP INDEX</b> — Gaps brusques dans les 2 sens\n"
-                f"   → SL large conseillé · Réduire le lot"
-            )
-        elif is_step:
-            deriv_tips = (
-                f"\n📊 <b>STEP INDEX</b> — Mouvement en paliers réguliers\n"
-                f"   → Idéal pour les OB/FVG précis · Très propre"
-            )
-        elif is_vol:
-            vol_pct = deriv_api.replace("R_", "")
-            deriv_tips = (
-                f"\n📈 <b>VOLATILITY {vol_pct} INDEX</b> — Pur algo 24/7\n"
-                f"   → SMC le plus fiable · Pas de gap ni news"
-            )
-    else:
-        market_badge = "🌍 MARCHÉ RÉEL"
-        deriv_tips   = ""
 
     msg = (
         f"<b>⭐ SMC SIGNALS PRO</b>\n"
         f"🟢 <b>NOUVEAU SIGNAL {num_str}</b>\n"
         f"<b>{sym_display}</b>\n"
-        f"<i>{market_badge}</i>\n"
         f"{'─'*30}\n"
         f"💎  <b>SETUP :</b> {mode}\n"
         f"🎯  <b>DIRECTION :</b> <b>{dir_arrow}</b>\n"
@@ -735,7 +554,6 @@ def tg_format_signal(sig: "Signal", tier: str = "", mode: str = "SMC",
         f"{'─'*30}\n"
         f"✅ <b>CONFLUENCE SMC VALIDÉE</b>\n"
         f"📈 Momentum {mom} + Structure {struct}\n"
-        f"{deriv_tips}\n"
         f"🧠 Patience • Discipline • Liquidité\n\n"
         f"<i>@smcsignalspro</i>"
     )
@@ -744,7 +562,7 @@ def tg_format_signal(sig: "Signal", tier: str = "", mode: str = "SMC",
 
 # ── Génération du graphique SMC ────────────────────────────────────────────
 def generate_chart_image(sig: "Signal") -> Optional[str]:
-    """Génère un graphique SMC dark-theme 8K (7680×4320) et retourne le chemin /tmp/*.png."""
+    """Génère un graphique SMC dark-theme 1280×720 optimisé Telegram et retourne le chemin /tmp/*.png."""
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -768,8 +586,8 @@ def generate_chart_image(sig: "Signal") -> Optional[str]:
         GRAY   = "#64748b"; LGRAY  = "#94a3b8"
         MONO   = "DejaVu Sans Mono"
 
-        # ── Figure 8K : 16×9 @ 480 dpi = 7680×4320 px ───────
-        fig, ax = plt.subplots(figsize=(16, 9), dpi=480, facecolor=BG)
+        # ── Figure 1280×720 — optimisé Telegram sendPhoto ────
+        fig, ax = plt.subplots(figsize=(13.33, 7.5), dpi=96, facecolor=BG)
         ax.set_facecolor(BG2)
         for s in ax.spines.values():
             s.set_color("#1e293b"); s.set_linewidth(0.4)
@@ -900,7 +718,7 @@ def generate_chart_image(sig: "Signal") -> Optional[str]:
         safe = (sig.symbol.replace("=X","").replace("-","")
                           .replace("^","").replace(".",""))
         path = f"/tmp/smc_{safe}_{int(time.time())}.png"
-        fig.savefig(path, dpi=480, bbox_inches="tight", facecolor=BG,
+        fig.savefig(path, dpi=96, bbox_inches="tight", facecolor=BG,
                     metadata={"Software": "SMC Signal Engine v3"})
         plt.close(fig)
         import gc as _gc; _gc.collect()
@@ -946,7 +764,7 @@ def tg_notify(sig: "Signal", tier: str = "", mode: str = "SMC",
         # Génère quand même le graphique pour vérification locale
         chart_path = generate_chart_image(sig)
         if chart_path:
-            print(c(f"  [TG] 📊 Graphique 8K généré : {chart_path}", "cyan"))
+            print(c(f"  [TG] 📊 Graphique 1280×720 généré : {chart_path}", "cyan"))
         return
 
     # Récupérer l'ID leader si pas encore connu
@@ -1091,10 +909,6 @@ def compute_lot(symbol: str, entry: float, sl: float,
     sl_distance = abs(entry - sl)
     if sl_distance == 0:
         return 0.0
-    # ── Routage Deriv : déléguer à compute_lot_deriv ─────────────────────
-    if is_deriv_symbol(symbol):
-        lot = risk_usd / (sl_distance * 1.0)
-        return max(0.01, round(lot, 2))
     sym = symbol.upper().replace("=X", "").replace("-", "").replace("^", "")
 
     if symbol in ("GC=F",):
@@ -1124,105 +938,8 @@ def compute_lot(symbol: str, entry: float, sl: float,
     return max(0.01, round(lot, 2))
 
 
-# ── Calcul lot DERIV SYNTHÉTIQUES ────────────────────────────────────────
-# Les indices synthétiques Deriv utilisent des contrats spécifiques :
-#   - Volatility (R_10/25/50/75/100) : 1 lot = 1 unité, P&L = sl_distance × lot
-#   - Boom/Crash : idem, spike aléatoires → risk fixe en USD
-#   - Jump : idem
-#   - Step : idem
-def compute_lot_deriv(symbol: str, entry: float, sl: float,
-                      risk_usd: float = RISK_USD) -> float:
-    """
-    Calcule la taille de position pour les synthétiques Deriv.
-    Deriv : P&L = (exit - entry) × lot_size × contract_multiplier
-    Multiplier standard = 1.0 pour les indices synthétiques.
-    En pratique : lot = risk_usd / sl_distance (simplifié, ajustable).
-    """
-    sl_distance = abs(entry - sl)
-    if sl_distance <= 0:
-        return 0.01
-
-    # Deriv synthétiques : contrat standard = 1 unité
-    # Pour les Volatility Index (R_10..R_100) → prix ~600-2000
-    # Pour Boom/Crash → prix ~200-3000
-    # Pour Jump → prix ~100-5000
-    # Lot minimum Deriv = 0.001 (micro)
-    lot = risk_usd / sl_distance
-    return max(0.001, round(lot, 3))
-
-
-def fetch_deriv(symbol: str, interval: str, period: str = "5d") -> pd.DataFrame:
-    """
-    Récupère les bougies OHLC via l'API WebSocket Deriv pour les indices synthétiques.
-    Requiert : pip install websocket-client
-    App ID gratuit  : https://developers.deriv.com
-    Variable d'env  : DERIV_APP_ID (défaut 1089 = public demo)
-    """
-    if not _WEBSOCKET_OK:
-        log.warning("  [DERIV] websocket-client manquant — pip install websocket-client")
-        return pd.DataFrame()
-
-    api_sym = DERIV_SYMBOL_MAP.get(symbol)
-    if api_sym is None:
-        log.warning(f"  [DERIV] Symbole inconnu : {symbol}")
-        return pd.DataFrame()
-
-    gran   = _DERIV_GRAN.get(interval, 3600)
-    counts = _DERIV_PERIOD_COUNT.get(period, _DERIV_PERIOD_COUNT["5d"])
-    count  = min(counts.get(interval, 120), 5000)
-
-    url     = f"wss://ws.binaryws.com/websockets/v3?app_id={DERIV_APP_ID}"
-    payload = _json.dumps({
-        "ticks_history": api_sym,
-        "end":           "latest",
-        "count":         count,
-        "granularity":   gran,
-        "style":         "candles",
-    })
-
-    try:
-        ws = _websocket_lib.create_connection(url, timeout=15)
-        ws.send(payload)
-        raw  = ws.recv()
-        ws.close()
-        data = _json.loads(raw)
-
-        if "error" in data:
-            log.warning(f"  [DERIV] API error {symbol}: {data['error'].get('message','?')}")
-            return pd.DataFrame()
-
-        candles = data.get("candles", [])
-        if not candles:
-            return pd.DataFrame()
-
-        rows = [
-            {
-                "open":   float(c["open"]),
-                "high":   float(c["high"]),
-                "low":    float(c["low"]),
-                "close":  float(c["close"]),
-                "volume": float(c.get("volume", 1)),   # synthétiques = pas de vrai volume
-            }
-            for c in candles
-        ]
-        df = pd.DataFrame(rows)
-        df.index = pd.to_datetime([c["epoch"] for c in candles], unit="s", utc=True)
-        df.dropna(inplace=True)
-
-        if SMC_DEBUG:
-            log.info(f"  [DERIV] {symbol} ({api_sym}) {interval} → {len(df)} bougies")
-        return df
-
-    except Exception as exc:
-        log.warning(f"  [DERIV] fetch_deriv({symbol}, {interval}): {exc}")
-        return pd.DataFrame()
-
-
 def fetch(symbol: str, interval: str, period: str = "5d",
           retries: int = 3, retry_delay: int = 15) -> pd.DataFrame:
-    # ── Indices synthétiques Deriv → API WebSocket dédiée ────
-    if is_deriv_symbol(symbol):
-        return fetch_deriv(symbol, interval, period)
     # Fallback sur plusieurs périodes si yfinance échoue
     periods_fallback = list(dict.fromkeys([period, "5d", "10d", "1mo"]))
     for p in periods_fallback:
@@ -2029,54 +1746,21 @@ def detect_institutional_entry_candles(df: pd.DataFrame,
 #  — Conservés et améliorés depuis v2
 # ═════════════════════════════════════════════════════════════
 
-def htf_bias(df: pd.DataFrame, symbol: str = "?") -> str:
-    """Biais H4 via EMA8 + structure HH/HL ou LH/LL sur les 20 dernières bougies.
-
-    Fix v5 : logique assouplie — on exige EMA + structure swing, pas forcément
-    que le dernier high soit le plus haut absolu des 5 dernières bougies.
-    En range (vendredi après-midi, etc.) l'ancienne condition donnait NEUTRAL
-    systématiquement, bloquant tout le pipeline.
-    """
+def htf_bias(df: pd.DataFrame) -> str:
+    """Biais H4 via EMA + HH/LL (20 bougies)."""
     if len(df) < 20:
-        if SMC_DEBUG:
-            log.info(f"  [HTF_DEBUG] {symbol}: données insuffisantes ({len(df)} bougies) → NEUTRAL")
         return "NEUTRAL"
-
     highs  = df["high"].iloc[-20:].values
     lows   = df["low"].iloc[-20:].values
     closes = df["close"].iloc[-20:].values
     ema    = np.convolve(closes, np.ones(8) / 8, mode="valid")
-
-    trend_up = closes[-1] > ema[-1]
-
-    # ── Structure swing : comparer les 2 derniers pivots sur fenêtre 10/5 ──
-    # HH : dernier high > high de -10 bougies
-    # LH  : dernier high < high de -10 bougies
-    # HL  : dernier low  > low  de -10 bougies
-    # LL  : dernier low  < low  de -10 bougies
-    hh = highs[-1] >= highs[-10]   # Higher High
-    hl = lows[-1]  >= lows[-10]    # Higher Low
-    lh = highs[-1] <= highs[-10]   # Lower High
-    ll = lows[-1]  <= lows[-10]    # Lower Low
-
-    bullish_structure = hh or hl   # au moins un pivot haussier
-    bearish_structure = lh or ll   # au moins un pivot baissier
-
-    if trend_up and bullish_structure:
-        result = "BULLISH"
-    elif not trend_up and bearish_structure:
-        result = "BEARISH"
-    else:
-        result = "NEUTRAL"
-
-    if SMC_DEBUG:
-        log.info(
-            f"  [HTF_DEBUG] {symbol}: "
-            f"close={closes[-1]:.5f} ema8={ema[-1]:.5f} "
-            f"trend_up={trend_up} | hh={hh} hl={hl} lh={lh} ll={ll} → {result}"
-        )
-
-    return result
+    trend_up  = closes[-1] > ema[-1]
+    last_hh   = highs[-1] < highs[-5:].max()
+    if not trend_up and last_hh:
+        return "BEARISH"
+    elif trend_up and not last_hh:
+        return "BULLISH"
+    return "NEUTRAL"
 
 
 def detect_bos(df: pd.DataFrame) -> list[dict]:
@@ -2154,79 +1838,183 @@ def detect_breaker_blocks(df: pd.DataFrame, bos_list: list[dict]) -> list[dict]:
     return breakers
 
 
-def detect_mitigation_blocks(
-    df: pd.DataFrame,
-    obs: list,          # list[OrderBlock]
-    direction: str,
-    atr: float = 0.0,
-) -> list[dict]:
+# ═════════════════════════════════════════════════════════════
+#  ORDER FLOW SHIFT STRUCTUREL (M15 / H4)
+#
+#  Différent du micro-OFS sur bougie unique.
+#  Ici on détecte un CHANGEMENT D'INTENT institutionnel sur M15 :
+#
+#  LONG  : série de HL montants (higher lows) + BOS haussier récent
+#           = les institutions accumulent → demande structurelle
+#
+#  SHORT : série de LH descendants (lower highs) + BOS baissier récent
+#           = les institutions distribuent → pression vendeuse
+#
+#  Bonus : +12 si OFS structurel aligné avec le biais H4
+# ═════════════════════════════════════════════════════════════
+
+def detect_order_flow_structural(df: pd.DataFrame, direction: str,
+                                  bos_list: list[dict]) -> dict:
     """
-    Mitigation Block = Order Block partiellement testé (prix entré dans la zone)
-    mais sans clôture de l'autre côté → zone encore valide, considérée premium.
+    Détecte un Order Flow Shift structurel sur M15 ou H4.
 
-    Différence avec Breaker Block :
-      - Breaker  : OB entièrement mitiqué, a flippé de direction
-      - Mitigation : OB touché mais tenu — réentrée possible dans le sens original
+    Critères LONG :
+      • Au moins 3 Higher Lows consécutifs sur les 20 dernières bougies
+      • BOS haussier récent (dans les 10 dernières bougies)
+      • Pas de cassure baissière après le dernier HL
 
-    Retourne les MBs actifs, triés par proximité au prix courant.
+    Critères SHORT :
+      • Au moins 3 Lower Highs consécutifs sur les 20 dernières bougies
+      • BOS baissier récent (dans les 10 dernières bougies)
+      • Pas de cassure haussière après le dernier LH
+
+    Retourne dict {detected, hl_count/lh_count, bos_aligned, score_bonus, reason}
     """
-    if len(df) < 5 or not obs:
-        return []
+    empty = {"detected": False, "count": 0, "bos_aligned": False,
+             "score_bonus": 0, "reason": ""}
 
-    current_price = df["close"].iloc[-1]
-    if atr == 0.0:
-        atr = (df["high"] - df["low"]).rolling(14).mean().iloc[-1]
-    proximity_limit = atr * 3.0   # zone doit être < 3 ATR du prix
+    if len(df) < 20:
+        return empty
 
-    result = []
-    for ob in obs:
-        if ob.direction != direction.lower():
-            continue
-        ob_idx = ob.index
-        if ob_idx + 2 >= len(df):
-            continue
+    window = df.iloc[-25:]
 
-        post = df.iloc[ob_idx + 1:]
-        if post.empty:
-            continue
+    # ── Détecter Higher Lows ou Lower Highs ────────────────────
+    if direction == "LONG":
+        # Higher Lows : chaque swing low > swing low précédent
+        lows = []
+        for i in range(1, len(window) - 1):
+            if window["low"].iloc[i] < window["low"].iloc[i-1] and \
+               window["low"].iloc[i] < window["low"].iloc[i+1]:
+                lows.append(window["low"].iloc[i])
 
-        ob_top = max(ob.top, ob.bottom)
-        ob_bot = min(ob.top, ob.bottom)
+        # Compte les HL consécutifs depuis la fin
+        hl_count = 0
+        for k in range(len(lows) - 1, 0, -1):
+            if lows[k] > lows[k-1]:
+                hl_count += 1
+            else:
+                break
 
-        if direction == "LONG":
-            # OB bullish : prix doit avoir effleuré la zone (low ≤ ob_top)
-            # mais aucune clôture sous ob_bot
-            touched    = (post["low"]   <= ob_top).any()
-            full_break = (post["close"] < ob_bot).any()
+        if hl_count < 2:
+            return empty
+
+        # BOS haussier récent aligné
+        bos_aligned = any(
+            b["type"] == "bullish"
+            for b in bos_list[-10:]
+        )
+
+        score_bonus = 0
+        if hl_count >= 3:
+            score_bonus = 12
+        elif hl_count >= 2:
+            score_bonus = 8
+
+        if bos_aligned:
+            score_bonus += 3
+
+        reason = (
+            f"📈 Order Flow Shift LONG — {hl_count} Higher Lows structurels"
+            f"{'  + BOS haussier aligné' if bos_aligned else ''}  (+{score_bonus})"
+        )
+        return {"detected": True, "count": hl_count, "bos_aligned": bos_aligned,
+                "score_bonus": score_bonus, "reason": reason}
+
+    else:  # SHORT
+        # Lower Highs : chaque swing high < swing high précédent
+        highs = []
+        for i in range(1, len(window) - 1):
+            if window["high"].iloc[i] > window["high"].iloc[i-1] and \
+               window["high"].iloc[i] > window["high"].iloc[i+1]:
+                highs.append(window["high"].iloc[i])
+
+        lh_count = 0
+        for k in range(len(highs) - 1, 0, -1):
+            if highs[k] < highs[k-1]:
+                lh_count += 1
+            else:
+                break
+
+        if lh_count < 2:
+            return empty
+
+        bos_aligned = any(
+            b["type"] == "bearish"
+            for b in bos_list[-10:]
+        )
+
+        score_bonus = 0
+        if lh_count >= 3:
+            score_bonus = 12
+        elif lh_count >= 2:
+            score_bonus = 8
+
+        if bos_aligned:
+            score_bonus += 3
+
+        reason = (
+            f"📉 Order Flow Shift SHORT — {lh_count} Lower Highs structurels"
+            f"{'  + BOS baissier aligné' if bos_aligned else ''}  (+{score_bonus})"
+        )
+        return {"detected": True, "count": lh_count, "bos_aligned": bos_aligned,
+                "score_bonus": score_bonus, "reason": reason}
+
+
+def detect_breaker_block_htf(df_htf: pd.DataFrame, df_mtf: pd.DataFrame,
+                              direction: str) -> dict:
+    """
+    Breaker Block MULTI-TIMEFRAME (H4 + M15).
+
+    Un Breaker Block H4 est le setup le plus puissant :
+    • OB haussier H4 cassé vers le bas (BOS bearish H4) → devient Supply (Breaker bearish)
+    • Prix revient tester ce niveau sur M15 → entrée SHORT de haute conviction
+    • Inverse pour LONG (OB baissier H4 cassé → Demand Breaker)
+
+    Score bonus :
+      +10 si Breaker M15 seul
+      +15 si Breaker H4 (niveau institutionnel)
+      +18 si Breaker H4 + prix revient tester sur M15
+
+    Retourne dict {detected, level_top, level_bottom, tf, score_bonus, reason}
+    """
+    empty = {"detected": False, "level_top": None, "level_bottom": None,
+             "tf": None, "score_bonus": 0, "reason": ""}
+
+    # ── Breaker Block H4 ──────────────────────────────────────
+    bos_htf = detect_bos(df_htf)
+    bkr_htf = detect_breaker_blocks(df_htf, bos_htf)
+
+    htf_bias_dir = "bearish" if direction == "SHORT" else "bullish"
+    htf_breakers = [b for b in bkr_htf if b["direction"] == htf_bias_dir]
+
+    if htf_breakers:
+        bb = htf_breakers[-1]  # le plus récent
+        price_now = df_mtf["close"].iloc[-1]
+        atr_mtf   = (df_mtf["high"] - df_mtf["low"]).rolling(14).mean().iloc[-1]
+
+        # Le prix reteste-t-il le Breaker H4 sur M15 ?
+        in_bb = (bb["bottom"] - atr_mtf * 0.2) <= price_now <= (bb["top"] + atr_mtf * 0.2)
+
+        if in_bb:
+            reason = (
+                f"🔥 Breaker Block H4 retesté sur M15 @ "
+                f"{round((bb['top']+bb['bottom'])/2, 5)}  (+18)"
+            )
+            return {"detected": True, "level_top": bb["top"], "level_bottom": bb["bottom"],
+                    "tf": "H4+M15", "score_bonus": 18, "reason": reason}
         else:
-            # OB bearish : prix doit avoir effleuré la zone (high ≥ ob_bot)
-            # mais aucune clôture au-dessus de ob_top
-            touched    = (post["high"]  >= ob_bot).any()
-            full_break = (post["close"] > ob_top).any()
+            reason = (
+                f"🔥 Breaker Block H4 actif @ "
+                f"{round((bb['top']+bb['bottom'])/2, 5)}  (+15)"
+            )
+            return {"detected": True, "level_top": bb["top"], "level_bottom": bb["bottom"],
+                    "tf": "H4", "score_bonus": 15, "reason": reason}
 
-        if not touched or full_break:
-            continue
+    return empty
 
-        # Proximité au prix courant
-        mid_zone = (ob_top + ob_bot) / 2
-        dist     = abs(current_price - mid_zone)
-        if dist > proximity_limit:
-            continue
 
-        dist_pct = dist / mid_zone * 100 if mid_zone > 0 else 999
-
-        result.append({
-            "direction": ob.direction,
-            "top":       ob_top,
-            "bottom":    ob_bot,
-            "index":     ob_idx,
-            "dist_pct":  round(dist_pct, 2),
-            "dist_atr":  round(dist / atr, 2) if atr > 0 else 0,
-        })
-
-    # Trier par distance au prix (le plus proche d'abord)
-    result.sort(key=lambda x: x["dist_pct"])
-    return result
+# ═════════════════════════════════════════════════════════════
+#  CHART PATTERNS DETECTION  (Images 1 & 2)
 #
 #  Bullish Continuation  : Ascending Triangle · Bull Flag · Bull Wedge · Sym Triangle
 #  Bearish Continuation  : Descending Triangle · Bear Flag · Bear Wedge · Sym Triangle
@@ -2877,7 +2665,11 @@ def compute_score_v3(
     # ── Nouveaux setups ──────────────────────────────────────
     sweep_shift_bonus:  int  = 0,    # Setup 4H Sweep + 5M Shift
     choch_eql_bonus:    int  = 0,    # Setup CHoCH + Equal Liq
-    mitigation_block:   bool = False, # Mitigation Block actif (OB partiellement testé)
+    # ── Order Flow + Breaker HTF ─────────────────────────────
+    ofs_structural_bonus: int = 0,   # Order Flow Shift structurel M15
+    ofs_structural_reason: str = "", # Raison OFS
+    breaker_htf_bonus:  int  = 0,   # Breaker Block H4 (niveau institutionnel)
+    breaker_htf_reason: str  = "",  # Raison Breaker HTF
 ) -> tuple[int, list[str]]:
     score   = 0
     reasons = []
@@ -2911,12 +2703,8 @@ def compute_score_v3(
         reasons.append("✅ Liquidité M15 prise (stop hunt)  (+8)")
 
     if breaker_block:
-        score += 5
-        reasons.append("🔥 Breaker Block M15 détecté  (+5)")
-
-    if mitigation_block:
-        score += 7
-        reasons.append("🧲 Mitigation Block actif (OB partiellement testé)  (+7)")
+        score += 10
+        reasons.append("🔥 Breaker Block M15 détecté  (+10)")
 
     if bsl_ssl_swept:
         score += 8
@@ -2925,6 +2713,18 @@ def compute_score_v3(
     if eqh_eql_present:
         score += 4
         reasons.append("⚡ Equal High/Low (EQH/EQL) = liquidité institutionnelle  (+4)")
+
+    # ── ORDER FLOW SHIFT STRUCTUREL (max 15 pts) ──────────────
+    if ofs_structural_bonus > 0 and ofs_structural_reason:
+        ofs_pts = min(ofs_structural_bonus, 15)
+        score  += ofs_pts
+        reasons.append(ofs_structural_reason)
+
+    # ── BREAKER BLOCK H4 (max 18 pts) ─────────────────────────
+    if breaker_htf_bonus > 0 and breaker_htf_reason:
+        bb_pts = min(breaker_htf_bonus, 18)
+        score += bb_pts
+        reasons.append(breaker_htf_reason)
 
     # ── M5 ENTRÉE (25 pts max) ────────────────────────────────
     if sd_zone_active:
@@ -3178,16 +2978,10 @@ def analyse(symbol: str, htf: str = HTF, ltf: str = LTF,
             print(c(f"  ⛔ Skip : {vol_reason}", "yellow"))
         return None
 
-    # ── Boom/Crash incompatibles avec le moteur SMC (spikes artificiels) ──
-    if symbol in BOOM_CRASH_SYMBOLS:
-        if not silent:
-            print(c("  ⛔ Boom/Crash — moteur SMC incompatible (spikes unilatéraux)", "yellow"))
-        return None
-
     # ─────────────────────────────────────────────────────────
     #  H4 : Biais + AMD + Septuple Traction
     # ─────────────────────────────────────────────────────────
-    bias      = htf_bias(df_htf, symbol)
+    bias      = htf_bias(df_htf)
     direction = "SHORT" if bias == "BEARISH" else ("LONG" if bias == "BULLISH" else None)
 
     if not silent:
@@ -3248,11 +3042,6 @@ def analyse(symbol: str, htf: str = HTF, ltf: str = LTF,
     liq_taken     = liq_mtf["bearish_sweep"] if direction == "SHORT" else liq_mtf["bullish_sweep"]
     breaker_ok    = any(b["direction"] == bias.lower() for b in bkr_mtf)
 
-    # ── Mitigation Block M15 ──────────────────────────────────
-    atr_mtf       = (df_mtf["high"] - df_mtf["low"]).rolling(14).mean().iloc[-1]
-    mit_blocks    = detect_mitigation_blocks(df_mtf, obs_mtf, direction, atr_mtf)
-    mitigation_ok = len(mit_blocks) > 0
-
     ob_mtf_match = next((o for o in reversed(obs_mtf) if o.direction == bias.lower()), None)
 
     if not silent:
@@ -3261,8 +3050,6 @@ def analyse(symbol: str, htf: str = HTF, ltf: str = LTF,
         print(f"  {'OB M15':<28} {tick(mtf_ob_ok)}")
         print(f"  {'Liquidité prise M15':<28} {tick(liq_taken)}")
         print(f"  {'Breaker Block M15':<28} {tick(breaker_ok)}")
-        print(f"  {'Mitigation Block M15':<28} {tick(mitigation_ok)}"
-              + (f"  dist={mit_blocks[0]['dist_pct']}%" if mitigation_ok else ""))
 
     # ─────────────────────────────────────────────────────────
     #  M5 : FVG, OB, Supply/Demand Zones, Bougies institutionnelles
@@ -3308,6 +3095,16 @@ def analyse(symbol: str, htf: str = HTF, ltf: str = LTF,
     ob_ret_bonus  = ob_retest.score_bonus if ob_retest.detected else 0
     ob_ret_desc   = ob_retest.description if ob_retest.detected else ""
 
+    # ── Order Flow Shift structurel M15 ──────────────────────
+    ofs_mtf       = detect_order_flow_structural(df_mtf, direction, bos_mtf)
+    ofs_bonus     = ofs_mtf["score_bonus"] if ofs_mtf["detected"] else 0
+    ofs_reason    = ofs_mtf["reason"] if ofs_mtf["detected"] else ""
+
+    # ── Breaker Block H4 (niveau institutionnel) ──────────────
+    bb_htf        = detect_breaker_block_htf(df_htf, df_mtf, direction)
+    bb_htf_bonus  = bb_htf["score_bonus"] if bb_htf["detected"] else 0
+    bb_htf_reason = bb_htf["reason"] if bb_htf["detected"] else ""
+
     # ── Setup ⑦ : 4H Sweep + 5M Shift ────────────────────────
     sweep_shift   = detect_h4_sweep_5m_shift(df_htf, df_ltf, direction)
     ss_bonus      = sweep_shift["score_bonus"] if sweep_shift["detected"] else 0
@@ -3345,6 +3142,19 @@ def analyse(symbol: str, htf: str = HTF, ltf: str = LTF,
             print(f"  {'💰 CHoCH+Equal Liq':<28} {c('✓ DÉTECTÉ', 'green')}  (+{ce_bonus})")
         else:
             print(f"  {'💰 CHoCH+Equal Liq':<28} {c('Non détecté', 'white')}")
+        # Order Flow + Breaker HTF
+        if ofs_mtf["detected"]:
+            _ofs_cnt = ofs_mtf["count"]
+            _ofs_lbl = c(f"{_ofs_cnt} HL/LH structurels", "green")
+            print(f"  {'📈 Order Flow Shift M15':<28} {_ofs_lbl}  (+{ofs_bonus})")
+        else:
+            print(f"  {'📈 Order Flow Shift M15':<28} {c('Non détecté', 'white')}")
+        if bb_htf["detected"]:
+            _bb_tf  = bb_htf["tf"]
+            _bb_lbl = c(f"{_bb_tf} ✓", "yellow")
+            print(f"  {'🔥 Breaker Block H4':<28} {_bb_lbl}  (+{bb_htf_bonus})")
+        else:
+            print(f"  {'🔥 Breaker Block H4':<28} {c('Non détecté', 'white')}")
 
     # ─────────────────────────────────────────────────────────
     #  SCORING v3
@@ -3372,7 +3182,10 @@ def analyse(symbol: str, htf: str = HTF, ltf: str = LTF,
         ob_retest_desc    = ob_ret_desc,
         sweep_shift_bonus = ss_bonus,
         choch_eql_bonus   = ce_bonus,
-        mitigation_block  = mitigation_ok,
+        ofs_structural_bonus  = ofs_bonus,
+        ofs_structural_reason = ofs_reason,
+        breaker_htf_bonus     = bb_htf_bonus,
+        breaker_htf_reason    = bb_htf_reason,
     )
 
     # Ajout des raisons AMD
@@ -3519,10 +3332,14 @@ def analyse(symbol: str, htf: str = HTF, ltf: str = LTF,
         # Boost score avec les raisons SMC_TRADER
         score = min(score + smc_trader.score // 4, 100)
         reasons = smc_trader.reasons + reasons
+    elif bb_htf["detected"] and bb_htf_bonus >= 15:
+        mode = "BREAKER_HTF"
     elif amd_ok and amd_conf >= 75:
         mode = "AMD"
     elif sept_ok and sept_count >= 5:
         mode = "SEPTUPLE"
+    elif ofs_mtf["detected"] and ofs_bonus >= 10:
+        mode = "OFS"
     elif sweep_shift["detected"] and ss_bonus >= 20:
         mode = "SWEEP_SHIFT"
     elif choch_eql["detected"] and ce_bonus >= 20:
@@ -3608,49 +3425,15 @@ def analyse(symbol: str, htf: str = HTF, ltf: str = LTF,
 
 
 # ═════════════════════════════════════════════════════════════
-#  WATCHLIST v4 — DERIV TIER 0 (PRIORITÉ ABSOLUE) + BTC + GOLD
+#  WATCHLIST v3 — BTC UNIQUEMENT pour crypto
 # ═════════════════════════════════════════════════════════════
 
-# ── TIER 0 : Deriv Synthétiques — Scannés EN PREMIER, 24/7 ─────────────
-# Sélection des meilleurs marchés Deriv pour SMC :
-#   • V10/V25/V50 : volatilité modérée → SMC très propre, idéal AMD + S/D
-#   • V75/V100    : haute volatilité → Septuple Traction + Liquidity Hunt
-#   • Boom 500/1000 : LONG uniquement (spikes haussiers)
-#   • Crash 500/1000 : SHORT uniquement (spikes baissiers)
-#   • Jump 25/50   : gaps → RR élevés possibles
-#   • Step Index   : patterns très propres
-TIER_0_DERIV: list[tuple[str, str]] = [
-    # ── Volatility indices — LES MEILLEURS pour SMC ────────────────
-    ("DERIV:R_10",       "V10 Index"),    # ← le plus calme, setups ultra-propres
-    ("DERIV:R_25",       "V25 Index"),    # ← excellent AMD + Supply/Demand
-    ("DERIV:R_50",       "V50 Index"),    # ← bon équilibre volatilité/précision
-    ("DERIV:R_75",       "V75 Index"),    # ← Septuple Traction fréquente
-    ("DERIV:R_100",      "V100 Index"),   # ← fort momentum, RR élevés
-    # ── Step Index — structure la plus propre ──────────────────────
-    ("DERIV:stpRNG",     "Step Index"),   # ← OB et FVG très fiables
-    # ── Boom / Crash — LONG ou SHORT spécifique ───────────────────
-    ("DERIV:BOOM500",    "Boom 500"),     # ← LONG uniquement conseillé
-    ("DERIV:BOOM1000",   "Boom 1000"),    # ← LONG uniquement conseillé
-    ("DERIV:CRASH500",   "Crash 500"),    # ← SHORT uniquement conseillé
-    ("DERIV:CRASH1000",  "Crash 1000"),   # ← SHORT uniquement conseillé
-    # ── Jump indices — gaps = RR potentiellement très élevés ───────
-    ("DERIV:JD25",       "Jump 25"),
-    ("DERIV:JD50",       "Jump 50"),
-    ("DERIV:JD75",       "Jump 75"),
-    # ── Boom/Crash 300 ─────────────────────────────────────────────
-    ("DERIV:BOOM300N",   "Boom 300"),
-    ("DERIV:CRASH300N",  "Crash 300"),
-    # ── Jump extrêmes ──────────────────────────────────────────────
-    ("DERIV:JD10",       "Jump 10"),
-    ("DERIV:JD100",      "Jump 100"),
-]
-
 TIER_1_PRIORITY: list[tuple[str, str]] = [
-    ("GC=F",    "Gold"),       # ← PRIORITÉ 1 après Deriv
-    ("BTC-USD", "Bitcoin"),    # ← BTC UNIQUEMENT (pas ETH, pas autres crypto)
+    ("GC=F",    "Gold"),
     ("SI=F",    "Silver"),
     ("CL=F",    "Oil WTI"),
     ("BZ=F",    "Oil Brent"),
+    ("BTC-USD", "Bitcoin"),    # ← BTC UNIQUEMENT (pas ETH, pas autres crypto)
 ]
 
 TIER_2_FOREX: list[tuple[str, str]] = [
@@ -3678,50 +3461,18 @@ TIER_3_EXTRA: list[tuple[str, str]] = [
     ("^GDAXI",   "DAX"),     ("^FCHI",  "CAC 40"),     ("^FTSE",  "FTSE 100"),
 ]
 
-# ── Indices Synthétiques Deriv (24/7) ──────────────────────────────────────
-TIER_1_SYNTHETIC: list[tuple[str, str]] = [
-    # Volatility indices — continus, pas de news, pur mouvement algorithmique
-    ("DERIV:R_10",       "V10 Index"),
-    ("DERIV:R_25",       "V25 Index"),
-    ("DERIV:R_50",       "V50 Index"),
-    ("DERIV:R_75",       "V75 Index"),
-    ("DERIV:R_100",      "V100 Index"),
-    # Boom indices — spikes haussiers aléatoires
-    ("DERIV:BOOM300N",   "Boom 300"),
-    ("DERIV:BOOM500",    "Boom 500"),
-    ("DERIV:BOOM1000",   "Boom 1000"),
-    # Crash indices — spikes baissiers aléatoires
-    ("DERIV:CRASH300N",  "Crash 300"),
-    ("DERIV:CRASH500",   "Crash 500"),
-    ("DERIV:CRASH1000",  "Crash 1000"),
-    # Step Index — mouvement régulier en paliers
-    ("DERIV:stpRNG",     "Step Index"),
-    # Jump indices — gaps brusques dans les deux sens
-    ("DERIV:JD10",       "Jump 10"),
-    ("DERIV:JD25",       "Jump 25"),
-    ("DERIV:JD50",       "Jump 50"),
-    ("DERIV:JD75",       "Jump 75"),
-    ("DERIV:JD100",      "Jump 100"),
-]
-
 CATEGORY_MAP: dict[str, list[tuple[str, str]]] = {
-    # TIER 0 uniquement (Deriv synthétiques)
-    "deriv"     : TIER_0_DERIV,
-    # Priorité : Deriv + Gold + BTC (recommandé)
-    "priority"  : TIER_0_DERIV + TIER_1_PRIORITY[:2],  # Deriv + Gold + BTC
+    "priority"  : TIER_1_PRIORITY,
     "btc"       : [("BTC-USD", "Bitcoin")],
     # forex_all inclut toujours Gold + BTC + toutes les paires forex
     "forex"     : [("GC=F", "Gold"), ("BTC-USD", "Bitcoin")] + TIER_2_FOREX + [s for s in TIER_3_EXTRA if "=X" in s[0]],
     "forex_all" : [("GC=F", "Gold"), ("BTC-USD", "Bitcoin")] + TIER_2_FOREX + [s for s in TIER_3_EXTRA if "=X" in s[0]],
-    # Indices synthétiques uniquement (alias de deriv)
-    "synthetic" : TIER_0_DERIV,
-    # Tout scanner — DERIV EN PREMIER, puis Gold/BTC, puis Forex
-    "all"       : TIER_0_DERIV + TIER_1_PRIORITY + TIER_2_FOREX + TIER_3_EXTRA,
+    "all"       : TIER_1_PRIORITY + TIER_2_FOREX + TIER_3_EXTRA,
 }
 
 
 def get_symbols(cat: str) -> list[tuple[str, str]]:
-    return CATEGORY_MAP.get(cat, TIER_0_DERIV + TIER_1_PRIORITY[:2] + TIER_2_FOREX)
+    return CATEGORY_MAP.get(cat, TIER_1_PRIORITY + TIER_2_FOREX + TIER_3_EXTRA)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -3729,24 +3480,20 @@ def get_symbols(cat: str) -> list[tuple[str, str]]:
 # ─────────────────────────────────────────────────────────────
 
 def print_market_list(symbols: list[tuple[str, str]]) -> None:
-    tier0_set = {s[0] for s in TIER_0_DERIV}
     tier1_set = {s[0] for s in TIER_1_PRIORITY}
     tier2_set = {s[0] for s in TIER_2_FOREX}
     groups = [
-        ("🤖  TIER 0  —  Deriv Synthétiques 24/7 (PRIORITÉ ABSOLUE)", []),
-        ("🥇  TIER 1  —  Gold / BTC (prioritaires)",                   []),
-        ("🥈  TIER 2  —  Forex Majeures",                              []),
-        ("🥉  TIER 3  —  Croisées / Indices",                          []),
+        ("🥇  TIER 1  —  Gold / BTC / Commodités", []),
+        ("🥈  TIER 2  —  Forex Majeures",           []),
+        ("🥉  TIER 3  —  Croisées / Indices",        []),
     ]
     for sym, name in symbols:
-        if sym in tier0_set:
+        if sym in tier1_set:
             groups[0][1].append((sym, name))
-        elif sym in tier1_set:
-            groups[1][1].append((sym, name))
         elif sym in tier2_set:
-            groups[2][1].append((sym, name))
+            groups[1][1].append((sym, name))
         else:
-            groups[3][1].append((sym, name))
+            groups[2][1].append((sym, name))
 
     W   = 72
     sep = "╔" + "═" * W + "╗"
@@ -3757,8 +3504,8 @@ def print_market_list(symbols: list[tuple[str, str]]) -> None:
         return "║  " + text + " " * max(0, W - 2 - len(text)) + "║"
 
     print(f"\n{sep}")
-    print(row(f"📋  SMC ENGINE v4  —  {len(symbols)} MARCHÉS  —  H4 · AMD · S/D · DERIV ELITE"))
-    print(row(f"   Deriv : score≥{DERIV_SCORE_THRESHOLD}/100 RR≥{DERIV_MIN_RR}   Gold/BTC : score≥{SCORE_THRESHOLD}/100 RR≥{MIN_RR}"))
+    print(row(f"📋  SMC ENGINE v3  —  {len(symbols)} MARCHÉS  —  H4 · AMD · S/D"))
+    print(row(f"   Score min : {SCORE_THRESHOLD}/100   |   RR min : 1:{MIN_RR}   |   Crypto : BTC only"))
     print(mid)
 
     grand_i = 1
@@ -3817,8 +3564,7 @@ def check_daily_limit(symbol: str) -> bool:
     if today != _daily_date:
         _daily_date  = today
         _daily_count = {}
-    max_per_day = DERIV_MAX_SIGNALS_DAY if is_deriv_symbol(symbol) else MAX_SIGNALS_PER_DAY
-    return _daily_count.get(symbol, 0) < max_per_day
+    return _daily_count.get(symbol, 0) < MAX_SIGNALS_PER_DAY
 
 
 def increment_daily_count(symbol: str) -> None:
@@ -3827,14 +3573,11 @@ def increment_daily_count(symbol: str) -> None:
 
 def startup_check() -> bool:
     log.info("=" * 65)
-    log.info("  SMC SIGNAL ENGINE v4  —  DERIV ELITE + GOLD + BTC")
+    log.info("  SMC SIGNAL ENGINE v3  —  AMD · Septuple · Supply/Demand")
     log.info(f"  HTF={HTF}  MTF={MTF}  LTF={LTF}")
-    log.info(f"  Score min Deriv   : {DERIV_SCORE_THRESHOLD}/100  RR min Deriv : {DERIV_MIN_RR}")
-    log.info(f"  Score min Gold/BTC: {SCORE_THRESHOLD}/100  RR min Gold/BTC : {MIN_RR}")
-    log.info(f"  Risque/trade      : ${RISK_USD}")
-    log.info(f"  Deriv 24/7  : {len(TIER_0_DERIV)} marchés synthétiques — scanné EN PREMIER")
-    log.info(f"  Gold + BTC  : TIER 1 prioritaire")
-    log.info(f"  Setups : SMC · AMD · Septuple · S/D · 4H Sweep+5M Shift · CHoCH+EQL")
+    log.info(f"  Score min : {SCORE_THRESHOLD}/100   RR min : {MIN_RR}   Risque : ${RISK_USD}")
+    log.info(f"  Crypto    : BTC-USD 24/7 (y compris weekends)")
+    log.info(f"  Setups    : SMC · AMD · Septuple · S/D · 4H Sweep+5M Shift · CHoCH+EQL")
     log.info("=" * 65)
 
     try:
@@ -3870,38 +3613,19 @@ def startup_check() -> bool:
     if not yf_ok:
         log.warning("  ⚠ yfinance indisponible — démarrage quand même.")
 
-    # ── Vérification connectivité Deriv ──────────────────────
-    if _WEBSOCKET_OK:
-        try:
-            df_deriv = fetch("DERIV:R_50", "15m", period="2d")
-            if not df_deriv.empty:
-                log.info(f"  ✓ Deriv API OK (R_50 — {len(df_deriv)} bougies)")
-            else:
-                log.warning("  ⚠ Deriv API indisponible — synthétiques désactivés")
-        except Exception as _de:
-            log.warning(f"  ⚠ Deriv API erreur : {_de}")
-    else:
-        log.warning("  ⚠ websocket-client manquant — synthétiques Deriv désactivés")
-
     # ── Message de démarrage Telegram ────────────────────────
     ts_start = datetime.now(timezone.utc).strftime("%d/%m/%Y %H:%M UTC")
     startup_msg = (
-        f"🟢 <b>SMC Signal Engine v4 — DÉMARRÉ</b>\n"
+        f"🟢 <b>SMC Signal Engine v3 — DÉMARRÉ</b>\n"
         f"{'─'*30}\n"
         f"<b>🕐 Heure :</b> <code>{ts_start}</code>\n"
         f"<b>📊 Timeframes :</b> H4 → H1 → M15\n"
-        f"{'─'*30}\n"
-        f"<b>🤖 DERIV SYNTHÉTIQUES (PRIORITÉ ABSOLUE)</b>\n"
-        f"<b>   Score min :</b> {DERIV_SCORE_THRESHOLD}/100  |  <b>RR min :</b> 1:{DERIV_MIN_RR}\n"
-        f"<b>   Marchés :</b> {len(TIER_0_DERIV)} indices · 24/7\n"
-        f"<b>   V10/V25/V50/V75/V100 + Boom/Crash + Jump + Step</b>\n"
-        f"{'─'*30}\n"
-        f"<b>🥇 GOLD + BTC (TIER 1)</b>\n"
-        f"<b>   Score min :</b> {SCORE_THRESHOLD}/100  |  <b>RR min :</b> 1:{MIN_RR}\n"
-        f"{'─'*30}\n"
+        f"<b>⚙️ Score min :</b> {SCORE_THRESHOLD}/100\n"
+        f"<b>⚖️ RR min :</b> 1:{MIN_RR}\n"
         f"<b>💰 Risque/trade :</b> ${RISK_USD}\n"
         f"<b>🔮 Modes :</b> SMC · AMD · Septuple · Supply/Demand\n"
         f"<b>🔄 Nouveau :</b> 4H Sweep+5M Shift · CHoCH+Equal Liq\n"
+        f"<b>₿ BTC :</b> Scan 24/7 (weekends inclus) ✅\n"
         f"{'─'*30}\n"
         f"✅ Bot connecté · yfinance {'OK' if yf_ok else '⚠ indispo'}\n"
         f"🔍 Scan actif toutes les 5 minutes"
@@ -3942,7 +3666,7 @@ def _reasons_flags(reasons: list[str]) -> tuple[str, str, str, str, str]:
 # ─────────────────────────────────────────────────────────────
 
 def run_live(cat: str = "all", min_score: int = SCORE_THRESHOLD,
-             min_rr: float = MIN_RR, interval: int = 30) -> None:
+             min_rr: float = MIN_RR, interval: int = 300) -> None:
     """
     Boucle principale VPS — scan continu toutes les {interval}s.
     Affiche un tableau de statut pour chaque marché :
@@ -3970,18 +3694,15 @@ def run_live(cat: str = "all", min_score: int = SCORE_THRESHOLD,
             now_str  = now_utc.strftime("%Y-%m-%d %H:%M:%S UTC")
 
             if is_weekend():
-                # ── Weekend : Deriv 24/7 (PRIORITÉ) + BTC 24/7 + Gold si dim soir ──
+                # ── Weekend : BTC 24/7 + Gold si dimanche soir ≥ 23h ──
                 always_on = [
                     (s, m) for s, m in symbols
-                    if is_deriv_symbol(s) or is_crypto_symbol(s)
-                    or (s in GOLD_SYMBOLS and is_gold_session_active())
+                    if is_crypto_symbol(s) or (s in GOLD_SYMBOLS and is_gold_session_active())
                 ]
                 if always_on:
                     symbols_to_scan = always_on
                     if cycle_n % 10 == 1:
-                        n_deriv = sum(1 for s, _ in always_on if is_deriv_symbol(s))
-                        names = f"{n_deriv} Deriv + " + ", ".join(
-                            m for s, m in always_on if not is_deriv_symbol(s))
+                        names = ", ".join(s for s, _ in always_on)
                         log.info(f"  🌙 [{cycle_n}] {now_utc.strftime('%H:%M UTC')} "
                                  f"— Weekend  |  Scan actif : {names}")
                 else:
@@ -3994,15 +3715,13 @@ def run_live(cat: str = "all", min_score: int = SCORE_THRESHOLD,
                     time.sleep(interval)
                     continue
             elif not is_session_active():
-                # ── Hors session (nuit semaine) : Deriv 24/7 + BTC uniquement ─────
-                always_active = [(s, m) for s, m in symbols
-                                 if is_deriv_symbol(s) or is_crypto_symbol(s)]
-                if always_active:
-                    symbols_to_scan = always_active
+                # ── Hors session (nuit semaine) : BTC uniquement ───────
+                btc_only = [(s, m) for s, m in symbols if is_crypto_symbol(s)]
+                if btc_only:
+                    symbols_to_scan = btc_only
                     if cycle_n % 10 == 1:
-                        n_deriv = sum(1 for s, _ in always_active if is_deriv_symbol(s))
                         log.info(f"  💤 [{cycle_n}] {now_utc.strftime('%H:%M UTC')} "
-                                 f"— Hors session — {n_deriv} Deriv + BTC actifs")
+                                 f"— Hors session — attente")
                 else:
                     if cycle_n % 10 == 1:
                         log.info(f"  💤 [{cycle_n}] {now_utc.strftime('%H:%M UTC')} — Hors session — attente")
@@ -4038,12 +3757,10 @@ def run_live(cat: str = "all", min_score: int = SCORE_THRESHOLD,
             signals_found: list[tuple[str, str, Signal, str]] = []
 
             for i, (sym, mkt) in enumerate(symbols_to_scan, 1):
-                t0 = {s[0] for s in TIER_0_DERIV}
                 t1 = {s[0] for s in TIER_1_PRIORITY}
                 t2 = {s[0] for s in TIER_2_FOREX}
-                tier = (c("T0🤖", "magenta") if sym in t0 else
-                        c("T1🥇", "yellow")  if sym in t1 else
-                       (c("T2🥈", "cyan")    if sym in t2 else c("T3🥉", "white")))
+                tier = c("T1🥇", "yellow") if sym in t1 else (
+                       c("T2🥈", "cyan")   if sym in t2 else c("T3🥉", "white"))
                 prefix = f"  {i:<4} {tier}  {mkt:<14} {c(sym, 'cyan'):<12}"
 
                 print(prefix + "  … ", end="", flush=True)
@@ -4078,18 +3795,13 @@ def run_live(cat: str = "all", min_score: int = SCORE_THRESHOLD,
                         rr_col = "green" if sig.rr >= 3 else "yellow"
                         d_col  = "red" if sig.direction == "SHORT" else "green"
 
-                        # ── Seuils selon le marché ────────────────────────────────
-                        eff_score = DERIV_SCORE_THRESHOLD if is_deriv_symbol(sym) else min_score
-                        eff_rr    = DERIV_MIN_RR          if is_deriv_symbol(sym) else min_rr
-
-                        if sig.score >= eff_score and sig.rr >= eff_rr:
+                        if sig.score >= min_score and sig.rr >= min_rr:
                             corr_ok, corr_reason = correlation_guard(sym, sig.direction)
                             if not corr_ok:
                                 status = c(f"🟠 Corrélé", "yellow")
                             else:
                                 tier_lbl = next(
                                     (lbl for lbl, grp in [
-                                        ("TIER 0 🤖  DERIV SYNTHÉTIQUES", TIER_0_DERIV),
                                         ("TIER 1 🥇  GOLD + BTC", TIER_1_PRIORITY),
                                         ("TIER 2 🥈  FOREX MAJEURES", TIER_2_FOREX),
                                         ("TIER 3 🥉  CROISÉES + EXTRA", TIER_3_EXTRA),
@@ -4098,7 +3810,7 @@ def run_live(cat: str = "all", min_score: int = SCORE_THRESHOLD,
                                 )
                                 signals_found.append((mkt, sym, sig, tier_lbl))
                                 status = c(f"⚡ {sig.direction} [{sig.mode}]", d_col)
-                        elif sig.score >= int(eff_score * 0.75):
+                        elif sig.score >= int(min_score * 0.75):
                             status = c(f"🟡 Proche ({sig.score})", "yellow")
                         else:
                             status = c(f"🔵 Attente ({sig.score})", "white")
@@ -4151,7 +3863,7 @@ def run_live(cat: str = "all", min_score: int = SCORE_THRESHOLD,
                     _STATUS["last_signals"] = _STATUS["last_signals"][-20:]
 
             if not signals_found:
-                print(c(f"  ℹ️  Aucun signal valide (Deriv≥{DERIV_SCORE_THRESHOLD}/RR{DERIV_MIN_RR} · Gold/BTC≥{min_score}/RR{min_rr})", "white"))
+                print(c(f"  ℹ️  Aucun signal valide (score≥{min_score} + RR≥{min_rr})", "white"))
 
             print(f"{'╚' + '═'*W + '╝'}")
             consecutive_errors = 0
@@ -4226,21 +3938,19 @@ def scan_watchlist(symbols: list[tuple[str, str]], htf: str, ltf: str,
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="SMC Signal Engine v4 — DERIV ELITE + Gold + BTC",
+        description="SMC Signal Engine v3 — AMD · Septuple Traction · Supply/Demand",
         formatter_class=argparse.RawTextHelpFormatter,
     )
     parser.add_argument("--symbol",    default=None,
-                        help="Symbole unique  (ex: BTC-USD, GC=F, EURUSD=X, DERIV:R_75)")
-    parser.add_argument("--cat",       default="priority",
-                        choices=["deriv", "priority", "btc", "forex", "forex_all", "synthetic", "all"],
+                        help="Symbole unique  (ex: BTC-USD, GC=F, EURUSD=X)")
+    parser.add_argument("--cat",       default="all",
+                        choices=["priority", "btc", "forex", "forex_all", "all"],
                         help=(
-                            "deriv      = Deriv synthétiques UNIQUEMENT (TIER 0)\n"
-                            "priority   = Deriv + Gold + BTC  [DÉFAUT]\n"
-                            "btc        = BTC uniquement\n"
-                            "forex      = Forex + Gold + BTC\n"
-                            "forex_all  = Forex complet\n"
-                            "synthetic  = alias de deriv\n"
-                            "all        = Tout scanner (Deriv en premier)\n"
+                            "priority  = Gold + BTC\n"
+                            "btc       = BTC uniquement\n"
+                            "forex     = Forex + Gold + BTC\n"
+                            "forex_all = Forex complet\n"
+                            "all       = Tout scanner (défaut)\n"
                         ))
     parser.add_argument("--scan",      action="store_true",
                         help="Scan unique (test local)")
@@ -4273,4 +3983,3 @@ if __name__ == "__main__":
     else:
         run_live(cat=args.cat, min_score=args.min_score,
                  min_rr=args.min_rr, interval=args.interval)
-
