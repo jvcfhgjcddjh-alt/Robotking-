@@ -6,4 +6,10 @@ numpy
 colorama
 flask
 requests
-
+ccxt 
+pandas
+numpy 
+matplotlib
+requests
+flask 
+colorama
