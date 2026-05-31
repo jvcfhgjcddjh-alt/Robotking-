@@ -136,7 +136,7 @@ MARKETS: list[tuple[str, str]] = [
     ("LINK/USDT:USDT", "Chainlink"),
     ("DOT/USDT:USDT",  "Polkadot"),
     ("LTC/USDT:USDT",  "Litecoin"),
-    ("MATIC/USDT:USDT","Polygon"),
+    ("POL/USDT:USDT",  "Polygon (POL)"),
     ("ATOM/USDT:USDT", "Cosmos"),
     ("NEAR/USDT:USDT", "NEAR"),
 ]
