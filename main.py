@@ -1765,19 +1765,54 @@ def detect_institutional_entry_candles(df: pd.DataFrame,
 # ═════════════════════════════════════════════════════════════
 
 def htf_bias(df: pd.DataFrame) -> str:
-    """Biais H4 via EMA + HH/LL (20 bougies)."""
-    if len(df) < 20:
+    """
+    Biais H4 via scoring multi-facteurs (plus robuste que EMA seul).
+
+    Facteurs BULLISH (+1 chacun) :
+      • Close > EMA8
+      • Close > EMA21
+      • Dernier HH (high[-1] > max des 3 bougies précédentes)
+      • Dernier HL (low[-1] > low[-5])
+      • 3+ closes haussiers sur les 5 dernières bougies
+
+    Facteurs BEARISH (-1 chacun) — inverse.
+
+    Score ≥ +2  → BULLISH
+    Score ≤ -2  → BEARISH
+    Sinon       → NEUTRAL (marché latéral, on attend)
+    """
+    if len(df) < 25:
         return "NEUTRAL"
-    highs  = df["high"].iloc[-20:].values
-    lows   = df["low"].iloc[-20:].values
-    closes = df["close"].iloc[-20:].values
-    ema    = np.convolve(closes, np.ones(8) / 8, mode="valid")
-    trend_up  = closes[-1] > ema[-1]
-    last_hh   = highs[-1] < highs[-5:].max()
-    if not trend_up and last_hh:
-        return "BEARISH"
-    elif trend_up and not last_hh:
-        return "BULLISH"
+
+    closes = df["close"].values
+    highs  = df["high"].values
+    lows   = df["low"].values
+
+    ema8  = np.convolve(closes, np.ones(8)  / 8,  mode="valid")
+    ema21 = np.convolve(closes, np.ones(21) / 21, mode="valid")
+
+    c_last  = closes[-1]
+    score   = 0
+
+    # EMA
+    if c_last > ema8[-1]:  score += 1
+    else:                  score -= 1
+    if c_last > ema21[-1]: score += 1
+    else:                  score -= 1
+
+    # Higher High / Lower Low
+    if highs[-1] > highs[-4:-1].max():  score += 1   # HH
+    else:                               score -= 1   # LH
+    if lows[-1] > lows[-6:-1].min():    score += 1   # HL
+    else:                               score -= 1   # LL
+
+    # Momentum : nombre de bougies haussières sur les 5 dernières
+    bull_candles = sum(closes[-5:] > closes[-6:-1])
+    if bull_candles >= 3:   score += 1
+    elif bull_candles <= 2: score -= 1
+
+    if   score >=  2: return "BULLISH"
+    elif score <= -2: return "BEARISH"
     return "NEUTRAL"
 
 
