@@ -261,20 +261,28 @@ ATR_MIN: dict[str, float] = {
     "^GDAXI"  : 30.0,    "^FCHI"   : 10.0,    "^FTSE"   : 15.0,
 }
 ATR_MIN_DEFAULT = 0.00050
-MAX_SPREAD_ATR_RATIO = 0.25
+MAX_SPREAD_ATR_RATIO = 0.35   # yfinance spreads légèrement > brokers réels
 
 
-def check_volatility(symbol: str, df_ltf: pd.DataFrame) -> tuple[bool, str]:
+def check_volatility(symbol: str, df_ltf: pd.DataFrame,
+                     df_mtf: pd.DataFrame | None = None) -> tuple[bool, str]:
     if df_ltf.empty or len(df_ltf) < 14:
         return False, "données insuffisantes"
-    atr = (df_ltf["high"] - df_ltf["low"]).rolling(14).mean().iloc[-1]
 
-    # ATR dynamique : moyenne 100 bougies × 0.5
+    atr_ltf = (df_ltf["high"] - df_ltf["low"]).rolling(14).mean().iloc[-1]
+
+    # Spread/ATR calculé sur M15 (plus stable que M5 pour yfinance)
+    # Si M15 dispo, on l'utilise pour le ratio ; sinon fallback M5
+    if df_mtf is not None and not df_mtf.empty and len(df_mtf) >= 14:
+        atr_for_spread = (df_mtf["high"] - df_mtf["low"]).rolling(14).mean().iloc[-1]
+    else:
+        atr_for_spread = atr_ltf
+
+    # ATR minimum dynamique : moyenne 100 bougies M5 × 0.5
     atr_mean = (df_ltf["high"] - df_ltf["low"]).rolling(100).mean().iloc[-1]
     if not pd.isna(atr_mean) and atr_mean > 0:
         atr_min = atr_mean * 0.5
     else:
-        # Fallback : pour BTC/crypto, seuil relatif au prix (0.12%)
         close = df_ltf["close"].iloc[-1]
         if is_crypto_symbol(symbol) and close > 0:
             atr_min = close * 0.0012
@@ -282,17 +290,14 @@ def check_volatility(symbol: str, df_ltf: pd.DataFrame) -> tuple[bool, str]:
             atr_min = ATR_MIN.get(symbol, ATR_MIN_DEFAULT) * 0.7
 
     # ── Facteur pré-session (05h–09h UTC) ────────────────────
-    # Avant London open, le marché est calme. On réduit le seuil
-    # de 40% pour ne pas rejeter des setups qui se forment
-    # pendant l'accumulation pré-London (07h–08h30 UTC typique).
     hour_utc = datetime.now(timezone.utc).hour
     if 5 <= hour_utc < 9:
         atr_min *= 0.60
 
     spread = get_spread(symbol)
-    if atr < atr_min:
-        return False, f"ATR trop faible ({round(atr, 5)} < {round(atr_min, 5)})"
-    ratio = spread / atr if atr > 0 else 1.0
+    if atr_ltf < atr_min:
+        return False, f"ATR trop faible ({round(atr_ltf, 5)} < {round(atr_min, 5)})"
+    ratio = spread / atr_for_spread if atr_for_spread > 0 else 1.0
     if ratio > MAX_SPREAD_ATR_RATIO:
         return False, f"spread/ATR={round(ratio*100,1)}% > {int(MAX_SPREAD_ATR_RATIO*100)}%"
     # Les cryptos (BTC) tradent 24/7 — pas de filtre session
@@ -382,7 +387,7 @@ def correlation_guard(symbol: str, direction: str) -> tuple[bool, str]:
 # ─────────────────────────────────────────────────────────────
 #  TELEGRAM
 # ─────────────────────────────────────────────────────────────
-_TG_TOKEN_ENV = os.environ.get("TG_TOKEN", "8665812395:AAGQl3fLE5g5fhq2ZXsW0qm7DAxrCgVCGSw")
+_TG_TOKEN_ENV = os.environ.get("TG_TOKEN", "")
 # TG_ENABLED : true automatiquement si TG_TOKEN est défini, sauf si explicitement désactivé
 _TG_ENABLED   = bool(_TG_TOKEN_ENV) if os.environ.get("TG_ENABLED", "") == "" else \
                 os.environ.get("TG_ENABLED", "false").lower() == "true"
@@ -3031,7 +3036,7 @@ def analyse(symbol: str, htf: str = HTF, ltf: str = LTF,
         return None
 
     # ── Filtre volatilité ────────────────────────────────────
-    vol_ok, vol_reason = check_volatility(symbol, df_ltf)
+    vol_ok, vol_reason = check_volatility(symbol, df_ltf, df_mtf)
     if not vol_ok:
         if not silent:
             print(c(f"  ⛔ Skip : {vol_reason}", "yellow"))
