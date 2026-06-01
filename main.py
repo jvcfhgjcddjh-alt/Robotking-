@@ -1,4 +1,3 @@
-
 """
 ╔══════════════════════════════════════════════════════════════════════════╗
 ║         SMC SIGNAL ENGINE  v3  — Smart Money Concepts ELITE             ║
@@ -208,8 +207,8 @@ SD_ZONE_BUFFER       = 0.15  # tolérance 15% de l'ATR pour "dans la zone"
 #  SESSIONS ACTIVES (UTC)
 # ─────────────────────────────────────────────────────────────
 SESSION_WINDOWS_UTC: list[tuple[int, int]] = [
-    (2,  5),    # Tokyo/Asian open
-    (7,  17),   # London open → NY close (couvre le gap 10h-13h)
+    (0,  5),    # Tokyo/Asian session
+    (6,  17),   # Pré-London + London open → NY close
 ]
 
 
@@ -243,18 +242,23 @@ def is_gold_session_active() -> bool:
 #  ATR MINIMUM PAR INSTRUMENT
 # ─────────────────────────────────────────────────────────────
 ATR_MIN: dict[str, float] = {
-    "EURUSD=X": 0.00060, "GBPUSD=X": 0.00080, "USDJPY=X": 0.080,
-    "USDCHF=X": 0.00060, "AUDUSD=X": 0.00055, "NZDUSD=X": 0.00050,
-    "USDCAD=X": 0.00060, "GBPJPY=X": 0.120,   "EURJPY=X": 0.090,
-    "GBPAUD=X": 0.00110, "GBPCAD=X": 0.00110, "GBPNZD=X": 0.00130,
-    "EURGBP=X": 0.00045, "EURAUD=X": 0.00090, "EURCAD=X": 0.00090,
-    "AUDJPY=X": 0.070,   "CADJPY=X": 0.070,   "CHFJPY=X": 0.080,
-    "NZDJPY=X": 0.065,
-    "GC=F"    : 1.50,    "SI=F"    : 0.05,
-    "CL=F"    : 0.30,    "BZ=F"    : 0.30,
-    "BTC-USD" : 200.0,   "ETH-USD" : 10.0,
-    "^GSPC"   : 8.0,     "^NDX"    : 30.0,    "^DJI"    : 80.0,
-    "^GDAXI"  : 40.0,
+    # Forex majeurs — calibrés sur ATR M15 observé (session pré-London incluse)
+    "EURUSD=X": 0.00035, "GBPUSD=X": 0.00040, "USDJPY=X": 0.035,
+    "USDCHF=X": 0.00035, "AUDUSD=X": 0.00022, "NZDUSD=X": 0.00018,
+    "USDCAD=X": 0.00035, "GBPJPY=X": 0.070,   "EURJPY=X": 0.050,
+    "GBPAUD=X": 0.00080, "GBPCAD=X": 0.00080, "GBPNZD=X": 0.00100,
+    "EURGBP=X": 0.00020, "EURAUD=X": 0.00060, "EURCAD=X": 0.00060,
+    "AUDJPY=X": 0.045,   "CADJPY=X": 0.040,   "CHFJPY=X": 0.060,
+    "NZDJPY=X": 0.040,
+    # Matières premières
+    "GC=F"    : 1.20,    "SI=F"    : 0.04,
+    "CL=F"    : 0.25,    "BZ=F"    : 0.25,
+    # Crypto
+    "BTC-USD" : 150.0,   "ETH-USD" : 8.0,
+    # Indices US — pas de filtre ATR strict (pas de spread toxique)
+    "^GSPC"   : 5.0,     "^NDX"    : 20.0,    "^DJI"    : 50.0,
+    # Indices EU — même logique
+    "^GDAXI"  : 30.0,    "^FCHI"   : 10.0,    "^FTSE"   : 15.0,
 }
 ATR_MIN_DEFAULT = 0.00050
 MAX_SPREAD_ATR_RATIO = 0.25
@@ -276,6 +280,14 @@ def check_volatility(symbol: str, df_ltf: pd.DataFrame) -> tuple[bool, str]:
             atr_min = close * 0.0012
         else:
             atr_min = ATR_MIN.get(symbol, ATR_MIN_DEFAULT) * 0.7
+
+    # ── Facteur pré-session (05h–09h UTC) ────────────────────
+    # Avant London open, le marché est calme. On réduit le seuil
+    # de 40% pour ne pas rejeter des setups qui se forment
+    # pendant l'accumulation pré-London (07h–08h30 UTC typique).
+    hour_utc = datetime.now(timezone.utc).hour
+    if 5 <= hour_utc < 9:
+        atr_min *= 0.60
 
     spread = get_spread(symbol)
     if atr < atr_min:
@@ -370,7 +382,7 @@ def correlation_guard(symbol: str, direction: str) -> tuple[bool, str]:
 # ─────────────────────────────────────────────────────────────
 #  TELEGRAM
 # ─────────────────────────────────────────────────────────────
-_TG_TOKEN_ENV = os.environ.get("TG_TOKEN", "8665812395:AAGQl3fLE5g5fhq2ZXsW0qm7DAxrCgVCGSw")
+_TG_TOKEN_ENV = os.environ.get("TG_TOKEN", "")
 # TG_ENABLED : true automatiquement si TG_TOKEN est défini, sauf si explicitement désactivé
 _TG_ENABLED   = bool(_TG_TOKEN_ENV) if os.environ.get("TG_ENABLED", "") == "" else \
                 os.environ.get("TG_ENABLED", "false").lower() == "true"
@@ -959,8 +971,14 @@ def fetch(symbol: str, interval: str, period: str = "5d",
                         df.columns = df.columns.get_level_values(0).str.lower()
                     else:
                         df.columns = df.columns.str.lower()
-                    df.dropna(inplace=True)
-                    return df
+                    # Normalise les colonnes minimales requises
+                    for col in ("open", "high", "low", "close", "volume"):
+                        if col not in df.columns:
+                            df[col] = float("nan")
+                    df.dropna(subset=["close", "high", "low"], inplace=True)
+                    df = df[pd.to_numeric(df["close"], errors="coerce").notna()]
+                    if not df.empty:
+                        return df
                 time.sleep(retry_delay * attempt)
             except Exception as e:
                 err_str = str(e).lower()
@@ -2962,9 +2980,15 @@ def analyse(symbol: str, htf: str = HTF, ltf: str = LTF,
         print(c("═" * 65, "cyan"))
 
     # ── Téléchargement H4 / M15 / M5 ────────────────────────
+    # Les indices EU (DAX, CAC, FTSE) ont moins de bougies M15 disponibles
+    # → on force une période plus longue pour eux
+    _idx_eu = {"^GDAXI", "^FCHI", "^FTSE", "^GSPC", "^NDX", "^DJI"}
+    _ltf_period = "5d" if symbol in _idx_eu else "2d"
+    _mtf_period = "10d" if symbol in _idx_eu else "5d"
+
     df_htf = fetch(symbol, htf, period="30d")   # H4 = 30j pour AMD
-    df_mtf = fetch(symbol, mtf, period="5d")
-    df_ltf = fetch(symbol, ltf, period="2d")
+    df_mtf = fetch(symbol, mtf, period=_mtf_period)
+    df_ltf = fetch(symbol, ltf, period=_ltf_period)
 
     if df_htf.empty or df_mtf.empty or df_ltf.empty:
         if not silent:
@@ -3983,3 +4007,4 @@ if __name__ == "__main__":
     else:
         run_live(cat=args.cat, min_score=args.min_score,
                  min_rr=args.min_rr, interval=args.interval)
+
