@@ -1,3 +1,4 @@
+
 """
 ╔══════════════════════════════════════════════════════════════════════════╗
 ║         SMC SIGNAL ENGINE  v3  — Smart Money Concepts ELITE             ║
@@ -189,7 +190,7 @@ LTF             = "15m"   # M15 : entrée précise
 FVG_MIN_RATIO   = 0.0002
 OB_LOOKBACK     = 5
 LIQ_THRESHOLD   = 0.0004
-SCORE_THRESHOLD = 80
+SCORE_THRESHOLD = 70
 MIN_RR          = 3.0
 RISK_USD        = 100.0
 
@@ -261,7 +262,7 @@ ATR_MIN: dict[str, float] = {
     "^GDAXI"  : 30.0,    "^FCHI"   : 10.0,    "^FTSE"   : 15.0,
 }
 ATR_MIN_DEFAULT = 0.00050
-MAX_SPREAD_ATR_RATIO = 0.35   # yfinance spreads légèrement > brokers réels
+MAX_SPREAD_ATR_RATIO = 0.50   # élargi à 50% pour réduire les faux rejets de spread
 
 
 def check_volatility(symbol: str, df_ltf: pd.DataFrame,
@@ -387,7 +388,7 @@ def correlation_guard(symbol: str, direction: str) -> tuple[bool, str]:
 # ─────────────────────────────────────────────────────────────
 #  TELEGRAM
 # ─────────────────────────────────────────────────────────────
-_TG_TOKEN_ENV = os.environ.get("TG_TOKEN", "8665812395:AAGQl3fLE5g5fhq2ZXsW0qm7DAxrCgVCGSw")
+_TG_TOKEN_ENV = os.environ.get("TG_TOKEN", "")
 # TG_ENABLED : true automatiquement si TG_TOKEN est défini, sauf si explicitement désactivé
 _TG_ENABLED   = bool(_TG_TOKEN_ENV) if os.environ.get("TG_ENABLED", "") == "" else \
                 os.environ.get("TG_ENABLED", "false").lower() == "true"
@@ -980,6 +981,10 @@ def fetch(symbol: str, interval: str, period: str = "5d",
                     for col in ("open", "high", "low", "close", "volume"):
                         if col not in df.columns:
                             df[col] = float("nan")
+                    # Remplace les None / NaN explicites avant conversion float (fix EURGBP)
+                    for _col in ("open", "high", "low", "close", "volume"):
+                        if _col in df.columns:
+                            df[_col] = pd.to_numeric(df[_col], errors="coerce")
                     df.dropna(subset=["close", "high", "low"], inplace=True)
                     df = df[pd.to_numeric(df["close"], errors="coerce").notna()]
                     if not df.empty:
@@ -3840,16 +3845,36 @@ def run_live(cat: str = "all", min_score: int = SCORE_THRESHOLD,
 
                     if sig is None:
                         try:
-                            df_peek = fetch(sym, LTF, period="1d")
+                            df_peek  = fetch(sym, LTF, period="1d")
+                            df_peek_htf = fetch(sym, HTF, period="5d")
                             px_s = str(round(df_peek["close"].iloc[-1],
                                              2 if df_peek["close"].iloc[-1] > 100 else 5)) \
                                    if not df_peek.empty else "—"
                             vol_ok, vol_reason = check_volatility(sym, df_peek) \
                                                   if not df_peek.empty else (True, "")
-                            skip = f"⛔ {vol_reason}" if not vol_ok else "⚪ Pas de setup"
-                        except Exception:
+                            if not vol_ok:
+                                skip = f"⛔ {vol_reason}"
+                            else:
+                                # Diagnostic SMC : affiche les critères qui échouent
+                                diag_parts = []
+                                if not df_peek_htf.empty and len(df_peek_htf) >= 25:
+                                    bias_str = htf_bias(df_peek_htf)
+                                    diag_parts.append(f"biais={bias_str}")
+                                    if bias_str == "NEUTRAL":
+                                        diag_parts.append("❌ NEUTRAL→skip")
+                                    else:
+                                        direction_d = "LONG" if bias_str == "BULLISH" else "SHORT"
+                                        amd_d = detect_amd_phase(df_peek_htf)
+                                        amd_ok_d = amd_d.phase == "distribution" and amd_d.direction == direction_d and amd_d.confidence >= 60
+                                        diag_parts.append(f"AMD={'✓' if amd_ok_d else f'✗({amd_d.phase}/{amd_d.confidence}%)'}")
+                                        sept_d = detect_septuple_traction(df_peek_htf)
+                                        diag_parts.append(f"Sept={'✓' if sept_d['detected'] else '✗'}")
+                                        bos_d = detect_bos(df_peek_htf)
+                                        diag_parts.append(f"BOS={'✓' if bos_d else '✗(0)'}")
+                                skip = f"⚪ {' | '.join(diag_parts)}" if diag_parts else "⚪ Pas de setup"
+                        except Exception as _de:
                             px_s = "—"
-                            skip = "⚪ Pas de setup"
+                            skip = f"⚪ err-diag:{str(_de)[:25]}"
                         print(f"\r{prefix}  {px_s:>14}  {'—':>6}"
                               f"  ·  ·  ·  ·  ·  {'—':>6}  {'—':>5}  {skip}")
                     else:
@@ -4047,4 +4072,3 @@ if __name__ == "__main__":
     else:
         run_live(cat=args.cat, min_score=args.min_score,
                  min_rr=args.min_rr, interval=args.interval)
-
