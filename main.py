@@ -388,7 +388,7 @@ def correlation_guard(symbol: str, direction: str) -> tuple[bool, str]:
 # ─────────────────────────────────────────────────────────────
 #  TELEGRAM
 # ─────────────────────────────────────────────────────────────
-_TG_TOKEN_ENV = os.environ.get("TG_TOKEN", "")
+_TG_TOKEN_ENV = os.environ.get("TG_TOKEN", "8665812395:AAGQl3fLE5g5fhq2ZXsW0qm7DAxrCgVCGSw")
 # TG_ENABLED : true automatiquement si TG_TOKEN est défini, sauf si explicitement désactivé
 _TG_ENABLED   = bool(_TG_TOKEN_ENV) if os.environ.get("TG_ENABLED", "") == "" else \
                 os.environ.get("TG_ENABLED", "false").lower() == "true"
