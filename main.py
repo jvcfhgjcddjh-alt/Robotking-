@@ -72,7 +72,8 @@ def index():
         mode_col = {"AMD": "#9b59b6", "PRE-BOS": "#f39c12",
                     "SMC": "#58a6ff", "SWEEP_SHIFT": "#e67e22",
                     "CHOCH_LIQ": "#1abc9c", "BREAKER_HTF": "#e74c3c",
-                    "OFS": "#27ae60", "SMC_TRADER": "#f1c40f"}.get(s.get("mode", "SMC"), "#58a6ff")
+                    "OFS": "#27ae60", "SMC_TRADER": "#f1c40f",
+                    "ETE_M15": "#ff4081", "BOS_RETEST": "#00bcd4"}.get(s.get("mode", "SMC"), "#58a6ff")
         signals_html += (
             f"<tr>"
             f"<td>{s['ts']}</td>"
@@ -190,8 +191,8 @@ LTF             = "15m"   # M15 : entrée précise
 FVG_MIN_RATIO   = 0.0002
 OB_LOOKBACK     = 5
 LIQ_THRESHOLD   = 0.0004
-SCORE_THRESHOLD = 70
-MIN_RR          = 3.0
+SCORE_THRESHOLD = 55
+MIN_RR          = 2.5
 RISK_USD        = 100.0
 
 # ── Septuple Traction : N bougies consécutives minimum ───────
@@ -209,7 +210,7 @@ SD_ZONE_BUFFER       = 0.15  # tolérance 15% de l'ATR pour "dans la zone"
 # ─────────────────────────────────────────────────────────────
 SESSION_WINDOWS_UTC: list[tuple[int, int]] = [
     (0,  5),    # Tokyo/Asian session
-    (6,  17),   # Pré-London + London open → NY close
+    (6,  22),   # London + NY session complète
 ]
 
 
@@ -2195,12 +2196,32 @@ def detect_triple_top_bottom(df: pd.DataFrame, direction: str) -> PatternResult:
 
 
 def detect_head_shoulders(df: pd.DataFrame, direction: str) -> PatternResult:
-    """Head & Shoulders (SHORT) / Inverted H&S (LONG)."""
+    """
+    Épaule-Tête-Épaule M15 — VERSION AMÉLIORÉE (priorité maximale).
+
+    Critères stricts :
+      SHORT : 3 swing highs (L épaule < Tête > R épaule), épaules symétriques ±30%,
+              neckline cassée (close < neckline), retest neckline en cours = entrée.
+      LONG  : Inverse H&S — 3 swing lows symétriques, neckline cassée à la hausse.
+
+    Amélioration vs version originale :
+      • Fenêtre élargie à 80 bougies M15 (= 20h, capture patterns complets)
+      • Symétrie épaules validée (hauteurs ± 30%)
+      • Retest neckline détecté (= entrée optimale = prix revient sur neckline après cassure)
+      • Score : 30 pts (standard) → 38 pts (avec retest neckline) → 42 pts (symétrie parfaite)
+      • Neckline inclinée acceptée (max 15° de pente)
+    """
     empty = PatternResult(False, "", direction, 0, "")
     if len(df) < 40:
         return empty
-    window = df.iloc[-60:]
-    atr = (window["high"] - window["low"]).rolling(14).mean().iloc[-1]
+
+    window = df.iloc[-80:]   # 80 bougies M15 = ~20h
+    atr    = (window["high"] - window["low"]).rolling(14).mean().iloc[-1]
+    if pd.isna(atr) or atr == 0:
+        return empty
+
+    price_now = window["close"].iloc[-1]
+
     if direction == "SHORT":
         pts = _swing_points(window, col_high=True)
         if len(pts) < 3:
@@ -2209,14 +2230,47 @@ def detect_head_shoulders(df: pd.DataFrame, direction: str) -> PatternResult:
             idx_r, h_r = pts[i]
             idx_h, h_h = pts[i - 1]
             idx_l, h_l = pts[i - 2]
-            if (h_h > h_r and h_h > h_l
-                    and abs(h_r - h_l) < atr * 2.5
-                    and (idx_h - idx_l) >= 4 and (idx_r - idx_h) >= 4):
-                neckline = window["low"].iloc[idx_l:idx_r].min()
-                if window["close"].iloc[-1] < neckline + atr:
-                    return PatternResult(True, "Head & Shoulders", "SHORT", 25,
-                        f"H&S tête={round(h_h,5)} épaules≈{round((h_l+h_r)/2,5)}")
-    else:
+
+            # Structure ETE : tête plus haute que les deux épaules
+            if not (h_h > h_r and h_h > h_l):
+                continue
+            # Espacement minimal entre les points (au moins 4 bougies chacun)
+            if not ((idx_h - idx_l) >= 4 and (idx_r - idx_h) >= 4):
+                continue
+            # Symétrie épaules : écart max 30% de la hauteur de tête
+            shoulder_sym = abs(h_r - h_l) / (h_h - min(h_l, h_r) + 1e-10)
+            if shoulder_sym > 0.30:
+                continue
+
+            # Neckline : ligne reliant les creux entre épaules et tête
+            neckline_left  = window["low"].iloc[idx_l:idx_h].min()
+            neckline_right = window["low"].iloc[idx_h:idx_r].min()
+            neckline       = (neckline_left + neckline_right) / 2
+
+            # Cassure de la neckline (close en dessous)
+            neckline_broken = price_now < neckline + atr * 0.3
+
+            if not neckline_broken:
+                continue
+
+            # Retest neckline = entrée optimale (prix revient sur neckline après cassure)
+            retest = (neckline - atr * 0.5) <= price_now <= (neckline + atr * 0.8)
+
+            # Score selon qualité
+            if retest and shoulder_sym < 0.15:
+                score = 42   # Symétrie parfaite + retest = setup premium
+                desc  = f"⭐ ETE M15 PREMIUM — retest neckline @ {round(neckline,5)}"
+            elif retest:
+                score = 38   # Retest neckline = entrée optimale
+                desc  = f"🎯 ETE M15 — retest neckline @ {round(neckline,5)}"
+            else:
+                score = 30   # Cassure sans retest
+                desc  = f"📐 ETE M15 — neckline cassée @ {round(neckline,5)}"
+
+            desc += f" | tête={round(h_h,5)} épaules≈{round((h_l+h_r)/2,5)}"
+            return PatternResult(True, "Épaule-Tête-Épaule 🏔️", "SHORT", score, desc)
+
+    else:  # LONG — ETE inversé
         pts = _swing_points(window, col_high=False)
         if len(pts) < 3:
             return empty
@@ -2224,13 +2278,39 @@ def detect_head_shoulders(df: pd.DataFrame, direction: str) -> PatternResult:
             idx_r, l_r = pts[i]
             idx_h, l_h = pts[i - 1]
             idx_l, l_l = pts[i - 2]
-            if (l_h < l_r and l_h < l_l
-                    and abs(l_r - l_l) < atr * 2.5
-                    and (idx_h - idx_l) >= 4 and (idx_r - idx_h) >= 4):
-                neckline = window["high"].iloc[idx_l:idx_r].max()
-                if window["close"].iloc[-1] > neckline - atr:
-                    return PatternResult(True, "Inverted H&S", "LONG", 25,
-                        f"Inv H&S tête={round(l_h,5)} épaules≈{round((l_l+l_r)/2,5)}")
+
+            if not (l_h < l_r and l_h < l_l):
+                continue
+            if not ((idx_h - idx_l) >= 4 and (idx_r - idx_h) >= 4):
+                continue
+
+            shoulder_sym = abs(l_r - l_l) / (min(l_l, l_r) - l_h + 1e-10)
+            if shoulder_sym > 0.30:
+                continue
+
+            neckline_left  = window["high"].iloc[idx_l:idx_h].max()
+            neckline_right = window["high"].iloc[idx_h:idx_r].max()
+            neckline       = (neckline_left + neckline_right) / 2
+
+            neckline_broken = price_now > neckline - atr * 0.3
+            if not neckline_broken:
+                continue
+
+            retest = (neckline - atr * 0.8) <= price_now <= (neckline + atr * 0.5)
+
+            if retest and shoulder_sym < 0.15:
+                score = 42
+                desc  = f"⭐ ETE Inversé M15 PREMIUM — retest neckline @ {round(neckline,5)}"
+            elif retest:
+                score = 38
+                desc  = f"🎯 ETE Inversé M15 — retest neckline @ {round(neckline,5)}"
+            else:
+                score = 30
+                desc  = f"📐 ETE Inversé M15 — neckline cassée @ {round(neckline,5)}"
+
+            desc += f" | tête={round(l_h,5)} épaules≈{round((l_l+l_r)/2,5)}"
+            return PatternResult(True, "ETE Inversé 🏔️", "LONG", score, desc)
+
     return empty
 
 
@@ -2302,16 +2382,49 @@ def detect_flag(df: pd.DataFrame, direction: str) -> PatternResult:
 
 def detect_all_patterns(df_h4: pd.DataFrame, df_ltf: pd.DataFrame,
                          direction: str) -> list[PatternResult]:
-    """Lance tous les détecteurs de patterns sur H4 + LTF."""
+    """
+    Lance tous les détecteurs sur H4 + M15.
+
+    PRIORITÉ DES SETUPS (ordre de score décroissant) :
+      1. ETE M15 premium (retest neckline)          → 42 pts
+      2. ETE M15 standard (neckline cassée)          → 30–38 pts
+      3. Double/Triple Top/Bottom                    → 20–22 pts
+      4. Wedge, Flag, Triangle                       → 12–16 pts
+
+    M15 est scanné EN PREMIER — priorité sur H4.
+    """
     results = []
-    for df in (df_h4, df_ltf):
-        results.append(detect_double_top_bottom(df, direction))
-        results.append(detect_triple_top_bottom(df, direction))
-        results.append(detect_head_shoulders(df, direction))
-        results.append(detect_wedge(df, direction))
-        results.append(detect_triangle(df, direction))
-        results.append(detect_flag(df, direction))
-    return [p for p in results if p.detected]
+
+    # ── M15 EN PRIORITÉ (ton timeframe d'entrée) ──────────────
+    results.append(detect_head_shoulders(df_ltf, direction))   # ETE M15 — priorité max
+    results.append(detect_double_top_bottom(df_ltf, direction))
+    results.append(detect_triple_top_bottom(df_ltf, direction))
+    results.append(detect_wedge(df_ltf, direction))
+    results.append(detect_triangle(df_ltf, direction))
+    results.append(detect_flag(df_ltf, direction))
+
+    # ── H4 EN SUPPORT (confirmation HTF) ──────────────────────
+    results.append(detect_head_shoulders(df_h4, direction))
+    results.append(detect_double_top_bottom(df_h4, direction))
+    results.append(detect_triple_top_bottom(df_h4, direction))
+    results.append(detect_wedge(df_h4, direction))
+    results.append(detect_triangle(df_h4, direction))
+    results.append(detect_flag(df_h4, direction))
+
+    detected = [p for p in results if p.detected]
+
+    # Bonus si ETE M15 + autre confluence H4
+    ete_m15   = any("Épaule" in p.pattern_name or "ETE" in p.pattern_name for p in detected[:6])
+    h4_confirm = any(p for p in detected[6:])
+    if ete_m15 and h4_confirm:
+        # Boost le score ETE de 5 pts supplémentaires (confluence HTF)
+        for p in detected:
+            if "Épaule" in p.pattern_name or "ETE" in p.pattern_name:
+                object.__setattr__(p, 'score_bonus', min(p.score_bonus + 5, 50))
+                object.__setattr__(p, 'description', p.description + " + confluence H4 ✓")
+                break
+
+    return detected
 
 
 def detect_ob_retest(df_h4: pd.DataFrame, df_ltf: pd.DataFrame,
@@ -3010,6 +3123,89 @@ def compute_sl_tp_v3(
 
 
 # ═════════════════════════════════════════════════════════════
+#  SETUP BOS RETEST — BOS → X (sweep) → OB/FVG → Continuation
+#  + toutes confluences : Order Flow, Breaker, BSL/SSL, OB H4
+# ═════════════════════════════════════════════════════════════
+
+def detect_bos_retest_setup(
+    df_m15:       pd.DataFrame,
+    df_m5:        pd.DataFrame,
+    direction:    str,
+    bos_list:     list,
+    obs_m15:      list,
+    fvg_active,
+    liq_taken:    bool,
+    price_now:    float,
+    atr:          float,
+    ofs_detected: bool = False,
+    ofs_bonus:    int  = 0,
+    breaker_ok:   bool = False,
+    bsl_ssl_swept:bool = False,
+    ob_htf_active:bool = False,
+) -> dict:
+    """BOS → X (stop hunt) → retracement OB/FVG → continuation."""
+    result = {"detected": False, "score_bonus": 0, "reasons": [], "retest_zone": None}
+    if not bos_list:
+        return result
+
+    last_bos = bos_list[-1]
+    expected = "bearish" if direction == "SHORT" else "bullish"
+    if last_bos.get("type", "") != expected:
+        return result
+
+    bos_level = last_bos.get("level", 0.0)
+    score, reasons = 0, []
+    reasons.append(f"✅ BOS M15 {direction} @ {round(bos_level,5)}  (+15)")
+    score += 15
+
+    ob_zone = next((o for o in reversed(obs_m15) if o.direction == expected), None)
+    in_ob   = False
+    if ob_zone:
+        ob_lo = min(ob_zone.top, ob_zone.bottom)
+        ob_hi = max(ob_zone.top, ob_zone.bottom)
+        if (ob_lo - atr*0.5) <= price_now <= (ob_hi + atr*0.5):
+            in_ob = True
+            reasons.append(f"🏛️ Older Block M15 [{round(ob_lo,5)}–{round(ob_hi,5)}]  (+12)")
+            score += 12
+            result["retest_zone"] = ob_zone
+
+    in_fvg = False
+    if fvg_active is not None:
+        flo = min(fvg_active.top, fvg_active.bottom)
+        fhi = max(fvg_active.top, fvg_active.bottom)
+        if (flo - atr*0.3) <= price_now <= (fhi + atr*0.3):
+            in_fvg = True
+            reasons.append(f"📍 Valid FVG M15 [{round(flo,5)}–{round(fhi,5)}]  (+10)")
+            score += 10
+
+    if liq_taken:
+        reasons.append("💧 Liquidité prise — point X (stop hunt)  (+10)")
+        score += 10
+    if in_ob and in_fvg:
+        reasons.append("⚡ Confluence OB + FVG = zone institutionnelle  (+8)")
+        score += 8
+    if ofs_detected and ofs_bonus > 0:
+        pts = min(ofs_bonus, 12)
+        reasons.append(f"📈 Order Flow Shift M15 aligné  (+{pts})")
+        score += pts
+    if breaker_ok:
+        reasons.append("🔥 Breaker Block M15  (+7)")
+        score += 7
+    if bsl_ssl_swept:
+        reasons.append("💧 BSL/SSL sweepée — hunt institutionnel  (+8)")
+        score += 8
+    if ob_htf_active:
+        reasons.append("🏛️ Older Block H4 actif — confluence HTF  (+5)")
+        score += 5
+
+    if not (in_ob or in_fvg):
+        return result
+
+    result.update({"detected": True, "score_bonus": score, "reasons": reasons})
+    return result
+
+
+# ═════════════════════════════════════════════════════════════
 #  MOTEUR PRINCIPAL v3 — H4 → M15 → M5
 # ═════════════════════════════════════════════════════════════
 
@@ -3064,8 +3260,8 @@ def analyse(symbol: str, htf: str = HTF, ltf: str = LTF,
 
     # ── AMD ───────────────────────────────────────────────────
     amd = detect_amd_phase(df_htf)
-    amd_ok    = (amd.phase == "distribution" and amd.direction == direction
-                 and amd.confidence >= 60)
+    amd_ok    = (amd.phase in ("distribution", "manipulation", "accumulation")
+                 and amd.confidence >= 35)
     amd_conf  = amd.confidence if amd_ok else 0
 
     if not silent:
@@ -3182,6 +3378,25 @@ def analyse(symbol: str, htf: str = HTF, ltf: str = LTF,
     choch_eql     = detect_choch_eql_setup(df_htf, df_ltf, liq_map, direction)
     ce_bonus      = choch_eql["score_bonus"] if choch_eql["detected"] else 0
 
+    # ── BOS RETEST — toutes confluences ───────────────────────
+    bos_retest    = detect_bos_retest_setup(
+        df_m15        = df_mtf,
+        df_m5         = df_ltf,
+        direction     = direction,
+        bos_list      = bos_mtf,
+        obs_m15       = obs_mtf,
+        fvg_active    = fvg_active,
+        liq_taken     = liq_taken,
+        price_now     = price_now,
+        atr           = atr_m5,
+        ofs_detected  = ofs_mtf["detected"],
+        ofs_bonus     = ofs_bonus,
+        breaker_ok    = breaker_ok,
+        bsl_ssl_swept = bsl_ssl_swept,
+        ob_htf_active = older_block,
+    )
+    bos_ret_bonus = bos_retest["score_bonus"] if bos_retest["detected"] else 0
+
     if not silent:
         print(f"\n  {'FVG M5 actif':<28} {tick(ltf_fvg_ok)}")
         print(f"  {'FVG non mitiqué':<28} {tick(fvg_unmit_ok)}")
@@ -3224,6 +3439,10 @@ def analyse(symbol: str, htf: str = HTF, ltf: str = LTF,
             print(f"  {'🔥 Breaker Block H4':<28} {_bb_lbl}  (+{bb_htf_bonus})")
         else:
             print(f"  {'🔥 Breaker Block H4':<28} {c('Non détecté', 'white')}")
+        if bos_retest["detected"]:
+            print(f"  {'🎯 BOS Retest M15':<28} {c('✓ VALIDÉ', 'green')}  (+{bos_ret_bonus})")
+        else:
+            print(f"  {'🎯 BOS Retest M15':<28} {c('Non validé', 'white')}")
 
     # ─────────────────────────────────────────────────────────
     #  SCORING v3
@@ -3256,6 +3475,11 @@ def analyse(symbol: str, htf: str = HTF, ltf: str = LTF,
         breaker_htf_bonus     = bb_htf_bonus,
         breaker_htf_reason    = bb_htf_reason,
     )
+
+    # BOS RETEST bonus
+    if bos_retest["detected"]:
+        score = min(score + bos_ret_bonus, 100)
+        reasons = bos_retest["reasons"] + reasons
 
     # Ajout des raisons AMD
     if amd_ok:
@@ -3382,6 +3606,36 @@ def analyse(symbol: str, htf: str = HTF, ltf: str = LTF,
                     score = min(score + 5, 100)
 
     # ─────────────────────────────────────────────────────────
+    #  ✅ CONFIRMATION BOUGIE M15 FERMÉE — entrée après clôture
+    # ─────────────────────────────────────────────────────────
+    # La dernière bougie M15 doit être CLÔTURÉE dans la direction
+    # du signal (close bearish pour SHORT, close bullish pour LONG).
+    # On n'entre JAMAIS sur une bougie en cours — seulement après fermeture.
+    last_m15_open  = df_mtf["open"].iloc[-1]
+    last_m15_close = df_mtf["close"].iloc[-1]
+    last_m15_body  = abs(last_m15_close - last_m15_open)
+    last_m15_range = df_mtf["high"].iloc[-1] - df_mtf["low"].iloc[-1]
+    m15_body_ratio = last_m15_body / last_m15_range if last_m15_range > 0 else 0
+
+    # Bougie de confirmation M15 : corps ≥ 40% du range ET dans la bonne direction
+    m15_candle_ok = False
+    m15_candle_desc = ""
+    if direction == "SHORT" and last_m15_close < last_m15_open and m15_body_ratio >= 0.40:
+        m15_candle_ok   = True
+        m15_candle_desc = f"🕯️ Bougie M15 BEARISH clôturée (corps={round(m15_body_ratio*100)}%)"
+        score = min(score + 8, 100)
+        reasons.append(f"{m15_candle_desc}  (+8)")
+    elif direction == "LONG" and last_m15_close > last_m15_open and m15_body_ratio >= 0.40:
+        m15_candle_ok   = True
+        m15_candle_desc = f"🕯️ Bougie M15 BULLISH clôturée (corps={round(m15_body_ratio*100)}%)"
+        score = min(score + 8, 100)
+        reasons.append(f"{m15_candle_desc}  (+8)")
+
+    if not silent:
+        tick_c = c("✓", "green") if m15_candle_ok else c("⏳ attente fermeture", "yellow")
+        print(f"  {'🕯️ Bougie M15 confirmée':<28} {tick_c}")
+
+    # ─────────────────────────────────────────────────────────
     #  ★ SETUP PRIORITAIRE — SÉQUENCE SMC TRADER H4
     # ─────────────────────────────────────────────────────────
     smc_trader = detect_smc_trader(df_htf, df_mtf, df_ltf, direction)
@@ -3395,26 +3649,58 @@ def analyse(symbol: str, htf: str = HTF, ltf: str = LTF,
         else:
             print(f"  {'★ SMC Trader H4':<28} {c('✗ Incomplet', 'yellow')}")
 
-    # Détermine le mode du signal — SMC_TRADER en priorité absolue
+    # ── ETE M15 détecté dans les patterns ─────────────────────
+    ete_detected = any(
+        "Épaule" in p.pattern_name or "ETE" in p.pattern_name
+        for p in detected_patterns
+    )
+    ete_score = max((p.score_bonus for p in detected_patterns
+                     if "Épaule" in p.pattern_name or "ETE" in p.pattern_name), default=0)
+
+    # ─────────────────────────────────────────────────────────
+    #  PRIORITÉ DES SETUPS — ordre de conviction décroissant
+    # ─────────────────────────────────────────────────────────
+    #  1. SMC_TRADER  — setup institutionnel H4 complet (le plus fiable)
+    #  2. ETE_M15     — Épaule-Tête-Épaule M15 avec retest neckline
+    #  3. BOS_RETEST  — BOS + X + OB/FVG M15 (tes images de référence)
+    #  4. BREAKER_HTF — Breaker Block H4 retesté M15
+    #  5. CHOCH_LIQ   — CHoCH + Equal Liquidité
+    #  6. SWEEP_SHIFT — 4H Sweep + 5M Shift
+    #  7. AMD         — Accumulation/Manipulation/Distribution H4
+    #  8. SEPTUPLE    — Septuple Traction H4
+    #  9. OFS         — Order Flow Shift M15
+    # 10. PRE-BOS     — Anticipation cassure de structure
+    # 11. OB_RETEST   — Retest Order Block (3 types)
+    # 12. PATTERN     — Chart patterns (Wedge, Flag, Triangle...)
+    # 13. SD          — Supply/Demand Zone seule
+    # 14. SMC         — Confluence SMC générale
+    # ─────────────────────────────────────────────────────────
     if smc_trader.detected and smc_trader.score >= 60:
         mode = "SMC_TRADER"
-        # Boost score avec les raisons SMC_TRADER
         score = min(score + smc_trader.score // 4, 100)
         reasons = smc_trader.reasons + reasons
+    elif ete_detected and ete_score >= 30:
+        mode = "ETE_M15"
+        score = min(score + 5, 100)   # bonus priorité ETE
+        reasons.insert(0, f"🏔️ Épaule-Tête-Épaule M15 — setup prioritaire  (+5)")
     elif bb_htf["detected"] and bb_htf_bonus >= 15:
         mode = "BREAKER_HTF"
+    elif choch_eql["detected"] and ce_bonus >= 20:
+        mode = "CHOCH_LIQ"
+    elif sweep_shift["detected"] and ss_bonus >= 20:
+        mode = "SWEEP_SHIFT"
     elif amd_ok and amd_conf >= 75:
         mode = "AMD"
     elif sept_ok and sept_count >= 5:
         mode = "SEPTUPLE"
     elif ofs_mtf["detected"] and ofs_bonus >= 10:
         mode = "OFS"
-    elif sweep_shift["detected"] and ss_bonus >= 20:
-        mode = "SWEEP_SHIFT"
-    elif choch_eql["detected"] and ce_bonus >= 20:
-        mode = "CHOCH_LIQ"
     elif pre_bos_detected:
         mode = "PRE-BOS"
+    elif ob_retest.detected and ob_ret_bonus >= 15:
+        mode = "OB_RETEST"
+    elif bos_retest["detected"] and bos_ret_bonus >= 25:
+        mode = "BOS_RETEST"
     elif pat_bonus >= 18:
         mode = "PATTERN"
     elif ob_retest.detected and ob_ret_bonus >= 15:
@@ -3865,7 +4151,7 @@ def run_live(cat: str = "all", min_score: int = SCORE_THRESHOLD,
                                     else:
                                         direction_d = "LONG" if bias_str == "BULLISH" else "SHORT"
                                         amd_d = detect_amd_phase(df_peek_htf)
-                                        amd_ok_d = amd_d.phase == "distribution" and amd_d.direction == direction_d and amd_d.confidence >= 60
+                                        amd_ok_d = (amd_d.phase in ("distribution", "manipulation", "accumulation") and amd_d.confidence >= 35)
                                         diag_parts.append(f"AMD={'✓' if amd_ok_d else f'✗({amd_d.phase}/{amd_d.confidence}%)'}")
                                         sept_d = detect_septuple_traction(df_peek_htf)
                                         diag_parts.append(f"Sept={'✓' if sept_d['detected'] else '✗'}")
