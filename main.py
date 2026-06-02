@@ -73,7 +73,8 @@ def index():
                     "SMC": "#58a6ff", "SWEEP_SHIFT": "#e67e22",
                     "CHOCH_LIQ": "#1abc9c", "BREAKER_HTF": "#e74c3c",
                     "OFS": "#27ae60", "SMC_TRADER": "#f1c40f",
-                    "ETE_M15": "#ff4081", "BOS_RETEST": "#00bcd4"}.get(s.get("mode", "SMC"), "#58a6ff")
+                    "ETE_M15": "#ff4081", "BOS_RETEST": "#00bcd4",
+                    "SWEEP_BOS_M15": "#c0392b"}.get(s.get("mode", "SMC"), "#58a6ff")
         signals_html += (
             f"<tr>"
             f"<td>{s['ts']}</td>"
@@ -191,7 +192,7 @@ LTF             = "15m"   # M15 : entrée précise
 FVG_MIN_RATIO   = 0.0002
 OB_LOOKBACK     = 5
 LIQ_THRESHOLD   = 0.0004
-SCORE_THRESHOLD = 55
+SCORE_THRESHOLD = 72
 MIN_RR          = 2.5
 RISK_USD        = 100.0
 
@@ -3206,6 +3207,210 @@ def detect_bos_retest_setup(
 
 
 # ═════════════════════════════════════════════════════════════
+#  SETUP PURE M15 : SWEEP SSL/BSL → BOS M15 → PULLBACK BREAKER
+#
+#  Séquence obligatoire (celle visible dans toutes tes images) :
+#    ① Le prix sweep un SSL (LONG) ou BSL (SHORT) sur M15
+#       → chasse les stops institutionnels
+#    ② Juste après le sweep : BOS M15 dans la direction opposée
+#       → premier signe de changement de structure
+#    ③ Le prix pullback dans la zone naturelle (Breaker naturel =
+#       dernière bougie qui a causé le BOS, ou FVG créé lors du BOS)
+#       → zone d'entrée institutionnelle (point X)
+#    ④ Entrée sur bougie de confirmation dans la zone pullback
+#
+#  Ce setup est différent de :
+#    - detect_smc_trader   : nécessite H4 → M15 → M5 et MSS
+#    - detect_bos_retest   : pas de sweep SSL/BSL obligatoire
+#
+#  Score bonus max : 30 pts
+#    +12 sweep SSL/BSL confirmé
+#    +10 BOS M15 post-sweep validé
+#    +8  prix dans zone pullback (OB naturel / FVG post-BOS)
+# ═════════════════════════════════════════════════════════════
+
+def detect_sweep_bos_m15_setup(
+    df_m15:    pd.DataFrame,
+    direction: str,
+    liq_map:   "LiquidityMap",
+    atr:       float,
+) -> dict:
+    """
+    Détecte la séquence pure M15 :
+      ① Sweep SSL (LONG) ou BSL (SHORT) sur M15
+      ② BOS M15 post-sweep dans la direction du trade
+      ③ Pullback dans la zone naturelle (Breaker / FVG post-BOS)
+
+    Paramètres :
+      df_m15    : données M15 (au moins 40 bougies)
+      direction : "LONG" | "SHORT"
+      liq_map   : LiquidityMap (pour vérifier swept_ssl/swept_bsl)
+      atr       : ATR M15 courant
+
+    Retourne dict :
+      detected      : bool
+      sweep_level   : float | None  — niveau SSL/BSL sweepé
+      bos_level     : float | None  — niveau BOS post-sweep
+      pullback_zone : tuple[float,float] | None  — zone naturelle (low, high)
+      score_bonus   : int
+      reasons       : list[str]
+    """
+    empty = {
+        "detected"     : False,
+        "sweep_level"  : None,
+        "bos_level"    : None,
+        "pullback_zone": None,
+        "score_bonus"  : 0,
+        "reasons"      : [],
+    }
+
+    if len(df_m15) < 40 or atr <= 0:
+        return empty
+
+    window    = df_m15.iloc[-60:].reset_index(drop=True)
+    n         = len(window)
+    price_now = window["close"].iloc[-1]
+    score     = 0
+    reasons   = []
+
+    # ── ① SWEEP SSL (LONG) ou BSL (SHORT) ────────────────────────
+    # On cherche une bougie récente (dans les 20 dernières) qui a
+    # percé un swing low/high puis clôturé au-dessus/dessous.
+    sweep_idx   = None
+    sweep_level = None
+
+    if direction == "LONG":
+        # Chercher un SSL sweep : low perce un swing low récent puis close >  swing low
+        for i in range(n - 20, n - 1):
+            if i < 5:
+                continue
+            swing_lo = window["low"].iloc[max(0, i-10):i].min()
+            bar_lo   = window["low"].iloc[i]
+            bar_cl   = window["close"].iloc[i]
+            # Bougie a percé sous le swing low puis refermé au-dessus → sweep
+            if bar_lo < swing_lo - atr * 0.05 and bar_cl > swing_lo - atr * 0.10:
+                sweep_idx   = i
+                sweep_level = swing_lo
+                break   # on prend le plus récent
+
+    else:  # SHORT
+        # Chercher un BSL sweep : high perce un swing high récent puis close < swing high
+        for i in range(n - 20, n - 1):
+            if i < 5:
+                continue
+            swing_hi = window["high"].iloc[max(0, i-10):i].max()
+            bar_hi   = window["high"].iloc[i]
+            bar_cl   = window["close"].iloc[i]
+            if bar_hi > swing_hi + atr * 0.05 and bar_cl < swing_hi + atr * 0.10:
+                sweep_idx   = i
+                sweep_level = swing_hi
+                break
+
+    if sweep_idx is None or sweep_level is None:
+        return empty
+
+    score += 12
+    sweep_dir = "SSL" if direction == "LONG" else "BSL"
+    reasons.append(
+        f"💧 Sweep {sweep_dir} M15 @ {round(sweep_level, 5)}  (+12)"
+    )
+
+    # ── ② BOS M15 POST-SWEEP ──────────────────────────────────────
+    # On cherche un BOS dans la bonne direction APRÈS la bougie sweep
+    bos_idx   = None
+    bos_level = None
+    search_from = sweep_idx + 1
+
+    if direction == "LONG":
+        # BOS haussier : close > swing high des N bougies avant
+        for i in range(search_from, n):
+            lookback_start = max(sweep_idx - 5, 0)
+            swing_hi_ref   = window["high"].iloc[lookback_start:i].max()
+            if window["close"].iloc[i] > swing_hi_ref:
+                bos_idx   = i
+                bos_level = swing_hi_ref
+                break
+    else:  # SHORT
+        # BOS baissier : close < swing low des N bougies avant
+        for i in range(search_from, n):
+            lookback_start = max(sweep_idx - 5, 0)
+            swing_lo_ref   = window["low"].iloc[lookback_start:i].min()
+            if window["close"].iloc[i] < swing_lo_ref:
+                bos_idx   = i
+                bos_level = swing_lo_ref
+                break
+
+    if bos_idx is None or bos_level is None:
+        return empty   # Pas de BOS post-sweep → séquence invalide
+
+    score += 10
+    bos_dir_lbl = "haussier" if direction == "LONG" else "baissier"
+    reasons.append(
+        f"📐 BOS M15 {bos_dir_lbl} post-sweep @ {round(bos_level, 5)}  (+10)"
+    )
+
+    # ── ③ ZONE PULLBACK = BREAKER NATUREL ────────────────────────
+    # La zone naturelle est la dernière bougie impulse qui a causé le BOS
+    # (ou le FVG créé lors de l'impulsion post-sweep).
+    # On cherche la bougie de BOS elle-même et la bougie juste avant.
+    pullback_zone = None
+
+    if bos_idx >= 1:
+        # Bougie qui a cassé la structure
+        bos_candle_hi = window["high"].iloc[bos_idx]
+        bos_candle_lo = window["low"].iloc[bos_idx]
+        # Bougie précédente (OB naturel)
+        prev_hi = window["high"].iloc[bos_idx - 1]
+        prev_lo = window["low"].iloc[bos_idx - 1]
+
+        if direction == "LONG":
+            # Zone pullback = corps de la bougie OB naturel (dernière bougie baissière avant le BOS haussier)
+            ob_hi = max(bos_candle_hi, prev_hi)
+            ob_lo = min(bos_candle_lo, prev_lo)
+            pullback_zone = (ob_lo, ob_hi)
+        else:
+            ob_hi = max(bos_candle_hi, prev_hi)
+            ob_lo = min(bos_candle_lo, prev_lo)
+            pullback_zone = (ob_lo, ob_hi)
+
+    # Vérifier si le prix courant est dans la zone pullback (ou proche)
+    in_pullback = False
+    if pullback_zone is not None:
+        pb_lo, pb_hi = pullback_zone
+        tol = atr * 0.5
+        in_pullback = (pb_lo - tol) <= price_now <= (pb_hi + tol)
+
+    if in_pullback and pullback_zone is not None:
+        score += 8
+        reasons.append(
+            f"🏛️ Prix dans zone pullback / Breaker naturel "
+            f"[{round(pullback_zone[0], 5)}–{round(pullback_zone[1], 5)}]  (+8)"
+        )
+    else:
+        # Pas dans la zone → séquence détectée mais entrée non encore optimale
+        # On retourne quand même "detected" pour le mode, mais score réduit
+        reasons.append(
+            f"⏳ Attente pullback dans Breaker naturel "
+            f"[{round(pullback_zone[0] if pullback_zone else 0, 5)}–"
+            f"{round(pullback_zone[1] if pullback_zone else 0, 5)}]"
+        )
+        # Séquence ①② valide mais ③ pas encore → score sans bonus pullback
+        # On retourne quand même si score ≥ 22 (sweep + BOS)
+        if score < 20:
+            return empty
+
+    return {
+        "detected"     : True,
+        "sweep_level"  : sweep_level,
+        "bos_level"    : bos_level,
+        "pullback_zone": pullback_zone,
+        "in_pullback"  : in_pullback,
+        "score_bonus"  : min(score, 30),
+        "reasons"      : reasons,
+    }
+
+
+# ═════════════════════════════════════════════════════════════
 #  MOTEUR PRINCIPAL v3 — H4 → M15 → M5
 # ═════════════════════════════════════════════════════════════
 
@@ -3397,6 +3602,11 @@ def analyse(symbol: str, htf: str = HTF, ltf: str = LTF,
     )
     bos_ret_bonus = bos_retest["score_bonus"] if bos_retest["detected"] else 0
 
+    # ── Setup SWEEP_BOS_M15 : SSL/BSL → BOS M15 → Pullback Breaker ──
+    sweep_bos_m15  = detect_sweep_bos_m15_setup(df_mtf, direction, liq_map, atr_m5)
+    sbm_bonus      = sweep_bos_m15["score_bonus"] if sweep_bos_m15["detected"] else 0
+    sbm_in_pb      = sweep_bos_m15.get("in_pullback", False) if sweep_bos_m15["detected"] else False
+
     if not silent:
         print(f"\n  {'FVG M5 actif':<28} {tick(ltf_fvg_ok)}")
         print(f"  {'FVG non mitiqué':<28} {tick(fvg_unmit_ok)}")
@@ -3443,6 +3653,11 @@ def analyse(symbol: str, htf: str = HTF, ltf: str = LTF,
             print(f"  {'🎯 BOS Retest M15':<28} {c('✓ VALIDÉ', 'green')}  (+{bos_ret_bonus})")
         else:
             print(f"  {'🎯 BOS Retest M15':<28} {c('Non validé', 'white')}")
+        if sweep_bos_m15["detected"]:
+            pb_lbl = c("✓ dans zone", "green") if sbm_in_pb else c("⏳ attente pullback", "yellow")
+            print(f"  {'🎯 Sweep→BOS→Breaker M15':<28} {pb_lbl}  (+{sbm_bonus})")
+        else:
+            print(f"  {'🎯 Sweep→BOS→Breaker M15':<28} {c('Non détecté', 'white')}")
 
     # ─────────────────────────────────────────────────────────
     #  SCORING v3
@@ -3480,6 +3695,11 @@ def analyse(symbol: str, htf: str = HTF, ltf: str = LTF,
     if bos_retest["detected"]:
         score = min(score + bos_ret_bonus, 100)
         reasons = bos_retest["reasons"] + reasons
+
+    # SWEEP_BOS_M15 bonus (séquence pure M15 : Sweep → BOS → Pullback Breaker)
+    if sweep_bos_m15["detected"]:
+        score = min(score + sbm_bonus, 100)
+        reasons = sweep_bos_m15["reasons"] + reasons
 
     # Ajout des raisons AMD
     if amd_ok:
@@ -3679,6 +3899,10 @@ def analyse(symbol: str, htf: str = HTF, ltf: str = LTF,
         mode = "SMC_TRADER"
         score = min(score + smc_trader.score // 4, 100)
         reasons = smc_trader.reasons + reasons
+    elif sweep_bos_m15["detected"] and sbm_bonus >= 22 and sbm_in_pb:
+        # Séquence complète ①②③ : sweep + BOS + prix dans zone pullback
+        mode = "SWEEP_BOS_M15"
+        reasons.insert(0, "🎯 Setup SWEEP→BOS→BREAKER M15 — séquence institutionnelle complète")
     elif ete_detected and ete_score >= 30:
         mode = "ETE_M15"
         score = min(score + 5, 100)   # bonus priorité ETE
@@ -3799,6 +4023,7 @@ TIER_2_FOREX: list[tuple[str, str]] = [
     ("AUDUSD=X", "AUD/USD"),
     ("NZDUSD=X", "NZD/USD"),
     ("USDCAD=X", "USD/CAD"),
+    ("^GDAXI",   "GER30 / DAX"),
 ]
 
 TIER_3_EXTRA: list[tuple[str, str]] = [
@@ -3813,7 +4038,7 @@ TIER_3_EXTRA: list[tuple[str, str]] = [
     ("USDSEK=X", "USD/SEK"), ("USDNOK=X", "USD/NOK"), ("USDSGD=X", "USD/SGD"),
     ("NG=F",     "Gaz Naturel"), ("HG=F",   "Cuivre"),
     ("^GSPC",    "S&P 500"), ("^NDX",   "Nasdaq 100"), ("^DJI",   "Dow Jones"),
-    ("^GDAXI",   "DAX"),     ("^FCHI",  "CAC 40"),     ("^FTSE",  "FTSE 100"),
+    ("^FCHI",   "CAC 40"),   ("^FTSE",  "FTSE 100"),
 ]
 
 CATEGORY_MAP: dict[str, list[tuple[str, str]]] = {
@@ -4206,7 +4431,7 @@ def run_live(cat: str = "all", min_score: int = SCORE_THRESHOLD,
             # ── Limite 2 meilleurs signaux / cycle ──────────
             print(f"  {'─'*93}")
             if len(signals_found) > 2:
-                signals_found = sorted(signals_found, key=lambda x: x[2].score, reverse=True)[:2]
+                signals_found = sorted(signals_found, key=lambda x: x[2].score, reverse=True)[:3]
 
             if signals_found:
                 print(c(f"\n  ⚡ {len(signals_found)} SIGNAL(S) — Envoi Telegram en cours…", "yellow"))
