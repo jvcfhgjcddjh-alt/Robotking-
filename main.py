@@ -1,22 +1,24 @@
 
+
 """
 ╔══════════════════════════════════════════════════════════════════════════╗
-║         SMC SIGNAL ENGINE  v7  — Smart Money Concepts ELITE             ║
+║         SMC SIGNAL ENGINE  v8  — Smart Money Concepts MAJEURS ONLY      ║
 ║                                                                          ║
-║  NOUVEAUTÉS v7 :                                                         ║
-║  ✦ ENTRÉE ZONE STRATÉGIQUE OBLIGATOIRE  — OB ou S/D sur TOUS les setups ║
-║  ✦ BOUGIE OBLIGATOIRE  — Englobante OU Mèche de rejet (sinon bloqué)    ║
-║  ✦ BOS FLEXIBLE  — avant OU dans les 5 dernières bougies M15            ║
-║  ✦ FONCTION CENTRALE  — _validate_strategic_entry_m15() partagée        ║
-║  ✦ MAX 8 SIGNAUX/CYCLE  — AMD indépendant                               ║
+║  NOUVEAUTÉS v8 :                                                         ║
+║  ✦ PAIRES MAJEURES UNIQUEMENT — 7 forex majeurs + Gold + BTC + 4 crosses║
+║  ✦ ANTI-SPAM — 1 signal max/paire/cycle + cooldown 30min                ║
+║  ✦ MAX 3 SIGNAUX/CYCLE (était 8) — qualité > quantité                  ║
+║  ✦ SCORE MIN 78/100 (était 72) — filtre renforcé                        ║
+║  ✦ BTC SELL BLOQUÉ — tendance macro haussière                           ║
+║  ✦ MAX 3 SIGNAUX/JOUR/PAIRE (était 8)                                   ║
 ║                                                                          ║
-║  FILTRE ENTRÉE v7 (appliqué sur tous les 7 modules) :                   ║
-║  ① Prix dans OB M15/H4  OU  Zone S/D H1/H4  → OBLIGATOIRE              ║
-║  ② Bougie M15 : Englobante OU Mèche rejet ≥2× corps   → OBLIGATOIRE    ║
-║  ③ BOS M15 dans les 5 dernières bougies (avant ou après) → OBLIGATOIRE  ║
-║  ④ Liquidité sweepée avant l'entrée          → +15 pts bonus            ║
+║  SUPPRESSIONS v8 :                                                       ║
+║  ✗ AUDCHF / AUDNZD / CADCHF — trop de SL consécutifs                   ║
+║  ✗ USDNOK / USDZAR / USDMXN — spreads élevés, comportement imprévisible ║
+║  ✗ EURNZD / GBPNZD / CHFJPY / CADJPY — liquidité insuffisante           ║
+║  ✗ Silver / Oil / Gaz / CAC40 / FTSE / DAX                             ║
 ║                                                                          ║
-║  ARCHITECTURE TIERS :                                                    ║
+║  ARCHITECTURE TIERS (inchangée) :                                        ║
 ║  T1 🥇 BREAKER BLOCK    — Sweep H4 + Breaker M15 + Retest               ║
 ║  T2 🥈 SUPPLY/DEMAND    — Zone H1 + Sweep + BOS M15 + Bougie            ║
 ║  T3 🥉 ORDER BLOCK      — OB H4/M15 + BOS + FVG M5                     ║
@@ -25,7 +27,7 @@
 ║  T6     FVG             — Fair Value Gap non mitiqué                     ║
 ║  T7     AMD             — Accumulation → Manipulation → Distribution     ║
 ║                                                                          ║
-║   FOREX  |  BTC  |  GOLD  |  INDICES                                    ║
+║   FOREX MAJEURS  |  BTC (BUY ONLY)  |  GOLD                             ║
 ╚══════════════════════════════════════════════════════════════════════════╝
 
 Installation :
@@ -211,7 +213,7 @@ LTF             = "15m"   # M15 : entrée précise
 FVG_MIN_RATIO   = 0.0002
 OB_LOOKBACK     = 5
 LIQ_THRESHOLD   = 0.0004
-SCORE_THRESHOLD = 72
+SCORE_THRESHOLD = 78    # v8 : seuil relevé à 78 (était 72) — moins de signaux, meilleure qualité
 MIN_RR          = 2.5
 RISK_USD        = 100.0
 
@@ -261,6 +263,9 @@ def is_weekend() -> bool:
 def is_crypto_symbol(symbol: str) -> bool:
     """BTC et autres crypto tradent 24/7, y compris le weekend."""
     return symbol in ("BTC-USD", "ETH-USD", "BTC-USDT", "ETH-USDT")
+
+# v8 : BTC — on bloque les signaux SELL/SHORT sur BTC (tendance haussière forte)
+BTC_SELL_BLOCKED = True
 
 GOLD_SYMBOLS = {"GC=F", "SI=F", "CL=F", "BZ=F"}
 
@@ -436,7 +441,7 @@ TELEGRAM_CHAT_ID   = None
 TELEGRAM_GROUP_ID  = "-1002335466840"
 TELEGRAM_LEADER_ID = os.environ.get("TG_LEADER_ID", "6982051442")
 
-SIGNAL_COOLDOWN = 600
+SIGNAL_COOLDOWN = 1800   # v8 : 30 min minimum entre 2 signaux sur la même paire (était 600)
 _signal_cache: dict[str, float] = {}
 _setup_sent: dict[str, bool] = {}
 
@@ -5233,15 +5238,17 @@ def scan_symbol(symbol: str, mkt: str, min_rr: float = MIN_RR) -> list[SetupSign
 #  WATCHLIST (réutilisée depuis v3)
 # ─────────────────────────────────────────────────────────────
 
+# ── v8 : Paires MAJEURES uniquement — suppression des exotiques ──
+# Résultat analyse : AUDCHF/AUDNZD/CADCHF/USDNOK/USDZAR/USDMXN = trop de SL
+# On garde : 7 forex majeurs + Gold + BTC + 4 crosses liquides
+
 TIER_1_PRIORITY: list[tuple[str, str]] = [
     ("GC=F",    "Gold"),
-    ("SI=F",    "Silver"),
-    ("CL=F",    "Oil WTI"),
-    ("BZ=F",    "Oil Brent"),
     ("BTC-USD", "Bitcoin"),
 ]
 
 TIER_2_FOREX: list[tuple[str, str]] = [
+    # 7 paires majeures USD — les plus liquides, spread le plus bas
     ("EURUSD=X", "EUR/USD"),
     ("GBPUSD=X", "GBP/USD"),
     ("USDJPY=X", "USD/JPY"),
@@ -5249,30 +5256,32 @@ TIER_2_FOREX: list[tuple[str, str]] = [
     ("AUDUSD=X", "AUD/USD"),
     ("NZDUSD=X", "NZD/USD"),
     ("USDCAD=X", "USD/CAD"),
-    ("^GDAXI",   "GER30 / DAX"),
 ]
 
 TIER_3_EXTRA: list[tuple[str, str]] = [
-    ("EURGBP=X", "EUR/GBP"), ("EURJPY=X", "EUR/JPY"), ("GBPJPY=X", "GBP/JPY"),
-    ("EURAUD=X", "EUR/AUD"), ("GBPAUD=X", "GBP/AUD"), ("AUDJPY=X", "AUD/JPY"),
-    ("CADJPY=X", "CAD/JPY"), ("CHFJPY=X", "CHF/JPY"), ("EURCAD=X", "EUR/CAD"),
-    ("GBPCAD=X", "GBP/CAD"), ("NZDJPY=X", "NZD/JPY"), ("GBPCHF=X", "GBP/CHF"),
-    ("EURCHF=X", "EUR/CHF"), ("EURNZD=X", "EUR/NZD"), ("GBPNZD=X", "GBP/NZD"),
-    ("AUDCAD=X", "AUD/CAD"), ("AUDNZD=X", "AUD/NZD"), ("AUDCHF=X", "AUD/CHF"),
-    ("NZDCAD=X", "NZD/CAD"), ("NZDCHF=X", "NZD/CHF"), ("CADCHF=X", "CAD/CHF"),
-    ("USDMXN=X", "USD/MXN"), ("USDZAR=X", "USD/ZAR"), ("USDTRY=X", "USD/TRY"),
-    ("USDSEK=X", "USD/SEK"), ("USDNOK=X", "USD/NOK"),
-    ("NG=F",     "Gaz Naturel"),
-    ("^GSPC",    "S&P 500"), ("^NDX", "Nasdaq 100"), ("^DJI", "Dow Jones"),
-    ("^FCHI",    "CAC 40"),  ("^FTSE", "FTSE 100"),
+    # Crosses majeures uniquement — haute liquidité, comportement SMC fiable
+    ("EURGBP=X", "EUR/GBP"),
+    ("EURJPY=X", "EUR/JPY"),
+    ("GBPJPY=X", "GBP/JPY"),
+    ("GBPAUD=X", "GBP/AUD"),
+    # Indices US — signaux puissants lors de la session NY
+    ("^GSPC",    "S&P 500"),
+    ("^NDX",     "Nasdaq 100"),
 ]
+
+# SUPPRIMÉS (trop de SL, faible liquidité, spreads élevés) :
+# AUDCHF, AUDNZD, CADCHF, USDNOK, USDZAR, USDMXN, USDTRY, USDSEK
+# EURNZD, GBPNZD, NZDJPY, NZDCAD, NZDCHF, AUDCAD, CADJPY, CHFJPY
+# EURCAD, GBPCAD, EURCHF, EURAUD, GBPNZD, GBPCHF, GBPCAD
+# Silver, Oil, Gaz, CAC40, FTSE, DAX
 
 
 def get_symbols(cat: str = "all") -> list[tuple[str, str]]:
-    if cat == "priority": return TIER_1_PRIORITY
-    if cat == "btc":      return [("BTC-USD", "Bitcoin")]
-    if cat == "forex":    return TIER_1_PRIORITY + TIER_2_FOREX
-    if cat == "forex_all":return TIER_1_PRIORITY + TIER_2_FOREX + TIER_3_EXTRA
+    if cat == "priority":  return TIER_1_PRIORITY
+    if cat == "btc":       return [("BTC-USD", "Bitcoin")]
+    if cat == "forex":     return TIER_1_PRIORITY + TIER_2_FOREX
+    if cat == "forex_all": return TIER_1_PRIORITY + TIER_2_FOREX + TIER_3_EXTRA
+    # "all" = majeures seulement (v8)
     return TIER_1_PRIORITY + TIER_2_FOREX + TIER_3_EXTRA
 
 
@@ -5292,7 +5301,7 @@ def setup_logging() -> logging.Logger:
 
 log = setup_logging()
 
-MAX_SIGNALS_PER_DAY = 8   # v6 : max 8 signaux/jour/symbole
+MAX_SIGNALS_PER_DAY = 3   # v8 : max 3 signaux/jour/symbole (était 8) — anti-spam
 _daily_counts: dict[str, int] = {}
 _daily_date:   str = ""
 
@@ -5330,17 +5339,19 @@ def run_live_v4(cat: str = "all", min_rr: float = MIN_RR, interval: int = 300) -
     # Message de démarrage Telegram
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     startup_msg = (
-        f"⚡ <b>SMC Signal Engine v7 — MULTI-SETUP</b>\n"
+        f"⚡ <b>SMC Signal Engine v8 — MAJEURS ONLY</b>\n"
         f"{'─'*30}\n"
         f"🕐 <code>{ts}</code>\n"
-        f"📊 <b>Architecture :</b> 7 modules INDÉPENDANTS\n"
+        f"📊 <b>Marchés :</b> {len(symbols)} actifs (majeures uniquement)\n"
         f"🥇 T1 Breaker · 🥈 T2 S/D Zone · 🥉 T3 OB\n"
-        f"T4 BOS · T5 MSS · T6 FVG · T7 AMD ← indépendant\n"
-        f"⚡ <b>Max 8 signaux/cycle</b> — AMD ne bloque rien\n"
-        f"📈 <b>Marchés :</b> {len(symbols)} actifs\n"
+        f"T4 BOS · T5 MSS · T6 FVG · T7 AMD\n"
+        f"⚡ <b>Max 3 signaux/cycle</b> — 1 signal/paire/cycle\n"
+        f"🚫 <b>BTC SELL bloqué</b> — tendance haussière\n"
+        f"📈 <b>Score min :</b> {SCORE_THRESHOLD}/100\n"
+        f"⏱ <b>Cooldown :</b> 30min entre 2 signaux/paire\n"
         f"⚖️ RR min : 1:{min_rr}  |  Risque : $100/trade\n"
         f"{'─'*30}\n"
-        f"✅ Bot v7 démarré — scan toutes les {interval//60} minutes"
+        f"✅ Bot v8 démarré — scan toutes les {interval//60} minutes"
     )
     try:
         if TELEGRAM_LEADER_ID:
@@ -5407,7 +5418,7 @@ def run_live_v4(cat: str = "all", min_rr: float = MIN_RR, interval: int = 300) -
             print(f"\n{'╔'+'═'*W+'╗'}")
             print(f"║  🔍  CYCLE v7 #{cycle_n}  [{now_str}]  {len(symbols_to_scan)} marchés"
                   + " " * max(0, W - 3 - len(now_str) - len(str(len(symbols_to_scan))) - 22) + "║")
-            print(f"║  T1=BREAKER · T2=S/D · T3=OB · T4=BOS · T5=MSS · T6=FVG · T7=AMD"
+            print(f"║  T1=BREAKER · T2=S/D · T3=OB · T4=BOS · T5=MSS · T6=FVG · T7=AMD  [v8-MAJEURS]"
                   + " " * max(0, W - 67) + "║")
             print(f"{'╠'+'═'*W+'╣'}")
             print(f"  {'N°':<4} {'Marché':<14} {'Sym':<12}  {'Biais':>6}  "
@@ -5467,11 +5478,17 @@ def run_live_v4(cat: str = "all", min_rr: float = MIN_RR, interval: int = 300) -
             # ── Envoi des meilleurs signaux du cycle ──────────
             print(f"  {'─'*W}")
 
-            # ── v6 : max 8 signaux par cycle — chaque module indépendant ──
-            # AMD ne bloque PAS les autres : chaque tier envoie son signal séparément
+            # ── v8 : max 3 signaux par cycle — 1 seul module par paire ──
+            # Priorité : T1 > T2 > T3. On ne double plus les signaux OB+BOS+FVG sur la même paire
+            seen_pairs_cycle = set()
+            deduped_signals = []
             cycle_signals.sort(key=lambda x: (x[2].tier, -x[2].score))
-            if len(cycle_signals) > 8:
-                cycle_signals = cycle_signals[:8]
+            for item in cycle_signals:
+                pair_key = item[1]  # symbol
+                if pair_key not in seen_pairs_cycle:
+                    seen_pairs_cycle.add(pair_key)
+                    deduped_signals.append(item)
+            cycle_signals = deduped_signals[:3]  # max 3 par cycle
 
             if cycle_signals:
                 print(c(f"\n  ⚡ {len(cycle_signals)} SIGNAL(S) — Envoi Telegram…", "yellow"))
@@ -5479,6 +5496,11 @@ def run_live_v4(cat: str = "all", min_rr: float = MIN_RR, interval: int = 300) -
             for mkt, sym, setup_sig in cycle_signals:
                 if not check_daily_limit(sym):
                     log.info(f"  ⏭ {sym} — limite {MAX_SIGNALS_PER_DAY} signaux/jour atteinte")
+                    continue
+
+                # v8 : bloquer les SELL sur BTC (tendance macro haussière)
+                if BTC_SELL_BLOCKED and sym == "BTC-USD" and setup_sig.direction in ("SHORT", "SELL"):
+                    log.info(f"  🚫 BTC SELL bloqué (v8 — biais haussier macro)")
                     continue
 
                 corr_ok, corr_reason = correlation_guard(sym, setup_sig.direction)
