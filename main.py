@@ -1,5 +1,4 @@
 
-
 """
 ╔══════════════════════════════════════════════════════════════════════════╗
 ║         SMC SIGNAL ENGINE  v8  — Smart Money Concepts MAJEURS ONLY      ║
@@ -130,7 +129,7 @@ def index():
   </style>
 </head>
 <body>
-  <h1>⚡ SMC Signal Engine v5 — Breaker · S/D Zone · OB · BOS · MSS · FVG · AMD</h1>
+  <h1>⚡ SMC Signal Engine v8 — Breaker · S/D Zone · OB · BOS · MSS · FVG · AMD</h1>
   <p>
     Statut : <span class="badge {'live' if st['scan_running'] else 'idle'}">
       {'🟢 SCAN ACTIF' if st['scan_running'] else '🟡 EN ATTENTE'}
@@ -164,6 +163,47 @@ def index():
 </body>
 </html>"""
     return html
+
+
+@flask_app.route("/stats")
+def stats_json():
+    """Journal statistique — résumé JSON des performances."""
+    from collections import defaultdict
+    stats  = get_signal_stats(500)
+    closed = [s for s in stats if s["result"] != "open"]
+    open_t = [s for s in stats if s["result"] == "open"]
+
+    by_setup: dict = defaultdict(list)
+    by_sym:   dict = defaultdict(list)
+    by_hour:  dict = defaultdict(list)
+
+    for s in closed:
+        by_setup[s["setup_type"]].append(s["pnl_r"])
+        by_sym[s["symbol"]].append(s["pnl_r"])
+        by_hour[s["hour_utc"]].append(s["pnl_r"])
+
+    def _summary(d):
+        return {
+            k: {
+                "trades": len(v),
+                "winrate": round(sum(1 for r in v if r > 0) / len(v) * 100, 1) if v else 0,
+                "avg_r":  round(sum(v) / len(v), 2) if v else 0,
+                "total_r": round(sum(v), 2),
+            }
+            for k, v in sorted(d.items(), key=lambda x: -sum(x[1]))
+        }
+
+    return jsonify({
+        "total_closed": len(closed),
+        "total_open":   len(open_t),
+        "winrate_pct":  round(sum(1 for s in closed if s["pnl_r"] > 0) / max(len(closed), 1) * 100, 1),
+        "avg_r":        round(sum(s["pnl_r"] for s in closed) / max(len(closed), 1), 2),
+        "total_r":      round(sum(s["pnl_r"] for s in closed), 2),
+        "by_setup":     _summary(by_setup),
+        "by_symbol":    _summary(by_sym),
+        "by_hour_utc":  _summary(by_hour),
+        "recent":       stats[:20],
+    })
 
 
 @flask_app.route("/status")
@@ -237,6 +277,117 @@ SESSION_WINDOWS_UTC: list[tuple[int, int]] = [
 
 
 US_INDEX_SYMBOLS = {"^GSPC", "^NDX", "^DJI"}
+
+# ═════════════════════════════════════════════════════════════
+#  FILTRE NEWS ÉCONOMIQUES ⭐⭐⭐⭐⭐
+#
+#  Bloque les signaux 30 min AVANT et 30 min APRÈS une news
+#  à impact FORT sur les devises majeures (USD, EUR, GBP, JPY).
+#
+#  Source : ForexFactory JSON feed (public, sans clé API).
+#  Fallback silencieux si réseau indisponible (pas de blocage).
+#
+#  Currencies surveillées :
+#    USD, EUR, GBP, JPY — les plus impactantes en SMC
+#
+#  Impact bloqué : "High" uniquement (rouge sur ForexFactory).
+#  "Medium" et "Low" sont autorisés.
+# ═════════════════════════════════════════════════════════════
+
+NEWS_CURRENCIES_BLOCKED = {"USD", "EUR", "GBP", "JPY"}
+NEWS_WINDOW_MINUTES     = 30      # blocage ±30 min autour de la news
+_news_cache: dict       = {}      # {date_str: [list of news dicts]}
+_news_cache_ts: float   = 0.0
+NEWS_CACHE_TTL          = 3600    # rafraîchissement toutes les heures
+
+# Mapping symbole → devises concernées
+_SYMBOL_CURRENCIES: dict[str, set] = {
+    "EURUSD=X": {"EUR", "USD"}, "GBPUSD=X": {"GBP", "USD"},
+    "USDJPY=X": {"USD", "JPY"}, "USDCHF=X": {"USD", "CHF"},
+    "AUDUSD=X": {"AUD", "USD"}, "NZDUSD=X": {"NZD", "USD"},
+    "USDCAD=X": {"USD", "CAD"}, "EURGBP=X": {"EUR", "GBP"},
+    "EURJPY=X": {"EUR", "JPY"}, "GBPJPY=X": {"GBP", "JPY"},
+    "GBPAUD=X": {"GBP", "AUD"}, "GC=F":     {"USD"},
+    "BTC-USD":  {"USD"},        "^GSPC":    {"USD"},
+    "^NDX":     {"USD"},        "^DJI":     {"USD"},
+}
+
+
+def _fetch_forex_news() -> list[dict]:
+    """
+    Télécharge les news du jour depuis ForexFactory (JSON public).
+    Retourne une liste de dicts {time_utc: datetime, currency: str, impact: str}.
+    Silencieux en cas d'erreur réseau.
+    """
+    global _news_cache, _news_cache_ts
+    now_ts = time.time()
+
+    if now_ts - _news_cache_ts < NEWS_CACHE_TTL and _news_cache:
+        return list(_news_cache.get("events", []))
+
+    try:
+        today = datetime.now(timezone.utc).strftime("%b%d.%Y").lower()
+        url   = f"https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+        r     = requests.get(url, timeout=8)
+        if r.status_code != 200:
+            return []
+
+        raw    = r.json()
+        events = []
+        for ev in raw:
+            impact   = ev.get("impact", "").strip().lower()
+            currency = ev.get("country", "").strip().upper()
+            if impact not in ("high",):   # on ne bloque que les rouges
+                continue
+            if currency not in NEWS_CURRENCIES_BLOCKED:
+                continue
+            date_str = ev.get("date", "")
+            time_str = ev.get("time", "")
+            try:
+                dt_naive = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %I:%M%p")
+                dt_utc   = dt_naive.replace(tzinfo=timezone.utc)
+                events.append({"time_utc": dt_utc, "currency": currency, "title": ev.get("title", "")})
+            except Exception:
+                continue
+
+        _news_cache    = {"events": events}
+        _news_cache_ts = now_ts
+        return events
+
+    except Exception as e:
+        log.debug(f"  [NEWS] Fetch échoué : {e}")
+        return []
+
+
+def is_news_blackout(symbol: str) -> tuple[bool, str]:
+    """
+    Retourne (True, raison) si le symbole est dans une fenêtre de news forte.
+    Retourne (False, "") si le marché est libre.
+    """
+    currencies = _SYMBOL_CURRENCIES.get(symbol, set())
+    if not currencies:
+        return False, ""
+
+    relevant_currencies = currencies & NEWS_CURRENCIES_BLOCKED
+    if not relevant_currencies:
+        return False, ""
+
+    now_utc = datetime.now(timezone.utc)
+    events  = _fetch_forex_news()
+
+    for ev in events:
+        if ev["currency"] not in relevant_currencies:
+            continue
+        delta = (ev["time_utc"] - now_utc).total_seconds() / 60.0
+        if -NEWS_WINDOW_MINUTES <= delta <= NEWS_WINDOW_MINUTES:
+            sign  = "dans" if delta >= 0 else "il y a"
+            mins  = abs(int(delta))
+            return True, (
+                f"🚫 News {ev['currency']} impact FORT : \"{ev['title']}\" "
+                f"({sign} {mins} min)"
+            )
+
+    return False, ""
 
 def is_us_market_open() -> bool:
     """
@@ -341,6 +492,18 @@ def check_volatility(symbol: str, df_ltf: pd.DataFrame,
     ratio = spread / atr_for_spread if atr_for_spread > 0 else 1.0
     if ratio > MAX_SPREAD_ATR_RATIO:
         return False, f"spread/ATR={round(ratio*100,1)}% > {int(MAX_SPREAD_ATR_RATIO*100)}%"
+
+    # ── 2. FILTRE VOLUME — cassures faibles éliminées ─────────
+    # Volume actuel > 80% de la moyenne des 20 dernières bougies
+    # (seuil assoupli à 80% car yfinance retourne parfois des volumes partiels)
+    if "volume" in df_ltf.columns and len(df_ltf) >= 21:
+        vol_now  = df_ltf["volume"].iloc[-1]
+        vol_mean = df_ltf["volume"].rolling(20).mean().iloc[-1]
+        if not pd.isna(vol_now) and not pd.isna(vol_mean) and vol_mean > 0:
+            vol_ratio = vol_now / vol_mean
+            if vol_ratio < 0.80:
+                return False, f"volume faible ({round(vol_ratio*100,0)}% de la moyenne 20)"
+
     # Les cryptos (BTC) tradent 24/7 — pas de filtre session
     if is_crypto_symbol(symbol):
         return True, ""
@@ -403,7 +566,7 @@ _CORR_GROUPS: dict[str, str] = {
 }
 
 _active_corr_groups: dict[str, float] = {}
-CORR_TTL = 900
+CORR_TTL = 600
 
 
 def correlation_guard_reset() -> None:
@@ -444,6 +607,10 @@ TELEGRAM_LEADER_ID = os.environ.get("TG_LEADER_ID", "6982051442")
 SIGNAL_COOLDOWN = 1800   # v8 : 30 min minimum entre 2 signaux sur la même paire (était 600)
 _signal_cache: dict[str, float] = {}
 _setup_sent: dict[str, bool] = {}
+# Cache pour le cooldown par niveau de prix : {symbol -> (direction, entry_price, timestamp)}
+_price_level_cache: dict[str, tuple[str, float, float]] = {}
+PRICE_LEVEL_COOLDOWN = 1800   # secondes — cohérent avec SIGNAL_COOLDOWN
+PRICE_LEVEL_TOLERANCE = 0.0003  # 0.03% — ne pas renvoyer si entry quasi-identique (~3.5 pips EURUSD)
 
 # ── Trade Management — base de données persistante ────────────
 # Astuce Render : définir TRADE_DB_PATH=/opt/render/project/src/trades.db
@@ -461,6 +628,27 @@ def is_setup_already_sent(symbol: str, direction: str, score: int) -> bool:
     return _setup_sent.get(_setup_key(symbol, direction, score), False)
 
 
+def is_price_level_duplicate(symbol: str, direction: str, entry_price: float) -> bool:
+    """Retourne True si un signal récent sur la même paire a une entrée quasi-identique."""
+    cached = _price_level_cache.get(symbol)
+    if cached is None:
+        return False
+    cached_dir, cached_entry, cached_ts = cached
+    if time.time() - cached_ts > PRICE_LEVEL_COOLDOWN:
+        del _price_level_cache[symbol]
+        return False
+    if cached_dir != direction:
+        return False
+    if cached_entry <= 0:
+        return False
+    pct_diff = abs(entry_price - cached_entry) / cached_entry
+    return pct_diff < PRICE_LEVEL_TOLERANCE
+
+
+def record_price_level(symbol: str, direction: str, entry_price: float) -> None:
+    _price_level_cache[symbol] = (direction, entry_price, time.time())
+
+
 def mark_setup_sent(symbol: str, direction: str, score: int) -> None:
     _setup_sent[_setup_key(symbol, direction, score)] = True
 
@@ -469,6 +657,7 @@ def reset_setup(symbol: str) -> None:
     keys_to_del = [k for k in _setup_sent if k.startswith(f"{symbol}:")]
     for k in keys_to_del:
         del _setup_sent[k]
+    _price_level_cache.pop(symbol, None)
 
 
 def _tg_url(method: str) -> str:
@@ -513,7 +702,7 @@ def tg_send(text: str, chat_id: str) -> bool:
 
 
 # ── Compteur de signaux ────────────────────────────────────────────────────
-_SIGNAL_COUNTER_FILE = "/tmp/smc_signal_count.txt"
+_SIGNAL_COUNTER_FILE = os.path.join(os.path.dirname(TRADE_DB), "smc_signal_count.txt")
 
 def _next_signal_number() -> int:
     try:
@@ -551,7 +740,7 @@ _signal_number_cache: dict[str, int] = {}
 # ═════════════════════════════════════════════════════════════
 
 def _init_trade_db() -> None:
-    """Crée la table active_trades si elle n'existe pas encore."""
+    """Crée la table active_trades et signal_stats si elles n'existent pas encore."""
     try:
         con = sqlite3.connect(TRADE_DB, check_same_thread=False)
         con.execute("PRAGMA journal_mode=WAL")
@@ -575,6 +764,31 @@ def _init_trade_db() -> None:
                 sl_hit     INTEGER DEFAULT 0,
                 be_set     INTEGER DEFAULT 0,
                 closed     INTEGER DEFAULT 0
+            )
+        """)
+        # ── Journal statistique ──────────────────────────────
+        # Enregistre le résultat de chaque trade pour analyse a posteriori.
+        # Permet de savoir : quel setup gagne le plus, quelle paire, quelle heure.
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS signal_stats (
+                stat_id    TEXT PRIMARY KEY,
+                trade_id   TEXT NOT NULL,
+                symbol     TEXT NOT NULL,
+                direction  TEXT NOT NULL,
+                setup_type TEXT NOT NULL,
+                score      INTEGER DEFAULT 0,
+                entry      REAL NOT NULL,
+                sl         REAL NOT NULL,
+                tp1        REAL NOT NULL,
+                lot        REAL DEFAULT 0,
+                signal_num INTEGER DEFAULT 0,
+                timestamp  TEXT NOT NULL,
+                hour_utc   INTEGER DEFAULT 0,
+                weekday    INTEGER DEFAULT 0,
+                result     TEXT DEFAULT 'open',
+                exit_price REAL DEFAULT 0,
+                pnl_r      REAL DEFAULT 0,
+                duration_min INTEGER DEFAULT 0
             )
         """)
         con.commit()
@@ -611,7 +825,138 @@ def register_trade(sig: "Signal", signal_num: int, setup_type: str = "SMC") -> s
         print(c(f"  [TRADE] ✓ Trade #{trade_id} enregistré — {sig.symbol} {sig.direction}", "cyan"))
     except Exception as e:
         print(f"  [TRADE_DB] Erreur enregistrement : {e}")
+
+    # ── Enregistrement dans le journal statistique ────────────
+    _register_stat(trade_id, sig, signal_num, setup_type)
     return trade_id
+
+
+def _register_stat(trade_id: str, sig: "Signal", signal_num: int, setup_type: str) -> None:
+    """Insère une entrée dans signal_stats au moment de l'envoi du signal."""
+    try:
+        now     = datetime.now(timezone.utc)
+        stat_id = str(uuid.uuid4())[:8].upper()
+        score   = getattr(sig, "score", 0)
+        con = sqlite3.connect(TRADE_DB, check_same_thread=False)
+        con.execute("PRAGMA journal_mode=WAL")
+        con.execute("""
+            INSERT OR IGNORE INTO signal_stats
+            (stat_id, trade_id, symbol, direction, setup_type, score,
+             entry, sl, tp1, lot, signal_num, timestamp, hour_utc, weekday,
+             result, exit_price, pnl_r, duration_min)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (
+            stat_id, trade_id, sig.symbol, sig.direction, setup_type, score,
+            sig.entry, sig.sl, sig.tp, sig.lot, signal_num,
+            now.isoformat(), now.hour, now.weekday(),
+            "open", 0.0, 0.0, 0
+        ))
+        con.commit()
+        con.close()
+    except Exception as e:
+        print(f"  [STATS] Erreur insertion stat : {e}")
+
+
+def _update_stat_result(trade_id: str, result: str, exit_price: float) -> None:
+    """
+    Met à jour le résultat d'un trade dans signal_stats.
+    result = "tp1" | "tp2" | "tp3" | "sl"
+    Calcule automatiquement pnl_r (en unités de R) et duration_min.
+    """
+    try:
+        con = sqlite3.connect(TRADE_DB, check_same_thread=False)
+        con.row_factory = sqlite3.Row
+        row = con.execute(
+            "SELECT * FROM signal_stats WHERE trade_id=?", (trade_id,)
+        ).fetchone()
+        if row is None:
+            con.close()
+            return
+
+        entry     = row["entry"]
+        sl        = row["sl"]
+        direction = row["direction"]
+        ts_open   = datetime.fromisoformat(row["timestamp"])
+        risk      = abs(entry - sl)
+        now       = datetime.now(timezone.utc)
+        duration  = int((now - ts_open).total_seconds() / 60)
+
+        if risk > 0:
+            if direction == "LONG":
+                pnl_r = (exit_price - entry) / risk
+            else:
+                pnl_r = (entry - exit_price) / risk
+        else:
+            pnl_r = 0.0
+
+        con.execute("""
+            UPDATE signal_stats
+            SET result=?, exit_price=?, pnl_r=?, duration_min=?
+            WHERE trade_id=?
+        """, (result, exit_price, round(pnl_r, 2), duration, trade_id))
+        con.commit()
+        con.close()
+        print(c(f"  [STATS] ✓ {trade_id} → {result}  pnl={round(pnl_r,2)}R  durée={duration}min", "cyan"))
+    except Exception as e:
+        print(f"  [STATS] Erreur update résultat : {e}")
+
+
+def get_signal_stats(limit: int = 100) -> list[dict]:
+    """
+    Retourne les dernières entrées du journal statistique.
+    Utile pour analyser les performances par setup, paire, heure.
+    """
+    try:
+        _init_trade_db()
+        con = sqlite3.connect(TRADE_DB, check_same_thread=False)
+        con.row_factory = sqlite3.Row
+        rows = con.execute(
+            "SELECT * FROM signal_stats ORDER BY timestamp DESC LIMIT ?", (limit,)
+        ).fetchall()
+        con.close()
+        return [dict(r) for r in rows]
+    except Exception as e:
+        print(f"  [STATS] Erreur lecture : {e}")
+        return []
+
+
+def print_stats_summary() -> None:
+    """Affiche un résumé des statistiques dans la console."""
+    stats = get_signal_stats(500)
+    closed = [s for s in stats if s["result"] != "open"]
+    if not closed:
+        print(c("  [STATS] Aucun trade clôturé dans le journal.", "yellow"))
+        return
+
+    wins  = [s for s in closed if s["pnl_r"] > 0]
+    losses= [s for s in closed if s["pnl_r"] <= 0]
+    wr    = round(len(wins) / len(closed) * 100, 1)
+    avg_r = round(sum(s["pnl_r"] for s in closed) / len(closed), 2)
+
+    print(c(f"\n  ╔══ 📊 JOURNAL STATISTIQUE ({'='*40})", "cyan"))
+    print(c(f"  ║  Trades analysés : {len(closed)}  |  Winrate : {wr}%  |  R moyen : {avg_r}R", "cyan"))
+
+    # Par setup
+    from collections import defaultdict
+    by_setup: dict = defaultdict(list)
+    for s in closed:
+        by_setup[s["setup_type"]].append(s["pnl_r"])
+    print(c("  ║  Par setup :", "cyan"))
+    for stype, rs in sorted(by_setup.items(), key=lambda x: -sum(x[1])):
+        w = sum(1 for r in rs if r > 0)
+        print(f"  ║    {stype:<12} : {len(rs)} trades  WR={round(w/len(rs)*100,0)}%  avg={round(sum(rs)/len(rs),2)}R")
+
+    # Par paire
+    by_sym: dict = defaultdict(list)
+    for s in closed:
+        by_sym[s["symbol"]].append(s["pnl_r"])
+    print(c("  ║  Top paires :", "cyan"))
+    top5 = sorted(by_sym.items(), key=lambda x: -sum(x[1]))[:5]
+    for sym, rs in top5:
+        w = sum(1 for r in rs if r > 0)
+        print(f"  ║    {sym:<14} : {len(rs)} trades  WR={round(w/len(rs)*100,0)}%  total={round(sum(rs),2)}R")
+
+    print(c("  ╚" + "═"*52, "cyan"))
 
 
 def get_active_trades() -> list[dict]:
@@ -630,8 +975,18 @@ def get_active_trades() -> list[dict]:
         return []
 
 
+# Whitelist of allowed column names for update_trade_field (prevents SQL injection)
+_ALLOWED_TRADE_FIELDS = frozenset({
+    "tp1_hit", "tp2_hit", "sl_hit", "closed", "be_set",
+    "close_price", "close_time", "pnl_pips"
+})
+
+
 def update_trade_field(trade_id: str, field: str, value) -> None:
     """Met à jour un champ d'un trade existant."""
+    if field not in _ALLOWED_TRADE_FIELDS:
+        print(f"  [TRADE_DB] ⛔ Champ non autorisé : {field}")
+        return
     try:
         con = sqlite3.connect(TRADE_DB, check_same_thread=False)
         con.execute(
@@ -642,6 +997,30 @@ def update_trade_field(trade_id: str, field: str, value) -> None:
         con.close()
     except Exception as e:
         print(f"  [TRADE_DB] Erreur update {field} : {e}")
+
+
+def update_trade_field_guarded(trade_id: str, field: str, value) -> int:
+    """
+    Met à jour un champ uniquement si sa valeur actuelle est 0/False (garde atomique).
+    Retourne le nombre de lignes modifiées (1 si succès, 0 si déjà mis à jour).
+    Utilisé pour éviter la race condition sur be_set.
+    """
+    if field not in _ALLOWED_TRADE_FIELDS:
+        print(f"  [TRADE_DB] ⛔ Champ non autorisé : {field}")
+        return 0
+    try:
+        con = sqlite3.connect(TRADE_DB, check_same_thread=False)
+        cur = con.execute(
+            f"UPDATE active_trades SET {field}=? WHERE trade_id=? AND ({field}=0 OR {field} IS NULL)",
+            (value, trade_id)
+        )
+        con.commit()
+        rows = cur.rowcount
+        con.close()
+        return rows
+    except Exception as e:
+        print(f"  [TRADE_DB] Erreur update_guarded {field} : {e}")
+        return 0
 
 
 def get_current_price_live(symbol: str) -> Optional[float]:
@@ -833,7 +1212,7 @@ def _monitor_trades_loop() -> None:
                         continue
 
                     # ── SL touché ─────────────────────────────
-                    if not trade["sl_hit"]:
+                    if not trade["sl_hit"] and not trade["closed"]:
                         sl_hit = (
                             (direction == "LONG"  and price <= trade["sl"]) or
                             (direction == "SHORT" and price >= trade["sl"])
@@ -842,6 +1221,9 @@ def _monitor_trades_loop() -> None:
                             update_trade_field(trade["trade_id"], "sl_hit", 1)
                             update_trade_field(trade["trade_id"], "closed",  1)
                             _send_trade_alert(trade, "SL", price)
+                            _update_stat_result(trade["trade_id"], "sl", price)
+                            trade["sl_hit"] = 1
+                            trade["closed"] = 1
                             continue   # trade clôturé
 
                     # ── TP1 touché ────────────────────────────
@@ -853,25 +1235,27 @@ def _monitor_trades_loop() -> None:
                         if tp1_hit:
                             update_trade_field(trade["trade_id"], "tp1_hit", 1)
                             _send_trade_alert(trade, "TP1", price)
+                            _update_stat_result(trade["trade_id"], "tp1", price)
                             trade["tp1_hit"] = 1
 
                     # ── Rappel Break Even (5 min après TP1) ───
                     if (trade["tp1_hit"] and not trade.get("be_set", 0)
                             and not trade["tp2_hit"] and not trade["closed"]):
-                        update_trade_field(trade["trade_id"], "be_set", 1)
-                        # Rappel décalé dans un thread séparé pour ne pas bloquer
-                        def _delayed_be(t=trade, p=price):
-                            time.sleep(300)
-                            # Re-vérifie que le trade est encore ouvert
-                            refreshed = get_active_trades()
-                            t_ref = next(
-                                (x for x in refreshed if x["trade_id"] == t["trade_id"]),
-                                None
-                            )
-                            if t_ref and not t_ref["tp2_hit"] and not t_ref["closed"]:
-                                new_price = get_current_price_live(t["symbol"]) or p
-                                _send_trade_alert(t, "BE_REMINDER", new_price)
-                        threading.Thread(target=_delayed_be, daemon=True).start()
+                        rows_updated = update_trade_field_guarded(trade["trade_id"], "be_set", 1)
+                        if rows_updated:
+                            # Rappel décalé dans un thread séparé pour ne pas bloquer
+                            def _delayed_be(t=trade, p=price):
+                                time.sleep(300)
+                                # Re-vérifie que le trade est encore ouvert
+                                refreshed = get_active_trades()
+                                t_ref = next(
+                                    (x for x in refreshed if x["trade_id"] == t["trade_id"]),
+                                    None
+                                )
+                                if t_ref and not t_ref["tp2_hit"] and not t_ref["closed"]:
+                                    new_price = get_current_price_live(t["symbol"]) or p
+                                    _send_trade_alert(t, "BE_REMINDER", new_price)
+                            threading.Thread(target=_delayed_be, daemon=True).start()
 
                     # ── TP2 touché ────────────────────────────
                     if (trade["tp1_hit"] and not trade["tp2_hit"]
@@ -883,6 +1267,7 @@ def _monitor_trades_loop() -> None:
                         if tp2_hit:
                             update_trade_field(trade["trade_id"], "tp2_hit", 1)
                             _send_trade_alert(trade, "TP2", price)
+                            _update_stat_result(trade["trade_id"], "tp2", price)
                             trade["tp2_hit"] = 1
 
                     # ── TP3 touché → clôture complète ─────────
@@ -896,6 +1281,7 @@ def _monitor_trades_loop() -> None:
                             update_trade_field(trade["trade_id"], "tp3_hit", 1)
                             update_trade_field(trade["trade_id"], "closed",  1)
                             _send_trade_alert(trade, "TP3", price)
+                            _update_stat_result(trade["trade_id"], "tp3", price)
 
                     time.sleep(2)   # pause entre chaque symbole
 
@@ -913,6 +1299,140 @@ def _monitor_trades_thread() -> None:
     t = threading.Thread(
         target=_monitor_trades_loop, daemon=True, name="trade-monitor"
     )
+    t.start()
+    return t
+
+
+# ─────────────────────────────────────────────────────────────
+#  RAPPORT JOURNALIER — envoi Telegram à 21h00 UTC ⭐⭐⭐⭐⭐
+#
+#  Calcule et envoie chaque jour à 21h00 UTC le winrate
+#  de la journée + résumé cumulé de la semaine.
+#  Format identique aux alertes du bot (lisible sur mobile).
+# ─────────────────────────────────────────────────────────────
+
+def _build_daily_report(date_str: str | None = None) -> str:
+    """
+    Construit le message du rapport journalier.
+    date_str : format 'YYYY-MM-DD'. Si None → aujourd'hui UTC.
+    """
+    from collections import defaultdict
+
+    if date_str is None:
+        date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    stats  = get_signal_stats(500)
+    today  = [s for s in stats if s["timestamp"].startswith(date_str) and s["result"] != "open"]
+    open_t = [s for s in stats if s["result"] == "open"]
+
+    # Calculs du jour
+    wins_d  = [s for s in today if s["pnl_r"] > 0]
+    loss_d  = [s for s in today if s["pnl_r"] <= 0]
+    wr_d    = round(len(wins_d) / max(len(today), 1) * 100, 0)
+    total_r = round(sum(s["pnl_r"] for s in today), 2)
+    avg_r   = round(sum(s["pnl_r"] for s in today) / max(len(today), 1), 2)
+
+    # Calculs de la semaine (7 derniers jours)
+    from datetime import timedelta
+    week_ago  = (datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%d")
+    week_cl   = [s for s in stats if s["result"] != "open" and s["timestamp"] >= week_ago]
+    wins_w    = [s for s in week_cl if s["pnl_r"] > 0]
+    wr_w      = round(len(wins_w) / max(len(week_cl), 1) * 100, 0)
+    total_r_w = round(sum(s["pnl_r"] for s in week_cl), 2)
+
+    # Emoji résultat
+    if not today:
+        bilan_emoji = "😶"
+        bilan_txt   = "Aucun trade clôturé aujourd'hui"
+    elif wr_d >= 70:
+        bilan_emoji = "🔥"
+        bilan_txt   = "Excellente journée !"
+    elif wr_d >= 50:
+        bilan_emoji = "✅"
+        bilan_txt   = "Journée positive"
+    else:
+        bilan_emoji = "⚠️"
+        bilan_txt   = "Journée difficile — analyser les setups"
+
+    # Détail par setup
+    by_setup: dict = defaultdict(list)
+    for s in today:
+        by_setup[s["setup_type"]].append(s["pnl_r"])
+
+    setup_lines = ""
+    for stype, rs in sorted(by_setup.items(), key=lambda x: -sum(x[1])):
+        w  = sum(1 for r in rs if r > 0)
+        wr = int(w / len(rs) * 100)
+        emo = "✅" if wr >= 50 else "❌"
+        setup_lines += f"  {emo} {stype:<12} {len(rs)}t  WR {wr}%  {round(sum(rs),2):+.1f}R\n"
+
+    if not setup_lines:
+        setup_lines = "  — aucun trade\n"
+
+    # Construction du message
+    msg = (
+        f"📊 <b>RAPPORT JOURNALIER SMC</b>\n"
+        f"📅 {date_str}  —  21h00 UTC\n"
+        f"{'─'*32}\n"
+        f"{bilan_emoji}  <b>{bilan_txt}</b>\n\n"
+        f"<b>Aujourd'hui :</b>\n"
+        f"  📈 Trades clôturés : <b>{len(today)}</b>  "
+        f"({len(wins_d)} ✅  {len(loss_d)} ❌)\n"
+        f"  🎯 Winrate : <b>{int(wr_d)}%</b>\n"
+        f"  💰 Total R : <b>{total_r:+.2f}R</b>  (moy {avg_r:+.2f}R)\n"
+        f"  ⏳ Ouverts : {len(open_t)} signal(s) en cours\n\n"
+        f"<b>7 derniers jours :</b>\n"
+        f"  🗓️ {len(week_cl)} trades  WR <b>{int(wr_w)}%</b>  "
+        f"Total <b>{total_r_w:+.2f}R</b>\n\n"
+        f"<b>Par setup (aujourd'hui) :</b>\n"
+        f"{setup_lines}"
+        f"{'─'*32}\n"
+        f"🧠 Patience • Discipline • Résultat\n"
+        f"@smcsignalspro"
+    )
+    return msg
+
+
+def _daily_report_loop() -> None:
+    """
+    Thread qui attend chaque jour 21h00 UTC et envoie le rapport.
+    Utilise un sleep adaptatif pour viser exactement 21:00:00 UTC.
+    """
+    print(c("  ✓ Rapport journalier activé — envoi chaque jour à 21h00 UTC", "cyan"))
+    while True:
+        try:
+            now   = datetime.now(timezone.utc)
+            # Prochain 21h UTC
+            next_21 = now.replace(hour=21, minute=0, second=0, microsecond=0)
+            if now >= next_21:
+                from datetime import timedelta
+                next_21 += timedelta(days=1)
+            wait_sec = (next_21 - now).total_seconds()
+            log.info(f"  [RAPPORT] Prochain rapport dans {int(wait_sec//3600)}h{int((wait_sec%3600)//60)}m")
+            time.sleep(wait_sec)
+
+            # Construction + envoi
+            date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            msg      = _build_daily_report(date_str)
+            sent     = False
+            if TELEGRAM_GROUP_ID:
+                sent = tg_send(msg, TELEGRAM_GROUP_ID)
+            if TELEGRAM_LEADER_ID:
+                tg_send(msg, TELEGRAM_LEADER_ID)
+            log.info(f"  [RAPPORT] ✓ Rapport {date_str} envoyé (group={sent})")
+            # Afficher aussi dans la console
+            print(c(f"\n  📊 RAPPORT JOURNALIER {date_str} ─────────────────", "cyan"))
+            print_stats_summary()
+            time.sleep(60)   # évite double envoi en cas de drift
+
+        except Exception as e:
+            log.error(f"  [RAPPORT] Erreur : {e}")
+            time.sleep(300)
+
+
+def _daily_report_thread() -> None:
+    """Lance le thread du rapport journalier."""
+    t = threading.Thread(target=_daily_report_loop, daemon=True, name="daily-report")
     t.start()
     return t
 
@@ -1274,6 +1794,8 @@ def tg_notify(sig: "Signal", tier: str = "", mode: str = "SMC",
     # ── Envoi au GROUPE — filtre doublon actif ────────────────────────
     if is_setup_already_sent(sig.symbol, sig.direction, sig.score):
         print(c(f"  [TG] ⏭ Groupe — setup déjà envoyé ({sig.symbol} {sig.direction})", "yellow"))
+    elif is_price_level_duplicate(sig.symbol, sig.direction, sig.entry):
+        print(c(f"  [TG] ⏭ Groupe — niveau de prix quasi-identique ({sig.symbol} {sig.entry})", "yellow"))
     else:
         mark_setup_sent(sig.symbol, sig.direction, sig.score)
         if TELEGRAM_GROUP_ID:
@@ -1283,6 +1805,8 @@ def tg_notify(sig: "Signal", tier: str = "", mode: str = "SMC",
             else:
                 ok_grp = tg_send(msg, TELEGRAM_GROUP_ID)
                 print(c(f"  [TG] {'✓ Groupe (texte)' if ok_grp else '✗ Groupe texte échoué'}", "green" if ok_grp else "red"))
+            if ok_grp:
+                record_price_level(sig.symbol, sig.direction, sig.entry)
         else:
             print(c("  [TG] ⚠ TELEGRAM_GROUP_ID non défini", "red"))
 
@@ -5194,9 +5718,15 @@ def scan_symbol(symbol: str, mkt: str, min_rr: float = MIN_RR) -> list[SetupSign
     if df_h4 is None:
         return []
 
-    # ── 2. Filtre volatilité ──────────────────────────────────
+    # ── 2. Filtre volatilité + volume ─────────────────────────
     vol_ok, _ = check_volatility(symbol, df_m5, df_m15)
     if not vol_ok:
+        return []
+
+    # ── 2b. FILTRE NEWS ÉCONOMIQUES ───────────────────────────
+    news_blocked, news_reason = is_news_blackout(symbol)
+    if news_blocked:
+        log.info(f"  ⛔ {symbol} — {news_reason}")
         return []
 
     # ── 3. Biais H4 ───────────────────────────────────────────
@@ -5204,6 +5734,16 @@ def scan_symbol(symbol: str, mkt: str, min_rr: float = MIN_RR) -> list[SetupSign
     direction = _direction_from_bias(bias)
     if direction is None:
         return []
+
+    # ── 3b. FILTRE MULTI-TIMEFRAME H1 ─────────────────────────
+    # On ne trade que dans le sens du biais H1 (confirmation intermédiaire).
+    # Élimine beaucoup de faux signaux counter-trend.
+    if df_h1 is not None and not df_h1.empty and len(df_h1) >= 25:
+        bias_h1 = htf_bias(df_h1)
+        if bias_h1 != "NEUTRAL" and bias_h1 != bias:
+            # H1 et H4 en désaccord → on passe
+            log.debug(f"  {symbol} — H4={bias} vs H1={bias_h1} : divergence ignorée")
+            return []
 
     # ── 4. Carte de liquidité (partagée) ─────────────────────
     liq_map = build_liquidity_map(df_h4, df_m5)
@@ -5416,7 +5956,7 @@ def run_live_v4(cat: str = "all", min_rr: float = MIN_RR, interval: int = 300) -
             # ── Tableau d'en-tête du cycle ────────────────────
             W = 100
             print(f"\n{'╔'+'═'*W+'╗'}")
-            print(f"║  🔍  CYCLE v7 #{cycle_n}  [{now_str}]  {len(symbols_to_scan)} marchés"
+            print(f"║  🔍  CYCLE v8 #{cycle_n}  [{now_str}]  {len(symbols_to_scan)} marchés"
                   + " " * max(0, W - 3 - len(now_str) - len(str(len(symbols_to_scan))) - 22) + "║")
             print(f"║  T1=BREAKER · T2=S/D · T3=OB · T4=BOS · T5=MSS · T6=FVG · T7=AMD  [v8-MAJEURS]"
                   + " " * max(0, W - 67) + "║")
@@ -5556,7 +6096,7 @@ def run_live_v4(cat: str = "all", min_rr: float = MIN_RR, interval: int = 300) -
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="SMC Signal Engine v4 — Multi-Setup Indépendant",
+        description="SMC Signal Engine v8 — Multi-Setup Indépendant",
         formatter_class=argparse.RawTextHelpFormatter,
     )
     parser.add_argument("--symbol", default=None,
@@ -5582,6 +6122,8 @@ if __name__ == "__main__":
     _init_trade_db()
     _monitor_trades_thread()
     log.info("  ✓ Trade Monitor actif — alertes TP1/TP2/TP3/SL automatiques")
+    _daily_report_thread()    # Rapport Telegram à 21h00 UTC
+    print_stats_summary()     # Résumé stats au démarrage
 
     if args.symbol:
         # Test d'un seul symbole
@@ -5612,3 +6154,4 @@ if __name__ == "__main__":
 
     else:
         run_live_v4(cat=args.cat, min_rr=args.min_rr, interval=args.interval)
+
