@@ -268,12 +268,39 @@ SD_MIN_IMPULSE_RATIO = 1.5  # corps bougie ≥ 1.5× ATR pour qualifier une zone
 SD_ZONE_BUFFER       = 0.15  # tolérance 15% de l'ATR pour "dans la zone"
 
 # ─────────────────────────────────────────────────────────────
-#  SESSIONS ACTIVES (UTC)
+#  KILL ZONES SMC — ICT (UTC)
+#
+#  Seules ces fenêtres horaires sont autorisées pour l'envoi
+#  de signaux. En dehors → scan ignoré, aucun signal envoyé.
+#
+#  v8.2 : recalées sur l'analyse volatilité réelle (GMT+0) :
+#  ┌─────────────────────────────────────────────────────────┐
+#  │  08h00–11h00 UTC  — London Open  ⭐ volatilité forte     │
+#  │  13h30–16h00 UTC  — NY Open / overlap London ⭐⭐         │
+#  │  Indices US (^GSPC/^NDX/^DJI) → NY Open UNIQUEMENT       │
+#  │  Tout le reste (22h-08h notamment) = faible volatilité,  │
+#  │  bloqué pour éviter les SL inutiles                      │
+#  └─────────────────────────────────────────────────────────┘
 # ─────────────────────────────────────────────────────────────
-SESSION_WINDOWS_UTC: list[tuple[int, int]] = [
-    (0,  5),    # Tokyo/Asian session
-    (6,  22),   # London + NY session complète
-]
+
+# Kill zones exprimées en MINUTES depuis minuit UTC (permet les demi-heures, ex: 13h30)
+LONDON_KZ_MIN: tuple[int, int] = (8 * 60,       11 * 60)        # 08h00–11h00 UTC
+NY_KZ_MIN:     tuple[int, int] = (13 * 60 + 30, 16 * 60)        # 13h30–16h00 UTC
+ASIAN_KZ_MIN:  tuple[int, int] = (0,            3 * 60)         # 00h00–03h00 UTC
+
+# Kill zones principales (toutes paires, sauf indices US — voir is_kill_zone_active)
+KILL_ZONES_UTC: list[tuple[int, int]] = [LONDON_KZ_MIN, NY_KZ_MIN]
+
+# Conservé pour compatibilité nominale (anciennement en heures pleines)
+ASIAN_KILL_ZONE_UTC: tuple[int, int] = ASIAN_KZ_MIN
+
+# Paires actives pendant la session asiatique
+ASIAN_PAIRS: set[str] = {
+    "USDJPY=X", "EURJPY=X", "GBPJPY=X", "AUDUSD=X", "NZDUSD=X",
+}
+
+# Compatibilité : SESSION_WINDOWS_UTC conservé pour les autres checks (en minutes désormais)
+SESSION_WINDOWS_UTC: list[tuple[int, int]] = KILL_ZONES_UTC + [ASIAN_KZ_MIN]
 
 
 US_INDEX_SYMBOLS = {"^GSPC", "^NDX", "^DJI"}
@@ -402,8 +429,53 @@ def is_us_market_open() -> bool:
 
 
 def is_session_active() -> bool:
-    hour = datetime.now(timezone.utc).hour
-    return any(start <= hour < end for start, end in SESSION_WINDOWS_UTC)
+    """Compatibilité — retourne True si au moins une kill zone est active."""
+    now_min = datetime.now(timezone.utc).hour * 60 + datetime.now(timezone.utc).minute
+    return any(start <= now_min < end for start, end in SESSION_WINDOWS_UTC)
+
+
+def is_kill_zone_active(symbol: str = "") -> tuple[bool, str]:
+    """
+    Vérifie si l'heure actuelle est dans une Kill Zone autorisée pour ce symbole.
+
+    Règles (v8.2 — recalées sur l'analyse volatilité réelle GMT+0) :
+      • 08h00-11h00 UTC  → London Open Kill Zone   (toutes paires/actifs, SAUF indices US)
+      • 13h30-16h00 UTC  → NY Open Kill Zone       (toutes paires/actifs, indices US INCLUS)
+      • 00h00-03h00 UTC  → Asian Kill Zone         (JPY / AUD / NZD seulement)
+      • Indices US (^GSPC/^NDX/^DJI) → autorisés UNIQUEMENT sur la fenêtre NY Open
+      • Autres heures → BLOQUÉ (dead zone, faible volatilité / nuit)
+
+    Retourne (True, nom_session) ou (False, raison_blocage).
+    """
+    now      = datetime.now(timezone.utc)
+    now_min  = now.hour * 60 + now.minute
+    hh_mm    = now.strftime("%Hh%M")
+
+    london_start, london_end = LONDON_KZ_MIN
+    ny_start, ny_end         = NY_KZ_MIN
+    asian_start, asian_end   = ASIAN_KZ_MIN
+
+    # Indices US — alignés UNIQUEMENT sur l'ouverture NY (pas de fenêtre Londres)
+    if symbol in US_INDEX_SYMBOLS:
+        if ny_start <= now_min < ny_end:
+            return True, "🇺🇸 NY Open KZ (13h30-16h00 UTC)"
+        return False, f"⛔ Indice US — hors fenêtre NY Open (13h30-16h00 UTC), actuellement {hh_mm}"
+
+    # Kill zone London Open
+    if london_start <= now_min < london_end:
+        return True, "🇬🇧 London Open KZ (08h00-11h00 UTC)"
+
+    # Kill zone NY Open
+    if ny_start <= now_min < ny_end:
+        return True, "🇺🇸 NY Open KZ (13h30-16h00 UTC)"
+
+    # Kill zone asiatique — paires asiatiques uniquement
+    if asian_start <= now_min < asian_end:
+        if not symbol or symbol in ASIAN_PAIRS:
+            return True, "🌏 Asian KZ (00h-03h UTC)"
+        return False, f"⏰ Asian KZ (00h-03h) — {symbol} non-asiatique, skip"
+
+    return False, f"⛔ {hh_mm} UTC — faible volatilité / nuit, hors Kill Zone"
 
 
 def is_weekend() -> bool:
@@ -504,8 +576,12 @@ def check_volatility(symbol: str, df_ltf: pd.DataFrame,
             if vol_ratio < 0.80:
                 return False, f"volume faible ({round(vol_ratio*100,0)}% de la moyenne 20)"
 
-    # Les cryptos (BTC) tradent 24/7 — pas de filtre session
+    # Les cryptos (BTC) tradent 24/7 — mais on bloque la nuit comme le Forex
+    # (mêmes Kill Zones : 08h-11h / 13h30-16h UTC) pour éviter les SL inutiles
     if is_crypto_symbol(symbol):
+        kz_ok, kz_reason = is_kill_zone_active(symbol)
+        if not kz_ok:
+            return False, kz_reason
         return True, ""
     # Gold/matières premières : filtre session spécifique (dim soir ok)
     if symbol in GOLD_SYMBOLS:
@@ -5841,20 +5917,34 @@ def setup_logging() -> logging.Logger:
 
 log = setup_logging()
 
-MAX_SIGNALS_PER_DAY = 3   # v8 : max 3 signaux/jour/symbole (était 8) — anti-spam
-_daily_counts: dict[str, int] = {}
-_daily_date:   str = ""
+MAX_SIGNALS_PER_DAY        = 3   # max 3 signaux/jour/symbole — anti-spam
+MAX_SIGNALS_GLOBAL_PER_DAY = 3   # ★ NEW : max 3 signaux TOTAL par jour (tous symboles confondus)
 
-def check_daily_limit(symbol: str) -> bool:
-    global _daily_date
+_daily_counts:        dict[str, int] = {}
+_daily_global_count:  int            = 0   # compteur global journalier
+_daily_date:          str            = ""
+
+def _reset_daily_if_needed() -> None:
+    """Remet à zéro tous les compteurs si le jour UTC a changé."""
+    global _daily_date, _daily_global_count
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     if today != _daily_date:
         _daily_counts.clear()
+        _daily_global_count = 0
         _daily_date = today
-    return _daily_counts.get(symbol, 0) < MAX_SIGNALS_PER_DAY
+
+def check_daily_limit(symbol: str) -> bool:
+    """Retourne True si on peut encore envoyer un signal (limites symbole ET global)."""
+    _reset_daily_if_needed()
+    per_symbol_ok = _daily_counts.get(symbol, 0) < MAX_SIGNALS_PER_DAY
+    global_ok     = _daily_global_count < MAX_SIGNALS_GLOBAL_PER_DAY
+    return per_symbol_ok and global_ok
 
 def increment_daily_count(symbol: str) -> None:
-    _daily_counts[symbol] = _daily_counts.get(symbol, 0) + 1
+    global _daily_global_count
+    _reset_daily_if_needed()
+    _daily_counts[symbol]  = _daily_counts.get(symbol, 0) + 1
+    _daily_global_count   += 1
 
 
 # ─────────────────────────────────────────────────────────────
@@ -5886,6 +5976,7 @@ def run_live_v4(cat: str = "all", min_rr: float = MIN_RR, interval: int = 300) -
         f"🥇 T1 Breaker · 🥈 T2 S/D Zone · 🥉 T3 OB\n"
         f"T4 BOS · T5 MSS · T6 FVG · T7 AMD\n"
         f"⚡ <b>Max 3 signaux/cycle</b> — 1 signal/paire/cycle\n"
+        f"📆 <b>Max {MAX_SIGNALS_GLOBAL_PER_DAY} signaux/jour GLOBAL</b> — qualité > quantité\n"
         f"🚫 <b>BTC SELL bloqué</b> — tendance haussière\n"
         f"📈 <b>Score min :</b> {SCORE_THRESHOLD}/100\n"
         f"⏱ <b>Cooldown :</b> 30min entre 2 signaux/paire\n"
@@ -5972,6 +6063,14 @@ def run_live_v4(cat: str = "all", min_rr: float = MIN_RR, interval: int = 300) -
                 print(prefix + "  … ", end="", flush=True)
 
                 try:
+                    # ── Kill Zone check — filtre horaire par symbole ──
+                    # v8.1 : appliqué à TOUS les marchés (Forex + Gold + Crypto)
+                    # pour bannir les heures de nuit/faible liquidité partout
+                    kz_ok, kz_reason = is_kill_zone_active(sym)
+                    if not kz_ok:
+                        print(f"\r{prefix}  {'—':>6}  {'—':<40}  {kz_reason}")
+                        continue
+
                     # Diagnostic rapide biais (sans tout fetcher)
                     df_peek = fetch(sym, "4h", period="5d")
                     if df_peek.empty:
@@ -6035,7 +6134,13 @@ def run_live_v4(cat: str = "all", min_rr: float = MIN_RR, interval: int = 300) -
 
             for mkt, sym, setup_sig in cycle_signals:
                 if not check_daily_limit(sym):
-                    log.info(f"  ⏭ {sym} — limite {MAX_SIGNALS_PER_DAY} signaux/jour atteinte")
+                    # Distinguer : limite symbole ou limite globale
+                    _reset_daily_if_needed()
+                    if _daily_global_count >= MAX_SIGNALS_GLOBAL_PER_DAY:
+                        log.info(f"  ⏹ Limite globale atteinte ({MAX_SIGNALS_GLOBAL_PER_DAY} signaux/jour) — plus aucun signal aujourd'hui")
+                        break   # inutile de continuer la boucle
+                    else:
+                        log.info(f"  ⏭ {sym} — limite {MAX_SIGNALS_PER_DAY} signaux/jour/paire atteinte")
                     continue
 
                 # v8 : bloquer les SELL sur BTC (tendance macro haussière)
@@ -6154,4 +6259,5 @@ if __name__ == "__main__":
 
     else:
         run_live_v4(cat=args.cat, min_rr=args.min_rr, interval=args.interval)
+
 
