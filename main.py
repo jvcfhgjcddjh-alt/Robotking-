@@ -1,21 +1,30 @@
 
+
 """
 ╔══════════════════════════════════════════════════════════════════════════╗
-║         SMC SIGNAL ENGINE  v8  — Smart Money Concepts MAJEURS ONLY      ║
+║       SMC SIGNAL ENGINE  v9.5  — Asset-Strategy Matching Edition         ║
 ║                                                                          ║
-║  NOUVEAUTÉS v8 :                                                         ║
-║  ✦ PAIRES MAJEURES UNIQUEMENT — 7 forex majeurs + Gold + BTC + 4 crosses║
-║  ✦ ANTI-SPAM — 1 signal max/paire/cycle + cooldown 30min                ║
-║  ✦ MAX 3 SIGNAUX/CYCLE (était 8) — qualité > quantité                  ║
-║  ✦ SCORE MIN 78/100 (était 72) — filtre renforcé                        ║
-║  ✦ BTC SELL BLOQUÉ — tendance macro haussière                           ║
-║  ✦ MAX 3 SIGNAUX/JOUR/PAIRE (était 8)                                   ║
+║  NOUVEAUTÉS v9.5 (recommandation #2) :                                   ║
+║  ✦ ASSET-STRATEGY MATCHING — chaque actif scanne UNIQUEMENT son setup   ║
+║    de prédilection, établi sur l'efficacité historique observée          ║
+║    ┌────────────────────────────────────────────────────────────────┐    ║
+║    │ BTC-USD   → T1 BREAKER BLOCK M15 (spécialiste exclusif)       │    ║
+║    │ EUR/USD   → T3 ORDER BLOCK + T6 FVG (structures internes SMC) │    ║
+║    │ GBP/USD   → T3 ORDER BLOCK + T6 FVG (BOS/CHoCH internes)      │    ║
+║    │ GOLD      → T2 SUPPLY/DEMAND H1 (zones institutionnelles)      │    ║
+║    │ AUTRES    → Tous setups T1→T7, score +0 pts (généraliste)      │    ║
+║    └────────────────────────────────────────────────────────────────┘    ║
+║  ✦ MALUS HORS-SPÉCIALITÉ : setup non-spécialisé → score -15 pts         ║
+║    + seuil de validation relevé à 80/100 (vs 74 pour le setup natif)    ║
+║  ✦ BONUS SPÉCIALITÉ : setup natif de l'actif → score +10 pts bonus      ║
+║  ✦ BTC : Tier 2/3/4/5/6/7 ignorés si score < 80 (Breaker seul valide)  ║
 ║                                                                          ║
-║  SUPPRESSIONS v8 :                                                       ║
-║  ✗ AUDCHF / AUDNZD / CADCHF — trop de SL consécutifs                   ║
-║  ✗ USDNOK / USDZAR / USDMXN — spreads élevés, comportement imprévisible ║
-║  ✗ EURNZD / GBPNZD / CHFJPY / CADJPY — liquidité insuffisante           ║
-║  ✗ Silver / Oil / Gaz / CAC40 / FTSE / DAX                             ║
+║  HÉRITAGE v9 (recommandation #1, inchangé) :                            ║
+║  ✦ MOD-1 : Limite globale → max 4 signaux/jour — reset 00h00 UTC        ║
+║  ✦ MOD-2 : Retest zones → tolérance 1.0×ATR (T1 + T2)                  ║
+║  ✦ MOD-3 : Volume Forex/Gold désactivé, crypto seuil 0.50               ║
+║  ✦ MOD-4 : Blackout news asymétrique (avant 30 min / après 10 min)      ║
+║  ✦ MOD-5 : SCORE_THRESHOLD 74 + RR flexible TP1≥1.8 & TP3≥3.0          ║
 ║                                                                          ║
 ║  ARCHITECTURE TIERS (inchangée) :                                        ║
 ║  T1 🥇 BREAKER BLOCK    — Sweep H4 + Breaker M15 + Retest               ║
@@ -33,13 +42,13 @@ Installation :
     pip install yfinance pandas numpy colorama flask requests
 
 Usage :
-    python smc_signals_v3.py                    # scan complet live
-    python smc_signals_v3.py --cat forex        # forex seulement
-    python smc_signals_v3.py --cat btc          # BTC seulement
-    python smc_signals_v3.py --cat priority     # Gold + BTC
-    python smc_signals_v3.py --symbol BTC-USD   # symbole unique
-    python smc_signals_v3.py --scan             # scan unique (test)
-    python smc_signals_v3.py --min-score 80     # filtre score
+    python smc_engine_v9_5.py                    # scan complet live
+    python smc_engine_v9_5.py --cat forex        # forex seulement
+    python smc_engine_v9_5.py --cat btc          # BTC seulement
+    python smc_engine_v9_5.py --cat priority     # Gold + BTC
+    python smc_engine_v9_5.py --symbol BTC-USD   # symbole unique
+    python smc_engine_v9_5.py --scan             # scan unique (test)
+    python smc_engine_v9_5.py --min-score 80     # filtre score
 """
 
 import argparse
@@ -148,17 +157,38 @@ def index():
       <th>Entrée</th><th>SL 🔴</th><th>TP 🟢</th><th>R:R</th><th>Score</th><th>Lot</th>
     </tr>{signals_html}
   </table>"""}
-  <h2>⚙️ Configuration</h2>
+  <h2>⚙️ Configuration v9.5</h2>
   <table>
     <tr><th>Paramètre</th><th>Valeur</th></tr>
-    <tr><td>Score minimum</td><td>{SCORE_THRESHOLD}/100</td></tr>
+    <tr><td>Score min (setup natif ⭐)</td><td>{SCORE_THRESHOLD}/100</td></tr>
+    <tr><td>Score min (hors-spécialité ⚠️)</td><td>{ASM_SCORE_THRESHOLD_OFF}/100</td></tr>
+    <tr><td>Bonus setup natif</td><td>+{ASM_BONUS_NATIVE} pts</td></tr>
+    <tr><td>Malus hors-spécialité</td><td>-{ASM_MALUS_OFF_SPEC} pts</td></tr>
     <tr><td>RR minimum</td><td>1:{MIN_RR}</td></tr>
-    <tr><td>Risque/trade</td><td>${RISK_USD}</td></tr>
+    <tr><td>Risque/trade</td><td>{RISK_PERCENT_PER_TRADE}% (${RISK_USD} sur ${ACCOUNT_BALANCE_USD:,.0f})</td></tr>
     <tr><td>Timeframes</td><td>H4 → H1 → M15 → M5</td></tr>
-    <tr><td>Modes</td><td>T1 Breaker · T2 S/D Zone · T3 OB · T4 BOS · T5 MSS · T6 FVG · T7 AMD (indépendant)</td></tr>
-    <tr><td>Max signaux/cycle</td><td>8 (AMD ne bloque pas les autres)</td></tr>
-    <tr><td>BTC</td><td>🟢 Scan 24/7 (weekends inclus)</td></tr>
+    <tr><td>Max signaux/jour</td><td>{MAX_SIGNALS_GLOBAL_PER_DAY} (reset 00h00 UTC)</td></tr>
+    <tr><td>BTC</td><td>🟢 Scan 24/7 — Breaker Block M15 uniquement</td></tr>
+    <tr><td>Gold</td><td>🥇 Supply/Demand H1 prioritaire</td></tr>
     <tr><td>Intervalle scan</td><td>5 minutes</td></tr>
+  </table>
+  <h2>🎯 Asset-Strategy Matching (v9.5)</h2>
+  <table>
+    <tr>
+      <th>Actif</th>
+      <th style='color:#2ecc71'>⭐ Setups natifs (+{ASM_BONUS_NATIVE} pts)</th>
+      <th style='color:#f39c12'>⚠️ Tolérés (-{ASM_MALUS_OFF_SPEC} pts, seuil {ASM_SCORE_THRESHOLD_OFF})</th>
+      <th style='color:#e74c3c'>🚫 Bloqués</th>
+    </tr>
+    {''.join(
+      f"<tr>"
+      f"<td><b>{sym}</b><br><small style='color:#8b949e'>{p['rationale']}</small></td>"
+      f"<td style='color:#2ecc71'>{', '.join(p['preferred'])}</td>"
+      f"<td style='color:#f39c12'>{', '.join(p['allowed']) or '—'}</td>"
+      f"<td style='color:#e74c3c'>{', '.join(p['blocked']) or '—'}</td>"
+      f"</tr>"
+      for sym, p in ASSET_STRATEGY_MAP.items()
+    )}
   </table>
 </body>
 </html>"""
@@ -253,9 +283,23 @@ LTF             = "15m"   # M15 : entrée précise
 FVG_MIN_RATIO   = 0.0002
 OB_LOOKBACK     = 5
 LIQ_THRESHOLD   = 0.0004
-SCORE_THRESHOLD = 78    # v8 : seuil relevé à 78 (était 72) — moins de signaux, meilleure qualité
+# [v9 MOD-5a] Score minimum abaissé de 78 à 74
+# → laisse passer les setups solides sans perfection théorique
+# → combiné avec la limite globale de 4 signaux/jour, la qualité reste chirurgicale
+SCORE_THRESHOLD = 74
 MIN_RR          = 2.5
-RISK_USD        = 100.0
+
+# ── [v8.5] GESTION DU RISQUE — risque fixe en % du capital ───────────
+# Directive : le risque par trade doit être rigoureusement fixé à 0.65%
+# de la taille du compte (et non un montant fixe en dollars comme avant).
+# ACCOUNT_BALANCE_USD est configurable via variable d'environnement pour
+# permettre une mise à jour du capital sans toucher au code (ex: après
+# un dépôt/retrait). RISK_USD est recalculé dynamiquement à partir de ce
+# pourcentage et reste la variable utilisée partout en aval (compute_lot,
+# dataclass Signal, dashboard Flask) pour ne rien casser.
+ACCOUNT_BALANCE_USD     = float(os.environ.get("ACCOUNT_BALANCE_USD", "10000"))
+RISK_PERCENT_PER_TRADE  = 0.65   # [v8.5] 0.65% du capital, fixe et rigoureux
+RISK_USD = round(ACCOUNT_BALANCE_USD * RISK_PERCENT_PER_TRADE / 100.0, 2)
 
 # ── Septuple Traction : N bougies consécutives minimum ───────
 SEPTUPLE_MIN_CANDLES = 5   # 5 suffisent en practice (7 = très rare)
@@ -322,7 +366,14 @@ US_INDEX_SYMBOLS = {"^GSPC", "^NDX", "^DJI"}
 # ═════════════════════════════════════════════════════════════
 
 NEWS_CURRENCIES_BLOCKED = {"USD", "EUR", "GBP", "JPY"}
-NEWS_WINDOW_MINUTES     = 30      # blocage ±30 min autour de la news
+# [v9 MOD-4] Fenêtres news asymétriques :
+#   → AVANT la news : 30 min de blocage (inchangé — trop dangereux de trader juste avant)
+#   → APRÈS la news : 10 min seulement (était 30 min)
+#     Raison : les sweeps de liquidité et structures SMC valides se forment
+#     dès les premières minutes post-news. Bloquer 30 min faisait rater ces setups.
+NEWS_WINDOW_BEFORE      = 30      # blocage 30 min AVANT la news
+NEWS_WINDOW_AFTER       = 10      # [v9 MOD-4] blocage 10 min seulement APRÈS la news (était 30)
+NEWS_WINDOW_MINUTES     = 30      # conservé pour compatibilité interne (utilisé dans l'ancienne logique)
 _news_cache: dict       = {}      # {date_str: [list of news dicts]}
 _news_cache_ts: float   = 0.0
 NEWS_CACHE_TTL          = 3600    # rafraîchissement toutes les heures
@@ -406,7 +457,11 @@ def is_news_blackout(symbol: str) -> tuple[bool, str]:
         if ev["currency"] not in relevant_currencies:
             continue
         delta = (ev["time_utc"] - now_utc).total_seconds() / 60.0
-        if -NEWS_WINDOW_MINUTES <= delta <= NEWS_WINDOW_MINUTES:
+        # [v9 MOD-4] Fenêtres asymétriques :
+        #   delta > 0  → news dans le futur  → on bloque NEWS_WINDOW_BEFORE min avant
+        #   delta < 0  → news passée         → on bloque NEWS_WINDOW_AFTER  min après
+        window_blocked = (-NEWS_WINDOW_AFTER <= delta <= NEWS_WINDOW_BEFORE)
+        if window_blocked:
             sign  = "dans" if delta >= 0 else "il y a"
             mins  = abs(int(delta))
             return True, (
@@ -565,16 +620,22 @@ def check_volatility(symbol: str, df_ltf: pd.DataFrame,
     if ratio > MAX_SPREAD_ATR_RATIO:
         return False, f"spread/ATR={round(ratio*100,1)}% > {int(MAX_SPREAD_ATR_RATIO*100)}%"
 
-    # ── 2. FILTRE VOLUME — cassures faibles éliminées ─────────
-    # Volume actuel > 80% de la moyenne des 20 dernières bougies
-    # (seuil assoupli à 80% car yfinance retourne parfois des volumes partiels)
-    if "volume" in df_ltf.columns and len(df_ltf) >= 21:
+    # ── 2. FILTRE VOLUME — [v9 MOD-3] ────────────────────────
+    # Forex & Gold : filtre volume DÉSACTIVÉ.
+    # Les données de volume yfinance sont fragmentées sur le Forex (tick volume
+    # partiel, souvent nul ou incohérent). Ce filtre rejetait d'excellents setups
+    # SMC valides. Sur Forex/Gold, on se fie uniquement à l'ATR et la structure.
+    #
+    # Crypto (BTC, ETH) : filtre conservé mais abaissé à 0.50 (50% de la moyenne)
+    # car les volumes crypto sont réels et disponibles en continu.
+    if "volume" in df_ltf.columns and len(df_ltf) >= 21 and is_crypto_symbol(symbol):
         vol_now  = df_ltf["volume"].iloc[-1]
         vol_mean = df_ltf["volume"].rolling(20).mean().iloc[-1]
         if not pd.isna(vol_now) and not pd.isna(vol_mean) and vol_mean > 0:
             vol_ratio = vol_now / vol_mean
-            if vol_ratio < 0.80:
-                return False, f"volume faible ({round(vol_ratio*100,0)}% de la moyenne 20)"
+            # [v9 MOD-3] Seuil abaissé à 0.50 pour crypto (était 0.80 pour tout)
+            if vol_ratio < 0.50:
+                return False, f"volume crypto faible ({round(vol_ratio*100,0)}% de la moyenne 20)"
 
     # Les cryptos (BTC) tradent 24/7 — mais on bloque la nuit comme le Forex
     # (mêmes Kill Zones : 08h-11h / 13h30-16h UTC) pour éviter les SL inutiles
@@ -4826,6 +4887,48 @@ def _rr_ok(entry: float, sl: float, tp: float, direction: str, min_rr: float) ->
     return (gain / risk) >= min_rr
 
 
+def _rr_ok_flexible(
+    entry: float, sl: float,
+    tp1: float, tp2: float, tp3: float,
+    direction: str,
+    min_rr: float = MIN_RR,
+) -> bool:
+    """
+    [v9 MOD-5b] Validation RR flexible sur 3 cibles.
+
+    Règle standard : TP1 doit offrir RR ≥ min_rr (ex: 2.5).
+
+    Règle assouplie : si TP1 offre un RR ≥ 1.8 (minimum viable),
+    on accepte le signal à condition que TP3 offre un RR ≥ 3.0.
+    Cela permet de valider des setups où l'entrée est légèrement avancée
+    mais où le potentiel global (TP2/TP3) est largement positif.
+
+    Paramètres :
+      tp2, tp3 : 0.0 si non disponibles → on utilise uniquement la règle standard.
+    """
+    risk = abs(entry - sl)
+    if risk <= 0:
+        return False
+
+    def _rr_val(tp: float) -> float:
+        gain = (tp - entry) if direction == "LONG" else (entry - tp)
+        return gain / risk
+
+    rr_tp1 = _rr_val(tp1)
+
+    # Règle standard : TP1 ≥ min_rr
+    if rr_tp1 >= min_rr:
+        return True
+
+    # Règle assouplie : TP1 entre 1.8 et min_rr, ET TP3 ≥ 3.0
+    if rr_tp1 >= 1.8 and tp3 > 0:
+        rr_tp3 = _rr_val(tp3)
+        if rr_tp3 >= 3.0:
+            return True
+
+    return False
+
+
 def detect_sd_entry_candle_m15(df_m15: pd.DataFrame, direction: str) -> tuple:
     """
     Détecte les bougies d'entrée M15 spécifiques au scanner Supply/Demand.
@@ -4977,7 +5080,9 @@ def check_breaker_setup(
     if bb_match:
         bb_lo = float(bb_match.get("bottom", bb_match.get("level", price_now)))
         bb_hi = float(bb_match.get("top",    bb_match.get("level", price_now)))
-        tol = atr_m5 * 0.5
+        # [v9 MOD-2] Tolérance retest élargie à 1.0 × ATR (était 0.5)
+        # → évite de rater l'entrée quand le prix front-run légèrement la zone
+        tol = atr_m5 * 1.0
         in_retest = (bb_lo - tol) <= price_now <= (bb_hi + tol)
     else:
         # Zone H4 : prix dans ATR de la zone de référence
@@ -5020,7 +5125,8 @@ def check_breaker_setup(
         symbol, direction, df_m5, df_m15, ob_match, fvg_active, None, liq_map
     )
 
-    if not _rr_ok(entry, sl, tp1, direction, min_rr):
+    # [v9 MOD-5b] Validation RR flexible (TP1 ≥ 1.8 + TP3 ≥ 3.0 accepté si TP1 < min_rr)
+    if not _rr_ok_flexible(entry, sl, tp1, tp2, tp3, direction, min_rr):
         return None
 
     lot = compute_lot(symbol, entry, sl)
@@ -5089,8 +5195,10 @@ def check_supply_demand_setup(
     active_zone = price_in_sd_zone(price_now, sd_zones_h1, atr_h1)
 
     # Tolérance élargie : prix à moins d'un ATR de la zone
+    # [v9 MOD-2] Tolérance retest S/D élargie à 1.0 × ATR_H1 (était 0.6)
+    # → évite de rater les retests légèrement hors zone à cause du front-running
     if active_zone is None:
-        tol = atr_h1 * 0.6
+        tol = atr_h1 * 1.0
         for z in sd_zones_h1[:3]:
             if (z.bottom - tol) <= price_now <= (z.top + tol):
                 active_zone = z
@@ -5182,7 +5290,8 @@ def check_supply_demand_setup(
         symbol, direction, df_m5, df_m15, ob_match, fvg_active, active_zone, liq_map
     )
 
-    if not _rr_ok(entry, sl, tp1, direction, min_rr):
+    # [v9 MOD-5b] Validation RR flexible (TP1 ≥ 1.8 + TP3 ≥ 3.0 accepté si TP1 < min_rr)
+    if not _rr_ok_flexible(entry, sl, tp1, tp2, tp3, direction, min_rr):
         return None
 
     lot  = compute_lot(symbol, entry, sl)
@@ -5781,12 +5890,213 @@ SETUP_LABELS = {
     "AMD":     "T7     AMD",
 }
 
+# ═════════════════════════════════════════════════════════════
+#  v9.5 — MATRICE ASSET-STRATEGY MATCHING (ASM)
+#
+#  Principe : chaque actif a un ou plusieurs setups de prédilection
+#  établis sur l'efficacité SMC observée.
+#
+#  Structure du profil :
+#    "preferred"  : list[str] — setups natifs (bonus +10 pts, seuil 74)
+#    "allowed"    : list[str] — setups tolérés (malus -15 pts, seuil 80)
+#    "blocked"    : list[str] — setups toujours rejetés pour cet actif
+#    "label"      : str       — libellé affiché dans les logs
+#    "rationale"  : str       — explication de la spécialisation
+#
+#  Règles de scoring ASM :
+#    • Setup dans "preferred" → score final += 10  (bonus spécialité)
+#    • Setup dans "allowed"   → score final -= 15  (malus hors-spécialité)
+#                               + seuil de validation relevé à 80 (vs 74)
+#    • Setup dans "blocked"   → signal rejeté immédiatement (None retourné)
+#
+#  Score minimal pour qu'un signal soit envoyé :
+#    • Setup natif   : SCORE_THRESHOLD      (74 par défaut)
+#    • Setup hors-spécialité : ASM_SCORE_THRESHOLD_OFF (80)
+# ═════════════════════════════════════════════════════════════
+
+# Seuil de score pour les setups hors-spécialité d'un actif
+ASM_SCORE_THRESHOLD_OFF = 80   # exige 80/100 si l'actif tente un setup non natif
+ASM_BONUS_NATIVE        = 10   # bonus de score pour un setup de prédilection
+ASM_MALUS_OFF_SPEC      = 15   # malus de score pour un setup hors-spécialité
+
+ASSET_STRATEGY_MAP: dict[str, dict] = {
+
+    # ── BTC — Spécialiste exclusif du Breaker Block M15 ──────────────────
+    # Raison : BTC a une liquidité extrêmement polarisée sur les stops
+    # institutionnels. Les Breaker Blocks M15 post-sweep sont les setups
+    # les plus répétables et les plus nets sur BTC (Winrate historique élevé).
+    # Les S/D H1 ou OB H4 sont moins respectés car BTC est plus volatile
+    # et réagit surtout aux accumulations/distributions rapides.
+    "BTC-USD": {
+        "preferred": ["BREAKER"],
+        "allowed":   ["AMD"],           # AMD toléré (manipulation H4 fréquente)
+        "blocked":   ["SD", "OB", "BOS", "MSS", "FVG"],
+        "label":     "₿ BTC — Breaker Block M15 specialist",
+        "rationale": "Liquidité polarisée stops institutionnels → Breaker M15 uniquement",
+    },
+
+    # ── EUR/USD — Spécialiste OB + FVG (structures internes SMC) ─────────
+    # Raison : EUR/USD est la paire la plus "propre" en termes de structure
+    # de marché. Les Order Blocks H4/M15 y sont très respectés car la
+    # paire est dominée par les flux institutionnels EUR/USD des banques
+    # centrales. Les FVG comblés en M15 après un BOS sont très fiables.
+    "EURUSD=X": {
+        "preferred": ["OB", "FVG", "BOS"],
+        "allowed":   ["BREAKER", "SD", "MSS"],
+        "blocked":   ["AMD"],           # AMD peu adapté sur EUR/USD (range tight)
+        "label":     "€ EUR/USD — OB + FVG specialist",
+        "rationale": "Structure institutionnelle propre → OB H4/M15 + FVG M15 après BOS",
+    },
+
+    # ── GBP/USD — Spécialiste OB + FVG + MSS (BOS/CHoCH agressifs) ──────
+    # Raison : GBP/USD est connu pour ses mouvements violents et ses
+    # faux breakouts (grâce à la volatilité GBP). Les setups MSS/CHoCH
+    # post-sweep + OB sont très efficaces car le marché crée des structures
+    # nettes avant de partir en tendance. Les FVG sont souvent créés et
+    # comblés rapidement lors des sessions London/NY.
+    "GBPUSD=X": {
+        "preferred": ["OB", "FVG", "MSS"],
+        "allowed":   ["BREAKER", "SD", "BOS"],
+        "blocked":   ["AMD"],
+        "label":     "£ GBP/USD — OB + FVG + MSS specialist",
+        "rationale": "Volatilité GBP → CHoCH + OB + FVG après sweeps agressifs",
+    },
+
+    # ── GOLD — Spécialiste Supply/Demand H1 institutionnel ───────────────
+    # Raison : Le Gold est l'actif qui respecte le MIEUX les grandes zones
+    # institutionnelles H1/H4. Les banques centrales et fonds macro placent
+    # leurs ordres sur des zones S/D clairement définies. Les retests de
+    # ces zones avec sweep de liquidité (chasse des stops) donnent les
+    # setups les plus fiables sur le Gold. Les Breaker Blocks M15 existent
+    # aussi mais sont moins nets que sur BTC.
+    "GC=F": {
+        "preferred": ["SD", "BREAKER"],
+        "allowed":   ["OB", "BOS"],
+        "blocked":   ["FVG", "MSS", "AMD"],  # trop de faux signaux sur Gold
+        "label":     "🥇 GOLD — Supply/Demand H1 specialist",
+        "rationale": "Zones institutionnelles H1 très respectées → S/D H1 + Breaker prioritaires",
+    },
+
+    # ── Crosses JPY — Spécialiste MSS + BOS (momentum Yen) ──────────────
+    # Raison : Les paires JPY ont des mouvements impulsifs forts lors des
+    # sessions asiatique et NY. Les structures MSS/CHoCH après accumulation
+    # et les BOS retests sont les setups les plus propres.
+    "USDJPY=X": {
+        "preferred": ["MSS", "BOS", "OB"],
+        "allowed":   ["BREAKER", "SD", "FVG"],
+        "blocked":   ["AMD"],
+        "label":     "¥ USD/JPY — MSS + BOS specialist",
+        "rationale": "Momentum Yen → MSS + BOS retests propres sur sessions Asie/NY",
+    },
+    "EURJPY=X": {
+        "preferred": ["MSS", "BOS", "OB"],
+        "allowed":   ["BREAKER", "SD", "FVG"],
+        "blocked":   ["AMD"],
+        "label":     "€¥ EUR/JPY — MSS + BOS specialist",
+        "rationale": "Momentum croisé EUR+JPY → CHoCH + BOS après sweeps",
+    },
+    "GBPJPY=X": {
+        "preferred": ["MSS", "BREAKER", "OB"],
+        "allowed":   ["BOS", "SD", "FVG"],
+        "blocked":   ["AMD"],
+        "label":     "£¥ GBP/JPY — MSS + Breaker specialist",
+        "rationale": "Volatilité extrême GBP/JPY → Breaker + CHoCH sur liquidités majeures",
+    },
+}
+
+# Profil par défaut : actifs non listés → généraliste (tous setups autorisés)
+_ASM_DEFAULT_PROFILE: dict = {
+    "preferred": ["BREAKER", "SD", "OB", "BOS", "MSS", "FVG", "AMD"],
+    "allowed":   [],
+    "blocked":   [],
+    "label":     "Généraliste — tous setups",
+    "rationale": "Actif non spécialisé → scan complet T1→T7",
+}
+
+
+def get_asset_profile(symbol: str) -> dict:
+    """
+    Retourne le profil ASM d'un symbole.
+    Fallback sur le profil généraliste si le symbole n'est pas dans la matrice.
+    """
+    return ASSET_STRATEGY_MAP.get(symbol, _ASM_DEFAULT_PROFILE)
+
+
+def asm_apply_score(
+    symbol: str,
+    setup_type: str,
+    raw_score: int,
+) -> tuple[int, bool, str]:
+    """
+    Applique le bonus/malus ASM au score brut d'un signal.
+
+    Retourne :
+      (score_final, is_valid_for_threshold, reason_str)
+
+    La validité est jugée par rapport au seuil adaptatif :
+      • Setup natif    → seuil SCORE_THRESHOLD (74)
+      • Setup toléré   → seuil ASM_SCORE_THRESHOLD_OFF (80)
+      • Setup bloqué   → is_valid = False immédiatement
+    """
+    profile   = get_asset_profile(symbol)
+    preferred = profile.get("preferred", [])
+    allowed   = profile.get("allowed",   [])
+    blocked   = profile.get("blocked",   [])
+
+    # ── Rejet immédiat si setup bloqué ───────────────────────
+    if setup_type in blocked:
+        return raw_score, False, (
+            f"🚫 ASM : {setup_type} bloqué pour {symbol} "
+            f"(spécialisation : {profile['label']})"
+        )
+
+    # ── Setup de prédilection → bonus + seuil standard ───────
+    if setup_type in preferred:
+        final = raw_score + ASM_BONUS_NATIVE
+        threshold = SCORE_THRESHOLD
+        reason = (
+            f"⭐ ASM : {setup_type} est le setup natif de {symbol} "
+            f"(+{ASM_BONUS_NATIVE} pts) → seuil {threshold}"
+        )
+        is_valid = final >= threshold
+        return final, is_valid, reason
+
+    # ── Setup toléré → malus + seuil renforcé ────────────────
+    if setup_type in allowed:
+        final = raw_score - ASM_MALUS_OFF_SPEC
+        threshold = ASM_SCORE_THRESHOLD_OFF
+        reason = (
+            f"⚠️ ASM : {setup_type} hors-spécialité pour {symbol} "
+            f"(-{ASM_MALUS_OFF_SPEC} pts) → seuil renforcé {threshold}"
+        )
+        is_valid = final >= threshold
+        return final, is_valid, reason
+
+    # ── Profil généraliste : pas de bonus/malus ───────────────
+    return raw_score, raw_score >= SCORE_THRESHOLD, (
+        f"✅ ASM : {symbol} généraliste — {setup_type} autorisé (seuil {SCORE_THRESHOLD})"
+    )
+
+
+
 def scan_symbol(symbol: str, mkt: str, min_rr: float = MIN_RR) -> list[SetupSignal]:
     """
-    Lance les 7 modules indépendants sur un seul symbole.
-    Retourne tous les signaux valides (peut en avoir plusieurs simultanément).
+    v9.5 — Lance les modules de scan sur un symbole avec filtre ASM.
 
-    Hiérarchie v5 :
+    Fonctionnement :
+      1. Téléchargement des données H4/H1/M15/M5 (une seule fois)
+      2. Filtres communs (volatilité, news, biais H4, alignement H1)
+      3. Récupération du profil ASM du symbole
+      4. Pour chaque module (T1→T7) :
+           a. Skip si setup bloqué pour cet actif (profil ASM)
+           b. Exécution du checker
+           c. Application du bonus/malus ASM sur le score brut
+           d. Validation du seuil adaptatif (74 natif / 80 hors-spécialité)
+           e. Log de la décision ASM pour traçabilité
+      5. Tri par tier (T1 d'abord) puis score décroissant
+      6. Retourne uniquement les signaux qui passent TOUS les filtres
+
+    Hiérarchie v9.5 :
       T1 BREAKER · T2 SUPPLY/DEMAND · T3 OB · T4 BOS · T5 MSS · T6 FVG · T7 AMD
     """
     # ── 1. Téléchargement des données (une seule fois) ────────
@@ -5812,21 +6122,28 @@ def scan_symbol(symbol: str, mkt: str, min_rr: float = MIN_RR) -> list[SetupSign
         return []
 
     # ── 3b. FILTRE MULTI-TIMEFRAME H1 ─────────────────────────
-    # On ne trade que dans le sens du biais H1 (confirmation intermédiaire).
-    # Élimine beaucoup de faux signaux counter-trend.
     if df_h1 is not None and not df_h1.empty and len(df_h1) >= 25:
         bias_h1 = htf_bias(df_h1)
         if bias_h1 != "NEUTRAL" and bias_h1 != bias:
-            # H1 et H4 en désaccord → on passe
             log.debug(f"  {symbol} — H4={bias} vs H1={bias_h1} : divergence ignorée")
             return []
 
     # ── 4. Carte de liquidité (partagée) ─────────────────────
     liq_map = build_liquidity_map(df_h4, df_m5)
 
-    # ── 5. Exécution des 7 modules ────────────────────────────
+    # ── 5. Profil ASM — récupération de la spécialisation ────
+    # Chaque actif a une liste de setups "preferred", "allowed", "blocked".
+    # Le profil guide la sélection et le scoring de chaque module.
+    profile = get_asset_profile(symbol)
+    log.info(
+        f"  📋 ASM {symbol} → {profile['label']} | "
+        f"natifs={profile['preferred']} | bloqués={profile['blocked']}"
+    )
+
+    # ── 6. Exécution des 7 modules avec filtre ASM ────────────
     signals: list[SetupSignal] = []
 
+    # Liste complète des checkers (nom_setup, lambda checker)
     checkers = [
         ("BREAKER", lambda: check_breaker_setup(symbol, df_h4, df_m15, df_m5, direction, liq_map, min_rr)),
         ("SD",      lambda: check_supply_demand_setup(symbol, df_h4, df_h1, df_m15, df_m5, direction, liq_map, min_rr)),
@@ -5838,16 +6155,59 @@ def scan_symbol(symbol: str, mkt: str, min_rr: float = MIN_RR) -> list[SetupSign
     ]
 
     for name, checker in checkers:
+
+        # ── a. Skip pré-exécution si setup bloqué par ASM ────
+        # Évite d'exécuter inutilement un checker dont le résultat
+        # sera de toute façon rejeté → gain de performance sur BTC/Gold.
+        if name in profile.get("blocked", []):
+            log.debug(
+                f"  🚫 ASM skip {symbol} [{name}] — setup bloqué pour cet actif"
+            )
+            continue
+
         try:
+            # ── b. Exécution du checker ───────────────────────
             sig = checker()
-            if sig is not None:
-                signals.append(sig)
+            if sig is None:
+                continue
+
+            # ── c. Application du score ASM ───────────────────
+            # asm_apply_score() retourne :
+            #   score_final  : int    — score après bonus/malus
+            #   is_valid     : bool   — passe le seuil adaptatif ?
+            #   asm_reason   : str    — log de la décision ASM
+            score_final, is_valid, asm_reason = asm_apply_score(
+                symbol, name, sig.score
+            )
+
+            # ── d. Validation du seuil adaptatif ─────────────
+            if not is_valid:
+                log.info(
+                    f"  ❌ ASM rejet {symbol} [{name}] "
+                    f"score_brut={sig.score} → score_asm={score_final} | {asm_reason}"
+                )
+                continue
+
+            # ── e. Mise à jour du score et log ───────────────
+            # SetupSignal est un dataclass non-frozen → affectation directe
+            score_brut_log = sig.score
+            sig.score = score_final
+            sig.reasons.append(asm_reason)
+
+            log.info(
+                f"  ✅ ASM validé {symbol} [{name}] "
+                f"score_brut={score_brut_log} → score_asm={score_final} | {asm_reason}"
+            )
+            signals.append(sig)
+
         except Exception as e:
             log.debug(f"  {symbol} [{name}] erreur : {e}")
 
-    # Tri par tier (T1 d'abord) puis score décroissant
+    # ── 7. Tri par tier (T1 d'abord) puis score décroissant ──
     signals.sort(key=lambda s: (s.tier, -s.score))
     return signals
+
+
 
 
 # ─────────────────────────────────────────────────────────────
@@ -5917,34 +6277,55 @@ def setup_logging() -> logging.Logger:
 
 log = setup_logging()
 
-MAX_SIGNALS_PER_DAY        = 3   # max 3 signaux/jour/symbole — anti-spam
-MAX_SIGNALS_GLOBAL_PER_DAY = 3   # ★ NEW : max 3 signaux TOTAL par jour (tous symboles confondus)
+MAX_SIGNALS_PER_DAY        = 2   # [v9 MOD-1] max 2 signaux/jour/symbole — qualité chirurgicale
+MAX_SIGNALS_GLOBAL_PER_DAY = 4   # [v9 MOD-1] max 4 signaux TOTAL par jour (tous symboles confondus)
+                                  # Règle absolue : jamais plus de 4 alertes par journée UTC.
 
 _daily_counts:        dict[str, int] = {}
 _daily_global_count:  int            = 0   # compteur global journalier
 _daily_date:          str            = ""
 
 def _reset_daily_if_needed() -> None:
-    """Remet à zéro tous les compteurs si le jour UTC a changé."""
+    """
+    [v9 MOD-1] Remet à zéro tous les compteurs si le jour UTC a changé.
+    Reset automatique à 00h00 UTC — aucune action manuelle requise.
+    """
     global _daily_date, _daily_global_count
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     if today != _daily_date:
         _daily_counts.clear()
         _daily_global_count = 0
         _daily_date = today
+        log.info(f"  🔄 [v9] Compteurs journaliers remis à zéro — nouveau jour UTC : {today}")
 
 def check_daily_limit(symbol: str) -> bool:
-    """Retourne True si on peut encore envoyer un signal (limites symbole ET global)."""
+    """
+    [v9 MOD-1] Retourne True si on peut encore envoyer un signal.
+    Vérifie DEUX limites :
+      • Limite par symbole : max MAX_SIGNALS_PER_DAY signaux/jour/paire
+      • Limite globale    : max MAX_SIGNALS_GLOBAL_PER_DAY signaux/jour (toutes paires)
+    Si l'une ou l'autre est dépassée → retourne False, signal bloqué.
+    """
     _reset_daily_if_needed()
     per_symbol_ok = _daily_counts.get(symbol, 0) < MAX_SIGNALS_PER_DAY
     global_ok     = _daily_global_count < MAX_SIGNALS_GLOBAL_PER_DAY
+    if not global_ok:
+        log.info(
+            f"  ⏹ [v9] Limite globale atteinte : {_daily_global_count}/{MAX_SIGNALS_GLOBAL_PER_DAY} "
+            f"signaux envoyés aujourd'hui — aucun signal supplémentaire jusqu'à 00h00 UTC."
+        )
     return per_symbol_ok and global_ok
 
 def increment_daily_count(symbol: str) -> None:
+    """[v9 MOD-1] Incrémente le compteur symbole ET le compteur global."""
     global _daily_global_count
     _reset_daily_if_needed()
     _daily_counts[symbol]  = _daily_counts.get(symbol, 0) + 1
     _daily_global_count   += 1
+    log.info(
+        f"  📊 [v9] Compteur : {symbol} → {_daily_counts[symbol]}/{MAX_SIGNALS_PER_DAY}  |  "
+        f"Global : {_daily_global_count}/{MAX_SIGNALS_GLOBAL_PER_DAY}"
+    )
 
 
 # ─────────────────────────────────────────────────────────────
