@@ -49,7 +49,8 @@
 ║  T2 🥈 SUPPLY/DEMAND    — Zone H1 + Sweep + BOS M15 + Bougie            ║
 ║  T3 🥉 ORDER BLOCK      — OB H4/M15 + BOS + FVG M5                     ║
 ║  T4     BOS RETEST      — BOS M15 + Retest OB/FVG                       ║
-║  T5     MSS/CHoCH       — Market Structure Shift + Liquidité             ║
+║  T5     MSS/CHoCH       — Zone H4 (OB jaune/Breaker/Balance) +          ║
+║                            BOS+CHoCH M15 (RR≥3)                          ║
 ║  T6     FVG             — Fair Value Gap non mitiqué                     ║
 ║  T7     AMD             — Accumulation → Manipulation → Distribution     ║
 ║                                                                          ║
@@ -337,6 +338,64 @@ ACCOUNT_BALANCE_USD     = float(os.environ.get("ACCOUNT_BALANCE_USD", "10000"))
 RISK_PERCENT_PER_TRADE  = 0.65   # 0.65% du capital par trade
 RISK_USD = round(ACCOUNT_BALANCE_USD * RISK_PERCENT_PER_TRADE / 100.0, 2)
 
+# ── [v11] RISQUE PROGRESSIF (réduction après perte / remontée après gain) ──
+# Après un Stop Loss touché : le risque du prochain trade est divisé par 2.
+# En cas de pertes consécutives, la réduction continue (÷2, ÷4, ÷8...) avec
+# un plancher pour ne jamais couper le risque à zéro.
+# Après un gain validé (TP touché) : le risque remonte progressivement
+# (×1.5) vers le risque plein (100%), sans jamais dépasser RISK_USD.
+RISK_MIN_MULTIPLIER   = 0.125   # plancher : jamais moins de 12.5% du risque de base
+RISK_RECOVERY_FACTOR  = 1.5     # facteur de remontée après un gain validé
+RISK_LOOKBACK_TRADES  = 30      # profondeur d'historique rejouée
+
+
+def get_dynamic_risk_multiplier(lookback: int = RISK_LOOKBACK_TRADES) -> float:
+    """
+    Calcule le multiplicateur de risque courant en rejouant l'historique
+    des derniers trades clôturés (table signal_stats) :
+      • Perte (pnl_r ≤ 0)  → multiplicateur ÷ 2   (plancher RISK_MIN_MULTIPLIER)
+      • Gain  (pnl_r > 0)  → multiplicateur × 1.5 (plafond 1.0 = risque plein)
+
+    Sans historique (premier lancement, DB absente) → 1.0 (risque plein).
+    Ne lève jamais d'exception : retourne 1.0 en cas d'erreur DB.
+    """
+    try:
+        con = sqlite3.connect(TRADE_DB, check_same_thread=False)
+        con.row_factory = sqlite3.Row
+        rows = con.execute("""
+            SELECT pnl_r FROM signal_stats
+            WHERE result != 'open'
+            ORDER BY timestamp ASC
+        """).fetchall()
+        con.close()
+    except Exception as e:
+        print(f"  [RISK] Erreur lecture historique — risque plein par défaut : {e}")
+        return 1.0
+
+    if not rows:
+        return 1.0
+
+    recent = rows[-lookback:] if len(rows) > lookback else rows
+
+    mult = 1.0
+    for r in recent:
+        if r["pnl_r"] <= 0:
+            mult = max(mult * 0.5, RISK_MIN_MULTIPLIER)
+        else:
+            mult = min(mult * RISK_RECOVERY_FACTOR, 1.0)
+    return round(mult, 4)
+
+
+def get_current_risk_usd() -> float:
+    """RISK_USD ajusté dynamiquement selon la série de résultats récents (v11)."""
+    mult = get_dynamic_risk_multiplier()
+    adjusted = round(RISK_USD * mult, 2)
+    if mult < 1.0:
+        print(c(f"  [RISK] Risque réduit à {int(mult*100)}% suite aux pertes récentes "
+                f"→ ${adjusted} (au lieu de ${RISK_USD})", "yellow"))
+    return adjusted
+
+
 # ── Septuple Traction : N bougies consécutives minimum ───────
 SEPTUPLE_MIN_CANDLES = 5   # 5 suffisent en practice (7 = très rare)
 
@@ -380,7 +439,9 @@ ASIAN_PAIRS: set[str] = {
 }
 
 # Compatibilité : SESSION_WINDOWS_UTC conservé pour les autres checks (en minutes désormais)
-SESSION_WINDOWS_UTC: list[tuple[int, int]] = KILL_ZONES_UTC + [ASIAN_KZ_MIN]
+# [v11] Restreint à Londres + New York UNIQUEMENT (demande utilisateur) —
+# la fenêtre asiatique est retirée du gate global, y compris pour JPY/AUD/NZD.
+SESSION_WINDOWS_UTC: list[tuple[int, int]] = KILL_ZONES_UTC
 
 
 US_INDEX_SYMBOLS = {"^GSPC", "^NDX", "^DJI"}
@@ -529,12 +590,13 @@ def is_kill_zone_active(symbol: str = "") -> tuple[bool, str]:
     """
     Vérifie si l'heure actuelle est dans une Kill Zone autorisée pour ce symbole.
 
-    Règles (v8.2 — recalées sur l'analyse volatilité réelle GMT+0) :
+    Règles [v11 — restreint à Londres + New York uniquement] :
       • 08h00-11h00 UTC  → London Open Kill Zone   (toutes paires/actifs, SAUF indices US)
       • 13h30-16h00 UTC  → NY Open Kill Zone       (toutes paires/actifs, indices US INCLUS)
-      • 00h00-03h00 UTC  → Asian Kill Zone         (JPY / AUD / NZD seulement)
       • Indices US (^GSPC/^NDX/^DJI) → autorisés UNIQUEMENT sur la fenêtre NY Open
-      • Autres heures → BLOQUÉ (dead zone, faible volatilité / nuit)
+      • Autres heures (y compris la fenêtre asiatique 00h-03h) → BLOQUÉ
+        Cette version ne trade plus la session asiatique, même sur JPY/AUD/NZD :
+        seuls Londres et New York envoient des signaux.
 
     Retourne (True, nom_session) ou (False, raison_blocage).
     """
@@ -544,7 +606,6 @@ def is_kill_zone_active(symbol: str = "") -> tuple[bool, str]:
 
     london_start, london_end = LONDON_KZ_MIN
     ny_start, ny_end         = NY_KZ_MIN
-    asian_start, asian_end   = ASIAN_KZ_MIN
 
     # Indices US — alignés UNIQUEMENT sur l'ouverture NY (pas de fenêtre Londres)
     if symbol in US_INDEX_SYMBOLS:
@@ -560,13 +621,7 @@ def is_kill_zone_active(symbol: str = "") -> tuple[bool, str]:
     if ny_start <= now_min < ny_end:
         return True, "🇺🇸 NY Open KZ (13h30-16h00 UTC)"
 
-    # Kill zone asiatique — paires asiatiques uniquement
-    if asian_start <= now_min < asian_end:
-        if not symbol or symbol in ASIAN_PAIRS:
-            return True, "🌏 Asian KZ (00h-03h UTC)"
-        return False, f"⏰ Asian KZ (00h-03h) — {symbol} non-asiatique, skip"
-
-    return False, f"⛔ {hh_mm} UTC — faible volatilité / nuit, hors Kill Zone"
+    return False, f"⛔ {hh_mm} UTC — hors Londres/New York, aucun signal envoyé"
 
 
 def is_weekend() -> bool:
@@ -582,6 +637,9 @@ def is_crypto_symbol(symbol: str) -> bool:
 BTC_SELL_BLOCKED = False
 
 GOLD_SYMBOLS = {"GC=F", "SI=F", "CL=F", "BZ=F"}
+
+# [v11] Gold + BTC uniquement : pipeline Supply/Demand dédié M15(zone) → M1(entrée)
+GOLD_BTC_M1_SYMBOLS = {"GC=F", "BTC-USD"}
 
 def is_gold_session_active() -> bool:
     """Gold trade aussi le dimanche soir dès 23h00 UTC."""
@@ -1741,8 +1799,8 @@ def tg_format_signal(sig: "Signal", tier: str = "", mode: str = "SMC",
                     "BOS M15 cassé → Retest OB/FVG → Stop hunt",
                     "✔ BOS M15 dans le sens du biais\n✔ Retest Order Block ou FVG\n✔ Liquidité prise avant BOS\n✔ Bougie M15 clôturée"),
         "MSS":     ("T5  MSS / CHoCH",
-                    "CHoCH M15 + Sweep EQH/EQL + OB/FVG post-shift",
-                    "✔ CHoCH M15 détecté\n✔ EQH ou EQL sweepé\n✔ OB ou FVG post-shift\n✔ Bougie M15 clôturée"),
+                    "Zone H4 (OB jaune/Breaker/Balance) + BOS+CHoCH M15 + RR≥3",
+                    "✔ Zone H4 : OB jaune, Breaker Block ou Balance\n✔ BOS M15 dans le sens attendu\n✔ CHoCH M15 (confirmation d'entrée)\n✔ Sweep liquidité (optionnel, bonus)\n✔ RR minimum 1:3"),
         "FVG":     ("T6  FAIR VALUE GAP",
                     "FVG H4 + BOS M15 + Retest FVG M5",
                     "✔ FVG H4 non mitiqué\n✔ BOS M15 aligné\n✔ Prix reteste le FVG M5\n✔ Bougie M15 clôturée"),
@@ -2269,7 +2327,7 @@ DERIV_SYMBOLS: list[tuple[str, str]] = [
 
 # Filtre haute-TF utilisé comme "biais" pour les indices Deriv (équivalent
 # du H4 utilisé en Forex). Mettre "30m" si tu préfères M30 plutôt que H1.
-DERIV_BIAS_TF = os.environ.get("DERIV_BIAS_TF", "1h")
+DERIV_BIAS_TF = os.environ.get("DERIV_BIAS_TF", "15m")   # [v11] M15 pour tous les indices Volatility (V100/V50/V25)
 
 _DERIV_GRANULARITY: dict[str, int] = {
     "1m": 60, "5m": 300, "15m": 900, "30m": 1800,
@@ -3493,6 +3551,74 @@ def detect_breaker_block_htf(df_htf: pd.DataFrame, df_mtf: pd.DataFrame,
             )
             return {"detected": True, "level_top": bb["top"], "level_bottom": bb["bottom"],
                     "tf": "H4", "score_bonus": 15, "reason": reason}
+
+    return empty
+
+
+def detect_h4_balance_zone(df_h4: pd.DataFrame, direction: str,
+                            lookback: int = 12) -> dict:
+    """
+    Détecte une zone de BALANCE / ÉQUILIBRE H4 (range de consolidation
+    institutionnel) — alternative au Breaker Block H4 et à l'OB H4.
+
+    Une "balance" = série de bougies H4 dont les hauts/bas restent
+    compressés dans une bande étroite (≤ 1.6×ATR H4), signe d'accumulation
+    ou de distribution avant un mouvement directionnel (AMD).
+
+    Score bonus :
+      +15 si le prix est actuellement DANS la balance (retest de l'équilibre)
+      +10 si le prix vient tout juste de sortir de la balance dans le
+          sens attendu (cassure directionnelle récente)
+
+    Retourne dict {detected, top, bottom, mid, score_bonus, reason}
+    """
+    empty = {"detected": False, "top": None, "bottom": None, "mid": None,
+              "score_bonus": 0, "reason": ""}
+
+    if len(df_h4) < lookback + 5:
+        return empty
+
+    atr_h4 = (df_h4["high"] - df_h4["low"]).rolling(14).mean().iloc[-1]
+    if pd.isna(atr_h4) or atr_h4 <= 0:
+        return empty
+
+    # Fenêtre de balance : on exclut les 3 dernières bougies (mouvement
+    # récent éventuel de sortie de range)
+    window = df_h4.iloc[-(lookback + 3):-3]
+    if len(window) < lookback:
+        return empty
+
+    zone_top    = window["high"].max()
+    zone_bottom = window["low"].min()
+    zone_height = zone_top - zone_bottom
+
+    # Une vraie balance = range compressé (pas une tendance étendue)
+    if zone_height <= 0 or zone_height > atr_h4 * 1.6:
+        return empty
+
+    price_now = df_h4["close"].iloc[-1]
+    zone_mid  = (zone_top + zone_bottom) / 2
+    tol       = atr_h4 * 0.25
+
+    in_zone = (zone_bottom - tol) <= price_now <= (zone_top + tol)
+
+    # Cassure directionnelle récente (3 dernières bougies) hors de la balance
+    recent = df_h4.iloc[-3:]
+    if direction == "LONG":
+        broke_out = recent["close"].iloc[-1] > zone_top
+    else:
+        broke_out = recent["close"].iloc[-1] < zone_bottom
+
+    if in_zone:
+        reason = (f"⚖️ Balance H4 [{round(zone_bottom, 5)}–{round(zone_top, 5)}] "
+                   f"— prix en zone d'équilibre  (+15)")
+        return {"detected": True, "top": zone_top, "bottom": zone_bottom,
+                 "mid": zone_mid, "score_bonus": 15, "reason": reason}
+    elif broke_out:
+        reason = (f"⚖️ Balance H4 [{round(zone_bottom, 5)}–{round(zone_top, 5)}] "
+                   f"— cassure directionnelle {direction}  (+10)")
+        return {"detected": True, "top": zone_top, "bottom": zone_bottom,
+                 "mid": zone_mid, "score_bonus": 10, "reason": reason}
 
     return empty
 
@@ -4912,22 +5038,29 @@ class SetupSignal:
 
 def _fetch_data(symbol: str) -> tuple:
     """
-    Télécharge H4 / H1 / M15 / M5 une seule fois.
-    Retourne (df_h4, df_h1, df_m15, df_m5) ou (None, None, None, None) si erreur.
+    Télécharge H4 / H1 / M15 / M5 (+ M1 pour Gold/BTC) une seule fois.
+    Retourne (df_h4, df_h1, df_m15, df_m5, df_m1).
+    df_m1 est vide (DataFrame) pour tous les symboles SAUF Gold et BTC.
     H1 est utilisé par le module Supply/Demand (T2) pour détecter les zones institutionnelles.
 
     Indices Deriv (Volatility) : pas de session réelle (24/7), H4 est moins
     pertinent comme filtre que sur du Forex classique. On utilise H1 (ou M30
     via DERIV_BIAS_TF) comme biais — placé à la fois dans le slot H4 et H1
     pour ne rien casser dans les modules qui lisent l'un ou l'autre.
+
+    [v11] Gold (GC=F) et BTC (BTC-USD) : pipeline dédié M15→M1.
+    Sur ces 2 actifs uniquement, le module Supply/Demand (T2) utilise le
+    M15 comme timeframe de référence de zone/tendance (à la place du H1)
+    et le M1 comme timeframe de confirmation d'entrée (à la place du M5),
+    pour une réactivité accrue sur ces marchés très volatils.
     """
     if is_deriv_symbol(symbol):
         df_bias = fetch(symbol, DERIV_BIAS_TF, period="n/a")
         df_m15  = fetch(symbol, "15m", period="n/a")
         df_m5   = fetch(symbol, "5m",  period="n/a")
         if df_bias.empty or df_m15.empty or df_m5.empty:
-            return None, None, None, None
-        return df_bias, df_bias, df_m15, df_m5
+            return None, None, None, None, None
+        return df_bias, df_bias, df_m15, df_m5, pd.DataFrame()
 
     _idx_eu = {"^GDAXI", "^FCHI", "^FTSE", "^GSPC", "^NDX", "^DJI"}
     ltf_p   = "5d"  if symbol in _idx_eu else "2d"
@@ -4940,11 +5073,21 @@ def _fetch_data(symbol: str) -> tuple:
     df_m5  = fetch(symbol, "5m",  period=ltf_p)
 
     if df_h4.empty or df_m15.empty or df_m5.empty:
-        return None, None, None, None
+        return None, None, None, None, None
     # df_h1 peut être vide sur certains instruments — on retourne un df vide plutôt que None
     if df_h1.empty:
         df_h1 = pd.DataFrame()
-    return df_h4, df_h1, df_m15, df_m5
+
+    # ── [v11] M1 réservé exclusivement à Gold + BTC ───────────
+    df_m1 = pd.DataFrame()
+    if symbol in GOLD_BTC_M1_SYMBOLS:
+        try:
+            df_m1 = fetch(symbol, "1m", period="1d")
+        except Exception as e:
+            print(f"  [FETCH] M1 indisponible pour {symbol} : {e}")
+            df_m1 = pd.DataFrame()
+
+    return df_h4, df_h1, df_m15, df_m5, df_m1
 
 
 def _direction_from_bias(bias: str) -> Optional[str]:
@@ -5415,7 +5558,7 @@ def check_breaker_setup(
     if not _rr_ok_flexible(entry, sl, tp1, tp2, tp3, direction, min_rr):
         return None
 
-    lot = compute_lot(symbol, entry, sl)
+    lot  = compute_lot(symbol, entry, sl, risk_usd=get_current_risk_usd())
     bias = "BULLISH" if direction == "LONG" else "BEARISH"
 
     return SetupSignal(
@@ -5580,7 +5723,7 @@ def check_supply_demand_setup(
     if not _rr_ok_flexible(entry, sl, tp1, tp2, tp3, direction, min_rr):
         return None
 
-    lot  = compute_lot(symbol, entry, sl)
+    lot  = compute_lot(symbol, entry, sl, risk_usd=get_current_risk_usd())
     bias = "BULLISH" if direction == "LONG" else "BEARISH"
 
     return SetupSignal(
@@ -5700,7 +5843,7 @@ def check_ob_setup(
     if not _rr_ok(entry, sl, tp1, direction, min_rr):
         return None
 
-    lot  = compute_lot(symbol, entry, sl)
+    lot  = compute_lot(symbol, entry, sl, risk_usd=get_current_risk_usd())
     bias = "BULLISH" if direction == "LONG" else "BEARISH"
 
     return SetupSignal(
@@ -5811,7 +5954,7 @@ def check_bos_setup(
     if not _rr_ok(entry, sl, tp1, direction, min_rr):
         return None
 
-    lot  = compute_lot(symbol, entry, sl)
+    lot  = compute_lot(symbol, entry, sl, risk_usd=get_current_risk_usd())
     bias = "BULLISH" if direction == "LONG" else "BEARISH"
 
     return SetupSignal(
@@ -5919,7 +6062,7 @@ def check_amd_setup(
     if not _rr_ok(entry, sl, tp1, direction, min_rr):
         return None
 
-    lot  = compute_lot(symbol, entry, sl)
+    lot  = compute_lot(symbol, entry, sl, risk_usd=get_current_risk_usd())
     bias = "BULLISH" if direction == "LONG" else "BEARISH"
 
     return SetupSignal(
@@ -6026,7 +6169,7 @@ def check_fvg_setup(
     if not _rr_ok(entry, sl, tp1, direction, min_rr):
         return None
 
-    lot  = compute_lot(symbol, entry, sl)
+    lot  = compute_lot(symbol, entry, sl, risk_usd=get_current_risk_usd())
     bias = "BULLISH" if direction == "LONG" else "BEARISH"
 
     return SetupSignal(
@@ -6049,19 +6192,27 @@ def check_mss_setup(
     min_rr: float = MIN_RR,
 ) -> Optional[SetupSignal]:
     """
-    T6 — MSS / CHoCH + Equal Liquidité
+    T5 — MSS / CHoCH + Zone Stratégique H4  (v11)
 
-    Critères :
-      ① CHoCH M15 dans le sens du retournement        → +35 pts
-      ② Equal High/Low sweepé (pool de liquidité)     → +30 pts
-      ③ OB ou FVG post-CHoCH                          → +20 pts
-      ④ Bougie M15 clôturée                           → +15 pts
+    Critères OBLIGATOIRES (si l'un échoue → setup invalide) :
+      ⓪ Zone H4 stratégique : OB H4 "jaune" OU Breaker Block H4 OU
+         Balance H4 (équilibre/consolidation)          → +10 à +18 pts
+      ① BOS M15 dans le sens attendu                   → +20 pts
+      ② CHoCH M15 (changement de structure)             → +25 à +35 pts
+         → BOS + CHoCH sont exigés ENSEMBLE comme confirmation d'entrée
+      RR ≥ 3.0 imposé (min_rr forcé à 3.0 minimum pour ce setup)
+
+    Bonus (ne bloquent pas, s'ajoutent au score) :
+      ③ Sweep de liquidité (Equal High/Low ou BSL/SSL) — optionnel
+      ④ OB ou FVG post-CHoCH                          → +15 à +20 pts
+      ⑤ Bougie M15 clôturée                           → +15 pts
 
     Seuil : score ≥ 55 / 100
     """
     score, reasons = 0, []
+    min_rr = max(min_rr, 3.0)   # RR3 minimum imposé sur ce setup
 
-    if len(df_m15) < 20 or len(df_m5) < 10:
+    if len(df_m15) < 20 or len(df_m5) < 10 or len(df_h4) < 20:
         return None
 
     if liq_map is None:
@@ -6071,27 +6222,77 @@ def check_mss_setup(
     atr_m5    = (df_m5["high"] - df_m5["low"]).rolling(14).mean().iloc[-1]
     expected  = "bullish" if direction == "LONG" else "bearish"
 
-    # ── ① CHoCH M15 ──────────────────────────────────────────
+    # ── ⓪ Zone H4 stratégique OBLIGATOIRE ─────────────────────
+    #     OB H4 "jaune" / Breaker Block H4 / Balance H4
+    h4_zone_ok = False
+    bos_h4     = detect_bos(df_h4)
+
+    # Option A : Breaker Block H4 (retesté ou actif)
+    bkr_h4 = detect_breaker_block_htf(df_h4, df_m15, direction)
+    if bkr_h4["detected"]:
+        h4_zone_ok = True
+        score += bkr_h4["score_bonus"]
+        reasons.append(bkr_h4["reason"])
+
+    # Option B : Balance / équilibre H4
+    if not h4_zone_ok:
+        bal_h4 = detect_h4_balance_zone(df_h4, direction)
+        if bal_h4["detected"]:
+            h4_zone_ok = True
+            score += bal_h4["score_bonus"]
+            reasons.append(bal_h4["reason"])
+
+    # Option C : OB H4 "zone stratégique jaune"
+    if not h4_zone_ok:
+        atr_h4 = (df_h4["high"] - df_h4["low"]).rolling(14).mean().iloc[-1]
+        if not pd.isna(atr_h4) and atr_h4 > 0:
+            obs_h4 = detect_order_blocks(df_h4, bos_h4)
+            ob_h4_match = next(
+                (o for o in reversed(obs_h4)
+                 if o.direction == expected and
+                    (min(o.top, o.bottom) - atr_h4 * 0.3) <= price_now <= (max(o.top, o.bottom) + atr_h4 * 0.3)),
+                None
+            )
+            if ob_h4_match:
+                h4_zone_ok = True
+                score += 12
+                reasons.append(
+                    f"🟡 Zone stratégique OB H4 [{round(ob_h4_match.bottom, 5)}"
+                    f"–{round(ob_h4_match.top, 5)}]  (+12)"
+                )
+
+    if not h4_zone_ok:
+        return None   # Aucune zone H4 stratégique (OB/Breaker/Balance) → invalide
+
+    # ── ① BOS M15 dans le sens attendu (obligatoire) ──────────
+    bos_m15    = detect_bos(df_m15)
+    bos_recent = [b for b in bos_m15[-8:] if b["type"] == expected]
+    if not bos_recent:
+        return None   # Pas de BOS M15 → confirmation d'entrée incomplète
+    score += 20
+    reasons.append(f"📐 BOS M15 {expected} @ {round(bos_recent[-1]['level'], 5)}  (+20)")
+
+    # ── ② CHoCH M15 (obligatoire — exigé EN PLUS du BOS) ──────
     choch_res = detect_choch_eql_setup(df_h4, df_m5, liq_map, direction)
     if choch_res["detected"] and choch_res["score_bonus"] >= 15:
         choch_pts = min(choch_res["score_bonus"], 35)
         score += choch_pts
         reasons += choch_res.get("reasons", [])
-        reasons.append(f"🔄 CHoCH/MSS M15 détecté  (+{choch_pts})")
+        reasons.append(f"🔄 CHoCH M15 détecté  (+{choch_pts})")
     else:
-        # Fallback : BOS contraire suivi d'un BOS dans notre sens
-        bos_m15 = detect_bos(df_m15)
-        recents = bos_m15[-6:]
+        # Fallback strict : BOS contraire suivi d'un BOS dans notre sens
+        # (= CHoCH structurel équivalent)
         opp = "bearish" if direction == "LONG" else "bullish"
+        recents = bos_m15[-6:]
         has_opp  = any(b["type"] == opp      for b in recents)
         has_same = any(b["type"] == expected  for b in recents[-3:])
         if has_opp and has_same:
             score += 25
-            reasons.append(f"🔄 MSS : retournement {opp}→{expected} M15  (+25)")
+            reasons.append(f"🔄 CHoCH M15 : retournement {opp}→{expected}  (+25)")
         else:
-            return None   # Pas de MSS/CHoCH → setup invalide
+            return None   # BOS + CHoCH requis ENSEMBLE → sans CHoCH, invalide
 
-    # ── ② Equal High/Low sweepé ──────────────────────────────
+    # ── ③ Sweep de liquidité — OPTIONNEL (bonus non bloquant) ─
     eqh_ok = bool(liq_map.eqh_levels) and direction == "SHORT"
     eql_ok = bool(liq_map.eql_levels) and direction == "LONG"
     bsl_ssl_swept = (liq_map.swept_bsl and direction == "SHORT") or \
@@ -6105,7 +6306,7 @@ def check_mss_setup(
         score += 20
         reasons.append(f"💧 BSL/SSL sweepée  (+20)")
 
-    # ── ③ OB ou FVG post-CHoCH ───────────────────────────────
+    # ── ④ OB ou FVG post-CHoCH ───────────────────────────────
     fvgs_m5    = detect_fvg(df_m5)
     fvg_active = active_fvg(df_m5, fvgs_m5, expected)
     bos_m5     = detect_bos(df_m5)
@@ -6148,7 +6349,7 @@ def check_mss_setup(
     if not _rr_ok(entry, sl, tp1, direction, min_rr):
         return None
 
-    lot  = compute_lot(symbol, entry, sl)
+    lot  = compute_lot(symbol, entry, sl, risk_usd=get_current_risk_usd())
     bias = "BULLISH" if direction == "LONG" else "BEARISH"
 
     return SetupSignal(
@@ -6386,7 +6587,7 @@ def scan_symbol(symbol: str, mkt: str, min_rr: float = MIN_RR) -> list[SetupSign
       T1 BREAKER · T2 SUPPLY/DEMAND · T3 OB · T4 BOS · T5 MSS · T6 FVG · T7 AMD
     """
     # ── 1. Téléchargement des données (une seule fois) ────────
-    df_h4, df_h1, df_m15, df_m5 = _fetch_data(symbol)
+    df_h4, df_h1, df_m15, df_m5, df_m1 = _fetch_data(symbol)
     if df_h4 is None:
         return []
 
@@ -6429,10 +6630,26 @@ def scan_symbol(symbol: str, mkt: str, min_rr: float = MIN_RR) -> list[SetupSign
     # ── 6. Exécution des 7 modules avec filtre ASM ────────────
     signals: list[SetupSignal] = []
 
+    # ── [v11] Gold/BTC : pipeline S/D dédié M15(zone) → M1(entrée) ─
+    # Sur ces 2 actifs, on réutilise check_supply_demand_setup en
+    # décalant les timeframes d'un cran : M15 remplace le H1 (zone
+    # de référence / tendance) et M1 remplace le M15/M5 (structure
+    # + confirmation d'entrée), pour une réactivité accrue.
+    use_m1_sd = symbol in GOLD_BTC_M1_SYMBOLS and df_m1 is not None and len(df_m1) >= 30
+
+    def _sd_checker():
+        if use_m1_sd:
+            return check_supply_demand_setup(
+                symbol, df_h4, df_m15, df_m1, df_m1, direction, liq_map, min_rr
+            )
+        return check_supply_demand_setup(
+            symbol, df_h4, df_h1, df_m15, df_m5, direction, liq_map, min_rr
+        )
+
     # Liste complète des checkers (nom_setup, lambda checker)
     checkers = [
         ("BREAKER", lambda: check_breaker_setup(symbol, df_h4, df_m15, df_m5, direction, liq_map, min_rr)),
-        ("SD",      lambda: check_supply_demand_setup(symbol, df_h4, df_h1, df_m15, df_m5, direction, liq_map, min_rr)),
+        ("SD",      _sd_checker),
         ("OB",      lambda: check_ob_setup(symbol, df_h4, df_m15, df_m5, direction, min_rr)),
         ("BOS",     lambda: check_bos_setup(symbol, df_h4, df_m15, df_m5, direction, min_rr)),
         ("MSS",     lambda: check_mss_setup(symbol, df_h4, df_m15, df_m5, direction, liq_map, min_rr)),
@@ -6564,54 +6781,112 @@ def setup_logging() -> logging.Logger:
 
 log = setup_logging()
 
-MAX_SIGNALS_PER_DAY        = 2   # [v9 MOD-1] max 2 signaux/jour/symbole — qualité chirurgicale
-MAX_SIGNALS_GLOBAL_PER_DAY = 2   # [v9.6] réduit de 4 → 2 — qualité > quantité
+MAX_SIGNALS_PER_DAY        = 3   # [v11] légèrement relevé (2→3) pour accompagner le passage à 8 signaux/jour globaux
+MAX_SIGNALS_GLOBAL_PER_DAY = 8   # [v11] relevé de 2 → 8 signaux/jour GLOBAL (demande utilisateur, tous marchés confondus)
                                   # Règle absolue : jamais plus de 4 alertes par journée UTC.
+MAX_SIGNALS_PER_SESSION    = 4   # [v11] max 4 signaux par session (Londres et New York comptés séparément)
+MAX_SIGNALS_DERIV_PER_DAY  = 5   # [v11] indices synthétiques Deriv (Volatility) : max 5 signaux/jour, tous ensemble
 
 _daily_counts:        dict[str, int] = {}
 _daily_global_count:  int            = 0   # compteur global journalier
+_daily_deriv_count:   int            = 0   # [v11] compteur dédié indices Volatility (V100/V50/V25)
+_session_counts:      dict[str, int] = {}  # [v11] {"LONDON": n, "NY": n}
+_last_session_label:  str            = ""
 _daily_date:          str            = ""
+
+def _current_session_label() -> str:
+    """[v11] Retourne 'LONDON', 'NY' ou '' si on est hors des deux kill zones."""
+    now_min = datetime.now(timezone.utc).hour * 60 + datetime.now(timezone.utc).minute
+    if LONDON_KZ_MIN[0] <= now_min < LONDON_KZ_MIN[1]:
+        return "LONDON"
+    if NY_KZ_MIN[0] <= now_min < NY_KZ_MIN[1]:
+        return "NY"
+    return ""
+
+def _reset_session_if_needed() -> None:
+    """[v11] Remet à zéro le compteur d'une session dès l'entrée dans une nouvelle fenêtre."""
+    global _last_session_label
+    label = _current_session_label()
+    if label and label != _last_session_label:
+        _session_counts[label] = 0
+        _last_session_label = label
+    elif not label:
+        _last_session_label = ""
 
 def _reset_daily_if_needed() -> None:
     """
     [v9 MOD-1] Remet à zéro tous les compteurs si le jour UTC a changé.
     Reset automatique à 00h00 UTC — aucune action manuelle requise.
     """
-    global _daily_date, _daily_global_count
+    global _daily_date, _daily_global_count, _daily_deriv_count
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     if today != _daily_date:
         _daily_counts.clear()
+        _session_counts.clear()
         _daily_global_count = 0
+        _daily_deriv_count  = 0
         _daily_date = today
         log.info(f"  🔄 [v9] Compteurs journaliers remis à zéro — nouveau jour UTC : {today}")
 
 def check_daily_limit(symbol: str) -> bool:
     """
-    [v9 MOD-1] Retourne True si on peut encore envoyer un signal.
-    Vérifie DEUX limites :
-      • Limite par symbole : max MAX_SIGNALS_PER_DAY signaux/jour/paire
-      • Limite globale    : max MAX_SIGNALS_GLOBAL_PER_DAY signaux/jour (toutes paires)
+    [v11] Retourne True si on peut encore envoyer un signal.
+    Vérifie QUATRE limites :
+      • Limite par symbole  : max MAX_SIGNALS_PER_DAY signaux/jour/paire
+      • Limite globale      : max MAX_SIGNALS_GLOBAL_PER_DAY signaux/jour (toutes paires)
+      • Limite par session  : max MAX_SIGNALS_PER_SESSION signaux (Londres et NY séparément)
+      • Limite indices Deriv: max MAX_SIGNALS_DERIV_PER_DAY signaux/jour (V100/V50/V25 confondus)
     Si l'une ou l'autre est dépassée → retourne False, signal bloqué.
     """
     _reset_daily_if_needed()
+    _reset_session_if_needed()
+
     per_symbol_ok = _daily_counts.get(symbol, 0) < MAX_SIGNALS_PER_DAY
     global_ok     = _daily_global_count < MAX_SIGNALS_GLOBAL_PER_DAY
+
+    session_label = _current_session_label()
+    session_ok    = (_session_counts.get(session_label, 0) < MAX_SIGNALS_PER_SESSION) if session_label else True
+
+    deriv_ok = (_daily_deriv_count < MAX_SIGNALS_DERIV_PER_DAY) if is_deriv_symbol(symbol) else True
+
     if not global_ok:
         log.info(
             f"  ⏹ [v9] Limite globale atteinte : {_daily_global_count}/{MAX_SIGNALS_GLOBAL_PER_DAY} "
             f"signaux envoyés aujourd'hui — aucun signal supplémentaire jusqu'à 00h00 UTC."
         )
-    return per_symbol_ok and global_ok
+    if session_label and not session_ok:
+        log.info(
+            f"  ⏹ [v11] Limite session {session_label} atteinte : "
+            f"{_session_counts.get(session_label, 0)}/{MAX_SIGNALS_PER_SESSION}"
+        )
+    if is_deriv_symbol(symbol) and not deriv_ok:
+        log.info(
+            f"  ⏹ [v11] Limite indices synthétiques atteinte : "
+            f"{_daily_deriv_count}/{MAX_SIGNALS_DERIV_PER_DAY} — plus de signal Volatility aujourd'hui."
+        )
+
+    return per_symbol_ok and global_ok and session_ok and deriv_ok
 
 def increment_daily_count(symbol: str) -> None:
-    """[v9 MOD-1] Incrémente le compteur symbole ET le compteur global."""
-    global _daily_global_count
+    """[v11] Incrémente les compteurs : symbole, global, session, et Deriv si applicable."""
+    global _daily_global_count, _daily_deriv_count
     _reset_daily_if_needed()
+    _reset_session_if_needed()
     _daily_counts[symbol]  = _daily_counts.get(symbol, 0) + 1
     _daily_global_count   += 1
+
+    session_label = _current_session_label()
+    if session_label:
+        _session_counts[session_label] = _session_counts.get(session_label, 0) + 1
+
+    if is_deriv_symbol(symbol):
+        _daily_deriv_count += 1
+
     log.info(
-        f"  📊 [v9] Compteur : {symbol} → {_daily_counts[symbol]}/{MAX_SIGNALS_PER_DAY}  |  "
-        f"Global : {_daily_global_count}/{MAX_SIGNALS_GLOBAL_PER_DAY}"
+        f"  📊 [v11] Compteur : {symbol} → {_daily_counts[symbol]}/{MAX_SIGNALS_PER_DAY}  |  "
+        f"Global : {_daily_global_count}/{MAX_SIGNALS_GLOBAL_PER_DAY}  |  "
+        f"Session {session_label or '—'} : {_session_counts.get(session_label, 0)}/{MAX_SIGNALS_PER_SESSION}"
+        + (f"  |  Deriv : {_daily_deriv_count}/{MAX_SIGNALS_DERIV_PER_DAY}" if is_deriv_symbol(symbol) else "")
     )
 
 
