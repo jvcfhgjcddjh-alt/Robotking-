@@ -555,7 +555,7 @@ SD_ZONE_BUFFER       = 0.15  # tolérance 15% de l'ATR pour "dans la zone"
 #  ┌─────────────────────────────────────────────────────────┐
 #  │  08h00–11h00 UTC  — London Open  ⭐ volatilité forte     │
 #  │  13h00–22h00 UTC  — NY Open / overlap London ⭐⭐         │
-#  │  Indices US (^GSPC/^NDX/^DJI) → NY Open UNIQUEMENT       │
+#  │  Gold et BTC → réservés à la fenêtre NY Open uniquement  │
 #  │  Tout le reste (22h-08h notamment) = faible volatilité,  │
 #  │  bloqué pour éviter les SL inutiles                      │
 #  └─────────────────────────────────────────────────────────┘
@@ -571,11 +571,6 @@ KILL_ZONES_UTC: list[tuple[int, int]] = [LONDON_KZ_MIN, NY_KZ_MIN]
 
 # Conservé pour compatibilité nominale (anciennement en heures pleines)
 ASIAN_KILL_ZONE_UTC: tuple[int, int] = ASIAN_KZ_MIN
-
-# Paires actives pendant la session asiatique
-ASIAN_PAIRS: set[str] = {
-    "USDJPY=X", "EURJPY=X", "GBPJPY=X", "AUDUSD=X", "NZDUSD=X",
-}
 
 # Compatibilité : SESSION_WINDOWS_UTC conservé pour les autres checks (en minutes désormais)
 # [v11] Restreint à Londres + New York UNIQUEMENT (demande utilisateur) —
@@ -614,16 +609,10 @@ _news_cache: dict       = {}      # {date_str: [list of news dicts]}
 _news_cache_ts: float   = 0.0
 NEWS_CACHE_TTL          = 3600    # rafraîchissement toutes les heures
 
-# Mapping symbole → devises concernées
+# Mapping symbole → devises concernées (seuls les 4 marchés actifs)
 _SYMBOL_CURRENCIES: dict[str, set] = {
-    "EURUSD=X": {"EUR", "USD"}, "GBPUSD=X": {"GBP", "USD"},
-    "USDJPY=X": {"USD", "JPY"}, "USDCHF=X": {"USD", "CHF"},
-    "AUDUSD=X": {"AUD", "USD"}, "NZDUSD=X": {"NZD", "USD"},
-    "USDCAD=X": {"USD", "CAD"}, "EURGBP=X": {"EUR", "GBP"},
-    "EURJPY=X": {"EUR", "JPY"}, "GBPJPY=X": {"GBP", "JPY"},
-    "GBPAUD=X": {"GBP", "AUD"}, "GC=F":     {"USD"},
-    "BTC-USD":  {"USD"},        "^GSPC":    {"USD"},
-    "^NDX":     {"USD"},        "^DJI":     {"USD"},
+    "GC=F":     {"USD"},
+    "BTC-USD":  {"USD"},
 }
 
 
@@ -792,8 +781,8 @@ def is_weekend() -> bool:
 
 
 def is_crypto_symbol(symbol: str) -> bool:
-    """BTC et autres crypto tradent 24/7, y compris le weekend."""
-    return symbol in ("BTC-USD", "ETH-USD", "BTC-USDT", "ETH-USDT")
+    """BTC trade 24/7, y compris le weekend."""
+    return symbol == "BTC-USD"
 
 # v8 : BTC — on bloque les signaux SELL/SHORT sur BTC (tendance haussière forte)
 BTC_SELL_BLOCKED = False
@@ -817,23 +806,8 @@ def is_gold_session_active() -> bool:
 #  ATR MINIMUM PAR INSTRUMENT
 # ─────────────────────────────────────────────────────────────
 ATR_MIN: dict[str, float] = {
-    # Forex majeurs — calibrés sur ATR M15 observé (session pré-London incluse)
-    "EURUSD=X": 0.00035, "GBPUSD=X": 0.00040, "USDJPY=X": 0.035,
-    "USDCHF=X": 0.00035, "AUDUSD=X": 0.00022, "NZDUSD=X": 0.00018,
-    "USDCAD=X": 0.00035, "GBPJPY=X": 0.070,   "EURJPY=X": 0.050,
-    "GBPAUD=X": 0.00080, "GBPCAD=X": 0.00080, "GBPNZD=X": 0.00100,
-    "EURGBP=X": 0.00020, "EURAUD=X": 0.00060, "EURCAD=X": 0.00060,
-    "AUDJPY=X": 0.045,   "CADJPY=X": 0.040,   "CHFJPY=X": 0.060,
-    "NZDJPY=X": 0.040,
-    # Matières premières
-    "GC=F"    : 1.20,    "SI=F"    : 0.04,
-    "CL=F"    : 0.25,    "BZ=F"    : 0.25,
-    # Crypto
-    "BTC-USD" : 150.0,   "ETH-USD" : 8.0,
-    # Indices US — pas de filtre ATR strict (pas de spread toxique)
-    "^GSPC"   : 5.0,     "^NDX"    : 20.0,    "^DJI"    : 50.0,
-    # Indices EU — même logique
-    "^GDAXI"  : 30.0,    "^FCHI"   : 10.0,    "^FTSE"   : 15.0,
+    "GC=F"    : 1.20,    # Gold
+    "BTC-USD" : 150.0,   # Bitcoin
 }
 ATR_MIN_DEFAULT = 0.00050
 MAX_SPREAD_ATR_RATIO = 0.50   # élargi à 50% pour réduire les faux rejets de spread
@@ -926,24 +900,8 @@ def check_volatility(symbol: str, df_ltf: pd.DataFrame,
 #  SPREADS
 # ─────────────────────────────────────────────────────────────
 SPREAD_TABLE: dict[str, float] = {
-    "EURUSD=X": 0.00008, "GBPUSD=X": 0.00010, "USDJPY=X": 0.009,
-    "USDCHF=X": 0.00010, "AUDUSD=X": 0.00010, "NZDUSD=X": 0.00013,
-    "USDCAD=X": 0.00012, "EURGBP=X": 0.00013, "EURJPY=X": 0.012,
-    "EURCHF=X": 0.00018, "EURAUD=X": 0.00020, "EURCAD=X": 0.00020,
-    "EURNZD=X": 0.00025, "GBPJPY=X": 0.018,   "GBPCHF=X": 0.00022,
-    "GBPAUD=X": 0.00025, "GBPCAD=X": 0.00025, "GBPNZD=X": 0.00030,
-    "AUDJPY=X": 0.012,   "CADJPY=X": 0.015,   "CHFJPY=X": 0.015,
-    "NZDJPY=X": 0.015,   "AUDCAD=X": 0.00018, "AUDCHF=X": 0.00018,
-    "AUDNZD=X": 0.00020, "NZDCAD=X": 0.00020, "NZDCHF=X": 0.00020,
-    "CADCHF=X": 0.00018, "USDMXN=X": 0.003,   "USDZAR=X": 0.005,
-    "USDTRY=X": 0.010,   "USDSEK=X": 0.004,   "USDNOK=X": 0.004,
-    "USDSGD=X": 0.00020, "USDHKD=X": 0.00030,
-    "GC=F"    : 0.30,    "SI=F"    : 0.015,
-    "CL=F"    : 0.03,    "BZ=F"    : 0.04,    "NG=F"    : 0.003,
-    "BTC-USD" : 15.0,    "ETH-USD" : 0.80,
-    "^GSPC"   : 0.30,    "^NDX"    : 0.50,    "^DJI"    : 2.00,
-    "^GDAXI"  : 1.00,    "^FCHI"   : 1.00,    "^FTSE"   : 1.00,
-    "^N225"   : 5.00,    "^HSI"    : 5.00,
+    "GC=F"    : 0.30,    # Gold
+    "BTC-USD" : 15.0,    # Bitcoin
 }
 
 
@@ -955,17 +913,8 @@ def get_spread(symbol: str) -> float:
 #  CORRÉLATION GUARD
 # ─────────────────────────────────────────────────────────────
 _CORR_GROUPS: dict[str, str] = {
-    "EURUSD=X": "USD", "GBPUSD=X": "USD", "AUDUSD=X": "USD", "NZDUSD=X": "USD",
-    "USDJPY=X": "USD", "USDCHF=X": "USD", "USDCAD=X": "USD",
-    "GBPJPY=X": "JPY", "EURJPY=X": "JPY", "AUDJPY=X": "JPY",
-    "CADJPY=X": "JPY", "CHFJPY=X": "JPY", "NZDJPY=X": "JPY",
-    "GBPAUD=X": "GBP", "GBPCAD=X": "GBP", "GBPNZD=X": "GBP", "EURGBP=X": "GBP",
-    "EURAUD=X": "EUR", "EURCAD=X": "EUR", "EURNZD=X": "EUR",
-    "GC=F"    : "GOLD", "SI=F"    : "GOLD",
-    "CL=F"    : "OIL",  "BZ=F"    : "OIL",
+    "GC=F"    : "GOLD",
     "BTC-USD" : "BTC",
-    "^GSPC"   : "US_IDX", "^NDX"  : "US_IDX", "^DJI"  : "US_IDX",
-    "^GDAXI"  : "EU_IDX", "^FCHI" : "EU_IDX",
 }
 
 _active_corr_groups: dict[str, float] = {}
@@ -1061,7 +1010,7 @@ _setup_sent: dict[str, bool] = {}
 # Cache pour le cooldown par niveau de prix : {symbol -> (direction, entry_price, timestamp)}
 _price_level_cache: dict[str, tuple[str, float, float]] = {}
 PRICE_LEVEL_COOLDOWN = 1800   # secondes — cohérent avec SIGNAL_COOLDOWN
-PRICE_LEVEL_TOLERANCE = 0.0003  # 0.03% — ne pas renvoyer si entry quasi-identique (~3.5 pips EURUSD)
+PRICE_LEVEL_TOLERANCE = 0.0003  # 0.03% — ne pas renvoyer si entry quasi-identique
 
 # ── Trade Management — base de données persistante ────────────
 # Astuce Render : définir TRADE_DB_PATH=/opt/render/project/src/trades.db
@@ -1540,10 +1489,8 @@ def _fmt_trade_alert(trade: dict, event: str, price: float) -> str:
     """Formate le message Telegram d'alerte de trade."""
     dec = 2 if trade["entry"] > 100 else 5
     sym_map = {
-        "GC=F"   : "XAUUSD / GOLD",    "SI=F"   : "XAGUSD / SILVER",
-        "CL=F"   : "USOIL",            "BZ=F"   : "UKOIL",
-        "BTC-USD": "BTCUSD / Bitcoin",  "^GSPC"  : "S&P 500",
-        "^NDX"   : "Nasdaq 100",        "^DJI"   : "Dow Jones",
+        "GC=F"   : "XAUUSD / GOLD",
+        "BTC-USD": "BTCUSD / Bitcoin",
     }
     sym_display = sym_map.get(
         trade["symbol"],
@@ -2682,9 +2629,7 @@ def tg_format_signal(sig: "Signal", tier: str = "", mode: str = "SMC",
         struct = "baissière"
 
     # Nom affichage
-    sym_map = {"GC=F": "XAUUSD / GOLD", "SI=F": "XAGUSD / SILVER",
-               "CL=F": "USOIL", "BZ=F": "UKOIL", "BTC-USD": "BTCUSD / Bitcoin",
-               "^GSPC": "S&P 500", "^NDX": "Nasdaq 100", "^DJI": "Dow Jones"}
+    sym_map = {"GC=F": "XAUUSD / GOLD", "BTC-USD": "BTCUSD / Bitcoin"}
     sym_display = sym_map.get(sig.symbol,
         sig.symbol.replace("=X", "").replace("-USD", "").replace("^", ""))
 
@@ -2863,8 +2808,7 @@ def generate_chart_image(sig: "Signal") -> Optional[str]:
                 fc=col if up else "none", ec=col, lw=0.8, zorder=5))
 
         # ── Titre & watermark ─────────────────────────────────
-        sym_display = ({"GC=F": "XAUUSD", "SI=F": "XAGUSD", "BTC-USD": "BTCUSD",
-                        "CL=F": "USOIL",  "BZ=F": "UKOIL"}
+        sym_display = ({"GC=F": "XAUUSD", "BTC-USD": "BTCUSD"}
                        .get(sig.symbol,
                             sig.symbol.replace("=X","").replace("-USD","").replace("^","")))
         ax.text(0.013, 0.975, f"{sym_display}  •  M15  •  SMC v3",
@@ -3088,43 +3032,27 @@ def c(text: str, color: str = "green") -> str:
 
 def compute_lot(symbol: str, entry: float, sl: float,
                 risk_usd: float = RISK_USD) -> float:
+    """Calcule la taille de lot pour les 4 marchés actifs : Gold, BTC, Deriv (R_75/R_25)."""
     sl_distance = abs(entry - sl)
     if sl_distance == 0:
         return 0.0
-    sym = symbol.upper().replace("=X", "").replace("-", "").replace("^", "")
 
-    if symbol in ("GC=F",):
+    if symbol == "GC=F":
         lot = risk_usd / (sl_distance * 100.0)
-    elif symbol in ("SI=F",):
-        lot = risk_usd / (sl_distance * 50.0)
-    elif symbol in ("CL=F", "BZ=F"):
-        lot = risk_usd / (sl_distance * 1000.0)
-    elif symbol in ("NG=F", "HG=F", "PL=F", "PA=F"):
-        lot = risk_usd / (sl_distance * 100.0)
-    elif is_deriv_symbol(symbol):
+        return max(0.01, round(lot, 2))
+    if is_deriv_symbol(symbol):
         # ⚠️ Approximatif : je n'ai pas de spec de contrat Deriv vérifiée
         # pour ces indices (taille de lot / valeur du point varie selon
         # le broker/plateforme). Formule générique $ risqué ÷ distance SL,
         # comme pour BTC. À CALIBRER avec la fiche "spécification du
         # symbole" de ton MT5 Deriv avant tout trade réel.
         return round(risk_usd / sl_distance, 4)
-    elif sym in ("BTCUSD", "ETHUSD") or symbol in ("BTC-USD", "ETH-USD"):
+    if symbol == "BTC-USD":
         return round(risk_usd / sl_distance, 6)
-    elif sym in ("GSPC", "NDX", "DJI", "GDAXI", "FCHI", "FTSE", "N225", "HSI"):
-        lot = risk_usd / (sl_distance * 10.0)
-    elif sym.endswith("JPY"):
-        sl_pips = sl_distance / 0.01
-        pip_val = 1000.0 / entry
-        lot = risk_usd / (sl_pips * pip_val)
-    elif sym.startswith("USD"):
-        sl_pips = sl_distance / 0.0001
-        pip_val = 10.0 / entry
-        lot = risk_usd / (sl_pips * pip_val)
-    else:
-        sl_pips = sl_distance / 0.0001
-        lot = risk_usd / (sl_pips * 10.0)
 
-    return max(0.01, round(lot, 2))
+    # Fallback (ne devrait jamais être atteint avec les 4 marchés actifs)
+    sl_pips = sl_distance / 0.0001
+    return max(0.01, round(risk_usd / (sl_pips * 10.0), 2))
 
 
 # ─────────────────────────────────────────────────────────────
@@ -6026,10 +5954,9 @@ def _fetch_data(symbol: str) -> tuple:
             return None, None, None, None, None
         return df_bias, df_bias, df_m15, df_m5, pd.DataFrame()
 
-    _idx_eu = {"^GDAXI", "^FCHI", "^FTSE", "^GSPC", "^NDX", "^DJI"}
-    ltf_p   = "5d"  if symbol in _idx_eu else "2d"
-    mtf_p   = "10d" if symbol in _idx_eu else "5d"
-    h1_p    = "20d" if symbol in _idx_eu else "15d"
+    ltf_p   = "2d"
+    mtf_p   = "5d"
+    h1_p    = "15d"
 
     df_h4  = fetch(symbol, "4h",  period="30d")
     df_h1  = fetch(symbol, "1h",  period=h1_p)
@@ -6460,109 +6387,67 @@ def detect_ob_retest_rejection(
 # ─────────────────────────────────────────────────────────────
 
 def check_mss_setup(
-    symbol: str, df_h4: pd.DataFrame, df_m15: pd.DataFrame,
-    df_m5: pd.DataFrame, direction: str,
+    symbol: str, df_m5: pd.DataFrame, direction: str,
     liq_map: Optional[LiquidityMap] = None,
     min_rr: float = MIN_RR,
 ) -> Optional[SetupSignal]:
     """
-    T5 — MSS / CHoCH + Zone Stratégique H4  (v11)
+    Stratégie unique — 100% M5, AUCUN ancrage H4, AUCUN biais de tendance (v16)
 
     Critères OBLIGATOIRES (si l'un échoue → setup invalide) :
-      ⓪ Zone H4 stratégique : OB H4 "jaune" OU Breaker Block H4 OU
-         Balance H4 (équilibre/consolidation)          → +10 à +18 pts
-      ① BOS M15 dans le sens attendu                   → +20 pts
-      ② CHoCH M15 (changement de structure)             → +25 à +35 pts
-         → BOS + CHoCH sont exigés ENSEMBLE comme confirmation d'entrée
+      ① BOS M5 dans le sens attendu (cassure de structure, corps de bougie
+         — pas la mèche)                                    → +20 pts
+      ② CHoCH M5 (changement de structure), exigé EN PLUS du BOS
+                                                              → +25 à +35 pts
       RR ≥ 3.0 imposé (min_rr forcé à 3.0 minimum pour ce setup)
 
     Bonus (ne bloquent pas, s'ajoutent au score) :
-      ③ Sweep de liquidité (Equal High/Low ou BSL/SSL) — optionnel
-      ④ OB ou FVG post-CHoCH                          → +15 à +20 pts
-      ⑤ Bougie M15 clôturée                           → +15 pts
+      ③ Sweep de liquidité (Equal High/Low ou BSL/SSL, calculés sur M5)
+      ④ OB ou FVG M5 post-CHoCH                             → +15 à +20 pts
+      ⑤ Bougie M5 clôturée (corps ≥ 40% du range)            → +15 pts
 
-    Seuil : score ≥ 55 / 100
+    Seuil : score ≥ 55/100.
+    Entrée directe (sweep + CHoCH confirmés, sans retest)     = 2⭐
+    Entrée confirmée (+ retest OB/FVG avec bougie de rejet)   = 3⭐
     """
     score, reasons = 0, []
     min_rr = max(min_rr, 3.0)   # RR3 minimum imposé sur ce setup
 
-    if len(df_m15) < 20 or len(df_m5) < 10 or len(df_h4) < 20:
+    if len(df_m5) < 20:
         return None
 
     if liq_map is None:
-        liq_map = build_liquidity_map(df_h4, df_m5)
+        liq_map = build_liquidity_map(df_m5, df_m5)
 
     price_now = df_m5["close"].iloc[-1]
     atr_m5    = (df_m5["high"] - df_m5["low"]).rolling(14).mean().iloc[-1]
     expected  = "bullish" if direction == "LONG" else "bearish"
 
-    # ── ⓪ Zone H4 stratégique OBLIGATOIRE ─────────────────────
-    #     OB H4 "jaune" / Breaker Block H4 / Balance H4
-    h4_zone_ok = False
-    bos_h4     = detect_bos(df_h4)
-
-    # Option A : Breaker Block H4 (retesté ou actif)
-    bkr_h4 = detect_breaker_block_htf(df_h4, df_m15, direction)
-    if bkr_h4["detected"]:
-        h4_zone_ok = True
-        score += bkr_h4["score_bonus"]
-        reasons.append(bkr_h4["reason"])
-
-    # Option B : Balance / équilibre H4
-    if not h4_zone_ok:
-        bal_h4 = detect_h4_balance_zone(df_h4, direction)
-        if bal_h4["detected"]:
-            h4_zone_ok = True
-            score += bal_h4["score_bonus"]
-            reasons.append(bal_h4["reason"])
-
-    # Option C : OB H4 "zone stratégique jaune"
-    if not h4_zone_ok:
-        atr_h4 = (df_h4["high"] - df_h4["low"]).rolling(14).mean().iloc[-1]
-        if not pd.isna(atr_h4) and atr_h4 > 0:
-            obs_h4 = detect_order_blocks(df_h4, bos_h4)
-            ob_h4_match = next(
-                (o for o in reversed(obs_h4)
-                 if o.direction == expected and
-                    (min(o.top, o.bottom) - atr_h4 * 0.3) <= price_now <= (max(o.top, o.bottom) + atr_h4 * 0.3)),
-                None
-            )
-            if ob_h4_match:
-                h4_zone_ok = True
-                score += 12
-                reasons.append(
-                    f"🟡 Zone stratégique OB H4 [{round(ob_h4_match.bottom, 5)}"
-                    f"–{round(ob_h4_match.top, 5)}]  (+12)"
-                )
-
-    if not h4_zone_ok:
-        return None   # Aucune zone H4 stratégique (OB/Breaker/Balance) → invalide
-
-    # ── ① BOS M15 dans le sens attendu (obligatoire) ──────────
-    bos_m15    = detect_bos(df_m15)
-    bos_recent = [b for b in bos_m15[-8:] if b["type"] == expected]
+    # ── ① BOS M5 dans le sens attendu (obligatoire) ───────────
+    bos_m5     = detect_bos(df_m5)
+    bos_recent = [b for b in bos_m5[-8:] if b["type"] == expected]
     if not bos_recent:
-        return None   # Pas de BOS M15 → confirmation d'entrée incomplète
+        return None   # Pas de BOS M5 → confirmation d'entrée incomplète
     score += 20
-    reasons.append(f"📐 BOS M15 {expected} @ {round(bos_recent[-1]['level'], 5)}  (+20)")
+    reasons.append(f"📐 BOS M5 {expected} @ {round(bos_recent[-1]['level'], 5)}  (+20)")
 
-    # ── ② CHoCH M15 (obligatoire — exigé EN PLUS du BOS) ──────
-    choch_res = detect_choch_eql_setup(df_h4, df_m5, liq_map, direction)
+    # ── ② CHoCH M5 (obligatoire — exigé EN PLUS du BOS) ───────
+    choch_res = detect_choch_eql_setup(df_m5, df_m5, liq_map, direction)
     if choch_res["detected"] and choch_res["score_bonus"] >= 15:
         choch_pts = min(choch_res["score_bonus"], 35)
         score += choch_pts
         reasons += choch_res.get("reasons", [])
-        reasons.append(f"🔄 CHoCH M15 détecté  (+{choch_pts})")
+        reasons.append(f"🔄 CHoCH M5 détecté  (+{choch_pts})")
     else:
         # Fallback strict : BOS contraire suivi d'un BOS dans notre sens
         # (= CHoCH structurel équivalent)
         opp = "bearish" if direction == "LONG" else "bullish"
-        recents = bos_m15[-6:]
+        recents  = bos_m5[-6:]
         has_opp  = any(b["type"] == opp      for b in recents)
         has_same = any(b["type"] == expected  for b in recents[-3:])
         if has_opp and has_same:
             score += 25
-            reasons.append(f"🔄 CHoCH M15 : retournement {opp}→{expected}  (+25)")
+            reasons.append(f"🔄 CHoCH M5 : retournement {opp}→{expected}  (+25)")
         else:
             return None   # BOS + CHoCH requis ENSEMBLE → sans CHoCH, invalide
 
@@ -6580,10 +6465,9 @@ def check_mss_setup(
         score += 20
         reasons.append(f"💧 BSL/SSL sweepée  (+20)")
 
-    # ── ④ OB ou FVG post-CHoCH ───────────────────────────────
+    # ── ④ OB ou FVG post-CHoCH ────────────────────────────────
     fvgs_m5    = detect_fvg(df_m5)
     fvg_active = active_fvg(df_m5, fvgs_m5, expected)
-    bos_m5     = detect_bos(df_m5)
     obs_m5     = detect_order_blocks(df_m5, bos_m5)
     ob_match   = next(
         (o for o in reversed(obs_m5)
@@ -6599,15 +6483,15 @@ def check_mss_setup(
         score += 15
         reasons.append(f"🏛️ OB M5 post-CHoCH  (+15)")
 
-    # ── ④ Bougie M15 ─────────────────────────────────────────
-    if _m15_candle_confirmed(df_m15, direction):
+    # ── ⑤ Bougie M5 clôturée ──────────────────────────────────
+    if _m15_candle_confirmed(df_m5, direction):
         score += 15
-        reasons.append(f"🕯️ Bougie M15 clôturée  (+15)")
+        reasons.append(f"🕯️ Bougie M5 clôturée  (+15)")
 
     if score < 55:
         return None
 
-    # ── ⑤ Entrée directe (2⭐) vs entrée confirmée par retest (3⭐) ──
+    # ── ⑥ Entrée directe (2⭐) vs entrée confirmée par retest (3⭐) ──
     # Les 2 systèmes tournent en parallèle : Sweep+CHoCH suffit pour
     # tirer un signal (2⭐) ; si en plus le prix est revenu retester
     # l'OB/FVG avec une bougie de rejet, le signal passe en 3⭐.
@@ -6618,17 +6502,8 @@ def check_mss_setup(
     else:
         reasons.append("⚡ Entrée directe — Sweep+CHoCH sans retest OB/FVG  → 2⭐")
 
-    # ── v7 : Validation entrée zone stratégique ──────────────
-    entry_ok, entry_reasons, entry_bonus = _validate_strategic_entry_m15(
-        symbol, direction, df_m15, df_m5, df_h4
-    )
-    if not entry_ok:
-        return None
-    reasons += entry_reasons
-    score   += entry_bonus
-
     entry, sl, tp1, rr, tp2, tp3 = _compute_levels(
-        symbol, direction, df_m5, df_m15, ob_match, fvg_active, None, liq_map, score=score
+        symbol, direction, df_m5, df_m5, ob_match, fvg_active, None, liq_map, score=score
     )
 
     if not _rr_ok(entry, sl, tp1, direction, min_rr):
@@ -6664,20 +6539,23 @@ SETUP_LABELS = {
 
 def scan_symbol(symbol: str, mkt: str, min_rr: float = MIN_RR) -> list[SetupSignal]:
     """
-    v13 — Stratégie unique : Sweep de liquidité + Cassure de structure.
+    v16 — Stratégie unique, 100% M5, sans ancrage H4, sans biais de tendance.
 
     Fonctionnement :
-      1. Téléchargement des données H4/H1/M15/M5 (une seule fois)
-      2. Filtres communs (volatilité, news, biais H4, alignement H1)
-      3. Exécution du module unique (check_mss_setup) :
-           Sweep + BOS + CHoCH M15, LONG comme SHORT
+      1. Téléchargement des données M5 (une seule fois)
+      2. Filtres communs (volatilité, news)
+      3. Carte de liquidité construite uniquement sur M5
+      4. Test des deux directions (LONG et SHORT) : la direction est
+         déterminée UNIQUEMENT par le sweep + la cassure de structure
+         (BOS + CHoCH, corps de bougie) sur M5 — aucun filtre de biais
+         H4/H1, aucune notion de "tendance de fond"
            → entrée directe (2⭐) ou entrée confirmée par retest
              OB/FVG + bougie de rejet (3⭐)
-      4. Retourne le signal s'il passe le score minimum et le RR minimum
+      5. Retourne le(s) signal(aux) qui passent le score et le RR minimum
     """
     # ── 1. Téléchargement des données (une seule fois) ────────
     df_h4, df_h1, df_m15, df_m5, df_m1 = _fetch_data(symbol)
-    if df_h4 is None:
+    if df_m5 is None or df_m5.empty:
         return []
 
     # ── 2. Filtre volatilité + volume ─────────────────────────
@@ -6691,46 +6569,26 @@ def scan_symbol(symbol: str, mkt: str, min_rr: float = MIN_RR) -> list[SetupSign
         log.info(f"  ⛔ {symbol} — {news_reason}")
         return []
 
-    # ── 3. Biais H4 ───────────────────────────────────────────
-    bias      = htf_bias(df_h4)
-    direction = _direction_from_bias(bias)
-    if direction is None:
-        return []
+    # ── 3. Carte de liquidité — 100% M5, aucun ancrage H4 ─────
+    liq_map = build_liquidity_map(df_m5, df_m5)
 
-    # ── [Cahier des charges] SHORT UNIQUEMENT ──────────────────
-    # Le bot ne prend plus que des positions SHORT (biais H4 baissier).
-    # Un biais haussier (LONG) est simplement ignoré, aucun signal généré.
-    if SHORT_ONLY and direction != "SHORT":
-        return []
-
-    # ── 3b. FILTRE MULTI-TIMEFRAME H1 ─────────────────────────
-    if df_h1 is not None and not df_h1.empty and len(df_h1) >= 25:
-        bias_h1 = htf_bias(df_h1)
-        if bias_h1 != "NEUTRAL" and bias_h1 != bias:
-            log.debug(f"  {symbol} — H4={bias} vs H1={bias_h1} : divergence ignorée")
-            return []
-
-    # ── 4. Carte de liquidité (partagée) ─────────────────────
-    liq_map = build_liquidity_map(df_h4, df_m5)
-
-    # ── 5. Exécution du module unique : Sweep + Cassure de structure ─
+    # ── 4. Test des deux directions — Sweep + Cassure de structure M5 ─
     signals: list[SetupSignal] = []
-    try:
-        # [v15] Exécution basculée sur M5 uniquement (au lieu de M15) —
-        # zone stratégique H4 inchangée comme ancrage ; sweep, validation
-        # de corps de bougie et CHoCH/BOS sont désormais évalués sur M5.
-        # Configurable en direct via le menu Telegram (⏱ Timeframe).
-        exec_tf = df_m5 if get_timeframe_setting() == "M5" else df_m15
-        sig = check_mss_setup(symbol, df_h4, exec_tf, df_m5, direction, liq_map, min_rr)
-        if sig is not None:
-            stars = getattr(sig, "stars", 2)
-            log.info(
-                f"  ✅ Signal validé {symbol} [SWEEP+CASSURE] "
-                f"{'⭐' * stars} score={sig.score} RR={sig.rr}"
-            )
-            signals.append(sig)
-    except Exception as e:
-        log.debug(f"  {symbol} [SWEEP+CASSURE] erreur : {e}")
+    for direction in ("LONG", "SHORT"):
+        # ── [Cahier des charges] SHORT UNIQUEMENT ──────────────
+        if SHORT_ONLY and direction != "SHORT":
+            continue
+        try:
+            sig = check_mss_setup(symbol, df_m5, direction, liq_map, min_rr)
+            if sig is not None:
+                stars = getattr(sig, "stars", 2)
+                log.info(
+                    f"  ✅ Signal validé {symbol} [SWEEP+CASSURE] "
+                    f"{'⭐' * stars} {direction} score={sig.score} RR={sig.rr}"
+                )
+                signals.append(sig)
+        except Exception as e:
+            log.debug(f"  {symbol} [SWEEP+CASSURE] {direction} erreur : {e}")
 
     return signals
 
@@ -7042,20 +6900,20 @@ def run_live_v4(cat: str = "all", min_rr: float = MIN_RR, interval: int = 300) -
                         print(f"\r{prefix}  {'—':>6}  {'—':<40}  {kz_reason}")
                         continue
 
-                    # Diagnostic rapide biais (sans tout fetcher)
+                    # Diagnostic rapide (affichage console uniquement —
+                    # ne filtre plus rien : plus de biais de tendance H4,
+                    # la direction est décidée uniquement par le sweep +
+                    # la cassure de structure M5 dans scan_symbol())
                     df_peek = fetch(sym, "4h", period="5d")
-                    if df_peek.empty:
-                        print(f"\r{prefix}  {'—':>6}  {'—':<40}  ⛔ Données indisponibles")
-                        continue
+                    if not df_peek.empty:
+                        bias_str = htf_bias(df_peek)
+                    else:
+                        bias_str = "NEUTRAL"
 
-                    bias_str = htf_bias(df_peek)
-                    if bias_str == "NEUTRAL":
-                        print(f"\r{prefix}  {c('NEUT','yellow'):>6}  {'—':<40}  ⚪ Biais NEUTRAL — skip")
-                        continue
+                    bias_col = "green" if bias_str == "BULLISH" else (
+                               "red" if bias_str == "BEARISH" else "yellow")
 
-                    bias_col = "green" if bias_str == "BULLISH" else "red"
-
-                    # ── Lancement des 6 modules ───────────────
+                    # ── Lancement du module unique (Sweep + Cassure M5) ─
                     sigs = scan_symbol(sym, mkt, min_rr=min_rr)
 
                     if not sigs:
@@ -7176,7 +7034,7 @@ if __name__ == "__main__":
         formatter_class=argparse.RawTextHelpFormatter,
     )
     parser.add_argument("--symbol", default=None,
-                        help="Symbole unique (ex: GC=F, BTC-USD, EURUSD=X)")
+                        help="Symbole unique (ex: GC=F, BTC-USD, R_75, R_25)")
     parser.add_argument("--cat",    default="all",
                         choices=["gold", "priority", "btc", "deriv", "all"])
     parser.add_argument("--scan",   action="store_true",
