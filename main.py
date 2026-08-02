@@ -2,59 +2,46 @@
 
 """
 ╔══════════════════════════════════════════════════════════════════════════╗
-║       SMC SIGNAL ENGINE  v10  — FUSION COMPLÈTE (v8.6 + v9.6 + v4)     ║
+║       ALPHABOT — SMC/ICT SIGNAL ENGINE  v13 — STRATÉGIE UNIQUE          ║
 ║                                                                          ║
-║  NOUVEAUTÉS v10 (fusion) :                                               ║
-║  ✦ FETCH DUAL-MODE : yfinance (défaut) + _yahoo_chart_json() sans       ║
-║    dépendance (fallback requests pur — compatible Pydroid/Android)       ║
+║  STRATÉGIE (unique, LONG et SHORT) :                                    ║
+║  ✦ Sweep de liquidité + Cassure de structure (BOS + CHoCH) M15,        ║
+║    ancrée sur une zone H4 stratégique (OB H4 / Breaker H4 / Balance)   ║
+║  ✦ Entrée directe (Sweep + CHoCH confirmés)      → signal  ⭐⭐          ║
+║  ✦ Entrée confirmée (+ retest OB/FVG avec bougie                       ║
+║    de rejet dans les 6 dernières bougies M5)      → signal  ⭐⭐⭐        ║
+║  ✦ RR ≥ 3.0 imposé, score minimum SCORE_THRESHOLD (78/100)             ║
+║                                                                          ║
+║  MARCHÉS SCANNÉS (4, aucun autre) :                                    ║
+║  ✦ Gold (XAUUSD) et BTC-USD   → session New York UNIQUEMENT            ║
+║    (13h00–22h00 UTC)                                                    ║
+║  ✦ Volatility 75 Index (R_75) et Volatility 25 Index (R_25)            ║
+║    → 24h/24 (indices synthétiques Deriv)                                ║
+║                                                                          ║
+║  SORTIE / TP :                                                          ║
+║  ✦ TP1 = RR3 minimum · TP2 = RR5 · TP3 = RR6+                          ║
+║  ✦ À TP1 (RR3) : clôture totale possible, ou option de laisser courir  ║
+║    vers TP2/TP3 avec SL remonté à l'entrée (break-even)                ║
+║                                                                          ║
+║  GESTION DU RISQUE :                                                    ║
 ║  ✦ RISQUE EN % DU CAPITAL : ACCOUNT_BALANCE_USD + RISK_PERCENT_PER_TRADE║
-║    configurables via variables d'env (0.65% par défaut → $65 sur $10k)  ║
-║    RISK_USD calculé dynamiquement — pas de montant fixe codé en dur      ║
-║  ✦ FLASK OPTIONNEL : import protégé par try/except (pas de crash si     ║
-║    flask absent sur Pydroid)                                             ║
+║    configurables via variables d'env (0.65% par défaut → $65 sur $10k) ║
+║    RISK_USD calculé dynamiquement, lot calculé automatiquement          ║
+║  ✦ Ajustement dynamique du risque selon la série de résultats récents  ║
 ║                                                                          ║
-║  HÉRITAGE v9.6 (inchangé) :                                             ║
-║  ✦ FIX CORRÉLATION : correlation_guard() interroge désormais             ║
-║    active_trades (trades réellement ouverts) au lieu d'un TTL mémoire   ║
-║    de 10 min qui était reset à chaque cycle (bug v9.5 — aucune          ║
-║    protection réelle au-delà d'un seul scan).                           ║
-║  ✦ QUALITÉ : SCORE_THRESHOLD 78, MIN_RR 3.0,                            ║
-║    MAX_SIGNALS_GLOBAL_PER_DAY 2, ASM_SCORE_THRESHOLD_OFF 84.            ║
-║    Objectif : moins de signaux, mais seulement les meilleurs.           ║
+║  TELEGRAM :                                                             ║
+║  ✦ 2 groupes séparés : Gold+BTC (TG_GROUP_GOLD_BTC_ID) et              ║
+║    Volatility 75/25 (TG_GROUP_DERIV_ID)                                 ║
+║  ✦ Chaque signal et chaque suivi de position (TP/SL) est envoyé à la   ║
+║    fois dans le groupe concerné ET en privé à l'admin (TG_LEADER_ID)   ║
 ║                                                                          ║
-║  HÉRITAGE v9.5 (recommandation #2) :                                   ║
-║  ✦ ASSET-STRATEGY MATCHING — chaque actif scanne UNIQUEMENT son setup   ║
-║    de prédilection, établi sur l'efficacité historique observée          ║
-║    ┌────────────────────────────────────────────────────────────────┐    ║
-║    │ BTC-USD   → T1 BREAKER BLOCK M15 (spécialiste exclusif)       │    ║
-║    │ EUR/USD   → T3 ORDER BLOCK + T6 FVG (structures internes SMC) │    ║
-║    │ GBP/USD   → T3 ORDER BLOCK + T6 FVG (BOS/CHoCH internes)      │    ║
-║    │ GOLD      → T2 SUPPLY/DEMAND H1 (zones institutionnelles)      │    ║
-║    │ AUTRES    → Tous setups T1→T7, score +0 pts (généraliste)      │    ║
-║    └────────────────────────────────────────────────────────────────┘    ║
-║  ✦ MALUS HORS-SPÉCIALITÉ : setup non-spécialisé → score -15 pts         ║
-║    + seuil de validation relevé à 80/100 (vs 74 pour le setup natif)    ║
-║  ✦ BONUS SPÉCIALITÉ : setup natif de l'actif → score +10 pts bonus      ║
-║  ✦ BTC : Tier 2/3/4/5/6/7 ignorés si score < 80 (Breaker seul valide)  ║
-║                                                                          ║
-║  HÉRITAGE v9 (recommandation #1, inchangé) :                            ║
-║  ✦ MOD-1 : Limite globale → max 4 signaux/jour — reset 00h00 UTC        ║
-║  ✦ MOD-2 : Retest zones → tolérance 1.0×ATR (T1 + T2)                  ║
-║  ✦ MOD-3 : Volume Forex/Gold désactivé, crypto seuil 0.50               ║
-║  ✦ MOD-4 : Blackout news asymétrique (avant 30 min / après 10 min)      ║
-║  ✦ MOD-5 : SCORE_THRESHOLD 74 + RR flexible TP1≥1.8 & TP3≥3.0          ║
-║                                                                          ║
-║  ARCHITECTURE TIERS (inchangée) :                                        ║
-║  T1 🥇 BREAKER BLOCK    — Sweep H4 + Breaker M15 + Retest               ║
-║  T2 🥈 SUPPLY/DEMAND    — Zone H1 + Sweep + BOS M15 + Bougie            ║
-║  T3 🥉 ORDER BLOCK      — OB H4/M15 + BOS + FVG M5                     ║
-║  T4     BOS RETEST      — BOS M15 + Retest OB/FVG                       ║
-║  T5     MSS/CHoCH       — Zone H4 (OB jaune/Breaker/Balance) +          ║
-║                            BOS+CHoCH M15 (RR≥3)                          ║
-║  T6     FVG             — Fair Value Gap non mitiqué                     ║
-║  T7     AMD             — Accumulation → Manipulation → Distribution     ║
-║                                                                          ║
-║   FOREX MAJEURS  |  BTC (BUY ONLY)  |  GOLD                             ║
+║  INFRASTRUCTURE (héritée, inchangée) :                                  ║
+║  ✦ FETCH DUAL-MODE : yfinance (défaut) + _yahoo_chart_json() sans       ║
+║    dépendance (fallback requests pur — compatible Pydroid/Android)      ║
+║  ✦ FLASK OPTIONNEL : import protégé par try/except (pas de crash si    ║
+║    flask absent sur Pydroid)                                            ║
+║  ✦ Corrélation guard, filtre news, filtre volatilité, limites          ║
+║    anti-sur-trading (par symbole / globale / session / Deriv)          ║
 ╚══════════════════════════════════════════════════════════════════════════╝
 
 Installation :
@@ -62,13 +49,13 @@ Installation :
     (yfinance et flask sont optionnels — fallback requests pur / sans dashboard web)
 
 Usage :
-    python smc_engine_v10.py                    # scan complet live
-    python smc_engine_v10.py --cat forex        # forex seulement
-    python smc_engine_v10.py --cat btc          # BTC seulement
-    python smc_engine_v10.py --cat priority     # Gold + BTC
-    python smc_engine_v10.py --symbol BTC-USD   # symbole unique
-    python smc_engine_v10.py --scan             # scan unique (test)
-    python smc_engine_v10.py --min-score 80     # filtre score
+    python main.py                    # scan complet live (Gold + BTC + V75 + V25)
+    python main.py --cat gold         # Gold seulement
+    python main.py --cat btc          # BTC seulement
+    python main.py --cat deriv        # Volatility 75 + 25 seulement
+    python main.py --symbol BTC-USD   # symbole unique
+    python main.py --scan             # scan unique (test)
+    python main.py --min-score 80     # filtre score
 """
 
 import argparse
@@ -88,6 +75,16 @@ import sys
 
 import numpy as np
 import pandas as pd
+
+# ── .env — charge les variables d'environnement depuis un fichier .env situé
+# à côté de ce script, si présent (sinon les variables d'env système/du
+# shell/de la plateforme de déploiement s'appliquent normalement). Optionnel :
+# si python-dotenv n'est pas installé, on continue sans planter.
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+except ImportError:
+    pass
 
 # ── yfinance — optionnel (fallback _yahoo_chart_json si absent) ───────────
 try:
@@ -194,38 +191,21 @@ def index():
       <th>Entrée</th><th>SL 🔴</th><th>TP 🟢</th><th>R:R</th><th>Score</th><th>Lot</th>
     </tr>{signals_html}
   </table>"""}
-  <h2>⚙️ Configuration v10 (v8.6 + v9.6 fusionnés)</h2>
+  <h2>⚙️ Configuration v13 — Stratégie unique (Sweep + Cassure de structure)</h2>
   <table>
     <tr><th>Paramètre</th><th>Valeur</th></tr>
-    <tr><td>Score min (setup natif ⭐)</td><td>{SCORE_THRESHOLD}/100</td></tr>
-    <tr><td>Score min (hors-spécialité ⚠️)</td><td>{ASM_SCORE_THRESHOLD_OFF}/100</td></tr>
-    <tr><td>Bonus setup natif</td><td>+{ASM_BONUS_NATIVE} pts</td></tr>
-    <tr><td>Malus hors-spécialité</td><td>-{ASM_MALUS_OFF_SPEC} pts</td></tr>
+    <tr><td>Stratégie</td><td>Sweep de liquidité + Cassure de structure (BOS/CHoCH), LONG et SHORT</td></tr>
+    <tr><td>Entrée directe</td><td>⭐⭐ Sweep + CHoCH confirmés → signal immédiat</td></tr>
+    <tr><td>Entrée confirmée</td><td>⭐⭐⭐ + retour retester l'Order Block / FVG avec bougie de rejet</td></tr>
+    <tr><td>Score minimum</td><td>{SCORE_THRESHOLD}/100</td></tr>
     <tr><td>RR minimum</td><td>1:{MIN_RR}</td></tr>
     <tr><td>Risque/trade</td><td>{RISK_PERCENT_PER_TRADE}% (${RISK_USD:.2f} sur ${ACCOUNT_BALANCE_USD:,.0f})</td></tr>
-    <tr><td>Timeframes</td><td>H4 → H1 → M15 → M5</td></tr>
+    <tr><td>Timeframes</td><td>H4 → M15 → M5</td></tr>
     <tr><td>Max signaux/jour</td><td>{MAX_SIGNALS_GLOBAL_PER_DAY} (reset 00h00 UTC)</td></tr>
-    <tr><td>BTC</td><td>🟢 Scan 24/7 — Breaker Block M15 uniquement</td></tr>
-    <tr><td>Gold</td><td>🥇 Supply/Demand H1 prioritaire</td></tr>
+    <tr><td>Gold + BTC</td><td>🇺🇸 Scan restreint à la session New York (13h00–22h00 UTC)</td></tr>
+    <tr><td>Volatility 75 / 25</td><td>🌐 Scan 24h/24 (indices synthétiques)</td></tr>
+    <tr><td>Groupes Telegram</td><td>Gold+BTC et Volatility 75/25 → 2 groupes séparés</td></tr>
     <tr><td>Intervalle scan</td><td>5 minutes</td></tr>
-  </table>
-  <h2>🎯 Asset-Strategy Matching (v9.5)</h2>
-  <table>
-    <tr>
-      <th>Actif</th>
-      <th style='color:#2ecc71'>⭐ Setups natifs (+{ASM_BONUS_NATIVE} pts)</th>
-      <th style='color:#f39c12'>⚠️ Tolérés (-{ASM_MALUS_OFF_SPEC} pts, seuil {ASM_SCORE_THRESHOLD_OFF})</th>
-      <th style='color:#e74c3c'>🚫 Bloqués</th>
-    </tr>
-    {''.join(
-      f"<tr>"
-      f"<td><b>{sym}</b><br><small style='color:#8b949e'>{p['rationale']}</small></td>"
-      f"<td style='color:#2ecc71'>{', '.join(p['preferred'])}</td>"
-      f"<td style='color:#f39c12'>{', '.join(p['allowed']) or '—'}</td>"
-      f"<td style='color:#e74c3c'>{', '.join(p['blocked']) or '—'}</td>"
-      f"</tr>"
-      for sym, p in ASSET_STRATEGY_MAP.items()
-    )}
   </table>
 </body>
 </html>"""
@@ -330,6 +310,16 @@ LIQ_THRESHOLD   = 0.0004
 SCORE_THRESHOLD = 78
 MIN_RR          = 3.0
 
+# ── [Cahier des charges] SHORT UNIQUEMENT ──────────────────────
+# True = le bot ignore tout signal LONG et ne scanne/n'envoie que des SHORT.
+SHORT_ONLY = os.environ.get("SHORT_ONLY", "true").lower() != "false"
+
+# ── [v15] TIMEFRAME D'EXÉCUTION ─────────────────────────────────
+# "M5" = sweep, validation de corps de bougie et CHoCH/BOS évalués sur
+# M5 uniquement (zone stratégique H4 conservée comme ancrage). "M15"
+# = ancien comportement.
+EXEC_TIMEFRAME = os.environ.get("EXEC_TIMEFRAME", "M5").upper()
+
 # ── [v8.5/v10] GESTION DU RISQUE EN % DU CAPITAL ──────────────────────────
 # Risque par trade = 0.65% de la taille du compte (configurable via env).
 # ACCOUNT_BALANCE_USD peut être mis à jour sans toucher au code (dépôt/retrait).
@@ -387,13 +377,162 @@ def get_dynamic_risk_multiplier(lookback: int = RISK_LOOKBACK_TRADES) -> float:
 
 
 def get_current_risk_usd() -> float:
-    """RISK_USD ajusté dynamiquement selon la série de résultats récents (v11)."""
+    """RISK_USD ajusté dynamiquement selon la série de résultats récents (v11),
+    sauf si le Recovery a été désactivé via le menu Telegram (v14)."""
+    base = get_base_risk_usd()
+    if not is_recovery_enabled():
+        return base
     mult = get_dynamic_risk_multiplier()
-    adjusted = round(RISK_USD * mult, 2)
+    adjusted = round(base * mult, 2)
     if mult < 1.0:
         print(c(f"  [RISK] Risque réduit à {int(mult*100)}% suite aux pertes récentes "
-                f"→ ${adjusted} (au lieu de ${RISK_USD})", "yellow"))
+                f"→ ${adjusted} (au lieu de ${base})", "yellow"))
     return adjusted
+
+
+# ═════════════════════════════════════════════════════════════
+#  [v14] PARAMÈTRES CONFIGURABLES VIA TELEGRAM
+#  Solde, risque ($ ou %), levier, objectif de profit, recovery
+#  → stockés en SQLite (persistent, survit aux redéploiements),
+#  avec les constantes ci-dessus comme valeurs par défaut.
+# ═════════════════════════════════════════════════════════════
+
+_SETTINGS_DEFAULTS = {
+    "account_balance":  str(ACCOUNT_BALANCE_USD),
+    "risk_mode":        "percent",              # "percent" ou "fixed"
+    "risk_value":       str(RISK_PERCENT_PER_TRADE),  # % si mode percent, $ si mode fixed
+    "leverage":         "100",                  # levier ex: 1:100
+    "profit_target":    "0",                    # objectif de profit $ (0 = désactivé)
+    "recovery_enabled": "1",                    # "1" = recovery actif (défaut), "0" = désactivé
+    "max_volume":       "0",                    # lot max autorisé par trade (0 = pas de plafond)
+    "timeframe":        EXEC_TIMEFRAME,          # "M5" ou "M15"
+    "session_mode":     "NY",                   # "NY" (13h-22h UTC) ou "24H"
+    "active_markets":   "all",                  # "all" | "gold_btc" | "deriv"
+    "profile_label":    "",                     # nom/étiquette libre du profil
+    "prop_firm_mode":   "0",                    # "1" = règles Prop Firm actives
+    "atr_sl_mult":      "0.6",                  # multiplicateur ATR pour le Stop Loss
+}
+
+
+def _settings_init() -> None:
+    try:
+        con = sqlite3.connect(TRADE_DB, check_same_thread=False)
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS bot_settings (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+        """)
+        con.commit()
+        con.close()
+    except Exception as e:
+        print(f"  [SETTINGS] Init erreur : {e}")
+
+
+def get_setting(key: str, default: Optional[str] = None) -> str:
+    fallback = default if default is not None else _SETTINGS_DEFAULTS.get(key, "")
+    try:
+        con = sqlite3.connect(TRADE_DB, check_same_thread=False)
+        con.row_factory = sqlite3.Row
+        row = con.execute("SELECT value FROM bot_settings WHERE key = ?", (key,)).fetchone()
+        con.close()
+        return row["value"] if row else fallback
+    except Exception:
+        return fallback
+
+
+def set_setting(key: str, value: str) -> None:
+    try:
+        con = sqlite3.connect(TRADE_DB, check_same_thread=False)
+        con.execute(
+            "INSERT INTO bot_settings (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, str(value)),
+        )
+        con.commit()
+        con.close()
+    except Exception as e:
+        print(f"  [SETTINGS] Erreur écriture {key} : {e}")
+
+
+def get_account_balance() -> float:
+    try:
+        return float(get_setting("account_balance"))
+    except Exception:
+        return ACCOUNT_BALANCE_USD
+
+
+def get_risk_config() -> tuple:
+    """Retourne (mode, value) — mode = 'percent' ou 'fixed'."""
+    mode  = get_setting("risk_mode")
+    value = get_setting("risk_value")
+    try:
+        return mode, float(value)
+    except Exception:
+        return "percent", RISK_PERCENT_PER_TRADE
+
+
+def get_base_risk_usd() -> float:
+    """Risque $ de base par trade, calculé depuis les paramètres configurés
+    (solde + mode de risque), avant ajustement recovery."""
+    balance = get_account_balance()
+    mode, value = get_risk_config()
+    if mode == "fixed":
+        return round(value, 2)
+    return round(balance * value / 100.0, 2)
+
+
+def get_leverage() -> int:
+    try:
+        return int(float(get_setting("leverage")))
+    except Exception:
+        return 100
+
+
+def get_profit_target() -> float:
+    try:
+        return float(get_setting("profit_target"))
+    except Exception:
+        return 0.0
+
+
+def is_recovery_enabled() -> bool:
+    return get_setting("recovery_enabled") == "1"
+
+
+def get_max_volume() -> float:
+    try:
+        return float(get_setting("max_volume"))
+    except Exception:
+        return 0.0
+
+
+def get_timeframe_setting() -> str:
+    return get_setting("timeframe") or EXEC_TIMEFRAME
+
+
+def get_session_mode() -> str:
+    return get_setting("session_mode") or "NY"
+
+
+def get_active_markets_setting() -> str:
+    return get_setting("active_markets") or "all"
+
+
+def get_profile_label() -> str:
+    return get_setting("profile_label") or "—"
+
+
+def is_prop_firm_mode() -> bool:
+    return get_setting("prop_firm_mode") == "1"
+
+
+def get_atr_sl_mult() -> float:
+    """Multiplicateur ATR pour le Stop Loss (défaut 0.6, configurable via menu)."""
+    try:
+        return float(get_setting("atr_sl_mult"))
+    except Exception:
+        return 0.6
 
 
 # ── Septuple Traction : N bougies consécutives minimum ───────
@@ -415,7 +554,7 @@ SD_ZONE_BUFFER       = 0.15  # tolérance 15% de l'ATR pour "dans la zone"
 #  v8.2 : recalées sur l'analyse volatilité réelle (GMT+0) :
 #  ┌─────────────────────────────────────────────────────────┐
 #  │  08h00–11h00 UTC  — London Open  ⭐ volatilité forte     │
-#  │  13h30–16h00 UTC  — NY Open / overlap London ⭐⭐         │
+#  │  13h00–22h00 UTC  — NY Open / overlap London ⭐⭐         │
 #  │  Indices US (^GSPC/^NDX/^DJI) → NY Open UNIQUEMENT       │
 #  │  Tout le reste (22h-08h notamment) = faible volatilité,  │
 #  │  bloqué pour éviter les SL inutiles                      │
@@ -424,7 +563,7 @@ SD_ZONE_BUFFER       = 0.15  # tolérance 15% de l'ATR pour "dans la zone"
 
 # Kill zones exprimées en MINUTES depuis minuit UTC (permet les demi-heures, ex: 13h30)
 LONDON_KZ_MIN: tuple[int, int] = (8 * 60,       11 * 60)        # 08h00–11h00 UTC
-NY_KZ_MIN:     tuple[int, int] = (13 * 60 + 30, 16 * 60)        # 13h30–16h00 UTC
+NY_KZ_MIN:     tuple[int, int] = (13 * 60,      22 * 60)        # 13h00–22h00 UTC [v15]
 ASIAN_KZ_MIN:  tuple[int, int] = (0,            3 * 60)         # 00h00–03h00 UTC
 
 # Kill zones principales (toutes paires, sauf indices US — voir is_kill_zone_active)
@@ -444,7 +583,7 @@ ASIAN_PAIRS: set[str] = {
 SESSION_WINDOWS_UTC: list[tuple[int, int]] = KILL_ZONES_UTC
 
 
-US_INDEX_SYMBOLS = {"^GSPC", "^NDX", "^DJI"}
+US_INDEX_SYMBOLS: set[str] = set()   # indices US supprimés — plus aucun marché indice
 
 # ═════════════════════════════════════════════════════════════
 #  FILTRE NEWS ÉCONOMIQUES ⭐⭐⭐⭐⭐
@@ -586,17 +725,27 @@ def is_session_active() -> bool:
     return any(start <= now_min < end for start, end in SESSION_WINDOWS_UTC)
 
 
+def is_ny_session_active() -> bool:
+    """Session NY Open uniquement (13h00-22h00 UTC).
+    Utilisée pour restreindre Gold et BTC à la seule fenêtre New York
+    (demande utilisateur) — Londres n'est plus autorisée pour ces 2 actifs."""
+    now_min = datetime.now(timezone.utc).hour * 60 + datetime.now(timezone.utc).minute
+    ny_start, ny_end = NY_KZ_MIN
+    return ny_start <= now_min < ny_end
+
+
 def is_kill_zone_active(symbol: str = "") -> tuple[bool, str]:
     """
     Vérifie si l'heure actuelle est dans une Kill Zone autorisée pour ce symbole.
 
-    Règles [v11 — restreint à Londres + New York uniquement] :
-      • 08h00-11h00 UTC  → London Open Kill Zone   (toutes paires/actifs, SAUF indices US)
-      • 13h30-16h00 UTC  → NY Open Kill Zone       (toutes paires/actifs, indices US INCLUS)
-      • Indices US (^GSPC/^NDX/^DJI) → autorisés UNIQUEMENT sur la fenêtre NY Open
-      • Autres heures (y compris la fenêtre asiatique 00h-03h) → BLOQUÉ
-        Cette version ne trade plus la session asiatique, même sur JPY/AUD/NZD :
-        seuls Londres et New York envoient des signaux.
+    Règles [v12 — 4 marchés uniquement] :
+      • Indices Deriv (Volatility 75 / Volatility 25) → 24h/24, AUCUN filtre
+        de session (flux synthétique continu, pas de carnet d'ordres réel).
+      • Gold (XAUUSD) et BTC → UNIQUEMENT la fenêtre NY Open
+        (13h00-22h00 UTC). Londres n'est plus autorisée pour ces 2 actifs.
+      • Tout autre symbole (legacy) → Londres (08h-11h) + NY (13h30-16h)
+        UTC, conservé pour compatibilité mais non utilisé (plus aucun
+        Forex/indice n'est scanné).
 
     Retourne (True, nom_session) ou (False, raison_blocage).
     """
@@ -607,19 +756,32 @@ def is_kill_zone_active(symbol: str = "") -> tuple[bool, str]:
     london_start, london_end = LONDON_KZ_MIN
     ny_start, ny_end         = NY_KZ_MIN
 
+    # Indices Deriv (Volatility 75/25) — 24h/24, aucun filtre de session
+    if is_deriv_symbol(symbol):
+        return True, "🌐 Deriv — 24h/24 (aucun filtre de session)"
+
+    # [v15] Mode session configurable via le menu Telegram (🌎 Session) :
+    # "24H" désactive la fenêtre NY pour Gold/BTC aussi (scan continu).
+    if get_session_mode() == "24H":
+        return True, "🌐 Mode 24H (session filter désactivé via menu)"
+
+    # Gold + BTC — réservés à la session New York uniquement
+    if symbol in GOLD_SYMBOLS or is_crypto_symbol(symbol):
+        if ny_start <= now_min < ny_end:
+            return True, "🇺🇸 NY Open KZ (13h00-22h00 UTC)"
+        return False, f"⛔ Gold/BTC — hors fenêtre NY Open (13h00-22h00 UTC), actuellement {hh_mm}"
+
     # Indices US — alignés UNIQUEMENT sur l'ouverture NY (pas de fenêtre Londres)
     if symbol in US_INDEX_SYMBOLS:
         if ny_start <= now_min < ny_end:
-            return True, "🇺🇸 NY Open KZ (13h30-16h00 UTC)"
-        return False, f"⛔ Indice US — hors fenêtre NY Open (13h30-16h00 UTC), actuellement {hh_mm}"
+            return True, "🇺🇸 NY Open KZ (13h00-22h00 UTC)"
+        return False, f"⛔ Indice US — hors fenêtre NY Open (13h00-22h00 UTC), actuellement {hh_mm}"
 
-    # Kill zone London Open
+    # Legacy (Forex — non utilisé, plus aucune paire scannée)
     if london_start <= now_min < london_end:
         return True, "🇬🇧 London Open KZ (08h00-11h00 UTC)"
-
-    # Kill zone NY Open
     if ny_start <= now_min < ny_end:
-        return True, "🇺🇸 NY Open KZ (13h30-16h00 UTC)"
+        return True, "🇺🇸 NY Open KZ (13h00-22h00 UTC)"
 
     return False, f"⛔ {hh_mm} UTC — hors Londres/New York, aucun signal envoyé"
 
@@ -636,7 +798,7 @@ def is_crypto_symbol(symbol: str) -> bool:
 # v8 : BTC — on bloque les signaux SELL/SHORT sur BTC (tendance haussière forte)
 BTC_SELL_BLOCKED = False
 
-GOLD_SYMBOLS = {"GC=F", "SI=F", "CL=F", "BZ=F"}
+GOLD_SYMBOLS = {"GC=F"}
 
 # [v11] Gold + BTC uniquement : pipeline Supply/Demand dédié M15(zone) → M1(entrée)
 GOLD_BTC_M1_SYMBOLS = {"GC=F", "BTC-USD"}
@@ -735,21 +897,23 @@ def check_volatility(symbol: str, df_ltf: pd.DataFrame,
             if vol_ratio < 0.50:
                 return False, f"volume crypto faible ({round(vol_ratio*100,0)}% de la moyenne 20)"
 
-    # Les cryptos (BTC) tradent 24/7 — mais on bloque la nuit comme le Forex
-    # (mêmes Kill Zones : 08h-11h / 13h30-16h UTC) pour éviter les SL inutiles
+    # BTC — restreint à la seule session New York (demande utilisateur,
+    # Londres n'est plus autorisée pour BTC désormais).
     if is_crypto_symbol(symbol):
-        kz_ok, kz_reason = is_kill_zone_active(symbol)
-        if not kz_ok:
-            return False, kz_reason
+        if not is_ny_session_active():
+            return False, "hors session NY Open (13h00-22h00 UTC) — BTC réservé à NY"
         return True, ""
     # Indices Deriv (Volatility) : flux synthétique 24/7, pas de session ni
     # de kill zone réelle (pas de carnet d'ordres interbancaire derrière).
     if is_deriv_symbol(symbol):
         return True, ""
-    # Gold/matières premières : filtre session spécifique (dim soir ok)
+    # Gold : ouvert dim 23h-ven, mais restreint à la session NY uniquement
+    # (demande utilisateur — Londres n'est plus autorisée pour Gold).
     if symbol in GOLD_SYMBOLS:
         if not is_gold_session_active():
             return False, "weekend — Gold fermé (sam + dim avant 23h UTC)"
+        if not is_ny_session_active():
+            return False, "hors session NY Open (13h00-22h00 UTC) — Gold réservé à NY"
         return True, ""
     if is_weekend():
         return False, "weekend — marché fermé (Forex)"
@@ -861,8 +1025,11 @@ def correlation_guard(symbol: str, direction: str) -> tuple[bool, str]:
 # ─────────────────────────────────────────────────────────────
 #  TELEGRAM
 # ─────────────────────────────────────────────────────────────
-_TG_TOKEN_ENV = os.environ.get("TG_TOKEN", "8665812395:AAGQl3fLE5g5fhq2ZXsW0qm7DAxrCgVCGSw")
-# TG_ENABLED : true automatiquement si TG_TOKEN est défini, sauf si explicitement désactivé
+# SÉCURITÉ : aucune valeur par défaut codée en dur. Si TG_TOKEN n'est pas
+# défini dans l'environnement (.env), Telegram reste désactivé — le moteur
+# ne doit JAMAIS retomber sur un token ou un chat/group ID appartenant à
+# quelqu'un d'autre.
+_TG_TOKEN_ENV = os.environ.get("TG_TOKEN", "8632763755:AAECibBa64ftswCGuDMF3DPFR5cuWKpQ_ZI")
 _TG_ENABLED   = bool(_TG_TOKEN_ENV) if os.environ.get("TG_ENABLED", "") == "" else \
                 os.environ.get("TG_ENABLED", "false").lower() == "true"
 
@@ -871,8 +1038,22 @@ if not _TG_TOKEN_ENV:
 
 TELEGRAM_TOKEN     = _TG_TOKEN_ENV
 TELEGRAM_CHAT_ID   = None
-TELEGRAM_GROUP_ID  = "-1002335466840"
+TELEGRAM_GROUP_ID  = os.environ.get("TG_GROUP_ID", "-1002335466840")
 TELEGRAM_LEADER_ID = os.environ.get("TG_LEADER_ID", "6982051442")
+
+# ── Groupes dédiés par marché ──────────────────────────────────
+# Deriv (Volatility 75 / Volatility 25) → groupe Deriv
+# Gold (XAUUSD) + BTC → groupe Gold/BTC
+# Surchargeables via variables d'env (TG_GROUP_DERIV_ID / TG_GROUP_GOLD_BTC_ID)
+TELEGRAM_GROUP_DERIV_ID    = os.environ.get("TG_GROUP_DERIV_ID", "-1002335466840")
+TELEGRAM_GROUP_GOLD_BTC_ID = os.environ.get("TG_GROUP_GOLD_BTC_ID", "-5281258868")
+
+
+def get_group_id_for_symbol(symbol: str) -> str:
+    """Retourne le groupe Telegram approprié selon le marché du signal."""
+    if is_deriv_symbol(symbol):
+        return TELEGRAM_GROUP_DERIV_ID
+    return TELEGRAM_GROUP_GOLD_BTC_ID
 
 SIGNAL_COOLDOWN = 1800   # v8 : 30 min minimum entre 2 signaux sur la même paire (était 600)
 _signal_cache: dict[str, float] = {}
@@ -885,7 +1066,10 @@ PRICE_LEVEL_TOLERANCE = 0.0003  # 0.03% — ne pas renvoyer si entry quasi-ident
 # ── Trade Management — base de données persistante ────────────
 # Astuce Render : définir TRADE_DB_PATH=/opt/render/project/src/trades.db
 # dans les variables d'environnement pour persistance entre redémarrages.
-TRADE_DB                = os.environ.get("TRADE_DB_PATH", "/opt/render/project/src/trades.db")
+TRADE_DB                = os.environ.get(
+    "TRADE_DB_PATH",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "trades.db"),
+)
 TRADE_MONITOR_INTERVAL  = 60   # secondes entre chaque vérification des prix
 
 
@@ -1066,6 +1250,24 @@ def _init_trade_db() -> None:
     except Exception as e:
         print(f"  [TRADE_DB] Init erreur : {e}")
 
+    # ── [v14] Migration : colonnes RR1 (BE) / RR2 (clôture partielle) ──
+    # Ajoutées à part des TP1/TP2/TP3 existants (non modifiés) — servent
+    # à des rappels intermédiaires plus précoces, conformes au cahier
+    # des charges (RR1=sécuriser, RR2=clôture partielle, RR3=laisser
+    # courir, RR6=objectif final — RR3/RR6 = TP1/TP3 déjà existants).
+    try:
+        con = sqlite3.connect(TRADE_DB, check_same_thread=False)
+        for col in ("rr1 REAL DEFAULT 0", "rr2 REAL DEFAULT 0",
+                    "rr1_hit INTEGER DEFAULT 0", "rr2_hit INTEGER DEFAULT 0"):
+            try:
+                con.execute(f"ALTER TABLE active_trades ADD COLUMN {col}")
+            except Exception:
+                pass  # colonne déjà présente
+        con.commit()
+        con.close()
+    except Exception as e:
+        print(f"  [TRADE_DB] Migration RR1/RR2 erreur : {e}")
+
 
 def register_trade(sig: "Signal", signal_num: int, setup_type: str = "SMC") -> str:
     """
@@ -1076,19 +1278,30 @@ def register_trade(sig: "Signal", signal_num: int, setup_type: str = "SMC") -> s
     trade_id = str(uuid.uuid4())[:8].upper()
     tp2 = getattr(sig, "tp2", 0.0) or 0.0
     tp3 = getattr(sig, "tp3", 0.0) or 0.0
+
+    # ── [v14] RR1 (sécuriser/BE) et RR2 (clôture partielle) ────
+    # Calculés indépendamment des TP1/TP2/TP3 existants (non touchés).
+    risk = abs(sig.entry - sig.sl)
+    if sig.direction == "LONG":
+        rr1 = round(sig.entry + 1 * risk, 6)
+        rr2 = round(sig.entry + 2 * risk, 6)
+    else:
+        rr1 = round(sig.entry - 1 * risk, 6)
+        rr2 = round(sig.entry - 2 * risk, 6)
+
     try:
         con = sqlite3.connect(TRADE_DB, check_same_thread=False)
         con.execute("PRAGMA journal_mode=WAL")
         con.execute("""
             INSERT OR IGNORE INTO active_trades
             (trade_id, symbol, direction, entry, sl, tp1, tp2, tp3,
-             lot, signal_num, setup_type, timestamp)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+             lot, signal_num, setup_type, timestamp, rr1, rr2)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             trade_id, sig.symbol, sig.direction,
             sig.entry, sig.sl, sig.tp, tp2, tp3,
             sig.lot, signal_num, setup_type,
-            datetime.now(timezone.utc).isoformat()
+            datetime.now(timezone.utc).isoformat(), rr1, rr2
         ))
         con.commit()
         con.close()
@@ -1248,7 +1461,7 @@ def get_active_trades() -> list[dict]:
 # Whitelist of allowed column names for update_trade_field (prevents SQL injection)
 _ALLOWED_TRADE_FIELDS = frozenset({
     "tp1_hit", "tp2_hit", "tp3_hit", "sl_hit", "closed", "be_set",
-    "close_price", "close_time", "pnl_pips"
+    "close_price", "close_time", "pnl_pips", "rr1_hit", "rr2_hit",
 })
 
 
@@ -1351,22 +1564,46 @@ def _fmt_trade_alert(trade: dict, event: str, price: float) -> str:
 
     SEP = "─" * 28
 
-    if event == "TP1":
+    if event == "RR1":
         return (
-            f"🎯 <b>TP1 TOUCHÉ !</b>  {num_str}\n"
+            f"🔒 <b>RR1 ATTEINT — Sécurise si tu veux</b>  {num_str}\n"
             f"{SEP}\n"
             f"{dir_emoji} <b>{sym_display}</b>  {dir_label}\n"
             f"💰 Entrée : <code>{entry}</code>\n"
-            f"✅ TP1 atteint : <code>{tp1}</code>\n"
             f"📍 Prix actuel : <code>{p_now}</code>\n"
-            f"💵 Gain estimé : <b>+$100</b>\n"
             f"{SEP}\n"
-            f"⚡ <b>ACTIONS IMMÉDIATES :</b>\n"
-            f"  • Ferme <b>30–50%</b> de ta position\n"
-            f"  • 🔒 Déplace SL → <code>{entry}</code> <b>(Break Even)</b>\n"
-            f"  • Laisse courir vers TP2 : {tp2_s}\n"
+            f"⚡ <b>Possibilité :</b> déplacer le SL sur <code>{entry}</code> "
+            f"(Break Even) pour sécuriser — au choix\n"
             f"{SEP}\n"
-            f"💡 Tu es maintenant en <b>risque zéro</b>\n"
+            f"<i>@smcsignalspro</i>"
+        )
+    elif event == "RR2":
+        return (
+            f"💰 <b>RR2 ATTEINT — Clôture partielle possible</b>  {num_str}\n"
+            f"{SEP}\n"
+            f"{dir_emoji} <b>{sym_display}</b>  {dir_label}\n"
+            f"📍 Prix actuel : <code>{p_now}</code>\n"
+            f"{SEP}\n"
+            f"⚡ <b>Possibilité :</b> clôturer une partie de la position ici, "
+            f"pour ceux qui veulent sécuriser des gains — au choix\n"
+            f"{SEP}\n"
+            f"<i>@smcsignalspro</i>"
+        )
+    elif event == "TP1":
+        return (
+            f"🎯 <b>TP1 TOUCHÉ (RR3) !</b>  {num_str}\n"
+            f"{SEP}\n"
+            f"{dir_emoji} <b>{sym_display}</b>  {dir_label}\n"
+            f"💰 Entrée : <code>{entry}</code>\n"
+            f"✅ TP1 atteint : <code>{tp1}</code>  (RR ≥ 3)\n"
+            f"📍 Prix actuel : <code>{p_now}</code>\n"
+            f"{SEP}\n"
+            f"⚡ <b>2 OPTIONS AU CHOIX :</b>\n"
+            f"  1️⃣ <b>Clôture totale ici</b> — sécurise le RR3 en entier\n"
+            f"  2️⃣ <b>Laisser courir</b> vers TP2 ({tp2_s}) / TP3 ({tp3_s})\n"
+            f"      → 🔒 Déplace alors le SL sur <code>{entry}</code> (Break Even)\n"
+            f"{SEP}\n"
+            f"💡 Les deux options sont valables — à toi de choisir selon ta gestion\n"
             f"<i>@smcsignalspro</i>"
         )
     elif event == "TP2":
@@ -1451,8 +1688,9 @@ def _send_trade_alert(trade: dict, event: str, price: float) -> None:
         ok = tg_send(msg, TELEGRAM_LEADER_ID)
         if ok:
             sent = True
-    if TELEGRAM_GROUP_ID:
-        tg_send(msg, TELEGRAM_GROUP_ID)
+    target_group = get_group_id_for_symbol(trade.get("symbol", ""))
+    if target_group:
+        tg_send(msg, target_group)
         sent = True
     icon = "✓" if sent else "✗"
     col  = "cyan" if sent else "red"
@@ -1500,6 +1738,28 @@ def _monitor_trades_loop() -> None:
                             trade["sl_hit"] = 1
                             trade["closed"] = 1
                             continue   # trade clôturé
+
+                    # ── [v14] RR1 touché (sécuriser / BE possible) ─
+                    if not trade.get("rr1_hit", 0) and trade.get("rr1", 0):
+                        rr1_hit = (
+                            (direction == "LONG"  and price >= trade["rr1"]) or
+                            (direction == "SHORT" and price <= trade["rr1"])
+                        )
+                        if rr1_hit:
+                            update_trade_field(trade["trade_id"], "rr1_hit", 1)
+                            _send_trade_alert(trade, "RR1", price)
+                            trade["rr1_hit"] = 1
+
+                    # ── [v14] RR2 touché (clôture partielle possible) ─
+                    if not trade.get("rr2_hit", 0) and trade.get("rr2", 0):
+                        rr2_hit = (
+                            (direction == "LONG"  and price >= trade["rr2"]) or
+                            (direction == "SHORT" and price <= trade["rr2"])
+                        )
+                        if rr2_hit:
+                            update_trade_field(trade["trade_id"], "rr2_hit", 1)
+                            _send_trade_alert(trade, "RR2", price)
+                            trade["rr2_hit"] = 1
 
                     # ── TP1 touché ────────────────────────────
                     if not trade["tp1_hit"] and trade["tp1"] > 0:
@@ -1668,12 +1928,248 @@ def _build_daily_report(date_str: str | None = None) -> str:
     return msg
 
 
+def _category_symbols(category: str) -> set:
+    """Renvoie l'ensemble des symboles ('GC=F','BTC-USD',...) d'une catégorie."""
+    if category == "gold_btc":
+        return {s for s, _ in TIER_1_PRIORITY}
+    return {s for s, _ in DERIV_SYMBOLS}
+
+
+def _build_perf_report(category: str, period: str = "daily") -> str:
+    """
+    Construit le rapport de performance texte pour une catégorie
+    ('gold_btc' ou 'deriv') sur une période ('daily' ou 'weekly').
+    Détail complet : winrate, R total, par instrument (Gold vs BTC /
+    V75 vs V25) et par setup.
+    """
+    from collections import defaultdict
+    from datetime import timedelta
+
+    cat_symbols = _category_symbols(category)
+    sym_labels  = dict(TIER_1_PRIORITY + DERIV_SYMBOLS)
+
+    stats  = [s for s in get_signal_stats(2000) if s["symbol"] in cat_symbols]
+    now    = datetime.now(timezone.utc)
+
+    if period == "daily":
+        date_str      = now.strftime("%Y-%m-%d")
+        period_trades = [s for s in stats if s["result"] != "open"
+                          and s["timestamp"].startswith(date_str)]
+        period_label  = f"📅 {date_str}  —  21h00 UTC"
+        period_word   = "Aujourd'hui"
+        compare_word   = "7 derniers jours"
+        compare_days   = 7
+    else:
+        week_start    = (now - timedelta(days=7)).strftime("%Y-%m-%d")
+        period_trades = [s for s in stats if s["result"] != "open"
+                          and s["timestamp"] >= week_start]
+        period_label  = f"📅 Semaine du {week_start} au {now.strftime('%Y-%m-%d')}"
+        period_word   = "Cette semaine"
+        compare_word   = "28 derniers jours"
+        compare_days   = 28
+
+    open_t = [s for s in stats if s["result"] == "open"]
+
+    wins   = [s for s in period_trades if s["pnl_r"] > 0]
+    losses = [s for s in period_trades if s["pnl_r"] <= 0]
+    wr     = round(len(wins) / max(len(period_trades), 1) * 100)
+    total_r= round(sum(s["pnl_r"] for s in period_trades), 2)
+    avg_r  = round(sum(s["pnl_r"] for s in period_trades) / max(len(period_trades), 1), 2)
+
+    ref_start   = (now - timedelta(days=compare_days)).strftime("%Y-%m-%d")
+    ref_trades  = [s for s in stats if s["result"] != "open" and s["timestamp"] >= ref_start]
+    ref_wins    = [s for s in ref_trades if s["pnl_r"] > 0]
+    ref_wr      = round(len(ref_wins) / max(len(ref_trades), 1) * 100)
+    ref_total_r = round(sum(s["pnl_r"] for s in ref_trades), 2)
+
+    if not period_trades:
+        emoji, bilan = "😶", "Aucun trade clôturé"
+    elif wr >= 70:
+        emoji, bilan = "🔥", "Excellente performance !"
+    elif wr >= 50:
+        emoji, bilan = "✅", "Performance positive"
+    else:
+        emoji, bilan = "⚠️", "Période difficile — à analyser"
+
+    # ── Détail par instrument (Gold vs BTC / V75 vs V25) ──────
+    by_symbol: dict = defaultdict(list)
+    for s in period_trades:
+        by_symbol[s["symbol"]].append(s["pnl_r"])
+    symbol_lines = ""
+    for sym, rs in sorted(by_symbol.items(), key=lambda x: -sum(x[1])):
+        w      = sum(1 for r in rs if r > 0)
+        w_rate = int(w / len(rs) * 100)
+        emo    = "✅" if w_rate >= 50 else "❌"
+        label  = sym_labels.get(sym, sym)
+        symbol_lines += f"  {emo} {label:<20} {len(rs)}t  WR {w_rate}%  {round(sum(rs),2):+.1f}R\n"
+    if not symbol_lines:
+        symbol_lines = "  — aucun trade\n"
+
+    # ── Détail par setup ───────────────────────────────────────
+    by_setup: dict = defaultdict(list)
+    for s in period_trades:
+        by_setup[s["setup_type"]].append(s["pnl_r"])
+    setup_lines = ""
+    for stype, rs in sorted(by_setup.items(), key=lambda x: -sum(x[1])):
+        w      = sum(1 for r in rs if r > 0)
+        w_rate = int(w / len(rs) * 100)
+        emo    = "✅" if w_rate >= 50 else "❌"
+        setup_lines += f"  {emo} {stype:<12} {len(rs)}t  WR {w_rate}%  {round(sum(rs),2):+.1f}R\n"
+    if not setup_lines:
+        setup_lines = "  — aucun trade\n"
+
+    title = ("🥇 <b>RAPPORT PERFORMANCE — GOLD + BTC</b>" if category == "gold_btc"
+              else "📡 <b>RAPPORT PERFORMANCE — DERIV (V75 / V25)</b>")
+
+    msg = (
+        f"{title}\n"
+        f"{period_label}\n"
+        f"{'─'*32}\n"
+        f"{emoji}  <b>{bilan}</b>\n\n"
+        f"<b>{period_word} :</b>\n"
+        f"  📈 Trades clôturés : <b>{len(period_trades)}</b>  "
+        f"({len(wins)} ✅  {len(losses)} ❌)\n"
+        f"  🎯 Winrate : <b>{wr}%</b>\n"
+        f"  💰 Total R : <b>{total_r:+.2f}R</b>  (moy {avg_r:+.2f}R)\n"
+        f"  ⏳ Ouverts : {len(open_t)} signal(s) en cours\n\n"
+        f"<b>{compare_word} :</b>\n"
+        f"  🗓️ {len(ref_trades)} trades  WR <b>{ref_wr}%</b>  "
+        f"Total <b>{ref_total_r:+.2f}R</b>\n\n"
+        f"<b>Par instrument :</b>\n{symbol_lines}\n"
+        f"<b>Par setup :</b>\n{setup_lines}"
+        f"{'─'*32}\n"
+        f"🧠 Patience • Discipline • Résultat\n"
+        f"@smcsignalspro"
+    )
+    return msg
+
+
+def generate_perf_chart(category: str, period: str = "daily") -> Optional[str]:
+    """
+    Génère une image claire (barres R, thème sombre) résumant la performance
+    d'une catégorie sur les 14 derniers jours (daily) ou 8 dernières semaines
+    (weekly), et retourne le chemin /tmp/*.png (ou None si échec/pas de data).
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from collections import defaultdict
+        from datetime import timedelta
+
+        cat_symbols = _category_symbols(category)
+        stats = [s for s in get_signal_stats(3000)
+                 if s["symbol"] in cat_symbols and s["result"] != "open"]
+
+        now = datetime.now(timezone.utc)
+        buckets: dict = defaultdict(float)
+
+        if period == "daily":
+            for i in range(13, -1, -1):
+                d = (now - timedelta(days=i)).strftime("%Y-%m-%d")
+                buckets[d] = 0.0
+            for s in stats:
+                d = s["timestamp"][:10]
+                if d in buckets:
+                    buckets[d] += s["pnl_r"]
+            labels   = list(buckets.keys())
+            x_labels = [d[5:] for d in labels]
+            chart_title = "Performance quotidienne (14 derniers jours)"
+        else:
+            for i in range(7, -1, -1):
+                wk = now - timedelta(weeks=i)
+                key = wk.strftime("%Y-S%W")
+                buckets[key] = 0.0
+            for s in stats:
+                ts  = datetime.fromisoformat(s["timestamp"])
+                key = ts.strftime("%Y-S%W")
+                if key in buckets:
+                    buckets[key] += s["pnl_r"]
+            labels   = list(buckets.keys())
+            x_labels = [l[-3:] for l in labels]
+            chart_title = "Performance hebdomadaire (8 dernières semaines)"
+
+        values = [buckets[k] for k in labels]
+        if not any(values):
+            pass  # on affiche quand même le graphique vide plutôt que rien
+
+        BG, BG2  = "#0a0c10", "#0d1117"
+        GREEN, RED, GRAY, FG = "#22c55e", "#ef4444", "#94a3b8", "#e2e8f0"
+
+        fig, ax = plt.subplots(figsize=(10, 5.2), dpi=110, facecolor=BG)
+        ax.set_facecolor(BG2)
+        colors = [GREEN if v >= 0 else RED for v in values]
+        ax.bar(range(len(values)), values, color=colors, width=0.6, zorder=3)
+        ax.axhline(0, color="#334155", lw=0.8, zorder=2)
+        ax.set_xticks(range(len(x_labels)))
+        ax.set_xticklabels(x_labels, color=GRAY, fontsize=9, rotation=45, ha="right")
+        ax.tick_params(colors=GRAY, labelsize=9)
+        for spine in ax.spines.values():
+            spine.set_color("#1e293b")
+        cumul = round(sum(values), 2)
+        cat_name = "Gold + BTC" if category == "gold_btc" else "Deriv — V75 / V25"
+        ax.set_title(f"{cat_name}\n{chart_title}  •  Cumul {cumul:+.2f}R",
+                     color=FG, fontsize=13, fontweight="bold")
+        ax.set_ylabel("R", color=GRAY)
+        ax.grid(axis="y", color="#1e293b", lw=0.5, ls="--", alpha=0.6, zorder=0)
+        plt.tight_layout()
+
+        path = f"/tmp/perf_{category}_{period}_{int(time.time())}.png"
+        fig.savefig(path, dpi=110, facecolor=BG, bbox_inches="tight")
+        plt.close(fig)
+        import gc as _gc; _gc.collect()
+        return path
+
+    except Exception as e:
+        print(f"  [CHART] Erreur génération graphique perf : {e}")
+        return None
+
+
+def _send_perf_report(category: str, period: str = "daily") -> None:
+    """
+    Construit et envoie le rapport de performance complet (image claire +
+    texte détaillé) pour une catégorie, au groupe Telegram dédié et en privé
+    à l'admin.
+    """
+    if not _TG_ENABLED:
+        log.info(f"  [RAPPORT] {category}/{period} ignoré — TG_ENABLED=false")
+        return
+
+    group_id = TELEGRAM_GROUP_DERIV_ID if category == "deriv" else TELEGRAM_GROUP_GOLD_BTC_ID
+    full_msg = _build_perf_report(category, period)
+    chart_path = generate_perf_chart(category, period)
+
+    cat_name    = "Gold + BTC" if category == "gold_btc" else "Deriv V75/V25"
+    period_name = "Quotidien" if period == "daily" else "Hebdomadaire"
+    caption = (f"📊 <b>Rapport {period_name} — {cat_name}</b>\n"
+               f"📈 Graphique de performance ci-dessus — détail complet ⬇️")
+
+    targets = [t for t in (group_id, TELEGRAM_LEADER_ID) if t]
+    for chat_id in targets:
+        if chart_path:
+            ok = tg_send_photo(chart_path, caption, chat_id)
+            if not ok:
+                tg_send(full_msg, chat_id)
+                continue
+        tg_send(full_msg, chat_id)
+
+    if chart_path:
+        try:
+            os.remove(chart_path)
+        except OSError:
+            pass
+
+    log.info(f"  [RAPPORT] ✓ {period}/{category} envoyé ({len(targets)} destinataire(s))")
+
+
 def _daily_report_loop() -> None:
     """
-    Thread qui attend chaque jour 21h00 UTC et envoie le rapport.
-    Utilise un sleep adaptatif pour viser exactement 21:00:00 UTC.
+    Thread qui attend chaque jour 21h00 UTC et envoie 2 rapports séparés
+    (Gold+BTC puis Deriv V75/V25), chacun avec un graphique clair + le
+    détail texte complet. Utilise un sleep adaptatif pour viser 21:00:00 UTC.
     """
-    print(c("  ✓ Rapport journalier activé — envoi chaque jour à 21h00 UTC", "cyan"))
+    print(c("  ✓ Rapport journalier activé — envoi chaque jour à 21h00 UTC "
+            "(Gold+BTC et Deriv séparément)", "cyan"))
     while True:
         try:
             now   = datetime.now(timezone.utc)
@@ -1686,16 +2182,11 @@ def _daily_report_loop() -> None:
             log.info(f"  [RAPPORT] Prochain rapport dans {int(wait_sec//3600)}h{int((wait_sec%3600)//60)}m")
             time.sleep(wait_sec)
 
-            # Construction + envoi
             date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-            msg      = _build_daily_report(date_str)
-            sent     = False
-            if TELEGRAM_GROUP_ID:
-                sent = tg_send(msg, TELEGRAM_GROUP_ID)
-            if TELEGRAM_LEADER_ID:
-                tg_send(msg, TELEGRAM_LEADER_ID)
-            log.info(f"  [RAPPORT] ✓ Rapport {date_str} envoyé (group={sent})")
-            # Afficher aussi dans la console
+            _send_perf_report("gold_btc", "daily")
+            _send_perf_report("deriv", "daily")
+
+            # Affichage console
             print(c(f"\n  📊 RAPPORT JOURNALIER {date_str} ─────────────────", "cyan"))
             print_stats_summary()
             time.sleep(60)   # évite double envoi en cas de drift
@@ -1708,6 +2199,422 @@ def _daily_report_loop() -> None:
 def _daily_report_thread() -> None:
     """Lance le thread du rapport journalier."""
     t = threading.Thread(target=_daily_report_loop, daemon=True, name="daily-report")
+    t.start()
+    return t
+
+
+def _weekly_report_loop() -> None:
+    """
+    Thread qui attend chaque dimanche 21h05 UTC (juste après le rapport
+    quotidien) et envoie 2 rapports hebdomadaires séparés (Gold+BTC puis
+    Deriv V75/V25), chacun avec graphique + détail texte complet.
+    """
+    print(c("  ✓ Rapport hebdomadaire activé — envoi chaque dimanche à 21h05 UTC "
+            "(Gold+BTC et Deriv séparément)", "cyan"))
+    while True:
+        try:
+            from datetime import timedelta
+            now = datetime.now(timezone.utc)
+            days_until_sunday = (6 - now.weekday()) % 7  # weekday(): lundi=0 ... dimanche=6
+            next_run = (now + timedelta(days=days_until_sunday)).replace(
+                hour=21, minute=5, second=0, microsecond=0)
+            if next_run <= now:
+                next_run += timedelta(days=7)
+            wait_sec = (next_run - now).total_seconds()
+            log.info(f"  [RAPPORT HEBDO] Prochain rapport dans "
+                     f"{int(wait_sec//86400)}j {int((wait_sec % 86400)//3600)}h")
+            time.sleep(wait_sec)
+
+            _send_perf_report("gold_btc", "weekly")
+            _send_perf_report("deriv", "weekly")
+
+            print(c(f"\n  📊 RAPPORT HEBDOMADAIRE ─────────────────", "cyan"))
+            time.sleep(60)
+
+        except Exception as e:
+            log.error(f"  [RAPPORT HEBDO] Erreur : {e}")
+            time.sleep(300)
+
+
+def _weekly_report_thread() -> None:
+    """Lance le thread du rapport hebdomadaire."""
+    t = threading.Thread(target=_weekly_report_loop, daemon=True, name="weekly-report")
+    t.start()
+    return t
+
+
+# ─────────────────────────────────────────────────────────────
+#  COMMANDE ADMIN  /rapport  — 2 rapports indépendants
+#  Deriv (V75/V25) → TELEGRAM_GROUP_DERIV_ID
+#  Gold + BTC      → TELEGRAM_GROUP_GOLD_BTC_ID
+# ─────────────────────────────────────────────────────────────
+
+def _build_category_report(category: str) -> str:
+    """Construit le rapport /rapport pour une catégorie ('deriv' ou 'gold_btc') :
+    catégorie → état du marché → signaux disponibles → trades actifs →
+    derniers signaux."""
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+    if category == "deriv":
+        title       = "📡 <b>RAPPORT DERIV — Volatility 75 / Volatility 25</b>"
+        cat_symbols = DERIV_SYMBOLS
+        cat_labels  = {"Volatility 75 Index", "Volatility 25 Index"}
+    else:
+        title       = "🥇 <b>RAPPORT GOLD + BTC</b>"
+        cat_symbols = TIER_1_PRIORITY
+        cat_labels  = {"Gold", "Bitcoin"}
+
+    sep = "─" * 30
+    lines = [title, f"🕐 <code>{ts}</code>", sep, "<b>📊 État du marché :</b>"]
+
+    for sym, label in cat_symbols:
+        ok, reason = is_kill_zone_active(sym)
+        icon = "🟢" if ok else "🔴"
+        lines.append(f"{icon} {label} ({sym}) — {reason}")
+
+    lines.append(sep)
+    lines.append("<b>⚡ Signaux disponibles aujourd'hui :</b>")
+    for sym, label in cat_symbols:
+        used = _daily_counts.get(sym, 0)
+        lines.append(f"• {label} : {used}/{MAX_SIGNALS_PER_DAY} signaux/jour")
+    if category == "deriv":
+        lines.append(f"• Cumul Deriv (V75+V25) : {_daily_deriv_count}/{MAX_SIGNALS_DERIV_PER_DAY}")
+    lines.append(f"• Cumul global (4 marchés) : {_daily_global_count}/{MAX_SIGNALS_GLOBAL_PER_DAY}")
+
+    lines.append(sep)
+    lines.append("<b>📈 Trades actifs :</b>")
+    cat_sym_set = {s for s, _ in cat_symbols}
+    try:
+        active = [t for t in get_active_trades() if t.get("symbol") in cat_sym_set]
+    except Exception as e:
+        active = []
+        lines.append(f"⚠ Erreur lecture trades actifs : {e}")
+    if active:
+        for t in active:
+            dir_emoji = "🟢" if t["direction"] in ("LONG", "BUY") else "🔴"
+            lines.append(
+                f"{dir_emoji} {t['symbol']} {t['direction']} — Entry <code>{t['entry']}</code> "
+                f"| SL <code>{t['sl']}</code> | TP1 <code>{t['tp1']}</code>"
+            )
+    else:
+        lines.append("Aucun trade actif")
+
+    lines.append(sep)
+    lines.append("<b>🕓 Derniers signaux envoyés :</b>")
+    with _STATUS_LOCK:
+        recent = [s for s in reversed(_STATUS["last_signals"]) if s.get("market") in cat_labels][:5]
+    if recent:
+        for s in recent:
+            lines.append(
+                f"• {s['ts']} — {s['market']} {s['direction']} "
+                f"[{s.get('mode','')}] score {s['score']}/100 RR 1:{s['rr']}"
+            )
+    else:
+        lines.append("Aucun signal récent")
+
+    return "\n".join(lines)
+
+
+def send_admin_report() -> None:
+    """Génère et envoie les 2 rapports /rapport, chacun dans son groupe dédié."""
+    if not _TG_ENABLED:
+        log.info("  [CMD] /rapport ignoré — TG_ENABLED=false")
+        return
+    try:
+        deriv_msg = _build_category_report("deriv")
+        if TELEGRAM_GROUP_DERIV_ID:
+            ok1 = tg_send(deriv_msg, TELEGRAM_GROUP_DERIV_ID)
+            log.info(f"  [CMD] {'✓' if ok1 else '✗'} Rapport Deriv → {TELEGRAM_GROUP_DERIV_ID}")
+    except Exception as e:
+        log.error(f"  [CMD] Erreur rapport Deriv : {e}")
+
+    try:
+        gb_msg = _build_category_report("gold_btc")
+        if TELEGRAM_GROUP_GOLD_BTC_ID:
+            ok2 = tg_send(gb_msg, TELEGRAM_GROUP_GOLD_BTC_ID)
+            log.info(f"  [CMD] {'✓' if ok2 else '✗'} Rapport Gold+BTC → {TELEGRAM_GROUP_GOLD_BTC_ID}")
+    except Exception as e:
+        log.error(f"  [CMD] Erreur rapport Gold+BTC : {e}")
+
+
+_TG_UPDATE_OFFSET = 0
+
+# ── [v14] Menu Paramètres — état "en attente de saisie" par admin ─────────
+# Quand l'admin tape un bouton comme "💰 Solde", on attend son prochain
+# message texte comme étant la nouvelle valeur pour ce paramètre.
+_AWAITING_INPUT: dict = {}   # {from_id: "account_balance" | "risk_value" | "leverage" | "profit_target"}
+
+
+def _is_admin(from_id: str) -> bool:
+    return bool(TELEGRAM_LEADER_ID) and str(from_id) == str(TELEGRAM_LEADER_ID)
+
+
+def _settings_menu_text() -> str:
+    balance   = get_account_balance()
+    mode, val = get_risk_config()
+    risk_lbl  = f"{val}%" if mode == "percent" else f"${val}"
+    risk_usd  = get_base_risk_usd()
+    leverage  = get_leverage()
+    target    = get_profit_target()
+    recovery  = "✅ Activé" if is_recovery_enabled() else "❌ Désactivé"
+    max_vol   = get_max_volume()
+    tf        = get_timeframe_setting()
+    session   = get_session_mode()
+    markets_lbl = {"all": "Tous (Gold+BTC+V75+V25)", "gold_btc": "Gold + BTC",
+                   "deriv": "Volatility 75 + 25"}.get(get_active_markets_setting(), "Tous")
+    profile   = get_profile_label()
+    prop_firm = "✅ Actif" if is_prop_firm_mode() else "❌ Inactif"
+    atr_mult  = get_atr_sl_mult()
+    return (
+        "⚙️ <b>MENU PARAMÈTRES — AlphaBot</b>\n"
+        "─────────────────────────\n"
+        f"💰 Solde du compte : <code>${balance:,.2f}</code>\n"
+        f"🎯 Risque par trade : <code>{risk_lbl}</code> (≈ ${risk_usd:.2f})\n"
+        f"⚖️ Levier : <code>1:{leverage}</code>\n"
+        f"🏆 Objectif de profit : <code>{'$'+format(target, ',.2f') if target > 0 else 'non défini'}</code>\n"
+        f"🔁 Recovery : {recovery}\n"
+        f"📊 Volume max : <code>{max_vol if max_vol > 0 else 'illimité'}</code>\n"
+        f"⏱ Timeframe : <code>{tf}</code>\n"
+        f"🌎 Session : <code>{session}</code>\n"
+        f"📈 Marchés actifs : <code>{markets_lbl}</code>\n"
+        f"👤 Profil : <code>{profile}</code>\n"
+        f"🏢 Mode Prop Firm : {prop_firm}\n"
+        f"📐 ATR SL (×) : <code>{atr_mult}</code>\n"
+        "─────────────────────────\n"
+        "Touche un bouton pour modifier un paramètre."
+    )
+
+
+def _settings_menu_keyboard() -> dict:
+    return {
+        "inline_keyboard": [
+            [{"text": "💰 Solde", "callback_data": "set:account_balance"},
+             {"text": "🎯 Risque %", "callback_data": "set:risk_value"}],
+            [{"text": "⚖️ Levier", "callback_data": "set:leverage"},
+             {"text": "🏆 Objectif profit", "callback_data": "set:profit_target"}],
+            [{"text": "🔁 Recovery ON/OFF", "callback_data": "toggle:recovery"},
+             {"text": "📊 Volume max", "callback_data": "set:max_volume"}],
+            [{"text": "⏱ Timeframe (M5/M15)", "callback_data": "toggle:timeframe"},
+             {"text": "🌎 Session (NY/24H)", "callback_data": "toggle:session"}],
+            [{"text": "📈 Marchés actifs", "callback_data": "toggle:markets"},
+             {"text": "👤 Profil", "callback_data": "set:profile_label"}],
+            [{"text": "🏢 Mode Prop Firm ON/OFF", "callback_data": "toggle:propfirm"},
+             {"text": "📐 ATR SL (×)", "callback_data": "set:atr_sl_mult"}],
+            [{"text": "🔄 Actualiser", "callback_data": "refresh"},
+             {"text": "❌ Fermer", "callback_data": "close"}],
+        ]
+    }
+
+
+def tg_send_menu(chat_id: str) -> None:
+    try:
+        requests.post(
+            _tg_url("sendMessage"),
+            json={
+                "chat_id": chat_id, "text": _settings_menu_text(),
+                "parse_mode": "HTML", "reply_markup": _settings_menu_keyboard(),
+            },
+            timeout=10,
+        )
+    except Exception as e:
+        print(c(f"  [TG] Erreur menu : {e}", "red"))
+
+
+_SETTING_PROMPTS = {
+    "account_balance": "💰 Envoie le nouveau <b>solde du compte</b> (en $), ex: <code>10000</code>",
+    "risk_value":       "🎯 Envoie le nouveau <b>risque par trade</b> — un %, ex: <code>0.65%</code>, "
+                        "ou un montant fixe, ex: <code>$50</code>",
+    "leverage":         "⚖️ Envoie le nouveau <b>levier</b>, ex: <code>100</code> pour 1:100",
+    "profit_target":    "🏆 Envoie le nouvel <b>objectif de profit</b> en $, ex: <code>500</code> "
+                        "(<code>0</code> pour désactiver)",
+    "max_volume":       "📊 Envoie le nouveau <b>volume (lot) max</b> par trade, ex: <code>0.5</code> "
+                        "(<code>0</code> pour illimité)",
+    "profile_label":    "👤 Envoie le nouveau <b>nom de profil</b> (libre), ex: <code>Compte Prop 10k</code>",
+    "atr_sl_mult":      "📐 Envoie le nouveau <b>multiplicateur ATR pour le SL</b>, ex: <code>0.6</code>",
+}
+
+
+def _handle_callback_query(cq: dict) -> None:
+    cq_id   = cq.get("id", "")
+    data    = cq.get("data", "")
+    from_id = str(cq.get("from", {}).get("id", ""))
+    chat_id = str(cq.get("message", {}).get("chat", {}).get("id", ""))
+
+    try:
+        requests.post(_tg_url("answerCallbackQuery"), json={"callback_query_id": cq_id}, timeout=10)
+    except Exception:
+        pass
+
+    if not _is_admin(from_id):
+        return
+
+    if data == "close":
+        return
+    if data == "refresh":
+        tg_send_menu(chat_id)
+        return
+    if data == "toggle:recovery":
+        new_val = "0" if is_recovery_enabled() else "1"
+        set_setting("recovery_enabled", new_val)
+        log.info(f"  [MENU] Recovery → {'ON' if new_val=='1' else 'OFF'}")
+        tg_send_menu(chat_id)
+        return
+    if data == "toggle:timeframe":
+        new_val = "M15" if get_timeframe_setting() == "M5" else "M5"
+        set_setting("timeframe", new_val)
+        log.info(f"  [MENU] Timeframe → {new_val}")
+        tg_send_menu(chat_id)
+        return
+    if data == "toggle:session":
+        new_val = "24H" if get_session_mode() == "NY" else "NY"
+        set_setting("session_mode", new_val)
+        log.info(f"  [MENU] Session → {new_val}")
+        tg_send_menu(chat_id)
+        return
+    if data == "toggle:markets":
+        order = ["all", "gold_btc", "deriv"]
+        cur   = get_active_markets_setting()
+        new_val = order[(order.index(cur) + 1) % len(order)] if cur in order else "all"
+        set_setting("active_markets", new_val)
+        log.info(f"  [MENU] Marchés actifs → {new_val}")
+        tg_send_menu(chat_id)
+        return
+    if data == "toggle:propfirm":
+        new_val = "0" if is_prop_firm_mode() else "1"
+        set_setting("prop_firm_mode", new_val)
+        log.info(f"  [MENU] Mode Prop Firm → {'ON' if new_val=='1' else 'OFF'}")
+        tg_send_menu(chat_id)
+        return
+    if data.startswith("set:"):
+        key = data.split(":", 1)[1]
+        _AWAITING_INPUT[from_id] = key
+        tg_send(_SETTING_PROMPTS.get(key, "Envoie la nouvelle valeur :"), chat_id)
+        return
+
+
+def _parse_risk_value_input(raw: str) -> Optional[tuple]:
+    """Parse '0.65%' → ('percent', 0.65) ; '$50' ou '50' → ('fixed', 50.0)."""
+    raw = raw.strip()
+    try:
+        if raw.endswith("%"):
+            return "percent", float(raw[:-1].strip())
+        if raw.startswith("$"):
+            return "fixed", float(raw[1:].strip())
+        # pas de symbole : on garde le mode actuel
+        mode, _ = get_risk_config()
+        return mode, float(raw)
+    except Exception:
+        return None
+
+
+def _handle_awaiting_input(text: str, from_id: str, chat_id: str) -> bool:
+    """Si l'admin a un paramètre en attente de saisie, traite `text` comme
+    la nouvelle valeur. Retourne True si consommé."""
+    key = _AWAITING_INPUT.get(from_id)
+    if not key:
+        return False
+    del _AWAITING_INPUT[from_id]
+
+    try:
+        if key == "account_balance":
+            set_setting("account_balance", str(float(text.strip().replace("$", "").replace(",", ""))))
+            tg_send("✅ Solde du compte mis à jour.", chat_id)
+        elif key == "risk_value":
+            parsed = _parse_risk_value_input(text)
+            if parsed is None:
+                tg_send("⚠️ Valeur invalide. Réessaie, ex: <code>0.65%</code> ou <code>$50</code>", chat_id)
+                return True
+            mode, value = parsed
+            set_setting("risk_mode", mode)
+            set_setting("risk_value", str(value))
+            tg_send("✅ Risque par trade mis à jour.", chat_id)
+        elif key == "leverage":
+            set_setting("leverage", str(int(float(text.strip()))))
+            tg_send("✅ Levier mis à jour.", chat_id)
+        elif key == "profit_target":
+            set_setting("profit_target", str(float(text.strip().replace("$", "").replace(",", ""))))
+            tg_send("✅ Objectif de profit mis à jour.", chat_id)
+        elif key == "max_volume":
+            set_setting("max_volume", str(float(text.strip().replace(",", "."))))
+            tg_send("✅ Volume max mis à jour.", chat_id)
+        elif key == "profile_label":
+            set_setting("profile_label", text.strip()[:64])
+            tg_send("✅ Profil mis à jour.", chat_id)
+        elif key == "atr_sl_mult":
+            val = float(text.strip().replace(",", "."))
+            if val <= 0:
+                tg_send("⚠️ Valeur invalide, doit être > 0.", chat_id)
+                return True
+            set_setting("atr_sl_mult", str(val))
+            tg_send("✅ Multiplicateur ATR SL mis à jour.", chat_id)
+    except Exception:
+        tg_send("⚠️ Valeur invalide, paramètre inchangé.", chat_id)
+        return True
+
+    tg_send_menu(chat_id)
+    return True
+
+
+def _handle_incoming_message(text: str, from_id: str, chat_id: str = "") -> None:
+    """Route les commandes admin reçues par Telegram."""
+    chat_id = chat_id or from_id
+
+    # Seul l'admin (TG_LEADER_ID) peut piloter le bot par message privé.
+    if not _is_admin(from_id):
+        return
+
+    # Si un paramètre est en attente de saisie, ce message est sa valeur.
+    if _handle_awaiting_input(text, from_id, chat_id):
+        return
+
+    cmd = (text or "").strip().split()[0].lower() if text else ""
+    if cmd == "/rapport":
+        log.info("  [CMD] ✓ /rapport reçu — génération des 2 rapports")
+        send_admin_report()
+    elif cmd in ("/parametres", "/menu", "/settings", "/start"):
+        log.info("  [CMD] ✓ /parametres reçu — envoi du menu")
+        tg_send_menu(chat_id)
+
+
+def _telegram_command_listener() -> None:
+    """Long-polling Telegram getUpdates() pour écouter /rapport et le menu
+    /parametres (boutons inline). Aucune URL publique/webhook requise →
+    compatible Render Background Worker (tourne dans un thread daemon,
+    comme le Trade Monitor et le rapport journalier)."""
+    global _TG_UPDATE_OFFSET
+    if not _TG_ENABLED:
+        log.info("  [CMD] Écoute commandes désactivée (TG_ENABLED=false)")
+        return
+    log.info("  ✓ Commandes admin /rapport + /parametres activées (long-polling)")
+    while True:
+        try:
+            r = requests.get(
+                _tg_url("getUpdates"),
+                params={"offset": _TG_UPDATE_OFFSET + 1, "timeout": 25},
+                timeout=30,
+            )
+            for upd in r.json().get("result", []):
+                _TG_UPDATE_OFFSET = max(_TG_UPDATE_OFFSET, upd.get("update_id", 0))
+
+                if "callback_query" in upd:
+                    _handle_callback_query(upd["callback_query"])
+                    continue
+
+                msg     = upd.get("message") or upd.get("channel_post") or {}
+                text    = msg.get("text", "")
+                from_id = str(msg.get("from", {}).get("id", ""))
+                chat_id = str(msg.get("chat", {}).get("id", from_id))
+                if text:
+                    _handle_incoming_message(text, from_id, chat_id)
+        except Exception as e:
+            log.error(f"  [CMD] Erreur listener commandes : {e}")
+            time.sleep(5)
+        time.sleep(1)
+
+
+def _telegram_command_thread() -> None:
+    """Lance le thread d'écoute des commandes admin (/rapport, /parametres)."""
+    t = threading.Thread(target=_telegram_command_listener, daemon=True, name="tg-commands")
     t.start()
     return t
 
@@ -1785,28 +2692,11 @@ def tg_format_signal(sig: "Signal", tier: str = "", mode: str = "SMC",
     num_str   = f"#{signal_num}" if signal_num else ""
 
     # ── Description setup + confirmations utilisées ──────────
+    # v13 — stratégie unique : Sweep de liquidité + Cassure de structure
     SETUP_DESCRIPTIONS = {
-        "BREAKER": ("T1 🥇 BREAKER BLOCK",
-                    "Sweep H4 → Breaker M15 → Retest zone",
-                    "✔ Sweep liquidité H4\n✔ Breaker block M15 actif\n✔ Retest confirmé\n✔ Bougie M15 clôturée"),
-        "SD":      ("T2 🥈 SUPPLY / DEMAND ZONE",
-                    "Zone H1 → Sweep → BOS M15 → Bougie entrée",
-                    "✔ Zone S/D H1 active\n✔ Sweep liquidité\n✔ BOS/MSS M15 aligné\n✔ Engulfing / Hammer / Morning Star M15"),
-        "OB":      ("T3 🥉 ORDER BLOCK",
-                    "OB H4/M15 → BOS M15 → FVG M5",
-                    "✔ Order Block H4 ou M15 actif\n✔ BOS M15 aligné biais\n✔ FVG M5 non mitiqué\n✔ Bougie M15 confirmation"),
-        "BOS":     ("T4  BOS RETEST",
-                    "BOS M15 cassé → Retest OB/FVG → Stop hunt",
-                    "✔ BOS M15 dans le sens du biais\n✔ Retest Order Block ou FVG\n✔ Liquidité prise avant BOS\n✔ Bougie M15 clôturée"),
-        "MSS":     ("T5  MSS / CHoCH",
-                    "Zone H4 (OB jaune/Breaker/Balance) + BOS+CHoCH M15 + RR≥3",
-                    "✔ Zone H4 : OB jaune, Breaker Block ou Balance\n✔ BOS M15 dans le sens attendu\n✔ CHoCH M15 (confirmation d'entrée)\n✔ Sweep liquidité (optionnel, bonus)\n✔ RR minimum 1:3"),
-        "FVG":     ("T6  FAIR VALUE GAP",
-                    "FVG H4 + BOS M15 + Retest FVG M5",
-                    "✔ FVG H4 non mitiqué\n✔ BOS M15 aligné\n✔ Prix reteste le FVG M5\n✔ Bougie M15 clôturée"),
-        "AMD":     ("T7  AMD — Accumulation→Manipulation→Distribution",
-                    "Phase distribution H4 → BOS M15 → FVG/OB",
-                    "✔ AMD distribution H4 confirmée\n✔ Direction AMD = biais H4\n✔ BOS M15 aligné\n✔ FVG ou OB dans zone distribution"),
+        "MSS": ("SWEEP + CASSURE DE STRUCTURE",
+                "Zone H4 (OB jaune/Breaker/Balance) + Sweep + BOS+CHoCH M15 + RR≥3",
+                "✔ Zone H4 : OB jaune, Breaker Block ou Balance\n✔ BOS M15 dans le sens attendu\n✔ CHoCH M15 (cassure de structure)\n✔ Sweep de liquidité (bonus de score)\n✔ RR minimum 1:3"),
     }
     s_title, s_logic, s_conf = SETUP_DESCRIPTIONS.get(
         mode, (mode, "SMC confluence", "✔ Critères SMC validés"))
@@ -1818,6 +2708,8 @@ def tg_format_signal(sig: "Signal", tier: str = "", mode: str = "SMC",
         f"{'─'*30}\n"
         f"💎  <b>SETUP :</b> {s_title}\n"
         f"📐  <b>LOGIQUE :</b> <i>{s_logic}</i>\n"
+        f"{'⭐'*max(getattr(sig,'stars',3),1)}  <b>QUALITÉ ENTRÉE :</b> "
+        f"{'Confirmée (retest + rejet)' if getattr(sig,'stars',3) >= 3 else 'Directe (sweep + CHoCH)'}\n"
         f"🎯  <b>DIRECTION :</b> <b>{dir_arrow}</b>\n"
         f"💰  <b>ENTRY M15 :</b> <code>{sig.entry}</code>\n"
         f"📦  <b>LOT :</b> <code>{base_lot}</code>  <i>(risque $100)</i>\n"
@@ -2073,17 +2965,18 @@ def tg_notify(sig: "Signal", tier: str = "", mode: str = "SMC",
         print(c(f"  [TG] ⏭ Groupe — niveau de prix quasi-identique ({sig.symbol} {sig.entry})", "yellow"))
     else:
         mark_setup_sent(sig.symbol, sig.direction, sig.score)
-        if TELEGRAM_GROUP_ID:
+        target_group = get_group_id_for_symbol(sig.symbol)
+        if target_group:
             if chart_path:
-                ok_grp = tg_send_photo(chart_path, msg, TELEGRAM_GROUP_ID)
+                ok_grp = tg_send_photo(chart_path, msg, target_group)
                 print(c(f"  [TG] {'✓ Groupe (photo)' if ok_grp else '✗ Groupe photo échoué'}", "green" if ok_grp else "red"))
             else:
-                ok_grp = tg_send(msg, TELEGRAM_GROUP_ID)
+                ok_grp = tg_send(msg, target_group)
                 print(c(f"  [TG] {'✓ Groupe (texte)' if ok_grp else '✗ Groupe texte échoué'}", "green" if ok_grp else "red"))
             if ok_grp:
                 record_price_level(sig.symbol, sig.direction, sig.entry)
         else:
-            print(c("  [TG] ⚠ TELEGRAM_GROUP_ID non défini", "red"))
+            print(c("  [TG] ⚠ Aucun groupe cible défini pour ce marché", "red"))
 
     # Nettoyage fichier temporaire
     if chart_path:
@@ -2175,6 +3068,7 @@ class Signal:
     choch_lv:   float  = 0.0
     tp2:        float  = 0.0   # cible structurelle RR5-6 (swing suivant)
     tp3:        float  = 0.0   # extension max RR8-10 (liquidité majeure)
+    stars:      int    = 3     # 2⭐ = entrée directe (sweep+CHoCH) | 3⭐ = entrée confirmée (retest+rejet)
 
 
 # ═════════════════════════════════════════════════════════════
@@ -2320,9 +3214,8 @@ DERIV_APP_ID = os.environ.get("DERIV_APP_ID", "1089")
 DERIV_WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
 
 DERIV_SYMBOLS: list[tuple[str, str]] = [
-    ("R_100", "Volatility 100 Index"),
-    ("R_50",  "Volatility 50 Index"),
-    ("R_25",  "Volatility 25 Index"),
+    ("R_75", "Volatility 75 Index"),
+    ("R_25", "Volatility 25 Index"),
 ]
 
 # Filtre haute-TF utilisé comme "biais" pour les indices Deriv (équivalent
@@ -4502,6 +5395,64 @@ def compute_score_v3(
 #  CALCUL NIVEAUX — ENTRY / SL / TP
 # ─────────────────────────────────────────────────────────────
 
+def _sl_in_liquidity_zone(
+    sl:        float,
+    direction: str,
+    atr:       float,
+    df_m5:     pd.DataFrame,
+    liq_map:   Optional[LiquidityMap],
+    ob:        Optional[OrderBlock],
+    tol:       float = 0.15,
+) -> bool:
+    """
+    Vérifie si le SL calculé tombe dans une zone de liquidité évidente :
+      1. Juste derrière un plus haut/bas structurel connu (BSL/SSL/EQH/EQL H4)
+      2. Accumulation de mèches M5 récentes autour du niveau du SL
+      3. À l'intérieur de l'Order Block
+
+    tol = tolérance en multiples d'ATR pour considérer un niveau "proche" du SL.
+    """
+    band = atr * tol
+
+    # ── 1. Proche d'un plus haut/bas structurel évident ────────
+    if liq_map is not None:
+        levels = []
+        if direction == "LONG":
+            levels = list(liq_map.ssl_levels) + list(liq_map.eql_levels)
+            if liq_map.nearest_ssl is not None:
+                levels.append(liq_map.nearest_ssl)
+            if liq_map.pdl is not None:
+                levels.append(liq_map.pdl)
+        else:
+            levels = list(liq_map.bsl_levels) + list(liq_map.eqh_levels)
+            if liq_map.nearest_bsl is not None:
+                levels.append(liq_map.nearest_bsl)
+            if liq_map.pdh is not None:
+                levels.append(liq_map.pdh)
+        if any(abs(sl - lvl) <= band for lvl in levels if lvl is not None):
+            return True
+
+    # ── 2. Accumulation de mèches M5 autour du SL ───────────────
+    if len(df_m5) >= 10:
+        recent = df_m5.iloc[-15:]
+        wick_hits = 0
+        for i in range(len(recent)):
+            h, l = recent["high"].iloc[i], recent["low"].iloc[i]
+            level = l if direction == "LONG" else h   # mèche du côté du SL
+            if abs(level - sl) <= band:
+                wick_hits += 1
+        if wick_hits >= 3:   # ≥3 mèches proches = accumulation
+            return True
+
+    # ── 3. SL à l'intérieur de l'Order Block ────────────────────
+    if ob is not None:
+        lo, hi = min(ob.bottom, ob.top), max(ob.bottom, ob.top)
+        if lo <= sl <= hi:
+            return True
+
+    return False
+
+
 def compute_sl_tp_v3(
     df_m5:     pd.DataFrame,
     df_m15:    pd.DataFrame,
@@ -4511,6 +5462,7 @@ def compute_sl_tp_v3(
     sd_zone:   Optional[SupplyDemandZone],
     liq_map:   Optional[LiquidityMap],
     symbol:    str = "",
+    score:     int = 0,
 ) -> tuple[float, float, float, float, float, float]:
     """
     Entry / SL / TP1 / TP2 / TP3 v3+ — cibles structurelles réelles.
@@ -4520,9 +5472,14 @@ def compute_sl_tp_v3(
       2. Milieu du FVG M5
       3. Close M5 courant
 
-    STOP LOSS :
-      LONG  : sous le bas de la Demand Zone / OB / FVG  + buffer ATR×0.4
-      SHORT : au-dessus du haut de la Supply Zone / OB / FVG  + buffer ATR×0.4
+    STOP LOSS (palier selon la qualité du setup — `score`) :
+      score ≥ 90     : derrière l'OB + 1.0×ATR
+      score 80–89    : derrière l'OB + 0.6×ATR
+      score 70–79    : 0.6×ATR fixe depuis l'entrée (pas de référence OB)
+      (score < 70 : aucun signal — filtré en amont)
+      Puis règle anti-liquidité : si le SL tombe derrière un plus haut/bas
+      évident, dans une accumulation de mèches, ou à l'intérieur de l'OB,
+      il est repoussé de +0.10 à 0.20×ATR au-delà de cette zone.
 
     TAKE PROFIT (3 niveaux structurels) :
       TP1 : RR3 min — BSL/SSL nearest ou PDH/PDL ou swing M15
@@ -4533,7 +5490,6 @@ def compute_sl_tp_v3(
     close  = df_m5["close"].iloc[-1]
     spread = get_spread(symbol) if symbol else 0.0
     dec    = 2 if close > 100 else 5
-    buf    = max(atr * 0.45, spread * 3.0)
 
     # ── 1. ENTRÉE ─────────────────────────────────────────────
     if sd_zone is not None:
@@ -4543,25 +5499,31 @@ def compute_sl_tp_v3(
     else:
         entry = round(close, dec)
 
-    # ── 2. STOP LOSS ──────────────────────────────────────────
+    # ── 2. STOP LOSS — palier de base selon le score ────────────
+    # Setups haute qualité : SL ancré derrière l'OB (probabilité élevée
+    # que le prix ne revienne pas dedans). Setups standards : SL fixe
+    # depuis l'entrée, comme avant.
+    atr_sl_mult = get_atr_sl_mult()
+    if score >= 90 and ob is not None:
+        anchor, sl_distance = (ob.bottom if direction == "LONG" else ob.top), atr * 1.0
+    elif score >= 80 and ob is not None:
+        anchor, sl_distance = (ob.bottom if direction == "LONG" else ob.top), atr * atr_sl_mult
+    else:
+        anchor, sl_distance = entry, atr * atr_sl_mult
+
     if direction == "LONG":
-        if sd_zone:
-            sl = round(sd_zone.bottom - buf, dec)
-        elif ob:
-            sl = round(ob.bottom - buf, dec)
-        elif fvg:
-            sl = round(min(fvg.top, fvg.bottom) - buf, dec)
-        else:
-            sl = round(entry - atr * 1.8, dec)
+        sl = round(anchor - sl_distance, dec)
     else:  # SHORT
-        if sd_zone:
-            sl = round(sd_zone.top + buf, dec)
-        elif ob:
-            sl = round(ob.top + buf, dec)
-        elif fvg:
-            sl = round(max(fvg.top, fvg.bottom) + buf, dec)
-        else:
-            sl = round(entry + atr * 1.8, dec)
+        sl = round(anchor + sl_distance, dec)
+
+    # ── 2b. Règle anti-liquidité ─────────────────────────────
+    # Si le SL tombe dans une zone de liquidité évidente (plus haut/bas
+    # structurel, accumulation de mèches, ou intérieur de l'OB), on le
+    # repousse de 0.10 à 0.20×ATR au-delà de cette zone plutôt que de le
+    # laisser exposé à un simple retest.
+    if _sl_in_liquidity_zone(sl, direction, atr, df_m5, liq_map, ob):
+        extra = atr * 0.15   # milieu de la fourchette 0.10–0.20×ATR
+        sl = round(sl - extra, dec) if direction == "LONG" else round(sl + extra, dec)
 
     risk = abs(entry - sl)
     if risk <= 0:
@@ -5008,6 +5970,7 @@ class SetupSignal:
     df_chart:   object   = field(default=None, repr=False)
     fvg_ref:    object   = field(default=None, repr=False)
     ob_ref:     object   = field(default=None, repr=False)
+    stars:      int      = 3   # 2⭐ = entrée directe (sweep+CHoCH) | 3⭐ = entrée confirmée (retest+rejet)
 
     def to_signal(self) -> "Signal":
         """Convertit en Signal v3 pour réutiliser tg_notify et generate_chart_image."""
@@ -5029,6 +5992,7 @@ class SetupSignal:
             ob_chart  = self.ob_ref,
             tp2       = self.tp2,
             tp3       = self.tp3,
+            stars     = self.stars,
         )
 
 
@@ -5078,14 +6042,9 @@ def _fetch_data(symbol: str) -> tuple:
     if df_h1.empty:
         df_h1 = pd.DataFrame()
 
-    # ── [v11] M1 réservé exclusivement à Gold + BTC ───────────
+    # ── [v13] M1 non utilisé par la stratégie unique (Sweep+Cassure) ──
+    # Conservé vide pour ne pas casser la signature de retour à 5 éléments.
     df_m1 = pd.DataFrame()
-    if symbol in GOLD_BTC_M1_SYMBOLS:
-        try:
-            df_m1 = fetch(symbol, "1m", period="1d")
-        except Exception as e:
-            print(f"  [FETCH] M1 indisponible pour {symbol} : {e}")
-            df_m1 = pd.DataFrame()
 
     return df_h4, df_h1, df_m15, df_m5, df_m1
 
@@ -5103,11 +6062,13 @@ def _compute_levels(
     fvg: Optional[FVG] = None,
     sd_zone: Optional[SupplyDemandZone] = None,
     liq_map: Optional[LiquidityMap] = None,
+    score: int = 0,
 ) -> tuple:
     """Wrapper compute_sl_tp_v3 → (entry, sl, tp1, rr, tp2, tp3)"""
     return compute_sl_tp_v3(
         df_m5=df_m5, df_m15=df_m15, direction=direction,
         ob=ob, fvg=fvg, sd_zone=sd_zone, liq_map=liq_map, symbol=symbol,
+        score=score,
     )
 
 
@@ -5433,752 +6394,65 @@ def detect_sd_entry_candle_m15(df_m15: pd.DataFrame, direction: str) -> tuple:
 
 
 # ─────────────────────────────────────────────────────────────
-#  T1 🥇 BREAKER BLOCK — Setup prioritaire
-#  Séquence : Sweep BSL/SSL H4 → Breaker Block M15 → Retest → Bougie
+#  ENTRÉE CONFIRMÉE — retest OB/FVG + bougie de rejet (3⭐)
+#
+#  Séquence complète : Sweep → CHoCH → retour dans l'OB/FVG →
+#  bougie de rejet claire → entrée.
+#  Sans cette confirmation, l'entrée reste "directe" (2⭐) :
+#  Sweep + CHoCH suffisent, sans attendre le retour en zone.
 # ─────────────────────────────────────────────────────────────
 
-def check_breaker_setup(
-    symbol: str, df_h4: pd.DataFrame, df_m15: pd.DataFrame,
-    df_m5: pd.DataFrame, direction: str,
-    liq_map: Optional[LiquidityMap] = None,
-    min_rr: float = MIN_RR,
-) -> Optional[SetupSignal]:
+def detect_ob_retest_rejection(
+    df_m5:     pd.DataFrame,
+    ob:        Optional["OrderBlock"],
+    fvg:       Optional["FVG"],
+    direction: str,
+    lookback:  int = 6,
+) -> dict:
     """
-    T1 — BREAKER BLOCK (setup institutionnel le plus fiable)
+    Vérifie si, après le CHoCH, le prix est revenu retester l'OB/FVG
+    ET qu'une bougie de rejet claire (mèche + clôture dans le sens du
+    trade, corps ≥ 35% du range) s'est formée dans les `lookback`
+    dernières bougies M5.
 
-    Critères :
-      ① Sweep BSL (SHORT) ou SSL (LONG) sur H4       → +30 pts
-      ② Breaker Block M15 dans le sens du biais       → +25 pts
-      ③ Prix dans zone du Breaker (retest)             → +25 pts
-      ④ Bougie M15 clôturée dans la bonne direction   → +20 pts
-
-    Seuil de déclenchement : score ≥ 65 / 100
+    Retourne {"confirmed": bool, "reason": str | None}.
     """
-    score, reasons = 0, []
+    zone = None
+    if ob is not None:
+        zone = (min(ob.bottom, ob.top), max(ob.bottom, ob.top))
+    elif fvg is not None:
+        zone = (min(fvg.bottom, fvg.top), max(fvg.bottom, fvg.top))
 
-    if len(df_h4) < 20 or len(df_m15) < 20 or len(df_m5) < 10:
-        return None
+    if zone is None or len(df_m5) < lookback + 1:
+        return {"confirmed": False, "reason": None}
 
-    atr_m5 = (df_m5["high"] - df_m5["low"]).rolling(14).mean().iloc[-1]
-    if pd.isna(atr_m5) or atr_m5 == 0:
-        return None
+    lo, hi = zone
+    recent = df_m5.iloc[-lookback:]
 
-    price_now = df_m5["close"].iloc[-1]
-
-    # ── ① Sweep BSL/SSL H4 ───────────────────────────────────
-    if liq_map is None:
-        liq_map = build_liquidity_map(df_h4, df_m5)
-
-    bsl_ssl_swept = (liq_map.swept_bsl and direction == "SHORT") or \
-                    (liq_map.swept_ssl and direction == "LONG")
-
-    if not bsl_ssl_swept:
-        # Sweep H4 via detect_h4_sweep_5m_shift
-        sweep_res = detect_h4_sweep_5m_shift(df_h4, df_m5, direction)
-        bsl_ssl_swept = sweep_res["detected"]
-
-    if bsl_ssl_swept:
-        score += 30
-        sweep_lbl = "SSL" if direction == "LONG" else "BSL"
-        reasons.append(f"💧 Sweep {sweep_lbl} H4 — chasse de liquidité  (+30)")
-    else:
-        return None   # Sweep obligatoire pour un Breaker
-
-    # ── ② Breaker Block M15 ──────────────────────────────────
-    bos_m15    = detect_bos(df_m15)
-    breakers   = detect_breaker_blocks(df_m15, bos_m15)
-    expected   = "bullish" if direction == "LONG" else "bearish"
-    bb_match   = next((b for b in reversed(breakers) if b.get("direction") == expected), None)
-
-    if bb_match is None:
-        # Fallback : Breaker Block H4 retesté M15
-        bb_htf = detect_breaker_block_htf(df_h4, df_m15, direction)
-        if bb_htf["detected"] and bb_htf["score_bonus"] >= 10:
-            score += 25
-            reasons.append(f"🔥 Breaker Block H4 retesté M15  (+25)")
+    for i in range(len(recent)):
+        o, h, l, cl = (recent["open"].iloc[i], recent["high"].iloc[i],
+                        recent["low"].iloc[i], recent["close"].iloc[i])
+        rng = h - l
+        if rng <= 0:
+            continue
+        body = abs(cl - o)
+        touched_zone = (l <= hi) and (h >= lo)   # bougie a touché la zone OB/FVG
+        if not touched_zone:
+            continue
+        body_ratio = body / rng
+        if direction == "LONG":
+            # rejet haussier : mèche basse dans la zone, clôture au-dessus, corps significatif
+            rejection = (cl > o) and (body_ratio >= 0.35) and (cl > lo)
         else:
-            return None   # Aucun Breaker → setup invalide
-    else:
-        score += 25
-        bb_lo = float(bb_match.get("bottom", bb_match.get("level", price_now)))
-        bb_hi = float(bb_match.get("top",    bb_match.get("level", price_now)))
-        reasons.append(f"🔥 Breaker Block M15 {expected} [{round(bb_lo,5)}–{round(bb_hi,5)}]  (+25)")
-
-    # ── ③ Retest dans la zone Breaker ────────────────────────
-    in_retest = False
-    if bb_match:
-        bb_lo = float(bb_match.get("bottom", bb_match.get("level", price_now)))
-        bb_hi = float(bb_match.get("top",    bb_match.get("level", price_now)))
-        # [v9 MOD-2] Tolérance retest élargie à 1.0 × ATR (était 0.5)
-        # → évite de rater l'entrée quand le prix front-run légèrement la zone
-        tol = atr_m5 * 1.0
-        in_retest = (bb_lo - tol) <= price_now <= (bb_hi + tol)
-    else:
-        # Zone H4 : prix dans ATR de la zone de référence
-        in_retest = bool(liq_map.swept_ssl or liq_map.swept_bsl)
-
-    if in_retest:
-        score += 25
-        reasons.append(f"✅ Prix en retest de la zone Breaker  (+25)")
-    else:
-        # Retest non atteint → setup partiel (score réduit mais on continue)
-        reasons.append("⏳ Attente retest zone Breaker — entrée non optimale")
-
-    # ── ④ Bougie M15 clôturée ────────────────────────────────
-    candle_ok = _m15_candle_confirmed(df_m15, direction)
-    if candle_ok:
-        score += 20
-        reasons.append(f"🕯️ Bougie M15 {'BULLISH' if direction == 'LONG' else 'BEARISH'} clôturée  (+20)")
-    # Bougie non confirmée → on n'ajoute pas les points mais on ne bloque pas
-
-    if score < 65:
-        return None
-
-    # ── v7 : Validation entrée zone stratégique ──────────────
-    entry_ok, entry_reasons, entry_bonus = _validate_strategic_entry_m15(
-        symbol, direction, df_m15, df_m5, df_h4
-    )
-    if not entry_ok:
-        return None
-    reasons += entry_reasons
-    score   += entry_bonus
-
-    # ── Niveaux Entry / SL / TP ──────────────────────────────
-    fvgs_m5    = detect_fvg(df_m5)
-    bos_m5     = detect_bos(df_m5)
-    obs_m5     = detect_order_blocks(df_m5, bos_m5)
-    fvg_active = active_fvg(df_m5, fvgs_m5, expected)
-    ob_match   = next((o for o in reversed(obs_m5) if o.direction == expected), None)
-
-    entry, sl, tp1, rr, tp2, tp3 = _compute_levels(
-        symbol, direction, df_m5, df_m15, ob_match, fvg_active, None, liq_map
-    )
-
-    # [v9 MOD-5b] Validation RR flexible (TP1 ≥ 1.8 + TP3 ≥ 3.0 accepté si TP1 < min_rr)
-    if not _rr_ok_flexible(entry, sl, tp1, tp2, tp3, direction, min_rr):
-        return None
-
-    lot  = compute_lot(symbol, entry, sl, risk_usd=get_current_risk_usd())
-    bias = "BULLISH" if direction == "LONG" else "BEARISH"
-
-    return SetupSignal(
-        symbol="symbol" if symbol is None else symbol,
-        setup_type="BREAKER", tier=1,
-        direction=direction, entry=entry, sl=sl, tp=tp1, tp2=tp2, tp3=tp3,
-        rr=rr, score=score, reasons=reasons,
-        htf_bias=bias, lot=lot,
-        df_chart=df_m5, fvg_ref=fvg_active, ob_ref=ob_match,
-    )
-
-
-# ─────────────────────────────────────────────────────────────
-#  T2 🥈 SUPPLY/DEMAND ZONE — Architecture H4 → H1 → M15
-#  Contexte H4 → Zone institutionnelle H1 → Entrée M15
-# ─────────────────────────────────────────────────────────────
-
-def check_supply_demand_setup(
-    symbol: str, df_h4: pd.DataFrame, df_h1: pd.DataFrame,
-    df_m15: pd.DataFrame, df_m5: pd.DataFrame, direction: str,
-    liq_map: Optional[LiquidityMap] = None,
-    min_rr: float = MIN_RR,
-) -> Optional[SetupSignal]:
-    """
-    T2 — SUPPLY/DEMAND ZONE (multi-timeframe H4 → H1 → M15)
-
-    Architecture :
-      H4  → Contexte / biais institutionnel (déjà validé par htf_bias)
-      H1  → Supply ou Demand Zone active (prix revenu dans la zone)
-      M15 → Bougie d'entrée confirmée
-
-    Scoring :
-      ① Zone Supply/Demand H1 valide (prix dans la zone)     → +40 pts
-      ② Sweep de liquidité avant retour en zone              → +20 pts
-      ③ BOS ou MSS M15 aligné avec le biais                  → +20 pts
-      ④ Bougie d'entrée M15 (Engulfing / Hammer / Star)      → +20 pts
-
-    Seuil de déclenchement : score ≥ 70 / 100
-    """
-    score, reasons = 0, []
-
-    # ── Garde-fous données ────────────────────────────────────
-    if df_h1 is None or df_h1.empty or len(df_h1) < 20:
-        return None
-    if len(df_h4) < 20 or len(df_m15) < 20 or len(df_m5) < 10:
-        return None
-
-    atr_h1    = (df_h1["high"] - df_h1["low"]).rolling(14).mean().iloc[-1]
-    atr_m5    = (df_m5["high"] - df_m5["low"]).rolling(14).mean().iloc[-1]
-    price_now = df_m5["close"].iloc[-1]
-    expected  = "bullish" if direction == "LONG" else "bearish"
-    zone_type = "demand"  if direction == "LONG" else "supply"
-    dec       = 2 if price_now > 100 else 5
-
-    if pd.isna(atr_h1) or atr_h1 == 0:
-        return None
-
-    # ── ① Zone Supply/Demand H1 active ───────────────────────
-    sd_zones_h1 = detect_supply_demand_zones(df_h1, zone_type)
-    if not sd_zones_h1:
-        return None
-
-    active_zone = price_in_sd_zone(price_now, sd_zones_h1, atr_h1)
-
-    # Tolérance élargie : prix à moins d'un ATR de la zone
-    # [v9 MOD-2] Tolérance retest S/D élargie à 1.0 × ATR_H1 (était 0.6)
-    # → évite de rater les retests légèrement hors zone à cause du front-running
-    if active_zone is None:
-        tol = atr_h1 * 1.0
-        for z in sd_zones_h1[:3]:
-            if (z.bottom - tol) <= price_now <= (z.top + tol):
-                active_zone = z
-                break
-
-    if active_zone is None:
-        return None
-
-    # Score proportionnel à la force de l'impulsion (impulse_size = corps / ATR)
-    zone_pts = max(30, min(40, int(active_zone.impulse_size * 12)))
-    score    += zone_pts
-    reasons.append(
-        f"🏛️ {zone_type.upper()} Zone H1 "
-        f"[{round(active_zone.bottom, dec)} – {round(active_zone.top, dec)}]  "
-        f"force={round(active_zone.impulse_size, 1)}×ATR  (+{zone_pts})"
-    )
-
-    # ── ② Sweep de liquidité ──────────────────────────────────
-    if liq_map is None:
-        liq_map = build_liquidity_map(df_h4, df_m5)
-
-    bsl_ssl_swept = (liq_map.swept_ssl and direction == "LONG") or \
-                    (liq_map.swept_bsl and direction == "SHORT")
-
-    if bsl_ssl_swept:
-        score    += 20
-        sweep_lbl = "SSL" if direction == "LONG" else "BSL"
-        reasons.append(f"💧 Sweep {sweep_lbl} H4 — chasse liquidité avant zone  (+20)")
-    else:
-        # Sweep M15 léger (stop hunt court terme)
-        liq_m15   = detect_liquidity_sweep(df_m15)
-        m15_swept = liq_m15["bullish_sweep"] if direction == "LONG" else liq_m15["bearish_sweep"]
-        if m15_swept:
-            score += 12
-            reasons.append("💧 Sweep M15 — stop hunt léger  (+12)")
-
-    # ── ③ BOS ou MSS M15 ─────────────────────────────────────
-    bos_m15     = detect_bos(df_m15)
-    recent_bos  = [b for b in bos_m15[-5:] if b["type"] == expected]
-
-    if recent_bos:
-        score += 20
-        bos_lv = recent_bos[-1]["level"]
-        reasons.append(f"✅ BOS M15 {expected} @ {round(bos_lv, dec)}  (+20)")
-    else:
-        # Fallback MSS : BOS opposé puis BOS dans notre sens
-        opp      = "bearish" if direction == "LONG" else "bullish"
-        recents  = bos_m15[-8:]
-        has_opp  = any(b["type"] == opp      for b in recents)
-        has_same = any(b["type"] == expected  for b in recents[-4:])
-        if has_opp and has_same:
-            score += 14
-            reasons.append(f"🔄 MSS M15 : retournement {opp}→{expected}  (+14)")
-
-    # ── ④ Bougie d'entrée M15 ────────────────────────────────
-    candle_ok, candle_name = detect_sd_entry_candle_m15(df_m15, direction)
-    if candle_ok:
-        score += 20
-        reasons.append(f"🕯️ Bougie M15 : {candle_name}  (+20)")
-    elif _m15_candle_confirmed(df_m15, direction):
-        score += 10
-        reasons.append(f"🕯️ Bougie M15 clôturée {direction}  (+10)")
-
-    if score < 70:
-        return None
-
-    # ── v7 : Validation entrée zone stratégique ──────────────
-    entry_ok, entry_reasons, entry_bonus = _validate_strategic_entry_m15(
-        symbol, direction, df_m15, df_m5, df_h4, df_h1
-    )
-    if not entry_ok:
-        return None
-    reasons += entry_reasons
-    score   += entry_bonus
-
-    # ── Niveaux Entry / SL / TP ──────────────────────────────
-    fvgs_m5    = detect_fvg(df_m5)
-    bos_m5     = detect_bos(df_m5)
-    obs_m5     = detect_order_blocks(df_m5, bos_m5)
-    fvg_active = active_fvg(df_m5, fvgs_m5, expected)
-    ob_match   = next(
-        (o for o in reversed(obs_m5)
-         if o.direction == expected and
-            (min(o.top, o.bottom) - atr_m5 * 0.3) <= price_now <= (max(o.top, o.bottom) + atr_m5 * 0.3)),
-        None
-    )
-
-    entry, sl, tp1, rr, tp2, tp3 = _compute_levels(
-        symbol, direction, df_m5, df_m15, ob_match, fvg_active, active_zone, liq_map
-    )
-
-    # [v9 MOD-5b] Validation RR flexible (TP1 ≥ 1.8 + TP3 ≥ 3.0 accepté si TP1 < min_rr)
-    if not _rr_ok_flexible(entry, sl, tp1, tp2, tp3, direction, min_rr):
-        return None
-
-    lot  = compute_lot(symbol, entry, sl, risk_usd=get_current_risk_usd())
-    bias = "BULLISH" if direction == "LONG" else "BEARISH"
-
-    return SetupSignal(
-        symbol=symbol, setup_type="SD", tier=2,
-        direction=direction, entry=entry, sl=sl, tp=tp1, tp2=tp2, tp3=tp3,
-        rr=rr, score=score, reasons=reasons,
-        htf_bias=bias, lot=lot,
-        df_chart=df_m5, fvg_ref=fvg_active, ob_ref=ob_match,
-    )
-
-
-# ─────────────────────────────────────────────────────────────
-#  T3 🥉 ORDER BLOCK — OB H4/M15 + BOS + FVG
-# ─────────────────────────────────────────────────────────────
-
-def check_ob_setup(
-    symbol: str, df_h4: pd.DataFrame, df_m15: pd.DataFrame,
-    df_m5: pd.DataFrame, direction: str,
-    min_rr: float = MIN_RR,
-) -> Optional[SetupSignal]:
-    """
-    T3 — ORDER BLOCK institutionnel
-
-    Critères :
-      ① Order Block H4 actif (prix dans la zone)      → +30 pts
-      ② BOS M15 aligné avec le biais H4               → +25 pts
-      ③ FVG M5 dans la zone OB (déséquilibre frais)   → +25 pts
-      ④ Bougie M15 de confirmation                     → +20 pts
-
-    Seuil : score ≥ 60 / 100
-    """
-    score, reasons = 0, []
-
-    if len(df_h4) < 20 or len(df_m15) < 15 or len(df_m5) < 10:
-        return None
-
-    atr_m5    = (df_m5["high"] - df_m5["low"]).rolling(14).mean().iloc[-1]
-    price_now = df_m5["close"].iloc[-1]
-    expected  = "bullish" if direction == "LONG" else "bearish"
-
-    # ── ① Order Block H4 actif ───────────────────────────────
-    bos_h4 = detect_bos(df_h4)
-    obs_h4 = detect_order_blocks(df_h4, bos_h4)
-    ob_h4  = next(
-        (o for o in reversed(obs_h4)
-         if o.direction == expected and
-            min(o.top, o.bottom) <= price_now <= max(o.top, o.bottom)),
-        None
-    )
-
-    if ob_h4:
-        score += 30
-        reasons.append(f"🏛️ Order Block H4 {expected} actif  [{round(ob_h4.bottom,5)}–{round(ob_h4.top,5)}]  (+30)")
-    else:
-        # Fallback : OB M15
-        bos_m15 = detect_bos(df_m15)
-        obs_m15 = detect_order_blocks(df_m15, bos_m15)
-        ob_m15  = next(
-            (o for o in reversed(obs_m15)
-             if o.direction == expected and
-                (min(o.top,o.bottom) - atr_m5*0.3) <= price_now <= (max(o.top,o.bottom) + atr_m5*0.3)),
-            None
-        )
-        if ob_m15:
-            score += 20   # OB M15 vaut moins que H4
-            reasons.append(f"🏛️ Order Block M15 {expected}  [{round(ob_m15.bottom,5)}–{round(ob_m15.top,5)}]  (+20)")
-        else:
-            return None   # Aucun OB → setup invalide
-
-    # ── ② BOS M15 aligné ─────────────────────────────────────
-    bos_m15_list = detect_bos(df_m15)
-    last_bos     = bos_m15_list[-1] if bos_m15_list else None
-    bos_ok       = last_bos is not None and last_bos["type"] == expected
-
-    if bos_ok:
-        score += 25
-        reasons.append(f"✅ BOS M15 {expected} @ {round(last_bos['level'],5)}  (+25)")
-    else:
-        reasons.append("⚠️ Pas de BOS M15 — structure non confirmée")
-
-    # ── ③ FVG M5 dans la zone ────────────────────────────────
-    fvgs_m5    = detect_fvg(df_m5)
-    fvg_active = active_fvg(df_m5, fvgs_m5, expected)
-    fvg_unmit  = is_fvg_unmitigated(df_m5, fvg_active) if fvg_active else False
-
-    if fvg_active and fvg_unmit:
-        score += 25
-        f_lo = min(fvg_active.top, fvg_active.bottom)
-        f_hi = max(fvg_active.top, fvg_active.bottom)
-        reasons.append(f"📍 FVG M5 non mitiqué [{round(f_lo,5)}–{round(f_hi,5)}]  (+25)")
-    elif fvg_active:
-        score += 15
-        reasons.append(f"📍 FVG M5 actif  (+15)")
-
-    # ── ④ Bougie M15 ─────────────────────────────────────────
-    if _m15_candle_confirmed(df_m15, direction):
-        score += 20
-        reasons.append(f"🕯️ Bougie M15 clôturée {direction}  (+20)")
-
-    if score < 60:
-        return None
-
-    # ── v7 : Validation entrée zone stratégique ──────────────
-    entry_ok, entry_reasons, entry_bonus = _validate_strategic_entry_m15(
-        symbol, direction, df_m15, df_m5, df_h4
-    )
-    if not entry_ok:
-        return None
-    reasons += entry_reasons
-    score   += entry_bonus
-
-    ob_ref = ob_h4 or (ob_m15 if 'ob_m15' in dir() else None)
-    entry, sl, tp1, rr, tp2, tp3 = _compute_levels(
-        symbol, direction, df_m5, df_m15, ob_ref, fvg_active
-    )
-
-    if not _rr_ok(entry, sl, tp1, direction, min_rr):
-        return None
-
-    lot  = compute_lot(symbol, entry, sl, risk_usd=get_current_risk_usd())
-    bias = "BULLISH" if direction == "LONG" else "BEARISH"
-
-    return SetupSignal(
-        symbol=symbol, setup_type="OB", tier=3,
-        direction=direction, entry=entry, sl=sl, tp=tp1, tp2=tp2, tp3=tp3,
-        rr=rr, score=score, reasons=reasons,
-        htf_bias=bias, lot=lot,
-        df_chart=df_m5, fvg_ref=fvg_active, ob_ref=ob_ref,
-    )
-
-
-# ─────────────────────────────────────────────────────────────
-#  T4 BOS_RETEST — BOS M15 + Retest OB/FVG + Confirmation
-# ─────────────────────────────────────────────────────────────
-
-def check_bos_setup(
-    symbol: str, df_h4: pd.DataFrame, df_m15: pd.DataFrame,
-    df_m5: pd.DataFrame, direction: str,
-    min_rr: float = MIN_RR,
-) -> Optional[SetupSignal]:
-    """
-    T4 — BOS RETEST
-
-    Critères :
-      ① BOS M15 cassé dans le sens du biais           → +35 pts
-      ② Retest OB ou FVG post-BOS                     → +30 pts
-      ③ Liquidité prise avant le BOS (stop hunt)       → +20 pts
-      ④ Bougie de confirmation M15                     → +15 pts
-
-    Seuil : score ≥ 55 / 100
-    """
-    score, reasons = 0, []
-
-    if len(df_m15) < 20 or len(df_m5) < 10:
-        return None
-
-    atr_m5    = (df_m5["high"] - df_m5["low"]).rolling(14).mean().iloc[-1]
-    price_now = df_m5["close"].iloc[-1]
-    expected  = "bullish" if direction == "LONG" else "bearish"
-
-    # ── ① BOS M15 ────────────────────────────────────────────
-    bos_m15  = detect_bos(df_m15)
-    last_bos = bos_m15[-1] if bos_m15 else None
-
-    if last_bos and last_bos["type"] == expected:
-        score += 35
-        reasons.append(f"✅ BOS M15 {expected} @ {round(last_bos['level'],5)}  (+35)")
-    else:
-        return None   # BOS obligatoire pour ce setup
-
-    # ── ② Retest OB ou FVG ───────────────────────────────────
-    obs_m15    = detect_order_blocks(df_m15, bos_m15)
-    fvgs_m5    = detect_fvg(df_m5)
-    fvg_active = active_fvg(df_m5, fvgs_m5, expected)
-    ob_match   = next(
-        (o for o in reversed(obs_m15)
-         if o.direction == expected and
-            (min(o.top,o.bottom)-atr_m5*0.5) <= price_now <= (max(o.top,o.bottom)+atr_m5*0.5)),
-        None
-    )
-
-    in_ob  = ob_match is not None
-    in_fvg = fvg_active is not None and (
-        (min(fvg_active.top,fvg_active.bottom)-atr_m5*0.3) <= price_now <=
-        (max(fvg_active.top,fvg_active.bottom)+atr_m5*0.3)
-    )
-
-    if in_ob and in_fvg:
-        score += 30
-        reasons.append(f"⚡ Confluence OB + FVG — zone institutionnelle  (+30)")
-    elif in_ob:
-        score += 22
-        reasons.append(f"🏛️ Retest Order Block M15  (+22)")
-    elif in_fvg:
-        score += 18
-        reasons.append(f"📍 Retest FVG M5  (+18)")
-    else:
-        reasons.append("⏳ Hors zone OB/FVG — entrée non optimale")
-
-    # ── ③ Liquidité prise ────────────────────────────────────
-    liq = detect_liquidity_sweep(df_m15)
-    liq_taken = liq["bullish_sweep"] if direction == "LONG" else liq["bearish_sweep"]
-    if liq_taken:
-        score += 20
-        reasons.append("💧 Stop hunt (liquidité prise) avant BOS  (+20)")
-
-    # ── ④ Bougie M15 ─────────────────────────────────────────
-    if _m15_candle_confirmed(df_m15, direction):
-        score += 15
-        reasons.append(f"🕯️ Bougie M15 clôturée {direction}  (+15)")
-
-    if score < 55:
-        return None
-
-    # ── v7 : Validation entrée zone stratégique ──────────────
-    entry_ok, entry_reasons, entry_bonus = _validate_strategic_entry_m15(
-        symbol, direction, df_m15, df_m5, df_h4
-    )
-    if not entry_ok:
-        return None
-    reasons += entry_reasons
-    score   += entry_bonus
-
-    entry, sl, tp1, rr, tp2, tp3 = _compute_levels(
-        symbol, direction, df_m5, df_m15, ob_match, fvg_active
-    )
-
-    if not _rr_ok(entry, sl, tp1, direction, min_rr):
-        return None
-
-    lot  = compute_lot(symbol, entry, sl, risk_usd=get_current_risk_usd())
-    bias = "BULLISH" if direction == "LONG" else "BEARISH"
-
-    return SetupSignal(
-        symbol=symbol, setup_type="BOS", tier=4,
-        direction=direction, entry=entry, sl=sl, tp=tp1, tp2=tp2, tp3=tp3,
-        rr=rr, score=score, reasons=reasons,
-        htf_bias=bias, lot=lot,
-        df_chart=df_m5, fvg_ref=fvg_active, ob_ref=ob_match,
-    )
-
-
-# ─────────────────────────────────────────────────────────────
-#  T4 — AMD  Accumulation → Manipulation → Distribution
-# ─────────────────────────────────────────────────────────────
-
-def check_amd_setup(
-    symbol: str, df_h4: pd.DataFrame, df_m15: pd.DataFrame,
-    df_m5: pd.DataFrame, direction: str,
-    min_rr: float = MIN_RR,
-) -> Optional[SetupSignal]:
-    """
-    T4 — AMD COMPLET
-
-    Ce module ne déclenche que si AMD est en phase "distribution"
-    (sweep validé + impulsion post-manipulation).
-
-    Critères :
-      ① AMD distribution confirmée (confidence ≥ 50)  → 40 pts
-      ② BOS M15 aligné avec la direction AMD           → +25 pts
-      ③ FVG ou OB dans la zone de distribution         → +20 pts
-      ④ Bougie M15 clôturée                            → +15 pts
-
-    Seuil : score ≥ 65 (AMD doit être distribution, pas accumulation)
-    """
-    score, reasons = 0, []
-
-    # ── ① AMD — distribution obligatoire ────────────────────
-    amd = detect_amd_phase(df_h4)
-
-    if amd.phase != "distribution" or amd.confidence < 50:
-        return None   # AMD partiel ou accum seule → pas de signal AMD
-
-    amd_pts = min(40, int(amd.confidence * 0.40))
-    score += amd_pts
-    reasons += amd.reasons
-    reasons.append(f"🔮 AMD Distribution confirmée (confidence {amd.confidence}%)  (+{amd_pts})")
-
-    # Vérifier alignement AMD ↔ biais
-    if amd.direction != direction:
-        return None   # AMD dit LONG mais biais H4 dit SHORT → incohérent
-
-    # ── ② BOS M15 ────────────────────────────────────────────
-    expected  = "bullish" if direction == "LONG" else "bearish"
-    bos_m15   = detect_bos(df_m15)
-    last_bos  = bos_m15[-1] if bos_m15 else None
-
-    if last_bos and last_bos["type"] == expected:
-        score += 25
-        reasons.append(f"✅ BOS M15 {expected} aligné AMD  (+25)")
-
-    # ── ③ FVG ou OB dans la zone de distribution ─────────────
-    price_now  = df_m5["close"].iloc[-1]
-    atr_m5     = (df_m5["high"] - df_m5["low"]).rolling(14).mean().iloc[-1]
-    fvgs_m5    = detect_fvg(df_m5)
-    fvg_active = active_fvg(df_m5, fvgs_m5, expected)
-    bos_m5     = detect_bos(df_m5)
-    obs_m5     = detect_order_blocks(df_m5, bos_m5)
-    ob_match   = next(
-        (o for o in reversed(obs_m5)
-         if o.direction == expected and
-            (min(o.top,o.bottom)-atr_m5*0.3) <= price_now <= (max(o.top,o.bottom)+atr_m5*0.3)),
-        None
-    )
-
-    if fvg_active:
-        score += 20
-        f_lo = min(fvg_active.top, fvg_active.bottom)
-        f_hi = max(fvg_active.top, fvg_active.bottom)
-        reasons.append(f"📍 FVG M5 dans zone distribution  [{round(f_lo,5)}–{round(f_hi,5)}]  (+20)")
-    elif ob_match:
-        score += 15
-        reasons.append(f"🏛️ OB M5 dans zone distribution  (+15)")
-
-    # ── ④ Bougie M15 ─────────────────────────────────────────
-    if _m15_candle_confirmed(df_m15, direction):
-        score += 15
-        reasons.append(f"🕯️ Bougie M15 clôturée — entrée validée  (+15)")
-
-    if score < 65:
-        return None
-
-    # ── v7 : Validation entrée zone stratégique ──────────────
-    entry_ok, entry_reasons, entry_bonus = _validate_strategic_entry_m15(
-        symbol, direction, df_m15, df_m5, df_h4
-    )
-    if not entry_ok:
-        return None
-    reasons += entry_reasons
-    score   += entry_bonus
-
-    entry, sl, tp1, rr, tp2, tp3 = _compute_levels(
-        symbol, direction, df_m5, df_m15, ob_match, fvg_active
-    )
-
-    if not _rr_ok(entry, sl, tp1, direction, min_rr):
-        return None
-
-    lot  = compute_lot(symbol, entry, sl, risk_usd=get_current_risk_usd())
-    bias = "BULLISH" if direction == "LONG" else "BEARISH"
-
-    return SetupSignal(
-        symbol=symbol, setup_type="AMD", tier=7,
-        direction=direction, entry=entry, sl=sl, tp=tp1, tp2=tp2, tp3=tp3,
-        rr=rr, score=score, reasons=reasons,
-        htf_bias=bias, lot=lot,
-        df_chart=df_m5, fvg_ref=fvg_active, ob_ref=ob_match,
-    )
-
-
-# ─────────────────────────────────────────────────────────────
-#  T5 — FVG  Fair Value Gap non mitiqué
-# ─────────────────────────────────────────────────────────────
-
-def check_fvg_setup(
-    symbol: str, df_h4: pd.DataFrame, df_m15: pd.DataFrame,
-    df_m5: pd.DataFrame, direction: str,
-    min_rr: float = MIN_RR,
-) -> Optional[SetupSignal]:
-    """
-    T5 — FVG (Fair Value Gap)
-
-    Critères :
-      ① FVG M5 non mitiqué dans le sens du biais      → +35 pts
-      ② BOS M15 ou BOS M5 confirme la direction        → +25 pts
-      ③ Prix actuellement dans le FVG                  → +25 pts
-      ④ Bougie M15 de confirmation                     → +15 pts
-
-    Seuil : score ≥ 60 / 100
-    """
-    score, reasons = 0, []
-
-    if len(df_m5) < 15 or len(df_m15) < 15:
-        return None
-
-    expected  = "bullish" if direction == "LONG" else "bearish"
-    price_now = df_m5["close"].iloc[-1]
-    atr_m5    = (df_m5["high"] - df_m5["low"]).rolling(14).mean().iloc[-1]
-
-    # ── ① FVG M5 non mitiqué ─────────────────────────────────
-    fvgs    = detect_fvg(df_m5)
-    fvg_dir = [f for f in fvgs if f.direction == expected]
-
-    fvg_best = None
-    for fvg_cand in reversed(fvg_dir):
-        if is_fvg_unmitigated(df_m5, fvg_cand):
-            fvg_best = fvg_cand
-            break
-
-    if fvg_best is None:
-        return None   # Aucun FVG frais → pas de signal FVG
-
-    score += 35
-    f_lo = min(fvg_best.top, fvg_best.bottom)
-    f_hi = max(fvg_best.top, fvg_best.bottom)
-    reasons.append(f"📍 FVG M5 non mitiqué [{round(f_lo,5)}–{round(f_hi,5)}]  (+35)")
-
-    # ── ② BOS M15 ou M5 ──────────────────────────────────────
-    bos_m15   = detect_bos(df_m15)
-    bos_m5    = detect_bos(df_m5)
-    bos_m15_ok = any(b["type"] == expected for b in bos_m15[-3:])
-    bos_m5_ok  = any(b["type"] == expected for b in bos_m5[-3:])
-
-    if bos_m15_ok:
-        score += 25
-        reasons.append(f"✅ BOS M15 {expected} confirme FVG  (+25)")
-    elif bos_m5_ok:
-        score += 15
-        reasons.append(f"✅ BOS M5 {expected} confirme FVG  (+15)")
-
-    # ── ③ Prix dans le FVG ───────────────────────────────────
-    in_fvg = (f_lo - atr_m5 * 0.2) <= price_now <= (f_hi + atr_m5 * 0.2)
-    if in_fvg:
-        score += 25
-        reasons.append(f"✅ Prix actuellement dans le FVG  (+25)")
-    else:
-        reasons.append(f"⏳ Attente que le prix entre dans le FVG [{round(f_lo,5)}–{round(f_hi,5)}]")
-
-    # ── ④ Bougie M15 ─────────────────────────────────────────
-    if _m15_candle_confirmed(df_m15, direction):
-        score += 15
-        reasons.append(f"🕯️ Bougie M15 clôturée  (+15)")
-
-    if score < 60:
-        return None
-
-    # ── v7 : Validation entrée zone stratégique ──────────────
-    entry_ok, entry_reasons, entry_bonus = _validate_strategic_entry_m15(
-        symbol, direction, df_m15, df_m5, df_h4
-    )
-    if not entry_ok:
-        return None
-    reasons += entry_reasons
-    score   += entry_bonus
-
-    obs_m5   = detect_order_blocks(df_m5, bos_m5)
-    ob_match = next((o for o in reversed(obs_m5) if o.direction == expected), None)
-
-    entry, sl, tp1, rr, tp2, tp3 = _compute_levels(
-        symbol, direction, df_m5, df_m15, ob_match, fvg_best
-    )
-
-    if not _rr_ok(entry, sl, tp1, direction, min_rr):
-        return None
-
-    lot  = compute_lot(symbol, entry, sl, risk_usd=get_current_risk_usd())
-    bias = "BULLISH" if direction == "LONG" else "BEARISH"
-
-    return SetupSignal(
-        symbol=symbol, setup_type="FVG", tier=6,
-        direction=direction, entry=entry, sl=sl, tp=tp1, tp2=tp2, tp3=tp3,
-        rr=rr, score=score, reasons=reasons,
-        htf_bias=bias, lot=lot,
-        df_chart=df_m5, fvg_ref=fvg_best, ob_ref=ob_match,
-    )
+            # rejet baissier : mèche haute dans la zone, clôture en dessous, corps significatif
+            rejection = (cl < o) and (body_ratio >= 0.35) and (cl < hi)
+        if rejection:
+            return {
+                "confirmed": True,
+                "reason": f"🔁 Retest OB/FVG + bougie de rejet confirmée (corps {round(body_ratio*100)}%)  → entrée 3⭐",
+            }
+
+    return {"confirmed": False, "reason": None}
 
 
 # ─────────────────────────────────────────────────────────────
@@ -6333,6 +6607,17 @@ def check_mss_setup(
     if score < 55:
         return None
 
+    # ── ⑤ Entrée directe (2⭐) vs entrée confirmée par retest (3⭐) ──
+    # Les 2 systèmes tournent en parallèle : Sweep+CHoCH suffit pour
+    # tirer un signal (2⭐) ; si en plus le prix est revenu retester
+    # l'OB/FVG avec une bougie de rejet, le signal passe en 3⭐.
+    retest = detect_ob_retest_rejection(df_m5, ob_match, fvg_active, direction)
+    stars  = 3 if retest["confirmed"] else 2
+    if retest["confirmed"]:
+        reasons.append(retest["reason"])
+    else:
+        reasons.append("⚡ Entrée directe — Sweep+CHoCH sans retest OB/FVG  → 2⭐")
+
     # ── v7 : Validation entrée zone stratégique ──────────────
     entry_ok, entry_reasons, entry_bonus = _validate_strategic_entry_m15(
         symbol, direction, df_m15, df_m5, df_h4
@@ -6343,13 +6628,16 @@ def check_mss_setup(
     score   += entry_bonus
 
     entry, sl, tp1, rr, tp2, tp3 = _compute_levels(
-        symbol, direction, df_m5, df_m15, ob_match, fvg_active, None, liq_map
+        symbol, direction, df_m5, df_m15, ob_match, fvg_active, None, liq_map, score=score
     )
 
     if not _rr_ok(entry, sl, tp1, direction, min_rr):
         return None
 
     lot  = compute_lot(symbol, entry, sl, risk_usd=get_current_risk_usd())
+    max_vol = get_max_volume()
+    if max_vol > 0 and lot > max_vol:
+        lot = max_vol
     bias = "BULLISH" if direction == "LONG" else "BEARISH"
 
     return SetupSignal(
@@ -6358,233 +6646,34 @@ def check_mss_setup(
         rr=rr, score=score, reasons=reasons,
         htf_bias=bias, lot=lot,
         df_chart=df_m5, fvg_ref=fvg_active, ob_ref=ob_match,
+        stars=stars,
     )
 
 
 # ─────────────────────────────────────────────────────────────
 #  ORCHESTRATEUR — scan_symbol()
-#  Lance les 6 modules sur un seul actif et retourne tous
-#  les signaux valides, triés par priorité (Tier 1 d'abord).
+#  Stratégie unique : Sweep de liquidité + Cassure de structure
+#  (BOS/CHoCH), LONG et SHORT. Entrée directe = 2⭐, entrée sur
+#  retest OB/FVG confirmé par bougie de rejet = 3⭐.
 # ─────────────────────────────────────────────────────────────
 
 SETUP_LABELS = {
-    "BREAKER": "T1 🥇 BREAKER",
-    "SD":      "T2 🥈 SUPPLY/DEMAND",
-    "OB":      "T3 🥉 ORDER BLOCK",
-    "BOS":     "T4     BOS RETEST",
-    "MSS":     "T5     MSS/CHoCH",
-    "FVG":     "T6     FVG",
-    "AMD":     "T7     AMD",
+    "MSS": "SWEEP + CASSURE DE STRUCTURE",
 }
-
-# ═════════════════════════════════════════════════════════════
-#  v9.5 — MATRICE ASSET-STRATEGY MATCHING (ASM)
-#
-#  Principe : chaque actif a un ou plusieurs setups de prédilection
-#  établis sur l'efficacité SMC observée.
-#
-#  Structure du profil :
-#    "preferred"  : list[str] — setups natifs (bonus +10 pts, seuil 74)
-#    "allowed"    : list[str] — setups tolérés (malus -15 pts, seuil 80)
-#    "blocked"    : list[str] — setups toujours rejetés pour cet actif
-#    "label"      : str       — libellé affiché dans les logs
-#    "rationale"  : str       — explication de la spécialisation
-#
-#  Règles de scoring ASM :
-#    • Setup dans "preferred" → score final += 10  (bonus spécialité)
-#    • Setup dans "allowed"   → score final -= 15  (malus hors-spécialité)
-#                               + seuil de validation relevé à 80 (vs 74)
-#    • Setup dans "blocked"   → signal rejeté immédiatement (None retourné)
-#
-#  Score minimal pour qu'un signal soit envoyé :
-#    • Setup natif   : SCORE_THRESHOLD      (74 par défaut)
-#    • Setup hors-spécialité : ASM_SCORE_THRESHOLD_OFF (80)
-# ═════════════════════════════════════════════════════════════
-
-# Seuil de score pour les setups hors-spécialité d'un actif
-ASM_SCORE_THRESHOLD_OFF = 84   # [v10] ajusté avec SCORE_THRESHOLD (78) — garde l'écart +6 pts hors-spécialité
-ASM_BONUS_NATIVE        = 10   # bonus de score pour un setup de prédilection
-ASM_MALUS_OFF_SPEC      = 15   # malus de score pour un setup hors-spécialité
-
-ASSET_STRATEGY_MAP: dict[str, dict] = {
-
-    # ── BTC — Spécialiste exclusif du Breaker Block M15 ──────────────────
-    # Raison : BTC a une liquidité extrêmement polarisée sur les stops
-    # institutionnels. Les Breaker Blocks M15 post-sweep sont les setups
-    # les plus répétables et les plus nets sur BTC (Winrate historique élevé).
-    # Les S/D H1 ou OB H4 sont moins respectés car BTC est plus volatile
-    # et réagit surtout aux accumulations/distributions rapides.
-    "BTC-USD": {
-        "preferred": ["BREAKER"],
-        "allowed":   ["AMD"],           # AMD toléré (manipulation H4 fréquente)
-        "blocked":   ["SD", "OB", "BOS", "MSS", "FVG"],
-        "label":     "₿ BTC — Breaker Block M15 specialist",
-        "rationale": "Liquidité polarisée stops institutionnels → Breaker M15 uniquement",
-    },
-
-    # ── EUR/USD — Spécialiste OB + FVG (structures internes SMC) ─────────
-    # Raison : EUR/USD est la paire la plus "propre" en termes de structure
-    # de marché. Les Order Blocks H4/M15 y sont très respectés car la
-    # paire est dominée par les flux institutionnels EUR/USD des banques
-    # centrales. Les FVG comblés en M15 après un BOS sont très fiables.
-    "EURUSD=X": {
-        "preferred": ["OB", "FVG", "BOS"],
-        "allowed":   ["BREAKER", "SD", "MSS"],
-        "blocked":   ["AMD"],           # AMD peu adapté sur EUR/USD (range tight)
-        "label":     "€ EUR/USD — OB + FVG specialist",
-        "rationale": "Structure institutionnelle propre → OB H4/M15 + FVG M15 après BOS",
-    },
-
-    # ── GBP/USD — Spécialiste OB + FVG + MSS (BOS/CHoCH agressifs) ──────
-    # Raison : GBP/USD est connu pour ses mouvements violents et ses
-    # faux breakouts (grâce à la volatilité GBP). Les setups MSS/CHoCH
-    # post-sweep + OB sont très efficaces car le marché crée des structures
-    # nettes avant de partir en tendance. Les FVG sont souvent créés et
-    # comblés rapidement lors des sessions London/NY.
-    "GBPUSD=X": {
-        "preferred": ["OB", "FVG", "MSS"],
-        "allowed":   ["BREAKER", "SD", "BOS"],
-        "blocked":   ["AMD"],
-        "label":     "£ GBP/USD — OB + FVG + MSS specialist",
-        "rationale": "Volatilité GBP → CHoCH + OB + FVG après sweeps agressifs",
-    },
-
-    # ── GOLD — Spécialiste Supply/Demand H1 institutionnel ───────────────
-    # Raison : Le Gold est l'actif qui respecte le MIEUX les grandes zones
-    # institutionnelles H1/H4. Les banques centrales et fonds macro placent
-    # leurs ordres sur des zones S/D clairement définies. Les retests de
-    # ces zones avec sweep de liquidité (chasse des stops) donnent les
-    # setups les plus fiables sur le Gold. Les Breaker Blocks M15 existent
-    # aussi mais sont moins nets que sur BTC.
-    "GC=F": {
-        "preferred": ["SD", "BREAKER"],
-        "allowed":   ["OB", "BOS"],
-        "blocked":   ["FVG", "MSS", "AMD"],  # trop de faux signaux sur Gold
-        "label":     "🥇 GOLD — Supply/Demand H1 specialist",
-        "rationale": "Zones institutionnelles H1 très respectées → S/D H1 + Breaker prioritaires",
-    },
-
-    # ── Crosses JPY — Spécialiste MSS + BOS (momentum Yen) ──────────────
-    # Raison : Les paires JPY ont des mouvements impulsifs forts lors des
-    # sessions asiatique et NY. Les structures MSS/CHoCH après accumulation
-    # et les BOS retests sont les setups les plus propres.
-    "USDJPY=X": {
-        "preferred": ["MSS", "BOS", "OB"],
-        "allowed":   ["BREAKER", "SD", "FVG"],
-        "blocked":   ["AMD"],
-        "label":     "¥ USD/JPY — MSS + BOS specialist",
-        "rationale": "Momentum Yen → MSS + BOS retests propres sur sessions Asie/NY",
-    },
-    "EURJPY=X": {
-        "preferred": ["MSS", "BOS", "OB"],
-        "allowed":   ["BREAKER", "SD", "FVG"],
-        "blocked":   ["AMD"],
-        "label":     "€¥ EUR/JPY — MSS + BOS specialist",
-        "rationale": "Momentum croisé EUR+JPY → CHoCH + BOS après sweeps",
-    },
-    "GBPJPY=X": {
-        "preferred": ["MSS", "BREAKER", "OB"],
-        "allowed":   ["BOS", "SD", "FVG"],
-        "blocked":   ["AMD"],
-        "label":     "£¥ GBP/JPY — MSS + Breaker specialist",
-        "rationale": "Volatilité extrême GBP/JPY → Breaker + CHoCH sur liquidités majeures",
-    },
-}
-
-# Profil par défaut : actifs non listés → généraliste (tous setups autorisés)
-_ASM_DEFAULT_PROFILE: dict = {
-    "preferred": ["BREAKER", "SD", "OB", "BOS", "MSS", "FVG", "AMD"],
-    "allowed":   [],
-    "blocked":   [],
-    "label":     "Généraliste — tous setups",
-    "rationale": "Actif non spécialisé → scan complet T1→T7",
-}
-
-
-def get_asset_profile(symbol: str) -> dict:
-    """
-    Retourne le profil ASM d'un symbole.
-    Fallback sur le profil généraliste si le symbole n'est pas dans la matrice.
-    """
-    return ASSET_STRATEGY_MAP.get(symbol, _ASM_DEFAULT_PROFILE)
-
-
-def asm_apply_score(
-    symbol: str,
-    setup_type: str,
-    raw_score: int,
-) -> tuple[int, bool, str]:
-    """
-    Applique le bonus/malus ASM au score brut d'un signal.
-
-    Retourne :
-      (score_final, is_valid_for_threshold, reason_str)
-
-    La validité est jugée par rapport au seuil adaptatif :
-      • Setup natif    → seuil SCORE_THRESHOLD (74)
-      • Setup toléré   → seuil ASM_SCORE_THRESHOLD_OFF (80)
-      • Setup bloqué   → is_valid = False immédiatement
-    """
-    profile   = get_asset_profile(symbol)
-    preferred = profile.get("preferred", [])
-    allowed   = profile.get("allowed",   [])
-    blocked   = profile.get("blocked",   [])
-
-    # ── Rejet immédiat si setup bloqué ───────────────────────
-    if setup_type in blocked:
-        return raw_score, False, (
-            f"🚫 ASM : {setup_type} bloqué pour {symbol} "
-            f"(spécialisation : {profile['label']})"
-        )
-
-    # ── Setup de prédilection → bonus + seuil standard ───────
-    if setup_type in preferred:
-        final = raw_score + ASM_BONUS_NATIVE
-        threshold = SCORE_THRESHOLD
-        reason = (
-            f"⭐ ASM : {setup_type} est le setup natif de {symbol} "
-            f"(+{ASM_BONUS_NATIVE} pts) → seuil {threshold}"
-        )
-        is_valid = final >= threshold
-        return final, is_valid, reason
-
-    # ── Setup toléré → malus + seuil renforcé ────────────────
-    if setup_type in allowed:
-        final = raw_score - ASM_MALUS_OFF_SPEC
-        threshold = ASM_SCORE_THRESHOLD_OFF
-        reason = (
-            f"⚠️ ASM : {setup_type} hors-spécialité pour {symbol} "
-            f"(-{ASM_MALUS_OFF_SPEC} pts) → seuil renforcé {threshold}"
-        )
-        is_valid = final >= threshold
-        return final, is_valid, reason
-
-    # ── Profil généraliste : pas de bonus/malus ───────────────
-    return raw_score, raw_score >= SCORE_THRESHOLD, (
-        f"✅ ASM : {symbol} généraliste — {setup_type} autorisé (seuil {SCORE_THRESHOLD})"
-    )
-
 
 
 def scan_symbol(symbol: str, mkt: str, min_rr: float = MIN_RR) -> list[SetupSignal]:
     """
-    v9.5 — Lance les modules de scan sur un symbole avec filtre ASM.
+    v13 — Stratégie unique : Sweep de liquidité + Cassure de structure.
 
     Fonctionnement :
       1. Téléchargement des données H4/H1/M15/M5 (une seule fois)
       2. Filtres communs (volatilité, news, biais H4, alignement H1)
-      3. Récupération du profil ASM du symbole
-      4. Pour chaque module (T1→T7) :
-           a. Skip si setup bloqué pour cet actif (profil ASM)
-           b. Exécution du checker
-           c. Application du bonus/malus ASM sur le score brut
-           d. Validation du seuil adaptatif (74 natif / 80 hors-spécialité)
-           e. Log de la décision ASM pour traçabilité
-      5. Tri par tier (T1 d'abord) puis score décroissant
-      6. Retourne uniquement les signaux qui passent TOUS les filtres
-
-    Hiérarchie v9.5 :
-      T1 BREAKER · T2 SUPPLY/DEMAND · T3 OB · T4 BOS · T5 MSS · T6 FVG · T7 AMD
+      3. Exécution du module unique (check_mss_setup) :
+           Sweep + BOS + CHoCH M15, LONG comme SHORT
+           → entrée directe (2⭐) ou entrée confirmée par retest
+             OB/FVG + bougie de rejet (3⭐)
+      4. Retourne le signal s'il passe le score minimum et le RR minimum
     """
     # ── 1. Téléchargement des données (une seule fois) ────────
     df_h4, df_h1, df_m15, df_m5, df_m1 = _fetch_data(symbol)
@@ -6608,6 +6697,12 @@ def scan_symbol(symbol: str, mkt: str, min_rr: float = MIN_RR) -> list[SetupSign
     if direction is None:
         return []
 
+    # ── [Cahier des charges] SHORT UNIQUEMENT ──────────────────
+    # Le bot ne prend plus que des positions SHORT (biais H4 baissier).
+    # Un biais haussier (LONG) est simplement ignoré, aucun signal généré.
+    if SHORT_ONLY and direction != "SHORT":
+        return []
+
     # ── 3b. FILTRE MULTI-TIMEFRAME H1 ─────────────────────────
     if df_h1 is not None and not df_h1.empty and len(df_h1) >= 25:
         bias_h1 = htf_bias(df_h1)
@@ -6618,97 +6713,27 @@ def scan_symbol(symbol: str, mkt: str, min_rr: float = MIN_RR) -> list[SetupSign
     # ── 4. Carte de liquidité (partagée) ─────────────────────
     liq_map = build_liquidity_map(df_h4, df_m5)
 
-    # ── 5. Profil ASM — récupération de la spécialisation ────
-    # Chaque actif a une liste de setups "preferred", "allowed", "blocked".
-    # Le profil guide la sélection et le scoring de chaque module.
-    profile = get_asset_profile(symbol)
-    log.info(
-        f"  📋 ASM {symbol} → {profile['label']} | "
-        f"natifs={profile['preferred']} | bloqués={profile['blocked']}"
-    )
-
-    # ── 6. Exécution des 7 modules avec filtre ASM ────────────
+    # ── 5. Exécution du module unique : Sweep + Cassure de structure ─
     signals: list[SetupSignal] = []
-
-    # ── [v11] Gold/BTC : pipeline S/D dédié M15(zone) → M1(entrée) ─
-    # Sur ces 2 actifs, on réutilise check_supply_demand_setup en
-    # décalant les timeframes d'un cran : M15 remplace le H1 (zone
-    # de référence / tendance) et M1 remplace le M15/M5 (structure
-    # + confirmation d'entrée), pour une réactivité accrue.
-    use_m1_sd = symbol in GOLD_BTC_M1_SYMBOLS and df_m1 is not None and len(df_m1) >= 30
-
-    def _sd_checker():
-        if use_m1_sd:
-            return check_supply_demand_setup(
-                symbol, df_h4, df_m15, df_m1, df_m1, direction, liq_map, min_rr
-            )
-        return check_supply_demand_setup(
-            symbol, df_h4, df_h1, df_m15, df_m5, direction, liq_map, min_rr
-        )
-
-    # Liste complète des checkers (nom_setup, lambda checker)
-    checkers = [
-        ("BREAKER", lambda: check_breaker_setup(symbol, df_h4, df_m15, df_m5, direction, liq_map, min_rr)),
-        ("SD",      _sd_checker),
-        ("OB",      lambda: check_ob_setup(symbol, df_h4, df_m15, df_m5, direction, min_rr)),
-        ("BOS",     lambda: check_bos_setup(symbol, df_h4, df_m15, df_m5, direction, min_rr)),
-        ("MSS",     lambda: check_mss_setup(symbol, df_h4, df_m15, df_m5, direction, liq_map, min_rr)),
-        ("FVG",     lambda: check_fvg_setup(symbol, df_h4, df_m15, df_m5, direction, min_rr)),
-        ("AMD",     lambda: check_amd_setup(symbol, df_h4, df_m15, df_m5, direction, min_rr)),
-    ]
-
-    for name, checker in checkers:
-
-        # ── a. Skip pré-exécution si setup bloqué par ASM ────
-        # Évite d'exécuter inutilement un checker dont le résultat
-        # sera de toute façon rejeté → gain de performance sur BTC/Gold.
-        if name in profile.get("blocked", []):
-            log.debug(
-                f"  🚫 ASM skip {symbol} [{name}] — setup bloqué pour cet actif"
-            )
-            continue
-
-        try:
-            # ── b. Exécution du checker ───────────────────────
-            sig = checker()
-            if sig is None:
-                continue
-
-            # ── c. Application du score ASM ───────────────────
-            # asm_apply_score() retourne :
-            #   score_final  : int    — score après bonus/malus
-            #   is_valid     : bool   — passe le seuil adaptatif ?
-            #   asm_reason   : str    — log de la décision ASM
-            score_final, is_valid, asm_reason = asm_apply_score(
-                symbol, name, sig.score
-            )
-
-            # ── d. Validation du seuil adaptatif ─────────────
-            if not is_valid:
-                log.info(
-                    f"  ❌ ASM rejet {symbol} [{name}] "
-                    f"score_brut={sig.score} → score_asm={score_final} | {asm_reason}"
-                )
-                continue
-
-            # ── e. Mise à jour du score et log ───────────────
-            # SetupSignal est un dataclass non-frozen → affectation directe
-            score_brut_log = sig.score
-            sig.score = score_final
-            sig.reasons.append(asm_reason)
-
+    try:
+        # [v15] Exécution basculée sur M5 uniquement (au lieu de M15) —
+        # zone stratégique H4 inchangée comme ancrage ; sweep, validation
+        # de corps de bougie et CHoCH/BOS sont désormais évalués sur M5.
+        # Configurable en direct via le menu Telegram (⏱ Timeframe).
+        exec_tf = df_m5 if get_timeframe_setting() == "M5" else df_m15
+        sig = check_mss_setup(symbol, df_h4, exec_tf, df_m5, direction, liq_map, min_rr)
+        if sig is not None:
+            stars = getattr(sig, "stars", 2)
             log.info(
-                f"  ✅ ASM validé {symbol} [{name}] "
-                f"score_brut={score_brut_log} → score_asm={score_final} | {asm_reason}"
+                f"  ✅ Signal validé {symbol} [SWEEP+CASSURE] "
+                f"{'⭐' * stars} score={sig.score} RR={sig.rr}"
             )
             signals.append(sig)
+    except Exception as e:
+        log.debug(f"  {symbol} [SWEEP+CASSURE] erreur : {e}")
 
-        except Exception as e:
-            log.debug(f"  {symbol} [{name}] erreur : {e}")
-
-    # ── 7. Tri par tier (T1 d'abord) puis score décroissant ──
-    signals.sort(key=lambda s: (s.tier, -s.score))
     return signals
+
 
 
 
@@ -6726,43 +6751,28 @@ TIER_1_PRIORITY: list[tuple[str, str]] = [
     ("BTC-USD", "Bitcoin"),
 ]
 
-TIER_2_FOREX: list[tuple[str, str]] = [
-    # 7 paires majeures USD — les plus liquides, spread le plus bas
-    ("EURUSD=X", "EUR/USD"),
-    ("GBPUSD=X", "GBP/USD"),
-    ("USDJPY=X", "USD/JPY"),
-    ("USDCHF=X", "USD/CHF"),
-    ("AUDUSD=X", "AUD/USD"),
-    ("NZDUSD=X", "NZD/USD"),
-    ("USDCAD=X", "USD/CAD"),
-]
-
-TIER_3_EXTRA: list[tuple[str, str]] = [
-    # Crosses majeures uniquement — haute liquidité, comportement SMC fiable
-    ("EURGBP=X", "EUR/GBP"),
-    ("EURJPY=X", "EUR/JPY"),
-    ("GBPJPY=X", "GBP/JPY"),
-    ("GBPAUD=X", "GBP/AUD"),
-    # Indices US — signaux puissants lors de la session NY
-    ("^GSPC",    "S&P 500"),
-    ("^NDX",     "Nasdaq 100"),
-]
-
-# SUPPRIMÉS (trop de SL, faible liquidité, spreads élevés) :
-# AUDCHF, AUDNZD, CADCHF, USDNOK, USDZAR, USDMXN, USDTRY, USDSEK
-# EURNZD, GBPNZD, NZDJPY, NZDCAD, NZDCHF, AUDCAD, CADJPY, CHFJPY
-# EURCAD, GBPCAD, EURCHF, EURAUD, GBPNZD, GBPCHF, GBPCAD
-# Silver, Oil, Gaz, CAC40, FTSE, DAX
+# SUPPRIMÉS (demande utilisateur — plus aucun Forex / indice US) :
+# EURUSD, GBPUSD, USDJPY, USDCHF, AUDUSD, NZDUSD, USDCAD (TIER_2_FOREX)
+# EURGBP, EURJPY, GBPJPY, GBPAUD, ^GSPC, ^NDX (TIER_3_EXTRA)
+# R_100, R_50 (Deriv — remplacés par R_75)
+#
+# Seuls 4 marchés restent actifs : XAUUSD (Gold), BTC, Volatility 75 Index,
+# Volatility 25 Index.
 
 
 def get_symbols(cat: str = "all") -> list[tuple[str, str]]:
-    if cat == "priority":  return TIER_1_PRIORITY
-    if cat == "btc":       return [("BTC-USD", "Bitcoin")]
-    if cat == "deriv":     return DERIV_SYMBOLS
-    if cat == "forex":     return TIER_1_PRIORITY + TIER_2_FOREX
-    if cat == "forex_all": return TIER_1_PRIORITY + TIER_2_FOREX + TIER_3_EXTRA
-    # "all" = majeures (v8) + indices Deriv 24/7
-    return TIER_1_PRIORITY + TIER_2_FOREX + TIER_3_EXTRA + DERIV_SYMBOLS
+    if cat == "gold":     return [("GC=F", "Gold")]
+    if cat == "btc":      return [("BTC-USD", "Bitcoin")]
+    if cat == "deriv":    return DERIV_SYMBOLS
+    if cat == "priority": return TIER_1_PRIORITY
+    # "all" = respecte le réglage 📈 Marchés actifs du menu Telegram
+    active = get_active_markets_setting()
+    if active == "gold_btc":
+        return TIER_1_PRIORITY
+    if active == "deriv":
+        return DERIV_SYMBOLS
+    # "all" (défaut) = les 4 marchés conservés : Gold + BTC + Volatility 75/25
+    return TIER_1_PRIORITY + DERIV_SYMBOLS
 
 
 # ─────────────────────────────────────────────────────────────
@@ -6915,7 +6925,8 @@ def run_live_v4(cat: str = "all", min_rr: float = MIN_RR, interval: int = 300) -
         f"⚡ <b>SMC Signal Engine v10 — FUSION COMPLÈTE (v8.6 + v9.6 + v4)</b>\n"
         f"{'─'*30}\n"
         f"🕐 <code>{ts}</code>\n"
-        f"📊 <b>Marchés :</b> {len(symbols)} actifs (majeures uniquement)\n"
+        f"📊 <b>Marchés ({len(symbols)}) :</b> XAUUSD (Gold) · BTC · "
+        f"Volatility 75 Index · Volatility 25 Index\n"
         f"🥇 T1 Breaker · 🥈 T2 S/D Zone · 🥉 T3 OB\n"
         f"T4 BOS · T5 MSS · T6 FVG · T7 AMD\n"
         f"⚡ <b>Max 3 signaux/cycle</b> — 1 signal/paire/cycle\n"
@@ -6934,6 +6945,22 @@ def run_live_v4(cat: str = "all", min_rr: float = MIN_RR, interval: int = 300) -
             }, timeout=10)
     except Exception:
         pass
+
+    # ── Confirmation de démarrage dans les DEUX groupes ────────────────
+    for grp_id, grp_label in (
+        (TELEGRAM_GROUP_DERIV_ID,    "Deriv (Volatility 75/25)"),
+        (TELEGRAM_GROUP_GOLD_BTC_ID, "Gold + BTC"),
+    ):
+        if not grp_id:
+            continue
+        try:
+            r = requests.post(_tg_url("sendMessage"), json={
+                "chat_id": grp_id, "text": startup_msg, "parse_mode": "HTML",
+            }, timeout=10)
+            ok = r.status_code == 200
+        except Exception:
+            ok = False
+        log.info(f"  [TG] {'✓' if ok else '✗'} Message de démarrage → groupe {grp_label} ({grp_id})")
 
     with _STATUS_LOCK:
         _STATUS["started_at"]    = ts
@@ -7151,7 +7178,7 @@ if __name__ == "__main__":
     parser.add_argument("--symbol", default=None,
                         help="Symbole unique (ex: GC=F, BTC-USD, EURUSD=X)")
     parser.add_argument("--cat",    default="all",
-                        choices=["priority", "btc", "forex", "forex_all", "all"])
+                        choices=["gold", "priority", "btc", "deriv", "all"])
     parser.add_argument("--scan",   action="store_true",
                         help="Scan unique (test local, sans Telegram)")
     parser.add_argument("--min-rr",  type=float, default=MIN_RR)
@@ -7169,9 +7196,12 @@ if __name__ == "__main__":
 
     # ── Trade Monitor — alertes TP/SL automatiques ───────────
     _init_trade_db()
+    _settings_init()
     _monitor_trades_thread()
     log.info("  ✓ Trade Monitor actif — alertes TP1/TP2/TP3/SL automatiques")
-    _daily_report_thread()    # Rapport Telegram à 21h00 UTC
+    _daily_report_thread()    # Rapport Telegram à 21h00 UTC (Gold+BTC + Deriv séparés)
+    _weekly_report_thread()   # Rapport Telegram hebdomadaire — dimanche 21h05 UTC
+    _telegram_command_thread()  # Commande admin /rapport (long-polling)
     print_stats_summary()     # Résumé stats au démarrage
 
     if args.symbol:
@@ -7203,5 +7233,6 @@ if __name__ == "__main__":
 
     else:
         run_live_v4(cat=args.cat, min_rr=args.min_rr, interval=args.interval)
+
 
 
