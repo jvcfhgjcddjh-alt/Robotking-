@@ -1,7110 +1,2951 @@
-
-
 """
-╔══════════════════════════════════════════════════════════════════════════╗
-║       ALPHABOT — SMC/ICT SIGNAL ENGINE  v13 — STRATÉGIE UNIQUE          ║
-║                                                                          ║
-║  STRATÉGIE (unique, LONG et SHORT) :                                    ║
-║  ✦ Sweep de liquidité + Cassure de structure (BOS + CHoCH) M15,        ║
-║    ancrée sur une zone H4 stratégique (OB H4 / Breaker H4 / Balance)   ║
-║  ✦ Entrée directe (Sweep + CHoCH confirmés)      → signal  ⭐⭐          ║
-║  ✦ Entrée confirmée (+ retest OB/FVG avec bougie                       ║
-║    de rejet dans les 6 dernières bougies M5)      → signal  ⭐⭐⭐        ║
-║  ✦ RR ≥ 3.0 imposé, score minimum SCORE_THRESHOLD (78/100)             ║
-║                                                                          ║
-║  MARCHÉS SCANNÉS (4, aucun autre) :                                    ║
-║  ✦ Gold (XAUUSD) et BTC-USD   → session New York UNIQUEMENT            ║
-║    (13h00–22h00 UTC)                                                    ║
-║  ✦ Volatility 75 Index (R_75) et Volatility 25 Index (R_25)            ║
-║    → 24h/24 (indices synthétiques Deriv)                                ║
-║                                                                          ║
-║  SORTIE / TP :                                                          ║
-║  ✦ TP1 = RR3 minimum · TP2 = RR5 · TP3 = RR6+                          ║
-║  ✦ À TP1 (RR3) : clôture totale possible, ou option de laisser courir  ║
-║    vers TP2/TP3 avec SL remonté à l'entrée (break-even)                ║
-║                                                                          ║
-║  GESTION DU RISQUE :                                                    ║
-║  ✦ RISQUE EN % DU CAPITAL : ACCOUNT_BALANCE_USD + RISK_PERCENT_PER_TRADE║
-║    configurables via variables d'env (0.65% par défaut → $65 sur $10k) ║
-║    RISK_USD calculé dynamiquement, lot calculé automatiquement          ║
-║  ✦ Ajustement dynamique du risque selon la série de résultats récents  ║
-║                                                                          ║
-║  TELEGRAM :                                                             ║
-║  ✦ 2 groupes séparés : Gold+BTC (TG_GROUP_GOLD_BTC_ID) et              ║
-║    Volatility 75/25 (TG_GROUP_DERIV_ID)                                 ║
-║  ✦ Chaque signal et chaque suivi de position (TP/SL) est envoyé à la   ║
-║    fois dans le groupe concerné ET en privé à l'admin (TG_LEADER_ID)   ║
-║                                                                          ║
-║  INFRASTRUCTURE (héritée, inchangée) :                                  ║
-║  ✦ FETCH DUAL-MODE : yfinance (défaut) + _yahoo_chart_json() sans       ║
-║    dépendance (fallback requests pur — compatible Pydroid/Android)      ║
-║  ✦ FLASK OPTIONNEL : import protégé par try/except (pas de crash si    ║
-║    flask absent sur Pydroid)                                            ║
-║  ✦ Corrélation guard, filtre news, filtre volatilité, limites          ║
-║    anti-sur-trading (par symbole / globale / session / Deriv)          ║
-╚══════════════════════════════════════════════════════════════════════════╝
+ALPHABOT SMC PRO — FUSION (fichier unique, prêt à déployer sur Render)
+========================================================================
+Fusion des deux cahiers des charges (PDF "SMC PRO" + DOCX "Liquidity Sweep +
+BOS Corps de Bougie"), confirmée avec Pie :
 
-Installation :
-    pip install yfinance pandas numpy colorama flask requests websocket-client
-    (yfinance et flask sont optionnels — fallback requests pur / sans dashboard web)
+  - Actifs : Gold (XAUUSD), BTC/USD, Deriv Volatility 75, Deriv Volatility 25
+  - Sessions : Gold + BTC -> session US/NY, 13h-22h UTC. Deriv (V75/V25) -> H24.
+  - Timeframe : M5 uniquement, sur tous les actifs.
+  - Signal : sweep de liquidité (mèche dépasse un niveau) PUIS cassure de
+    structure validée UNIQUEMENT par la clôture du CORPS de la bougie au-delà
+    du niveau de structure interne opposé (pas le niveau balayé lui-même).
+    Une mèche seule ne valide jamais -> signal ignoré.
+  - Entrée : directe (★★) si pas de FVG laissé par la bougie de cassure,
+    retour dans l'imbalance (★★★) si un FVG est détecté (plus haute confiance).
+  - SL : ATR(14) x 0,6 au-delà de l'extrémité du sweep, marge spread/commission incluse.
+  - TP1 : RR3, avec BE proposé à RR1 et sécurisation partielle proposée à RR2.
+  - TP2 : cible stratégique = prochain pool de liquidité non mitigé dans le sens
+    du trade (peut donner RR > 10, pas de plafond — juste un badge d'alerte).
+  - Score global 0-100 (étoiles + qualité du RR de TP2) ; seuil de publication
+    configurable (MIN_SCORE_TO_PUBLISH).
+  - Diffusion Telegram sur 2 groupes : "BTC + Gold" et "Deriv" (V75/V25).
+  - Dashboard Flask : capital/levier/risque/lot, stats, profils de risque,
+    statut des trades (pris/ignoré/clôturé), endpoint /health pour Render.
+  - Persistance SQLite : historique complet, anti-doublon, cap quotidien de signaux.
+  - Robustesse : chaque itération de scan est protégée par try/except, la
+    boucle ne s'arrête jamais ; à faire tourner avec redémarrage automatique
+    côté Render (Background Worker ou Web Service, cf. section DÉPLOIEMENT
+    en bas de fichier).
 
-Usage :
-    python main.py                    # scan complet live (Gold + BTC + V75 + V25)
-    python main.py --cat gold         # Gold seulement
-    python main.py --cat btc          # BTC seulement
-    python main.py --cat deriv        # Volatility 75 + 25 seulement
-    python main.py --symbol BTC-USD   # symbole unique
-    python main.py --scan             # scan unique (test)
-    python main.py --min-score 80     # filtre score
+  - Flux Deriv (V75/V25) : branché en direct sur l'API publique Deriv (WebSocket
+    ticks_history, granularity M5). App ID configurable via DERIV_APP_ID
+    (App ID public de démo "1089" utilisé par défaut).
+  - Rapports automatiques : journalier (21h UTC), hebdomadaire (dimanche
+    21h30 UTC), mensuel (dernier jour du mois, 22h UTC) — envoyés sur
+    Telegram (TG_CHAT_REPORTS si défini, sinon sur les 2 groupes de signaux)
+    et consultables via /api/reports/daily, /weekly, /monthly.
+
+⚠️ POINTS OUVERTS avant la prod réelle (voir aussi les commentaires inline) :
+  1. Flux Gold via yfinance (GC=F) est un flux "best effort" — remplacer par
+     un flux broker/MT5 si tu veux un prix plus fidèle à ton exécution réelle.
+  2. Génération d'image annotée (chart-img.com) non branchée ici — la fonction
+     send_telegram_signal() accepte déjà un `image_path` optionnel, prêt à
+     recevoir un screenshot si tu veux l'ajouter.
+  3. Les rapports raisonnent en multiples de R (pas de $ réel), car aucun
+     capital/lot n'est stocké par trade dans la base — cohérent avec le RR
+     déjà affiché dans chaque signal.
 """
 
-import argparse
-import threading
-import time
 import os
+import time
 import json
 import sqlite3
-import uuid
-import requests
-from datetime import datetime, timezone
-from dataclasses import dataclass, field
-from typing import Optional
-
 import logging
-import sys
+import threading
+import traceback
+import urllib.request
+from contextlib import contextmanager
+from dataclasses import dataclass
+from datetime import datetime, timezone, timedelta
+from typing import List, Dict, Optional
 
-import numpy as np
-import pandas as pd
+import requests
+from flask import Flask, request, jsonify, render_template_string
 
-# ── .env — charge les variables d'environnement depuis un fichier .env situé
-# à côté de ce script, si présent (sinon les variables d'env système/du
-# shell/de la plateforme de déploiement s'appliquent normalement). Optionnel :
-# si python-dotenv n'est pas installé, on continue sans planter.
-try:
-    from dotenv import load_dotenv
-    load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
-except ImportError:
-    pass
+import matplotlib
+matplotlib.use("Agg")  # pas d'affichage graphique — génération d'images en fichier uniquement
+import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle
 
-# ── yfinance — optionnel (fallback _yahoo_chart_json si absent) ───────────
-try:
-    import yfinance as yf
-    _HAS_YFINANCE = True
-except ImportError:
-    yf = None
-    _HAS_YFINANCE = False
 
-# ── Flask — serveur HTTP pour Render (optionnel — pas nécessaire sur Pydroid) ──
-try:
-    from flask import Flask, jsonify
-    flask_app = Flask(__name__)
-    _HAS_FLASK = True
-except ImportError:
-    Flask = None
-    jsonify = None
-    flask_app = None
-    _HAS_FLASK = False
+# ============================================================================
+# 1. CONFIGURATION
+# ============================================================================
 
-_STATUS: dict = {
-    "started_at"   : None,
-    "last_scan"    : None,
-    "cycle"        : 0,
-    "symbols_count": 0,
-    "last_signals" : [],
-    "scan_running" : False,
+@dataclass(frozen=True)
+class AssetConfig:
+    symbol: str
+    display_name: str
+    data_source: str            # "yfinance" | "binance" | "deriv_ws"
+    telegram_group: str         # "btc_gold" | "deriv"
+    session_continuous: bool
+    session_start_utc: Optional[int] = None
+    session_end_utc: Optional[int] = None
+    pip_size: float = 0.01
+    contract_type: str = "classic"
+
+
+ASSETS = {
+    "XAUUSD": AssetConfig(
+        symbol="XAUUSD", display_name="Gold (XAUUSD)", data_source="yfinance",
+        telegram_group="btc_gold", session_continuous=False,
+        session_start_utc=13, session_end_utc=22, contract_type="classic",
+    ),
+    "BTCUSD": AssetConfig(
+        symbol="BTCUSD", display_name="BTC/USD", data_source="binance",
+        telegram_group="btc_gold", session_continuous=False,
+        session_start_utc=13, session_end_utc=22, contract_type="crypto",
+    ),
+    "V75": AssetConfig(
+        symbol="V75", display_name="Volatility 75 Index", data_source="deriv_ws",
+        telegram_group="deriv", session_continuous=True, contract_type="synthetic",
+    ),
+    "V25": AssetConfig(
+        symbol="V25", display_name="Volatility 25 Index", data_source="deriv_ws",
+        telegram_group="deriv", session_continuous=True, contract_type="synthetic",
+    ),
 }
-_STATUS_LOCK = threading.Lock()
+
+TIMEFRAME = "M5"
+SCAN_INTERVAL_SECONDS = 30
+
+# Anti-doublon "temps" : délai minimum entre deux signaux sur le MÊME actif,
+# quel que soit leur statut (même après clôture). Vient en plus de la
+# protection structurelle par setup_key (symbol:direction:niveau balayé), qui
+# ne couvre que les setups encore actifs. Ce cooldown couvre le cas où le
+# même niveau est re-balayé peu après la clôture d'un premier signal.
+SIGNAL_COOLDOWN_MINUTES = float(os.environ.get("SIGNAL_COOLDOWN_MINUTES", "15"))
+SIGNAL_COOLDOWN_SECONDS = SIGNAL_COOLDOWN_MINUTES * 60
+
+ATR_PERIOD = 14
+ATR_SL_MULTIPLIER = 0.6
+INCLUDE_SPREAD_COMMISSION_BUFFER = True
+
+TP1_RR = 3.0
+BE_TRIGGER_RR = 1.0
+SECURE_TRIGGER_RR = 2.0
+TP2_MIN_RR_WARNING = 10.0
+
+ENTRY_TYPES = {
+    "direct": {"stars": "★★", "label": "Entrée directe", "score_weight": 60},
+    "fvg_return": {"stars": "★★★", "label": "Retour Imbalance (FVG)", "score_weight": 85},
+}
+MIN_SCORE_TO_PUBLISH = 70
+
+MAX_SIGNALS_PER_DAY_GLOBAL = 3
+MAX_SIGNALS_PER_DAY_PER_ASSET = 2
+
+# ⚠️ SÉCURITÉ — valeurs par défaut codées en dur à la demande explicite du
+# porteur du projet (tokens/chat IDs communiqués en clair dans la conversation
+# de configuration). Ces valeurs sont utilisées UNIQUEMENT si la variable
+# d'environnement correspondante n'est pas définie sur Render — donc si tu
+# régénères un token plus tard, définis simplement la variable d'env
+# correspondante et elle prendra le dessus automatiquement, sans toucher au
+# code. Recommandé : régénère ces tokens via @BotFather dès que possible
+# puisqu'ils ont transité en clair dans un chat, puis passe par les
+# variables d'environnement Render au lieu de ce fallback.
+_DEFAULT_TG_CHAT_BTC_GOLD = "-5281258868"
+_DEFAULT_TG_TOKEN_BTC_GOLD = "6950706659:AAEeRW9Ld1zNz0xyDLwlKuIQxZst4S7RU0Q"
+_DEFAULT_TG_CHAT_DERIV = "-1002335466840"
+_DEFAULT_TG_TOKEN_DERIV = "8665812395:AAGdB95bYjQOcGrk5r84V7bosdGboRQJcUQ"
+
+TELEGRAM_GROUPS = {
+    # Groupe 1 : BTC/USD + XAU/USD (Gold) — bot Telegram dédié, indépendant du groupe Deriv.
+    "btc_gold": {
+        "token_env": "TELEGRAM_BOT_TOKEN_BTC_GOLD",
+        "chat_id_env": "TG_CHAT_BTC_GOLD",
+        "assets": ["XAUUSD", "BTCUSD"],
+        "token_default": _DEFAULT_TG_TOKEN_BTC_GOLD,
+        "chat_id_default": _DEFAULT_TG_CHAT_BTC_GOLD,
+    },
+    # Groupe 2 : Volatility 25 + Volatility 75 (Deriv) — bot Telegram dédié.
+    "deriv": {
+        "token_env": "TELEGRAM_BOT_TOKEN_DERIV",
+        "chat_id_env": "TG_CHAT_DERIV",
+        "assets": ["V25", "V75"],
+        "token_default": _DEFAULT_TG_TOKEN_DERIV,
+        "chat_id_default": _DEFAULT_TG_CHAT_DERIV,
+    },
+    # Optionnel : si TG_CHAT_REPORTS n'est pas défini, les rapports sont
+    # envoyés sur les deux groupes de signaux ci-dessus à la place (chacun
+    # avec son propre bot token). TELEGRAM_BOT_TOKEN_REPORTS est optionnel ;
+    # à défaut, le token du groupe "btc_gold" est réutilisé pour ce canal.
+    "reports": {"token_env": "TELEGRAM_BOT_TOKEN_REPORTS", "chat_id_env": "TG_CHAT_REPORTS", "assets": []},
+}
 
 
-# Guard : si Flask absent, les décorateurs de route sont des no-ops
-_route = flask_app.route if _HAS_FLASK and flask_app else (lambda *a, **k: (lambda f: f))
+def enforce_group_asset_whitelist():
+    """Vérifie au démarrage que chaque actif n'est routé QUE vers le groupe
+    Telegram autorisé pour lui (BTC/XAU -> btc_gold, V25/V75 -> deriv).
+    Lève une erreur explicite si la config a été modifiée de façon incohérente."""
+    for symbol, asset in ASSETS.items():
+        allowed = TELEGRAM_GROUPS.get(asset.telegram_group, {}).get("assets", [])
+        if allowed and symbol not in allowed:
+            raise RuntimeError(
+                f"Incohérence de configuration : l'actif '{symbol}' est routé vers le "
+                f"groupe Telegram '{asset.telegram_group}', qui n'autorise que {allowed}."
+            )
 
-@_route("/")
-def index():
-    with _STATUS_LOCK:
-        st = dict(_STATUS)
+REPORT_DAILY_HOUR_UTC = 21
+REPORT_WEEKLY_HOUR_UTC = 21
+REPORT_WEEKLY_MINUTE_UTC = 30   # décalé de la journalière pour ne pas se chevaucher
+REPORT_MONTHLY_HOUR_UTC = 22
 
-    signals_html = ""
-    for s in reversed(st["last_signals"][-15:]):
-        color    = "#e74c3c" if s["direction"] == "SHORT" else "#2ecc71"
-        mode_col = {"AMD": "#9b59b6", "PRE-BOS": "#f39c12",
-                    "SMC": "#58a6ff", "SWEEP_SHIFT": "#e67e22",
-                    "CHOCH_LIQ": "#1abc9c", "BREAKER_HTF": "#e74c3c",
-                    "OFS": "#27ae60", "SMC_TRADER": "#f1c40f",
-                    "ETE_M15": "#ff4081", "BOS_RETEST": "#00bcd4",
-                    "SWEEP_BOS_M15": "#c0392b",
-                    "BREAKER": "#e74c3c", "SD": "#f39c12",
-                    "OB": "#9b59b6", "BOS": "#00bcd4",
-                    "MSS": "#1abc9c", "FVG": "#3498db",
-                    }.get(s.get("mode", "SMC"), "#58a6ff")
-        signals_html += (
-            f"<tr>"
-            f"<td>{s['ts']}</td>"
-            f"<td><b>{s['market']}</b></td>"
-            f"<td style='color:{color};font-weight:bold'>{s['direction']}</td>"
-            f"<td><span style='background:{mode_col};color:#000;padding:2px 6px;"
-            f"border-radius:4px;font-size:.8em;font-weight:bold'>{s.get('mode','SMC')}</span></td>"
-            f"<td>{s['entry']}</td>"
-            f"<td style='color:#e74c3c'>{s['sl']}</td>"
-            f"<td style='color:#2ecc71'>{s['tp']}</td>"
-            f"<td>1:{s['rr']}</td>"
-            f"<td>{s['score']}/100</td>"
-            f"<td>{s['lot']} lot</td>"
-            f"</tr>"
+DB_PATH = os.environ.get("DB_PATH", "alphabot_smc_fusion.db")
+TELEGRAM_API = "https://api.telegram.org/bot{token}/{method}"
+
+CHARTS_DIR = os.environ.get("CHARTS_DIR", "charts")
+CHARTS_KEEP_LAST = 300  # nettoyage automatique — ne garde que les N dernières images
+
+# --- Telegram : boutons interactifs -------------------------------------
+# Secret optionnel utilisé pour vérifier l'origine des appels webhook Telegram
+# (envoyé par Telegram dans le header X-Telegram-Bot-Api-Secret-Token si tu le
+# configures lors de l'appel à setWebhook, cf. section DÉPLOIEMENT en bas).
+TELEGRAM_WEBHOOK_SECRET = os.environ.get("TELEGRAM_WEBHOOK_SECRET", "")
+
+# --- Deriv WebSocket : flux temps réel -----------------------------------
+DERIV_APP_ID = os.environ.get("DERIV_APP_ID", "1089")
+DERIV_RECONNECT_MIN_SECONDS = 2
+DERIV_RECONNECT_MAX_SECONDS = 60
+DERIV_WS_TIMEOUT_SECONDS = 15          # timeout socket (connexion + recv)
+DERIV_CACHE_STALE_SECONDS = 900        # au-delà, le cache est jugé périmé (fallback one-shot)
+DERIV_PING_INTERVAL_SECONDS = 20       # ping applicatif pour détecter les connexions mortes
+
+# --- Watchdog VPS / Render ------------------------------------------------
+WATCHDOG_CHECK_INTERVAL_SECONDS = 15
+WATCHDOG_MAX_SILENCE_SECONDS = 180     # si aucun scan depuis ce délai -> considéré comme bloqué
+WATCHDOG_RESTART_COOLDOWN_SECONDS = 30 # anti rage-restart
+
+# --- TP2 intelligent SMC/ICT --------------------------------------------
+# Poids de priorité utilisés uniquement comme repère en cas d'égalité de
+# distance entre deux cibles candidates : un Order Block non mitigé est une
+# empreinte institutionnelle plus fiable qu'un simple FVG, lui-même plus
+# fiable qu'un pool de liquidité brut (cible "ultime" mais moins précise).
+TP2_TARGET_PRIORITY = {"order_block": 3, "fvg": 2, "liquidity": 1}
+TP2_TARGET_LABELS = {
+    "order_block": "Order Block",
+    "fvg": "Fair Value Gap",
+    "liquidity_buy": "Liquidité (BSL)",
+    "liquidity_sell": "Liquidité (SSL)",
+}
+OB_IMPULSE_ATR_MULTIPLIER = 1.3  # une bougie est jugée "impulsive" si son corps > ATR x ce facteur
+
+os.makedirs("logs", exist_ok=True)
+os.makedirs(CHARTS_DIR, exist_ok=True)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler(), logging.FileHandler("logs/alphabot_smc.log")],
+)
+log = logging.getLogger("alphabot_smc")
+
+
+# ============================================================================
+# 2. PERSISTANCE SQLITE
+# ============================================================================
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS signals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol TEXT NOT NULL,
+    setup_key TEXT NOT NULL,
+    direction TEXT NOT NULL,
+    entry_type TEXT NOT NULL,
+    stars TEXT NOT NULL,
+    score INTEGER NOT NULL,
+    entry_price REAL NOT NULL,
+    stop_loss REAL NOT NULL,
+    tp1 REAL NOT NULL,
+    tp2 REAL,
+    rr_tp1 REAL NOT NULL,
+    rr_tp2 REAL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    telegram_group TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    closed_at REAL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_active_setup
+    ON signals(setup_key)
+    WHERE status NOT IN ('closed', 'invalidated', 'tp2_hit');
+
+CREATE TABLE IF NOT EXISTS daily_counters (
+    day TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    count INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (day, symbol)
+);
+
+CREATE TABLE IF NOT EXISTS report_log (
+    report_type TEXT NOT NULL,
+    period_key TEXT NOT NULL,
+    sent_at REAL NOT NULL,
+    PRIMARY KEY (report_type, period_key)
+);
+
+CREATE TABLE IF NOT EXISTS app_settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS profiles (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,
+    capital REAL NOT NULL,
+    leverage REAL NOT NULL,
+    risk_percent REAL NOT NULL,
+    max_open_positions INTEGER NOT NULL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+
+-- Journal de toutes les actions déclenchées par les boutons Telegram
+-- interactifs (✅ pris / ❌ ignoré / 🟡 BE / 🔒 sécurisé / 🔴 clôturé).
+CREATE TABLE IF NOT EXISTS trade_actions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    signal_id INTEGER NOT NULL,
+    action TEXT NOT NULL,
+    previous_status TEXT,
+    new_status TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT 'telegram',
+    actor TEXT,
+    created_at REAL NOT NULL,
+    FOREIGN KEY (signal_id) REFERENCES signals(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_trade_actions_signal ON trade_actions(signal_id);
+
+-- Table à ligne unique (id=1) utilisée par le watchdog pour suivre l'état de
+-- vie de la boucle de scan (heartbeat) et le nombre de redémarrages forcés.
+CREATE TABLE IF NOT EXISTS watchdog_heartbeat (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    last_scan_at REAL,
+    last_heartbeat_at REAL,
+    restart_count INTEGER NOT NULL DEFAULT 0,
+    last_restart_at REAL,
+    last_restart_reason TEXT
+);
+"""
+
+
+def _migrate_schema():
+    """Ajoute les colonnes introduites après la première mise en prod, sans
+    jamais toucher aux données existantes (ALTER TABLE best-effort)."""
+    with get_conn() as conn:
+        cols = {row["name"] for row in conn.execute("PRAGMA table_info(signals)")}
+        if "tp2_source" not in cols:
+            conn.execute("ALTER TABLE signals ADD COLUMN tp2_source TEXT")
+
+# ----------------------------------------------------------------------
+# Paramètres modifiables depuis le dashboard (sans toucher au code).
+# Stockés en SQLite (table app_settings, une ligne JSON), avec ces valeurs
+# par défaut au premier démarrage.
+# ----------------------------------------------------------------------
+DEFAULT_SETTINGS = {
+    "capital": 1000.0,                      # capital du compte ($)
+    "leverage": 100,                        # levier (x)
+    "risk_percent": 1.0,                    # risque par trade (%)
+    "risk_mode": "standard",                # conservé pour compatibilité (voir table `profiles`)
+    "active_profile_id": None,              # id du profil actuellement sélectionné (table `profiles`)
+    "martingale_enabled": False,             # martingale ON/OFF
+    "martingale_multiplier": 2.0,            # multiplicateur de risque après une perte
+    "recovery_enabled": False,               # mode recovery ON/OFF
+    "recovery_max_multiplier": 1.5,          # plafond du multiplicateur de risque en recovery
+    "max_open_positions": 3,                 # nombre maximum de positions ouvertes simultanées
+    "min_score_to_publish": MIN_SCORE_TO_PUBLISH,  # score minimum pour publier un signal
+}
+
+_SETTINGS_KEY = "config"
+
+
+@contextmanager
+def get_conn():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def init_db():
+    with get_conn() as conn:
+        conn.executescript(SCHEMA)
+    _migrate_schema()
+    _seed_default_settings()
+    _seed_default_profiles()
+    _seed_watchdog_heartbeat()
+
+
+def _seed_watchdog_heartbeat():
+    now = time.time()
+    with get_conn() as conn:
+        conn.execute(
+            """INSERT INTO watchdog_heartbeat (id, last_scan_at, last_heartbeat_at, restart_count)
+               VALUES (1, ?, ?, 0)
+               ON CONFLICT(id) DO NOTHING""",
+            (now, now),
         )
 
-    html = f"""<!DOCTYPE html>
-<html lang="fr">
-<head>
-  <meta charset="UTF-8">
-  <meta http-equiv="refresh" content="30">
-  <title>SMC Signal Engine v10</title>
-  <style>
-    body  {{ font-family: monospace; background:#0d1117; color:#c9d1d9; margin:2em; }}
-    h1    {{ color:#58a6ff; }}
-    h2    {{ color:#8b949e; border-bottom:1px solid #30363d; padding-bottom:.3em; }}
-    table {{ border-collapse:collapse; width:100%; }}
-    th    {{ background:#161b22; color:#8b949e; padding:.5em 1em; text-align:left; }}
-    td    {{ padding:.4em 1em; border-bottom:1px solid #21262d; }}
-    .badge{{ display:inline-block; padding:.2em .6em; border-radius:4px; font-size:.85em; font-weight:bold; }}
-    .live {{ background:#2ecc71; color:#000; }}
-    .idle {{ background:#f39c12; color:#000; }}
-  </style>
-</head>
-<body>
-  <h1>⚡ SMC Signal Engine v10 — Breaker · S/D Zone · OB · BOS · MSS · FVG · AMD</h1>
-  <p>
-    Statut : <span class="badge {'live' if st['scan_running'] else 'idle'}">
-      {'🟢 SCAN ACTIF' if st['scan_running'] else '🟡 EN ATTENTE'}
-    </span>
-    &nbsp;|&nbsp; Démarré : <b>{st['started_at'] or '—'}</b>
-    &nbsp;|&nbsp; Cycle : <b>#{st['cycle']}</b>
-    &nbsp;|&nbsp; Marchés : <b>{st['symbols_count']}</b>
-    &nbsp;|&nbsp; Dernier scan : <b>{st['last_scan'] or '—'}</b>
-  </p>
-  <p style="color:#8b949e;font-size:.85em">⟳ Rafraîchissement toutes les 30s</p>
-  <h2>📋 Derniers signaux</h2>
-  {'<p style="color:#f39c12">Aucun signal validé pour le moment.</p>' if not st['last_signals'] else f"""
-  <table>
-    <tr>
-      <th>Heure UTC</th><th>Marché</th><th>Direction</th><th>Mode</th>
-      <th>Entrée</th><th>SL 🔴</th><th>TP 🟢</th><th>R:R</th><th>Score</th><th>Lot</th>
-    </tr>{signals_html}
-  </table>"""}
-  <h2>⚙️ Configuration v13 — Stratégie unique (Sweep + Cassure de structure)</h2>
-  <table>
-    <tr><th>Paramètre</th><th>Valeur</th></tr>
-    <tr><td>Stratégie</td><td>Sweep de liquidité + Cassure de structure (BOS/CHoCH), LONG et SHORT</td></tr>
-    <tr><td>Entrée directe</td><td>⭐⭐ Sweep + CHoCH confirmés → signal immédiat</td></tr>
-    <tr><td>Entrée confirmée</td><td>⭐⭐⭐ + retour retester l'Order Block / FVG avec bougie de rejet</td></tr>
-    <tr><td>Score minimum</td><td>{SCORE_THRESHOLD}/100</td></tr>
-    <tr><td>RR minimum</td><td>1:{MIN_RR}</td></tr>
-    <tr><td>Risque/trade</td><td>{RISK_PERCENT_PER_TRADE}% (${RISK_USD:.2f} sur ${ACCOUNT_BALANCE_USD:,.0f})</td></tr>
-    <tr><td>Timeframes</td><td>H4 → M15 → M5</td></tr>
-    <tr><td>Max signaux/jour</td><td>{MAX_SIGNALS_GLOBAL_PER_DAY} (reset 00h00 UTC)</td></tr>
-    <tr><td>Gold + BTC</td><td>🇺🇸 Scan restreint à la session New York (13h00–22h00 UTC)</td></tr>
-    <tr><td>Volatility 75 / 25</td><td>🌐 Scan 24h/24 (indices synthétiques)</td></tr>
-    <tr><td>Groupes Telegram</td><td>Gold+BTC et Volatility 75/25 → 2 groupes séparés</td></tr>
-    <tr><td>Intervalle scan</td><td>5 minutes</td></tr>
-  </table>
-</body>
-</html>"""
-    return html
+
+def _seed_default_settings():
+    """Insère les réglages par défaut au tout premier démarrage uniquement
+    (n'écrase jamais des réglages déjà personnalisés depuis le dashboard)."""
+    with get_conn() as conn:
+        row = conn.execute("SELECT value FROM app_settings WHERE key=?", (_SETTINGS_KEY,)).fetchone()
+        if row is None:
+            conn.execute(
+                "INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, ?)",
+                (_SETTINGS_KEY, json.dumps(DEFAULT_SETTINGS), time.time()),
+            )
 
 
-@_route("/stats")
-def stats_json():
-    """Journal statistique — résumé JSON des performances."""
-    from collections import defaultdict
-    stats  = get_signal_stats(500)
-    closed = [s for s in stats if s["result"] != "open"]
-    open_t = [s for s in stats if s["result"] == "open"]
+def get_settings() -> Dict:
+    """Retourne les réglages actuels (fusionnés avec les défauts, pour rester
+    compatible si de nouvelles clés sont ajoutées après une mise à jour)."""
+    with get_conn() as conn:
+        row = conn.execute("SELECT value FROM app_settings WHERE key=?", (_SETTINGS_KEY,)).fetchone()
+    settings = dict(DEFAULT_SETTINGS)
+    if row:
+        try:
+            settings.update(json.loads(row["value"]))
+        except (json.JSONDecodeError, TypeError):
+            log.error("app_settings corrompu, retour aux valeurs par défaut.")
+    return settings
 
-    by_setup: dict = defaultdict(list)
-    by_sym:   dict = defaultdict(list)
-    by_hour:  dict = defaultdict(list)
 
-    for s in closed:
-        by_setup[s["setup_type"]].append(s["pnl_r"])
-        by_sym[s["symbol"]].append(s["pnl_r"])
-        by_hour[s["hour_utc"]].append(s["pnl_r"])
+def update_settings(patch: Dict) -> Dict:
+    """Met à jour uniquement les clés fournies (validation légère des types),
+    persiste, et retourne les réglages complets à jour."""
+    current = get_settings()
 
-    def _summary(d):
+    validators = {
+        "capital": (float, lambda v: v > 0),
+        "leverage": (float, lambda v: v > 0),
+        "risk_percent": (float, lambda v: 0 < v <= 100),
+        "risk_mode": (str, lambda v: True),  # champ hérité, remplacé par le système de profils (table `profiles`)
+        "martingale_enabled": (bool, lambda v: True),
+        "martingale_multiplier": (float, lambda v: v >= 1),
+        "recovery_enabled": (bool, lambda v: True),
+        "recovery_max_multiplier": (float, lambda v: v >= 1),
+        "max_open_positions": (int, lambda v: v >= 1),
+        "min_score_to_publish": (int, lambda v: 0 <= v <= 100),
+    }
+
+    for key, raw_value in patch.items():
+        if key not in validators:
+            continue  # clé inconnue -> ignorée silencieusement (pas d'injection de champs arbitraires)
+        cast, check = validators[key]
+        try:
+            value = cast(raw_value)
+        except (TypeError, ValueError):
+            raise ValueError(f"Valeur invalide pour '{key}': {raw_value!r}")
+        if not check(value):
+            raise ValueError(f"Valeur hors limites pour '{key}': {raw_value!r}")
+        current[key] = value
+
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE app_settings SET value=?, updated_at=? WHERE key=?",
+            (json.dumps(current), time.time(), _SETTINGS_KEY),
+        )
+    return current
+
+
+def _set_active_profile_id(profile_id: Optional[int]):
+    current = get_settings()
+    current["active_profile_id"] = profile_id
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE app_settings SET value=?, updated_at=? WHERE key=?",
+            (json.dumps(current), time.time(), _SETTINGS_KEY),
+        )
+
+
+# ----------------------------------------------------------------------
+# 2bis. SYSTÈME DE PROFILS (sauvegardés en SQLite, gérables sans toucher au code)
+# ----------------------------------------------------------------------
+DEFAULT_PROFILES = [
+    # (nom, capital, levier, risque %, positions max)
+    ("Scalping",     1000.0, 200, 2.0, 5),
+    ("Standard",     1000.0, 100, 1.0, 3),
+    ("Conservative", 1000.0,  50, 0.5, 2),
+]
+
+
+def _seed_default_profiles():
+    """Crée les 3 profils de départ (Scalping / Standard / Conservative)
+    uniquement s'il n'existe encore aucun profil, et active 'Standard'."""
+    with get_conn() as conn:
+        count = conn.execute("SELECT COUNT(*) AS n FROM profiles").fetchone()["n"]
+        if count > 0:
+            return
+        now = time.time()
+        standard_id = None
+        for name, capital, leverage, risk_percent, max_pos in DEFAULT_PROFILES:
+            cur = conn.execute(
+                "INSERT INTO profiles (name, capital, leverage, risk_percent, "
+                "max_open_positions, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (name, capital, leverage, risk_percent, max_pos, now, now),
+            )
+            if name == "Standard":
+                standard_id = cur.lastrowid
+    if standard_id:
+        _set_active_profile_id(standard_id)
+
+
+def list_profiles() -> List[Dict]:
+    with get_conn() as conn:
+        rows = conn.execute("SELECT * FROM profiles ORDER BY id ASC").fetchall()
+    active_id = get_settings().get("active_profile_id")
+    return [dict(r, active=(r["id"] == active_id)) for r in rows]
+
+
+def get_profile(profile_id: int) -> Optional[Dict]:
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM profiles WHERE id=?", (profile_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def create_profile(name: str, capital: float, leverage: float,
+                    risk_percent: float, max_open_positions: int) -> Dict:
+    if not name or not name.strip():
+        raise ValueError("Le nom du profil est obligatoire.")
+    if capital <= 0 or leverage <= 0 or not (0 < risk_percent <= 100) or max_open_positions < 1:
+        raise ValueError("Paramètres de profil invalides.")
+    now = time.time()
+    with get_conn() as conn:
+        try:
+            cur = conn.execute(
+                "INSERT INTO profiles (name, capital, leverage, risk_percent, "
+                "max_open_positions, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (name.strip(), capital, leverage, risk_percent, max_open_positions, now, now),
+            )
+        except sqlite3.IntegrityError:
+            raise ValueError(f"Un profil nommé '{name}' existe déjà.")
+    return get_profile(cur.lastrowid)
+
+
+def update_profile(profile_id: int, patch: Dict) -> Dict:
+    existing = get_profile(profile_id)
+    if not existing:
+        raise ValueError("Profil introuvable.")
+    fields = {
+        "name": str, "capital": float, "leverage": float,
+        "risk_percent": float, "max_open_positions": int,
+    }
+    updates = dict(existing)
+    for key, cast in fields.items():
+        if key in patch:
+            updates[key] = cast(patch[key])
+    if updates["capital"] <= 0 or updates["leverage"] <= 0 \
+            or not (0 < updates["risk_percent"] <= 100) or updates["max_open_positions"] < 1:
+        raise ValueError("Paramètres de profil invalides.")
+    with get_conn() as conn:
+        try:
+            conn.execute(
+                "UPDATE profiles SET name=?, capital=?, leverage=?, risk_percent=?, "
+                "max_open_positions=?, updated_at=? WHERE id=?",
+                (updates["name"], updates["capital"], updates["leverage"], updates["risk_percent"],
+                 updates["max_open_positions"], time.time(), profile_id),
+            )
+        except sqlite3.IntegrityError:
+            raise ValueError(f"Un profil nommé '{updates['name']}' existe déjà.")
+    # Si le profil modifié est actif, on répercute immédiatement ses valeurs
+    # sur les réglages en cours (capital/levier/risque/positions max).
+    if get_settings().get("active_profile_id") == profile_id:
+        activate_profile(profile_id)
+    return get_profile(profile_id)
+
+
+def delete_profile(profile_id: int):
+    settings = get_settings()
+    if settings.get("active_profile_id") == profile_id:
+        raise ValueError("Impossible de supprimer le profil actif — active un autre profil d'abord.")
+    with get_conn() as conn:
+        conn.execute("DELETE FROM profiles WHERE id=?", (profile_id,))
+
+
+def activate_profile(profile_id: int) -> Dict:
+    """Sélectionne un profil comme actif ET applique immédiatement ses valeurs
+    (capital, levier, risque %, positions max) aux réglages utilisés par le
+    bot — aucune modification de code nécessaire."""
+    p = get_profile(profile_id)
+    if not p:
+        raise ValueError("Profil introuvable.")
+    update_settings({
+        "capital": p["capital"],
+        "leverage": p["leverage"],
+        "risk_percent": p["risk_percent"],
+        "max_open_positions": p["max_open_positions"],
+    })
+    _set_active_profile_id(profile_id)
+    return get_settings()
+
+
+def has_active_setup(setup_key: str) -> bool:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM signals WHERE setup_key = ? "
+            "AND status NOT IN ('closed', 'invalidated', 'tp2_hit') LIMIT 1",
+            (setup_key,),
+        ).fetchone()
+        return row is not None
+
+
+def seconds_since_last_signal(symbol: str) -> Optional[float]:
+    """Ancienneté (en secondes) du dernier signal publié pour cet actif, quel
+    que soit son statut (y compris déjà clôturé). Retourne None si aucun
+    signal n'a jamais été publié pour cet actif."""
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT created_at FROM signals WHERE symbol = ? ORDER BY created_at DESC LIMIT 1",
+            (symbol,),
+        ).fetchone()
+    if not row:
+        return None
+    return time.time() - row["created_at"]
+
+
+def insert_signal(symbol, setup_key, direction, entry_type, stars, score,
+                   entry_price, stop_loss, tp1, tp2, rr_tp1, rr_tp2, telegram_group,
+                   tp2_source=None) -> int:
+    now = time.time()
+    with get_conn() as conn:
+        cur = conn.execute(
+            """INSERT INTO signals
+               (symbol, setup_key, direction, entry_type, stars, score,
+                entry_price, stop_loss, tp1, tp2, rr_tp1, rr_tp2, status,
+                telegram_group, created_at, updated_at, tp2_source)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?, 'pending', ?, ?, ?, ?)""",
+            (symbol, setup_key, direction, entry_type, stars, score,
+             entry_price, stop_loss, tp1, tp2, rr_tp1, rr_tp2, telegram_group, now, now, tp2_source),
+        )
+        return cur.lastrowid
+
+
+def update_status(signal_id: int, status: str):
+    now = time.time()
+    closed = now if status in ("closed", "invalidated", "tp2_hit") else None
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE signals SET status=?, updated_at=?, closed_at=COALESCE(?, closed_at) WHERE id=?",
+            (status, now, closed, signal_id),
+        )
+
+
+def get_signal(signal_id: int) -> Optional[sqlite3.Row]:
+    with get_conn() as conn:
+        return conn.execute("SELECT * FROM signals WHERE id=?", (signal_id,)).fetchone()
+
+
+def record_trade_action(signal_id: int, action: str, new_status: str,
+                         source: str = "telegram", actor: Optional[str] = None) -> int:
+    """Enregistre une action déclenchée par un bouton Telegram (ou l'API) dans
+    trade_actions, met à jour le statut du signal, et retourne l'id de l'action.
+    Les statistiques (get_stats / get_period_stats / ...) sont calculées à la
+    volée depuis `signals`, donc elles reflètent immédiatement ce changement."""
+    row = get_signal(signal_id)
+    previous_status = row["status"] if row else None
+    now = time.time()
+    with get_conn() as conn:
+        cur = conn.execute(
+            """INSERT INTO trade_actions
+               (signal_id, action, previous_status, new_status, source, actor, created_at)
+               VALUES (?,?,?,?,?,?,?)""",
+            (signal_id, action, previous_status, new_status, source, actor, now),
+        )
+        action_id = cur.lastrowid
+    update_status(signal_id, new_status)
+    return action_id
+
+
+def get_trade_actions(signal_id: int) -> List[sqlite3.Row]:
+    with get_conn() as conn:
+        return conn.execute(
+            "SELECT * FROM trade_actions WHERE signal_id=? ORDER BY created_at ASC",
+            (signal_id,),
+        ).fetchall()
+
+
+def get_stats():
+    with get_conn() as conn:
+        total = conn.execute("SELECT COUNT(*) c FROM signals").fetchone()["c"]
+        by_status = conn.execute("SELECT status, COUNT(*) c FROM signals GROUP BY status").fetchall()
+        by_symbol = conn.execute("SELECT symbol, COUNT(*) c FROM signals GROUP BY symbol").fetchall()
         return {
-            k: {
-                "trades": len(v),
-                "winrate": round(sum(1 for r in v if r > 0) / len(v) * 100, 1) if v else 0,
-                "avg_r":  round(sum(v) / len(v), 2) if v else 0,
-                "total_r": round(sum(v), 2),
-            }
-            for k, v in sorted(d.items(), key=lambda x: -sum(x[1]))
+            "total": total,
+            "by_status": {r["status"]: r["c"] for r in by_status},
+            "by_symbol": {r["symbol"]: r["c"] for r in by_symbol},
         }
 
-    return jsonify({
-        "total_closed": len(closed),
-        "total_open":   len(open_t),
-        "winrate_pct":  round(sum(1 for s in closed if s["pnl_r"] > 0) / max(len(closed), 1) * 100, 1),
-        "avg_r":        round(sum(s["pnl_r"] for s in closed) / max(len(closed), 1), 2),
-        "total_r":      round(sum(s["pnl_r"] for s in closed), 2),
-        "by_setup":     _summary(by_setup),
-        "by_symbol":    _summary(by_sym),
-        "by_hour_utc":  _summary(by_hour),
-        "recent":       stats[:20],
-    })
+
+# ----------------------------------------------------------------------
+# Statistiques par période (pour les rapports auto)
+# ----------------------------------------------------------------------
+
+# Statuts considérés comme gain / perte / neutre pour le calcul du résultat
+# en multiples de R (le SQLite ne stocke pas de solde/lot par trade, donc on
+# raisonne en R — cohérent avec le RR affiché dans chaque signal).
+WIN_STATUSES = {"tp1_hit", "tp2_hit", "secured"}
+LOSS_STATUSES = {"invalidated"}
+BE_STATUSES = {"be"}
 
 
-@_route("/status")
-def status_json():
-    with _STATUS_LOCK:
-        return jsonify(_STATUS)
-
-
-def start_flask(port: int = 10000) -> None:
-    if not _HAS_FLASK or flask_app is None:
-        print("  [FLASK] Flask non disponible — dashboard désactivé")
-        return
-    flask_app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
-
-
-def start_self_ping(port: int = 10000) -> None:
-    url = os.environ.get("RENDER_EXTERNAL_URL", f"http://localhost:{port}")
-    ping_url = f"{url}/status"
-
-    def _ping_loop():
-        time.sleep(30)
-        while True:
-            try:
-                r = requests.get(ping_url, timeout=10)
-                if r.status_code != 200:
-                    log.warning(f"  ⚠ Self-ping HTTP {r.status_code}")
-            except Exception as e:
-                log.warning(f"  ⚠ Self-ping échoué : {e}")
-            time.sleep(240)
-
-    t = threading.Thread(target=_ping_loop, daemon=True, name="self-ping")
-    t.start()
-    log.info(f"  ✓ Self-ping actif → {ping_url}")
-
-
-try:
-    from colorama import Fore, Style, init as colorama_init
-    colorama_init(autoreset=True)
-    COLOR = True
-except ImportError:
-    COLOR = False
-
-# ═════════════════════════════════════════════════════════════
-#  CONFIGURATION GLOBALE
-# ═════════════════════════════════════════════════════════════
-HTF             = "4h"    # ← H4 : biais institutionnel + AMD + Septuple Traction
-MTF             = "1h"    # H1  : confirmation structure
-LTF             = "15m"   # M15 : entrée précise
-
-FVG_MIN_RATIO   = 0.0002
-OB_LOOKBACK     = 5
-LIQ_THRESHOLD   = 0.0004
-# [v9.6 — quality tuning] Relevé de 74 → 82 à la demande de Noël :
-# moins de signaux, mais on ne laisse plus passer les setups "moyens".
-# Combiné à MIN_RR=3.0 et MAX_SIGNALS_GLOBAL_PER_DAY réduit, l'objectif
-# est "peu de signaux, mais qui tiennent la route" plutôt que la quantité.
-SCORE_THRESHOLD = 78
-MIN_RR          = 3.0
-
-# ── [Cahier des charges] SHORT UNIQUEMENT ──────────────────────
-# True = le bot ignore tout signal LONG et ne scanne/n'envoie que des SHORT.
-SHORT_ONLY = os.environ.get("SHORT_ONLY", "true").lower() != "false"
-
-# ── [v15] TIMEFRAME D'EXÉCUTION ─────────────────────────────────
-# "M5" = sweep, validation de corps de bougie et CHoCH/BOS évalués sur
-# M5 uniquement (zone stratégique H4 conservée comme ancrage). "M15"
-# = ancien comportement.
-EXEC_TIMEFRAME = os.environ.get("EXEC_TIMEFRAME", "M5").upper()
-
-# ── [v8.5/v10] GESTION DU RISQUE EN % DU CAPITAL ──────────────────────────
-# Risque par trade = 0.65% de la taille du compte (configurable via env).
-# ACCOUNT_BALANCE_USD peut être mis à jour sans toucher au code (dépôt/retrait).
-# RISK_USD est recalculé dynamiquement et utilisé partout en aval.
-ACCOUNT_BALANCE_USD     = float(os.environ.get("ACCOUNT_BALANCE_USD", "10000"))
-RISK_PERCENT_PER_TRADE  = 0.65   # 0.65% du capital par trade
-RISK_USD = round(ACCOUNT_BALANCE_USD * RISK_PERCENT_PER_TRADE / 100.0, 2)
-
-# ── [v11] RISQUE PROGRESSIF (réduction après perte / remontée après gain) ──
-# Après un Stop Loss touché : le risque du prochain trade est divisé par 2.
-# En cas de pertes consécutives, la réduction continue (÷2, ÷4, ÷8...) avec
-# un plancher pour ne jamais couper le risque à zéro.
-# Après un gain validé (TP touché) : le risque remonte progressivement
-# (×1.5) vers le risque plein (100%), sans jamais dépasser RISK_USD.
-RISK_MIN_MULTIPLIER   = 0.125   # plancher : jamais moins de 12.5% du risque de base
-RISK_RECOVERY_FACTOR  = 1.5     # facteur de remontée après un gain validé
-RISK_LOOKBACK_TRADES  = 30      # profondeur d'historique rejouée
-
-
-def get_dynamic_risk_multiplier(lookback: int = RISK_LOOKBACK_TRADES) -> float:
-    """
-    Calcule le multiplicateur de risque courant en rejouant l'historique
-    des derniers trades clôturés (table signal_stats) :
-      • Perte (pnl_r ≤ 0)  → multiplicateur ÷ 2   (plancher RISK_MIN_MULTIPLIER)
-      • Gain  (pnl_r > 0)  → multiplicateur × 1.5 (plafond 1.0 = risque plein)
-
-    Sans historique (premier lancement, DB absente) → 1.0 (risque plein).
-    Ne lève jamais d'exception : retourne 1.0 en cas d'erreur DB.
-    """
-    try:
-        con = sqlite3.connect(TRADE_DB, check_same_thread=False)
-        con.row_factory = sqlite3.Row
-        rows = con.execute("""
-            SELECT pnl_r FROM signal_stats
-            WHERE result != 'open'
-            ORDER BY timestamp ASC
-        """).fetchall()
-        con.close()
-    except Exception as e:
-        print(f"  [RISK] Erreur lecture historique — risque plein par défaut : {e}")
-        return 1.0
-
-    if not rows:
-        return 1.0
-
-    recent = rows[-lookback:] if len(rows) > lookback else rows
-
-    mult = 1.0
-    for r in recent:
-        if r["pnl_r"] <= 0:
-            mult = max(mult * 0.5, RISK_MIN_MULTIPLIER)
-        else:
-            mult = min(mult * RISK_RECOVERY_FACTOR, 1.0)
-    return round(mult, 4)
-
-
-def get_current_risk_usd() -> float:
-    """RISK_USD ajusté dynamiquement selon la série de résultats récents (v11),
-    sauf si le Recovery a été désactivé via le menu Telegram (v14)."""
-    base = get_base_risk_usd()
-    if not is_recovery_enabled():
-        return base
-    mult = get_dynamic_risk_multiplier()
-    adjusted = round(base * mult, 2)
-    if mult < 1.0:
-        print(c(f"  [RISK] Risque réduit à {int(mult*100)}% suite aux pertes récentes "
-                f"→ ${adjusted} (au lieu de ${base})", "yellow"))
-    return adjusted
-
-
-# ═════════════════════════════════════════════════════════════
-#  [v14] PARAMÈTRES CONFIGURABLES VIA TELEGRAM
-#  Solde, risque ($ ou %), levier, objectif de profit, recovery
-#  → stockés en SQLite (persistent, survit aux redéploiements),
-#  avec les constantes ci-dessus comme valeurs par défaut.
-# ═════════════════════════════════════════════════════════════
-
-_SETTINGS_DEFAULTS = {
-    "account_balance":  str(ACCOUNT_BALANCE_USD),
-    "risk_mode":        "percent",              # "percent" ou "fixed"
-    "risk_value":       str(RISK_PERCENT_PER_TRADE),  # % si mode percent, $ si mode fixed
-    "leverage":         "100",                  # levier ex: 1:100
-    "profit_target":    "0",                    # objectif de profit $ (0 = désactivé)
-    "recovery_enabled": "1",                    # "1" = recovery actif (défaut), "0" = désactivé
-    "max_volume":       "0",                    # lot max autorisé par trade (0 = pas de plafond)
-    "timeframe":        EXEC_TIMEFRAME,          # "M5" ou "M15"
-    "session_mode":     "NY",                   # "NY" (13h-22h UTC) ou "24H"
-    "active_markets":   "all",                  # "all" | "gold_btc" | "deriv"
-    "profile_label":    "",                     # nom/étiquette libre du profil
-    "prop_firm_mode":   "0",                    # "1" = règles Prop Firm actives
-    "atr_sl_mult":      "0.6",                  # multiplicateur ATR pour le Stop Loss
-}
-
-
-def _settings_init() -> None:
-    try:
-        con = sqlite3.connect(TRADE_DB, check_same_thread=False)
-        con.execute("""
-            CREATE TABLE IF NOT EXISTS bot_settings (
-                key   TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            )
-        """)
-        con.commit()
-        con.close()
-    except Exception as e:
-        print(f"  [SETTINGS] Init erreur : {e}")
-
-
-def get_setting(key: str, default: Optional[str] = None) -> str:
-    fallback = default if default is not None else _SETTINGS_DEFAULTS.get(key, "")
-    try:
-        con = sqlite3.connect(TRADE_DB, check_same_thread=False)
-        con.row_factory = sqlite3.Row
-        row = con.execute("SELECT value FROM bot_settings WHERE key = ?", (key,)).fetchone()
-        con.close()
-        return row["value"] if row else fallback
-    except Exception:
-        return fallback
-
-
-def set_setting(key: str, value: str) -> None:
-    try:
-        con = sqlite3.connect(TRADE_DB, check_same_thread=False)
-        con.execute(
-            "INSERT INTO bot_settings (key, value) VALUES (?, ?) "
-            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            (key, str(value)),
-        )
-        con.commit()
-        con.close()
-    except Exception as e:
-        print(f"  [SETTINGS] Erreur écriture {key} : {e}")
-
-
-def get_account_balance() -> float:
-    try:
-        return float(get_setting("account_balance"))
-    except Exception:
-        return ACCOUNT_BALANCE_USD
-
-
-def get_risk_config() -> tuple:
-    """Retourne (mode, value) — mode = 'percent' ou 'fixed'."""
-    mode  = get_setting("risk_mode")
-    value = get_setting("risk_value")
-    try:
-        return mode, float(value)
-    except Exception:
-        return "percent", RISK_PERCENT_PER_TRADE
-
-
-def get_base_risk_usd() -> float:
-    """Risque $ de base par trade, calculé depuis les paramètres configurés
-    (solde + mode de risque), avant ajustement recovery."""
-    balance = get_account_balance()
-    mode, value = get_risk_config()
-    if mode == "fixed":
-        return round(value, 2)
-    return round(balance * value / 100.0, 2)
-
-
-def get_leverage() -> int:
-    try:
-        return int(float(get_setting("leverage")))
-    except Exception:
-        return 100
-
-
-def get_profit_target() -> float:
-    try:
-        return float(get_setting("profit_target"))
-    except Exception:
+def _r_result(row: sqlite3.Row) -> Optional[float]:
+    status = row["status"]
+    if status == "tp2_hit" and row["rr_tp2"]:
+        return float(row["rr_tp2"])
+    if status in ("tp1_hit", "secured"):
+        return float(row["rr_tp1"])
+    if status in BE_STATUSES:
         return 0.0
-
-
-def is_recovery_enabled() -> bool:
-    return get_setting("recovery_enabled") == "1"
-
-
-def get_max_volume() -> float:
-    try:
-        return float(get_setting("max_volume"))
-    except Exception:
-        return 0.0
-
-
-def get_timeframe_setting() -> str:
-    return get_setting("timeframe") or EXEC_TIMEFRAME
-
-
-def get_session_mode() -> str:
-    return get_setting("session_mode") or "NY"
-
-
-def get_active_markets_setting() -> str:
-    return get_setting("active_markets") or "all"
-
-
-def get_profile_label() -> str:
-    return get_setting("profile_label") or "—"
-
-
-def is_prop_firm_mode() -> bool:
-    return get_setting("prop_firm_mode") == "1"
-
-
-def get_atr_sl_mult() -> float:
-    """Multiplicateur ATR pour le Stop Loss (défaut 0.6, configurable via menu)."""
-    try:
-        return float(get_setting("atr_sl_mult"))
-    except Exception:
-        return 0.6
-
-
-# ── Septuple Traction : N bougies consécutives minimum ───────
-SEPTUPLE_MIN_CANDLES = 5   # 5 suffisent en practice (7 = très rare)
-
-# ── AMD Phase Detection ────────────────────────────────────
-AMD_LOOKBACK = 30   # FIX v3.1 : 30 bougies H4 suffisent (≈5 jours), 50 causait "unknown" sur instruments peu fournis
-
-# ── Supply & Demand Zones ─────────────────────────────────
-SD_MIN_IMPULSE_RATIO = 1.5  # corps bougie ≥ 1.5× ATR pour qualifier une zone S/D
-SD_ZONE_BUFFER       = 0.15  # tolérance 15% de l'ATR pour "dans la zone"
-
-# ─────────────────────────────────────────────────────────────
-#  KILL ZONES SMC — ICT (UTC)
-#
-#  Seules ces fenêtres horaires sont autorisées pour l'envoi
-#  de signaux. En dehors → scan ignoré, aucun signal envoyé.
-#
-#  v8.2 : recalées sur l'analyse volatilité réelle (GMT+0) :
-#  ┌─────────────────────────────────────────────────────────┐
-#  │  08h00–11h00 UTC  — London Open  ⭐ volatilité forte     │
-#  │  13h00–22h00 UTC  — NY Open / overlap London ⭐⭐         │
-#  │  Gold et BTC → réservés à la fenêtre NY Open uniquement  │
-#  │  Tout le reste (22h-08h notamment) = faible volatilité,  │
-#  │  bloqué pour éviter les SL inutiles                      │
-#  └─────────────────────────────────────────────────────────┘
-# ─────────────────────────────────────────────────────────────
-
-# Kill zones exprimées en MINUTES depuis minuit UTC (permet les demi-heures, ex: 13h30)
-LONDON_KZ_MIN: tuple[int, int] = (8 * 60,       11 * 60)        # 08h00–11h00 UTC
-NY_KZ_MIN:     tuple[int, int] = (13 * 60,      22 * 60)        # 13h00–22h00 UTC [v15]
-ASIAN_KZ_MIN:  tuple[int, int] = (0,            3 * 60)         # 00h00–03h00 UTC
-
-# Kill zones principales (toutes paires, sauf indices US — voir is_kill_zone_active)
-KILL_ZONES_UTC: list[tuple[int, int]] = [LONDON_KZ_MIN, NY_KZ_MIN]
-
-# Conservé pour compatibilité nominale (anciennement en heures pleines)
-ASIAN_KILL_ZONE_UTC: tuple[int, int] = ASIAN_KZ_MIN
-
-# Compatibilité : SESSION_WINDOWS_UTC conservé pour les autres checks (en minutes désormais)
-# [v11] Restreint à Londres + New York UNIQUEMENT (demande utilisateur) —
-# la fenêtre asiatique est retirée du gate global, y compris pour JPY/AUD/NZD.
-SESSION_WINDOWS_UTC: list[tuple[int, int]] = KILL_ZONES_UTC
-
-
-US_INDEX_SYMBOLS: set[str] = set()   # indices US supprimés — plus aucun marché indice
-
-# ═════════════════════════════════════════════════════════════
-#  FILTRE NEWS ÉCONOMIQUES ⭐⭐⭐⭐⭐
-#
-#  Bloque les signaux 30 min AVANT et 30 min APRÈS une news
-#  à impact FORT sur les devises majeures (USD, EUR, GBP, JPY).
-#
-#  Source : ForexFactory JSON feed (public, sans clé API).
-#  Fallback silencieux si réseau indisponible (pas de blocage).
-#
-#  Currencies surveillées :
-#    USD, EUR, GBP, JPY — les plus impactantes en SMC
-#
-#  Impact bloqué : "High" uniquement (rouge sur ForexFactory).
-#  "Medium" et "Low" sont autorisés.
-# ═════════════════════════════════════════════════════════════
-
-NEWS_CURRENCIES_BLOCKED = {"USD", "EUR", "GBP", "JPY"}
-# [v9 MOD-4] Fenêtres news asymétriques :
-#   → AVANT la news : 30 min de blocage (inchangé — trop dangereux de trader juste avant)
-#   → APRÈS la news : 10 min seulement (était 30 min)
-#     Raison : les sweeps de liquidité et structures SMC valides se forment
-#     dès les premières minutes post-news. Bloquer 30 min faisait rater ces setups.
-NEWS_WINDOW_BEFORE      = 30      # blocage 30 min AVANT la news
-NEWS_WINDOW_AFTER       = 10      # [v9 MOD-4] blocage 10 min seulement APRÈS la news (était 30)
-NEWS_WINDOW_MINUTES     = 30      # conservé pour compatibilité interne (utilisé dans l'ancienne logique)
-_news_cache: dict       = {}      # {date_str: [list of news dicts]}
-_news_cache_ts: float   = 0.0
-NEWS_CACHE_TTL          = 3600    # rafraîchissement toutes les heures
-
-# Mapping symbole → devises concernées (seuls les 4 marchés actifs)
-_SYMBOL_CURRENCIES: dict[str, set] = {
-    "GC=F":     {"USD"},
-    "BTC-USD":  {"USD"},
-}
-
-
-def _fetch_forex_news() -> list[dict]:
-    """
-    Télécharge les news du jour depuis ForexFactory (JSON public).
-    Retourne une liste de dicts {time_utc: datetime, currency: str, impact: str}.
-    Silencieux en cas d'erreur réseau.
-    """
-    global _news_cache, _news_cache_ts
-    now_ts = time.time()
-
-    if now_ts - _news_cache_ts < NEWS_CACHE_TTL and _news_cache:
-        return list(_news_cache.get("events", []))
-
-    try:
-        today = datetime.now(timezone.utc).strftime("%b%d.%Y").lower()
-        url   = f"https://nfs.faireconomy.media/ff_calendar_thisweek.json"
-        r     = requests.get(url, timeout=8)
-        if r.status_code != 200:
-            return []
-
-        raw    = r.json()
-        events = []
-        for ev in raw:
-            impact   = ev.get("impact", "").strip().lower()
-            currency = ev.get("country", "").strip().upper()
-            if impact not in ("high",):   # on ne bloque que les rouges
-                continue
-            if currency not in NEWS_CURRENCIES_BLOCKED:
-                continue
-            date_str = ev.get("date", "")
-            time_str = ev.get("time", "")
-            try:
-                dt_naive = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %I:%M%p")
-                dt_utc   = dt_naive.replace(tzinfo=timezone.utc)
-                events.append({"time_utc": dt_utc, "currency": currency, "title": ev.get("title", "")})
-            except Exception:
-                continue
-
-        _news_cache    = {"events": events}
-        _news_cache_ts = now_ts
-        return events
-
-    except Exception as e:
-        log.debug(f"  [NEWS] Fetch échoué : {e}")
-        return []
-
-
-def is_news_blackout(symbol: str) -> tuple[bool, str]:
-    """
-    Retourne (True, raison) si le symbole est dans une fenêtre de news forte.
-    Retourne (False, "") si le marché est libre.
-    """
-    currencies = _SYMBOL_CURRENCIES.get(symbol, set())
-    if not currencies:
-        return False, ""
-
-    relevant_currencies = currencies & NEWS_CURRENCIES_BLOCKED
-    if not relevant_currencies:
-        return False, ""
-
-    now_utc = datetime.now(timezone.utc)
-    events  = _fetch_forex_news()
-
-    for ev in events:
-        if ev["currency"] not in relevant_currencies:
-            continue
-        delta = (ev["time_utc"] - now_utc).total_seconds() / 60.0
-        # [v9 MOD-4] Fenêtres asymétriques :
-        #   delta > 0  → news dans le futur  → on bloque NEWS_WINDOW_BEFORE min avant
-        #   delta < 0  → news passée         → on bloque NEWS_WINDOW_AFTER  min après
-        window_blocked = (-NEWS_WINDOW_AFTER <= delta <= NEWS_WINDOW_BEFORE)
-        if window_blocked:
-            sign  = "dans" if delta >= 0 else "il y a"
-            mins  = abs(int(delta))
-            return True, (
-                f"🚫 News {ev['currency']} impact FORT : \"{ev['title']}\" "
-                f"({sign} {mins} min)"
-            )
-
-    return False, ""
-
-def is_us_market_open() -> bool:
-    """
-    Vérifie si le marché US est ouvert (NYSE/NASDAQ).
-    Heures : 13h30–20h00 UTC (9h30–16h00 ET), lundi–vendredi.
-    Hors ces heures → pas de données 15m disponibles sur Yahoo Finance.
-    """
-    now = datetime.now(timezone.utc)
-    if now.weekday() >= 5:   # weekend
-        return False
-    return 13 <= now.hour < 20
-
-
-def is_session_active() -> bool:
-    """Compatibilité — retourne True si au moins une kill zone est active."""
-    now_min = datetime.now(timezone.utc).hour * 60 + datetime.now(timezone.utc).minute
-    return any(start <= now_min < end for start, end in SESSION_WINDOWS_UTC)
-
-
-def is_ny_session_active() -> bool:
-    """Session NY Open uniquement (13h00-22h00 UTC).
-    Utilisée pour restreindre Gold et BTC à la seule fenêtre New York
-    (demande utilisateur) — Londres n'est plus autorisée pour ces 2 actifs."""
-    now_min = datetime.now(timezone.utc).hour * 60 + datetime.now(timezone.utc).minute
-    ny_start, ny_end = NY_KZ_MIN
-    return ny_start <= now_min < ny_end
-
-
-def is_kill_zone_active(symbol: str = "") -> tuple[bool, str]:
-    """
-    Vérifie si l'heure actuelle est dans une Kill Zone autorisée pour ce symbole.
-
-    Règles [v12 — 4 marchés uniquement] :
-      • Indices Deriv (Volatility 75 / Volatility 25) → 24h/24, AUCUN filtre
-        de session (flux synthétique continu, pas de carnet d'ordres réel).
-      • Gold (XAUUSD) et BTC → UNIQUEMENT la fenêtre NY Open
-        (13h00-22h00 UTC). Londres n'est plus autorisée pour ces 2 actifs.
-      • Tout autre symbole (legacy) → Londres (08h-11h) + NY (13h30-16h)
-        UTC, conservé pour compatibilité mais non utilisé (plus aucun
-        Forex/indice n'est scanné).
-
-    Retourne (True, nom_session) ou (False, raison_blocage).
-    """
-    now      = datetime.now(timezone.utc)
-    now_min  = now.hour * 60 + now.minute
-    hh_mm    = now.strftime("%Hh%M")
-
-    london_start, london_end = LONDON_KZ_MIN
-    ny_start, ny_end         = NY_KZ_MIN
-
-    # Indices Deriv (Volatility 75/25) — 24h/24, aucun filtre de session
-    if is_deriv_symbol(symbol):
-        return True, "🌐 Deriv — 24h/24 (aucun filtre de session)"
-
-    # [v15] Mode session configurable via le menu Telegram (🌎 Session) :
-    # "24H" désactive la fenêtre NY pour Gold/BTC aussi (scan continu).
-    if get_session_mode() == "24H":
-        return True, "🌐 Mode 24H (session filter désactivé via menu)"
-
-    # Gold + BTC — réservés à la session New York uniquement
-    if symbol in GOLD_SYMBOLS or is_crypto_symbol(symbol):
-        if ny_start <= now_min < ny_end:
-            return True, "🇺🇸 NY Open KZ (13h00-22h00 UTC)"
-        return False, f"⛔ Gold/BTC — hors fenêtre NY Open (13h00-22h00 UTC), actuellement {hh_mm}"
-
-    # Indices US — alignés UNIQUEMENT sur l'ouverture NY (pas de fenêtre Londres)
-    if symbol in US_INDEX_SYMBOLS:
-        if ny_start <= now_min < ny_end:
-            return True, "🇺🇸 NY Open KZ (13h00-22h00 UTC)"
-        return False, f"⛔ Indice US — hors fenêtre NY Open (13h00-22h00 UTC), actuellement {hh_mm}"
-
-    # Legacy (Forex — non utilisé, plus aucune paire scannée)
-    if london_start <= now_min < london_end:
-        return True, "🇬🇧 London Open KZ (08h00-11h00 UTC)"
-    if ny_start <= now_min < ny_end:
-        return True, "🇺🇸 NY Open KZ (13h00-22h00 UTC)"
-
-    return False, f"⛔ {hh_mm} UTC — hors Londres/New York, aucun signal envoyé"
-
-
-def is_weekend() -> bool:
-    """Retourne True si on est samedi ou dimanche (UTC)."""
-    return datetime.now(timezone.utc).weekday() >= 5   # 5=Sat, 6=Sun
-
-
-def is_crypto_symbol(symbol: str) -> bool:
-    """BTC trade 24/7, y compris le weekend."""
-    return symbol == "BTC-USD"
-
-# v8 : BTC — on bloque les signaux SELL/SHORT sur BTC (tendance haussière forte)
-BTC_SELL_BLOCKED = False
-
-GOLD_SYMBOLS = {"GC=F"}
-
-# [v11] Gold + BTC uniquement : pipeline Supply/Demand dédié M15(zone) → M1(entrée)
-GOLD_BTC_M1_SYMBOLS = {"GC=F", "BTC-USD"}
-
-def is_gold_session_active() -> bool:
-    """Gold trade aussi le dimanche soir dès 23h00 UTC."""
-    now = datetime.now(timezone.utc)
-    if now.weekday() == 5:   # samedi → fermé
-        return False
-    if now.weekday() == 6:   # dimanche → ouvert à partir de 23h UTC
-        return now.hour >= 23
-    return True  # lundi–vendredi toujours ouvert
-
-
-# ─────────────────────────────────────────────────────────────
-#  ATR MINIMUM PAR INSTRUMENT
-# ─────────────────────────────────────────────────────────────
-ATR_MIN: dict[str, float] = {
-    "GC=F"    : 1.20,    # Gold
-    "BTC-USD" : 150.0,   # Bitcoin
-}
-ATR_MIN_DEFAULT = 0.00050
-MAX_SPREAD_ATR_RATIO = 0.50   # élargi à 50% pour réduire les faux rejets de spread
-
-
-def check_volatility(symbol: str, df_ltf: pd.DataFrame,
-                     df_mtf: pd.DataFrame | None = None) -> tuple[bool, str]:
-    if df_ltf.empty or len(df_ltf) < 14:
-        return False, "données insuffisantes"
-
-    atr_ltf = (df_ltf["high"] - df_ltf["low"]).rolling(14).mean().iloc[-1]
-
-    # Spread/ATR calculé sur M15 (plus stable que M5 pour yfinance)
-    # Si M15 dispo, on l'utilise pour le ratio ; sinon fallback M5
-    if df_mtf is not None and not df_mtf.empty and len(df_mtf) >= 14:
-        atr_for_spread = (df_mtf["high"] - df_mtf["low"]).rolling(14).mean().iloc[-1]
-    else:
-        atr_for_spread = atr_ltf
-
-    # ATR minimum dynamique : moyenne 100 bougies M5 × 0.5
-    atr_mean = (df_ltf["high"] - df_ltf["low"]).rolling(100).mean().iloc[-1]
-    if not pd.isna(atr_mean) and atr_mean > 0:
-        atr_min = atr_mean * 0.5
-    else:
-        close = df_ltf["close"].iloc[-1]
-        if is_crypto_symbol(symbol) and close > 0:
-            atr_min = close * 0.0012
-        elif is_deriv_symbol(symbol) and close > 0:
-            # Pas de référence ATR_MIN fixe pertinente (échelle de prix
-            # variable selon l'indice) → seuil relatif au prix courant.
-            atr_min = close * 0.0008
-        else:
-            atr_min = ATR_MIN.get(symbol, ATR_MIN_DEFAULT) * 0.7
-
-    # ── Facteur pré-session (05h–09h UTC) ────────────────────
-    hour_utc = datetime.now(timezone.utc).hour
-    if 5 <= hour_utc < 9:
-        atr_min *= 0.60
-
-    spread = get_spread(symbol)
-    if atr_ltf < atr_min:
-        return False, f"ATR trop faible ({round(atr_ltf, 5)} < {round(atr_min, 5)})"
-    ratio = spread / atr_for_spread if atr_for_spread > 0 else 1.0
-    if ratio > MAX_SPREAD_ATR_RATIO:
-        return False, f"spread/ATR={round(ratio*100,1)}% > {int(MAX_SPREAD_ATR_RATIO*100)}%"
-
-    # ── 2. FILTRE VOLUME — [v9 MOD-3] ────────────────────────
-    # Forex & Gold : filtre volume DÉSACTIVÉ.
-    # Les données de volume yfinance sont fragmentées sur le Forex (tick volume
-    # partiel, souvent nul ou incohérent). Ce filtre rejetait d'excellents setups
-    # SMC valides. Sur Forex/Gold, on se fie uniquement à l'ATR et la structure.
-    #
-    # Crypto (BTC, ETH) : filtre conservé mais abaissé à 0.50 (50% de la moyenne)
-    # car les volumes crypto sont réels et disponibles en continu.
-    if "volume" in df_ltf.columns and len(df_ltf) >= 21 and is_crypto_symbol(symbol):
-        vol_now  = df_ltf["volume"].iloc[-1]
-        vol_mean = df_ltf["volume"].rolling(20).mean().iloc[-1]
-        if not pd.isna(vol_now) and not pd.isna(vol_mean) and vol_mean > 0:
-            vol_ratio = vol_now / vol_mean
-            # [v9 MOD-3] Seuil abaissé à 0.50 pour crypto (était 0.80 pour tout)
-            if vol_ratio < 0.50:
-                return False, f"volume crypto faible ({round(vol_ratio*100,0)}% de la moyenne 20)"
-
-    # BTC — restreint à la seule session New York (demande utilisateur,
-    # Londres n'est plus autorisée pour BTC désormais).
-    if is_crypto_symbol(symbol):
-        if not is_ny_session_active():
-            return False, "hors session NY Open (13h00-22h00 UTC) — BTC réservé à NY"
-        return True, ""
-    # Indices Deriv (Volatility) : flux synthétique 24/7, pas de session ni
-    # de kill zone réelle (pas de carnet d'ordres interbancaire derrière).
-    if is_deriv_symbol(symbol):
-        return True, ""
-    # Gold : ouvert dim 23h-ven, mais restreint à la session NY uniquement
-    # (demande utilisateur — Londres n'est plus autorisée pour Gold).
-    if symbol in GOLD_SYMBOLS:
-        if not is_gold_session_active():
-            return False, "weekend — Gold fermé (sam + dim avant 23h UTC)"
-        if not is_ny_session_active():
-            return False, "hors session NY Open (13h00-22h00 UTC) — Gold réservé à NY"
-        return True, ""
-    if is_weekend():
-        return False, "weekend — marché fermé (Forex)"
-    if not is_session_active():
-        return False, "hors session (London/NY)"
-    return True, ""
-
-
-# ─────────────────────────────────────────────────────────────
-#  SPREADS
-# ─────────────────────────────────────────────────────────────
-SPREAD_TABLE: dict[str, float] = {
-    "GC=F"    : 0.30,    # Gold
-    "BTC-USD" : 15.0,    # Bitcoin
-}
-
-
-def get_spread(symbol: str) -> float:
-    return SPREAD_TABLE.get(symbol, 0.00015)
-
-
-# ─────────────────────────────────────────────────────────────
-#  CORRÉLATION GUARD
-# ─────────────────────────────────────────────────────────────
-_CORR_GROUPS: dict[str, str] = {
-    "GC=F"    : "GOLD",
-    "BTC-USD" : "BTC",
-}
-
-_active_corr_groups: dict[str, float] = {}
-CORR_TTL = 600
-
-
-def correlation_guard_reset() -> None:
-    """Conservé pour compatibilité — ne fait plus rien (v9.6).
-    Le guard interroge désormais active_trades en direct, donc il n'y a
-    plus d'état en mémoire à réinitialiser entre les cycles."""
-    pass
-
-
-def correlation_guard(symbol: str, direction: str) -> tuple[bool, str]:
-    """v9.6 — FIX : le guard interroge la table active_trades (trades
-    réellement ouverts en DB) au lieu d'un TTL mémoire de 10 min.
-
-    Bug v9.5 : correlation_guard_reset() était appelé à CHAQUE cycle de
-    scan (toutes les 5 min), ce qui vidait le verrou avant même que le
-    CORR_TTL (600s) n'expire. Résultat : aucune protection réelle au-delà
-    d'un seul cycle — plusieurs paires corrélées (JPY, USD, GBP...)
-    pouvaient être ouvertes en même temps et sauter ensemble sur leur SL.
-
-    Désormais : un nouveau signal est bloqué si un trade encore OUVERT
-    (closed=0) existe sur le même groupe de corrélation, dans la même
-    direction — peu importe depuis combien de temps il est ouvert.
-    """
-    group = _CORR_GROUPS.get(symbol)
-    if group is None:
-        return True, ""
-
-    same_group_symbols = [s for s, g in _CORR_GROUPS.items() if g == group]
-    if not same_group_symbols:
-        return True, ""
-
-    try:
-        con = sqlite3.connect(TRADE_DB, check_same_thread=False)
-        placeholders = ",".join("?" for _ in same_group_symbols)
-        row = con.execute(
-            f"""SELECT trade_id, symbol FROM active_trades
-                WHERE closed = 0 AND direction = ?
-                AND symbol IN ({placeholders})
-                LIMIT 1""",
-            (direction, *same_group_symbols),
-        ).fetchone()
-        con.close()
-    except Exception as e:
-        # En cas d'erreur DB, on bloque par sécurité plutôt que de laisser
-        # passer un signal potentiellement corrélé.
-        return False, f"corrélation {group} — DB indisponible ({e})"
-
-    if row:
-        return False, f"corrélation {group} {direction} active (trade ouvert sur {row[1]})"
-    return True, ""
-
-
-# ─────────────────────────────────────────────────────────────
-#  TELEGRAM
-# ─────────────────────────────────────────────────────────────
-# SÉCURITÉ : aucune valeur par défaut codée en dur. Si TG_TOKEN n'est pas
-# défini dans l'environnement (.env), Telegram reste désactivé — le moteur
-# ne doit JAMAIS retomber sur un token ou un chat/group ID appartenant à
-# quelqu'un d'autre.
-_TG_TOKEN_ENV = os.environ.get("TG_TOKEN", "")
-_TG_ENABLED   = bool(_TG_TOKEN_ENV) if os.environ.get("TG_ENABLED", "") == "" else \
-                os.environ.get("TG_ENABLED", "false").lower() == "true"
-
-if not _TG_TOKEN_ENV:
-    print("  [TG] ⚠  TG_TOKEN absent — envoi Telegram désactivé")
-
-TELEGRAM_TOKEN     = _TG_TOKEN_ENV
-TELEGRAM_CHAT_ID   = None
-TELEGRAM_GROUP_ID  = os.environ.get("TG_GROUP_ID", "-1002335466840")
-TELEGRAM_LEADER_ID = os.environ.get("TG_LEADER_ID", "6982051442")
-
-# ── Groupes dédiés par marché ──────────────────────────────────
-# Deriv (Volatility 75 / Volatility 25) → groupe Deriv
-# Gold (XAUUSD) + BTC → groupe Gold/BTC
-# Surchargeables via variables d'env (TG_GROUP_DERIV_ID / TG_GROUP_GOLD_BTC_ID)
-TELEGRAM_GROUP_DERIV_ID    = os.environ.get("TG_GROUP_DERIV_ID", "-1002335466840")
-TELEGRAM_GROUP_GOLD_BTC_ID = os.environ.get("TG_GROUP_GOLD_BTC_ID", "-5281258868")
-
-
-def get_group_id_for_symbol(symbol: str) -> str:
-    """Retourne le groupe Telegram approprié selon le marché du signal."""
-    if is_deriv_symbol(symbol):
-        return TELEGRAM_GROUP_DERIV_ID
-    return TELEGRAM_GROUP_GOLD_BTC_ID
-
-SIGNAL_COOLDOWN = 1800   # v8 : 30 min minimum entre 2 signaux sur la même paire (était 600)
-_signal_cache: dict[str, float] = {}
-_setup_sent: dict[str, bool] = {}
-# Cache pour le cooldown par niveau de prix : {symbol -> (direction, entry_price, timestamp)}
-_price_level_cache: dict[str, tuple[str, float, float]] = {}
-PRICE_LEVEL_COOLDOWN = 1800   # secondes — cohérent avec SIGNAL_COOLDOWN
-PRICE_LEVEL_TOLERANCE = 0.0003  # 0.03% — ne pas renvoyer si entry quasi-identique
-
-# ── Trade Management — base de données persistante ────────────
-# Astuce Render : définir TRADE_DB_PATH=/opt/render/project/src/trades.db
-# dans les variables d'environnement pour persistance entre redémarrages.
-TRADE_DB                = os.environ.get(
-    "TRADE_DB_PATH",
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "trades.db"),
-)
-TRADE_MONITOR_INTERVAL  = 60   # secondes entre chaque vérification des prix
-
-
-def _setup_key(symbol: str, direction: str, score: int) -> str:
-    bucket = (score // 5) * 5
-    return f"{symbol}:{direction}:{bucket}"
-
-
-def is_setup_already_sent(symbol: str, direction: str, score: int) -> bool:
-    return _setup_sent.get(_setup_key(symbol, direction, score), False)
-
-
-def is_price_level_duplicate(symbol: str, direction: str, entry_price: float) -> bool:
-    """Retourne True si un signal récent sur la même paire a une entrée quasi-identique."""
-    cached = _price_level_cache.get(symbol)
-    if cached is None:
-        return False
-    cached_dir, cached_entry, cached_ts = cached
-    if time.time() - cached_ts > PRICE_LEVEL_COOLDOWN:
-        del _price_level_cache[symbol]
-        return False
-    if cached_dir != direction:
-        return False
-    if cached_entry <= 0:
-        return False
-    pct_diff = abs(entry_price - cached_entry) / cached_entry
-    return pct_diff < PRICE_LEVEL_TOLERANCE
-
-
-def record_price_level(symbol: str, direction: str, entry_price: float) -> None:
-    _price_level_cache[symbol] = (direction, entry_price, time.time())
-
-
-def mark_setup_sent(symbol: str, direction: str, score: int) -> None:
-    _setup_sent[_setup_key(symbol, direction, score)] = True
-
-
-def reset_setup(symbol: str) -> None:
-    keys_to_del = [k for k in _setup_sent if k.startswith(f"{symbol}:")]
-    for k in keys_to_del:
-        del _setup_sent[k]
-    _price_level_cache.pop(symbol, None)
-
-
-def _tg_url(method: str) -> str:
-    return f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/{method}"
-
-
-def tg_get_chat_id() -> Optional[str]:
-    global TELEGRAM_GROUP_ID
-    try:
-        r = requests.get(_tg_url("getUpdates"), timeout=10)
-        updates = r.json().get("result", [])
-        personal_id = None
-        for upd in reversed(updates):
-            msg = upd.get("message") or upd.get("channel_post", {})
-            if not msg:
-                continue
-            chat      = msg.get("chat", {})
-            chat_type = chat.get("type", "")
-            cid       = str(chat.get("id", ""))
-            if chat_type in ("group", "supergroup") and not TELEGRAM_GROUP_ID:
-                TELEGRAM_GROUP_ID = cid
-            elif chat_type == "private" and not personal_id:
-                personal_id = cid
-        return personal_id
-    except Exception:
-        pass
-    return None
-
-
-def tg_send(text: str, chat_id: str) -> bool:
-    try:
-        r = requests.post(
-            _tg_url("sendMessage"),
-            json={"chat_id": chat_id, "text": text,
-                  "parse_mode": "HTML", "disable_web_page_preview": True},
-            timeout=10,
-        )
-        return r.status_code == 200
-    except Exception as e:
-        print(c(f"  [TG] Erreur : {e}", "red"))
-        return False
-
-
-# ── Compteur de signaux ────────────────────────────────────────────────────
-_SIGNAL_COUNTER_FILE = os.path.join(os.path.dirname(TRADE_DB), "smc_signal_count.txt")
-
-def _next_signal_number() -> int:
-    try:
-        with open(_SIGNAL_COUNTER_FILE, "r") as f:
-            n = int(f.read().strip()) + 1
-    except Exception:
-        n = 1
-    try:
-        with open(_SIGNAL_COUNTER_FILE, "w") as f:
-            f.write(str(n))
-    except Exception:
-        pass
-    return n
-
-_signal_number_cache: dict[str, int] = {}
-
-
-# ═════════════════════════════════════════════════════════════
-#  TRADE MANAGEMENT — Suivi en temps réel après envoi du signal
-#
-#  Fonctionnement :
-#    1. Chaque signal envoyé est enregistré dans SQLite
-#    2. Un thread de fond vérifie le prix toutes les 60s
-#    3. Alertes Telegram automatiques : TP1 / TP2 / TP3 / SL
-#    4. Rappel "déplace SL en Break Even" 5 min après TP1
-#
-#  Alerte TP1 : "🎯 TP1 TOUCHÉ — ferme 30%, SL → Break Even"
-#  Alerte TP2 : "🚀 TP2 TOUCHÉ — ferme 50% du restant"
-#  Alerte TP3 : "💎 TP3 TOUCHÉ — ferme tout !"
-#  Alerte SL  : "❌ STOP LOSS — ferme la position maintenant"
-#
-#  CONSEIL RENDER :
-#    Définir TRADE_DB_PATH=/opt/render/project/src/trades.db
-#    dans les variables d'environnement → persistance entre redémarrages
-# ═════════════════════════════════════════════════════════════
-
-def _init_trade_db() -> None:
-    """Crée la table active_trades et signal_stats si elles n'existent pas encore."""
-    try:
-        con = sqlite3.connect(TRADE_DB, check_same_thread=False)
-        con.execute("PRAGMA journal_mode=WAL")
-        con.execute("""
-            CREATE TABLE IF NOT EXISTS active_trades (
-                trade_id   TEXT PRIMARY KEY,
-                symbol     TEXT NOT NULL,
-                direction  TEXT NOT NULL,
-                entry      REAL NOT NULL,
-                sl         REAL NOT NULL,
-                tp1        REAL NOT NULL,
-                tp2        REAL DEFAULT 0,
-                tp3        REAL DEFAULT 0,
-                lot        REAL DEFAULT 0,
-                signal_num INTEGER DEFAULT 0,
-                setup_type TEXT DEFAULT '',
-                timestamp  TEXT NOT NULL,
-                tp1_hit    INTEGER DEFAULT 0,
-                tp2_hit    INTEGER DEFAULT 0,
-                tp3_hit    INTEGER DEFAULT 0,
-                sl_hit     INTEGER DEFAULT 0,
-                be_set     INTEGER DEFAULT 0,
-                closed     INTEGER DEFAULT 0
-            )
-        """)
-        # ── Journal statistique ──────────────────────────────
-        # Enregistre le résultat de chaque trade pour analyse a posteriori.
-        # Permet de savoir : quel setup gagne le plus, quelle paire, quelle heure.
-        con.execute("""
-            CREATE TABLE IF NOT EXISTS signal_stats (
-                stat_id    TEXT PRIMARY KEY,
-                trade_id   TEXT NOT NULL,
-                symbol     TEXT NOT NULL,
-                direction  TEXT NOT NULL,
-                setup_type TEXT NOT NULL,
-                score      INTEGER DEFAULT 0,
-                entry      REAL NOT NULL,
-                sl         REAL NOT NULL,
-                tp1        REAL NOT NULL,
-                lot        REAL DEFAULT 0,
-                signal_num INTEGER DEFAULT 0,
-                timestamp  TEXT NOT NULL,
-                hour_utc   INTEGER DEFAULT 0,
-                weekday    INTEGER DEFAULT 0,
-                result     TEXT DEFAULT 'open',
-                exit_price REAL DEFAULT 0,
-                pnl_r      REAL DEFAULT 0,
-                duration_min INTEGER DEFAULT 0
-            )
-        """)
-        con.commit()
-        con.close()
-    except Exception as e:
-        print(f"  [TRADE_DB] Init erreur : {e}")
-
-    # ── [v14] Migration : colonnes RR1 (BE) / RR2 (clôture partielle) ──
-    # Ajoutées à part des TP1/TP2/TP3 existants (non modifiés) — servent
-    # à des rappels intermédiaires plus précoces, conformes au cahier
-    # des charges (RR1=sécuriser, RR2=clôture partielle, RR3=laisser
-    # courir, RR6=objectif final — RR3/RR6 = TP1/TP3 déjà existants).
-    try:
-        con = sqlite3.connect(TRADE_DB, check_same_thread=False)
-        for col in ("rr1 REAL DEFAULT 0", "rr2 REAL DEFAULT 0",
-                    "rr1_hit INTEGER DEFAULT 0", "rr2_hit INTEGER DEFAULT 0"):
-            try:
-                con.execute(f"ALTER TABLE active_trades ADD COLUMN {col}")
-            except Exception:
-                pass  # colonne déjà présente
-        con.commit()
-        con.close()
-    except Exception as e:
-        print(f"  [TRADE_DB] Migration RR1/RR2 erreur : {e}")
-
-
-def register_trade(sig: "Signal", signal_num: int, setup_type: str = "SMC") -> str:
-    """
-    Enregistre un trade actif dans la base SQLite.
-    Retourne l'ID unique du trade (8 chars).
-    """
-    _init_trade_db()
-    trade_id = str(uuid.uuid4())[:8].upper()
-    tp2 = getattr(sig, "tp2", 0.0) or 0.0
-    tp3 = getattr(sig, "tp3", 0.0) or 0.0
-
-    # ── [v14] RR1 (sécuriser/BE) et RR2 (clôture partielle) ────
-    # Calculés indépendamment des TP1/TP2/TP3 existants (non touchés).
-    risk = abs(sig.entry - sig.sl)
-    if sig.direction == "LONG":
-        rr1 = round(sig.entry + 1 * risk, 6)
-        rr2 = round(sig.entry + 2 * risk, 6)
-    else:
-        rr1 = round(sig.entry - 1 * risk, 6)
-        rr2 = round(sig.entry - 2 * risk, 6)
-
-    try:
-        con = sqlite3.connect(TRADE_DB, check_same_thread=False)
-        con.execute("PRAGMA journal_mode=WAL")
-        con.execute("""
-            INSERT OR IGNORE INTO active_trades
-            (trade_id, symbol, direction, entry, sl, tp1, tp2, tp3,
-             lot, signal_num, setup_type, timestamp, rr1, rr2)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-        """, (
-            trade_id, sig.symbol, sig.direction,
-            sig.entry, sig.sl, sig.tp, tp2, tp3,
-            sig.lot, signal_num, setup_type,
-            datetime.now(timezone.utc).isoformat(), rr1, rr2
-        ))
-        con.commit()
-        con.close()
-        print(c(f"  [TRADE] ✓ Trade #{trade_id} enregistré — {sig.symbol} {sig.direction}", "cyan"))
-    except Exception as e:
-        print(f"  [TRADE_DB] Erreur enregistrement : {e}")
-
-    # ── Enregistrement dans le journal statistique ────────────
-    _register_stat(trade_id, sig, signal_num, setup_type)
-    return trade_id
-
-
-def _register_stat(trade_id: str, sig: "Signal", signal_num: int, setup_type: str) -> None:
-    """Insère une entrée dans signal_stats au moment de l'envoi du signal."""
-    try:
-        now     = datetime.now(timezone.utc)
-        stat_id = str(uuid.uuid4())[:8].upper()
-        score   = getattr(sig, "score", 0)
-        con = sqlite3.connect(TRADE_DB, check_same_thread=False)
-        con.execute("PRAGMA journal_mode=WAL")
-        con.execute("""
-            INSERT OR IGNORE INTO signal_stats
-            (stat_id, trade_id, symbol, direction, setup_type, score,
-             entry, sl, tp1, lot, signal_num, timestamp, hour_utc, weekday,
-             result, exit_price, pnl_r, duration_min)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-        """, (
-            stat_id, trade_id, sig.symbol, sig.direction, setup_type, score,
-            sig.entry, sig.sl, sig.tp, sig.lot, signal_num,
-            now.isoformat(), now.hour, now.weekday(),
-            "open", 0.0, 0.0, 0
-        ))
-        con.commit()
-        con.close()
-    except Exception as e:
-        print(f"  [STATS] Erreur insertion stat : {e}")
-
-
-def _update_stat_result(trade_id: str, result: str, exit_price: float) -> None:
-    """
-    Met à jour le résultat d'un trade dans signal_stats.
-    result = "tp1" | "tp2" | "tp3" | "sl"
-    Calcule automatiquement pnl_r (en unités de R) et duration_min.
-    """
-    try:
-        con = sqlite3.connect(TRADE_DB, check_same_thread=False)
-        con.row_factory = sqlite3.Row
-        row = con.execute(
-            "SELECT * FROM signal_stats WHERE trade_id=?", (trade_id,)
-        ).fetchone()
-        if row is None:
-            con.close()
-            return
-
-        entry     = row["entry"]
-        sl        = row["sl"]
-        direction = row["direction"]
-        ts_open   = datetime.fromisoformat(row["timestamp"])
-        risk      = abs(entry - sl)
-        now       = datetime.now(timezone.utc)
-        duration  = int((now - ts_open).total_seconds() / 60)
-
-        if risk > 0:
-            if direction == "LONG":
-                pnl_r = (exit_price - entry) / risk
-            else:
-                pnl_r = (entry - exit_price) / risk
-        else:
-            pnl_r = 0.0
-
-        con.execute("""
-            UPDATE signal_stats
-            SET result=?, exit_price=?, pnl_r=?, duration_min=?
-            WHERE trade_id=?
-        """, (result, exit_price, round(pnl_r, 2), duration, trade_id))
-        con.commit()
-        con.close()
-        print(c(f"  [STATS] ✓ {trade_id} → {result}  pnl={round(pnl_r,2)}R  durée={duration}min", "cyan"))
-    except Exception as e:
-        print(f"  [STATS] Erreur update résultat : {e}")
-
-
-def get_signal_stats(limit: int = 100) -> list[dict]:
-    """
-    Retourne les dernières entrées du journal statistique.
-    Utile pour analyser les performances par setup, paire, heure.
-    """
-    try:
-        _init_trade_db()
-        con = sqlite3.connect(TRADE_DB, check_same_thread=False)
-        con.row_factory = sqlite3.Row
-        rows = con.execute(
-            "SELECT * FROM signal_stats ORDER BY timestamp DESC LIMIT ?", (limit,)
+    if status in LOSS_STATUSES:
+        return -1.0
+    return None  # pending / taken / ignored / closed -> exclu du calcul R
+
+
+def get_period_stats(start_ts: float, end_ts: float) -> Dict:
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM signals WHERE created_at >= ? AND created_at < ? "
+            "ORDER BY created_at ASC",
+            (start_ts, end_ts),
         ).fetchall()
-        con.close()
-        return [dict(r) for r in rows]
-    except Exception as e:
-        print(f"  [STATS] Erreur lecture : {e}")
-        return []
 
+    total = len(rows)
+    wins = losses = be = 0
+    best = worst = None
+    by_symbol: Dict[str, Dict] = {}
+    cum, peak, max_dd = 0.0, 0.0, 0.0
+    total_r = 0.0
 
-def print_stats_summary() -> None:
-    """Affiche un résumé des statistiques dans la console."""
-    stats = get_signal_stats(500)
-    closed = [s for s in stats if s["result"] != "open"]
-    if not closed:
-        print(c("  [STATS] Aucun trade clôturé dans le journal.", "yellow"))
-        return
+    for row in rows:
+        sym_stats = by_symbol.setdefault(row["symbol"], {"total": 0, "wins": 0, "losses": 0})
+        sym_stats["total"] += 1
 
-    wins  = [s for s in closed if s["pnl_r"] > 0]
-    losses= [s for s in closed if s["pnl_r"] <= 0]
-    wr    = round(len(wins) / len(closed) * 100, 1)
-    avg_r = round(sum(s["pnl_r"] for s in closed) / len(closed), 2)
-
-    print(c(f"\n  ╔══ 📊 JOURNAL STATISTIQUE ({'='*40})", "cyan"))
-    print(c(f"  ║  Trades analysés : {len(closed)}  |  Winrate : {wr}%  |  R moyen : {avg_r}R", "cyan"))
-
-    # Par setup
-    from collections import defaultdict
-    by_setup: dict = defaultdict(list)
-    for s in closed:
-        by_setup[s["setup_type"]].append(s["pnl_r"])
-    print(c("  ║  Par setup :", "cyan"))
-    for stype, rs in sorted(by_setup.items(), key=lambda x: -sum(x[1])):
-        w = sum(1 for r in rs if r > 0)
-        print(f"  ║    {stype:<12} : {len(rs)} trades  WR={round(w/len(rs)*100,0)}%  avg={round(sum(rs)/len(rs),2)}R")
-
-    # Par paire
-    by_sym: dict = defaultdict(list)
-    for s in closed:
-        by_sym[s["symbol"]].append(s["pnl_r"])
-    print(c("  ║  Top paires :", "cyan"))
-    top5 = sorted(by_sym.items(), key=lambda x: -sum(x[1]))[:5]
-    for sym, rs in top5:
-        w = sum(1 for r in rs if r > 0)
-        print(f"  ║    {sym:<14} : {len(rs)} trades  WR={round(w/len(rs)*100,0)}%  total={round(sum(rs),2)}R")
-
-    print(c("  ╚" + "═"*52, "cyan"))
-
-
-def get_active_trades() -> list[dict]:
-    """Retourne tous les trades non clôturés."""
-    try:
-        _init_trade_db()
-        con = sqlite3.connect(TRADE_DB, check_same_thread=False)
-        con.row_factory = sqlite3.Row
-        rows = con.execute(
-            "SELECT * FROM active_trades WHERE closed=0 ORDER BY timestamp DESC"
-        ).fetchall()
-        con.close()
-        return [dict(r) for r in rows]
-    except Exception as e:
-        print(f"  [TRADE_DB] Erreur lecture : {e}")
-        return []
-
-
-# Whitelist of allowed column names for update_trade_field (prevents SQL injection)
-_ALLOWED_TRADE_FIELDS = frozenset({
-    "tp1_hit", "tp2_hit", "tp3_hit", "sl_hit", "closed", "be_set",
-    "close_price", "close_time", "pnl_pips", "rr1_hit", "rr2_hit",
-})
-
-
-def update_trade_field(trade_id: str, field: str, value) -> None:
-    """Met à jour un champ d'un trade existant."""
-    if field not in _ALLOWED_TRADE_FIELDS:
-        print(f"  [TRADE_DB] ⛔ Champ non autorisé : {field}")
-        return
-    try:
-        con = sqlite3.connect(TRADE_DB, check_same_thread=False)
-        con.execute(
-            f"UPDATE active_trades SET {field}=? WHERE trade_id=?",
-            (value, trade_id)
-        )
-        con.commit()
-        con.close()
-    except Exception as e:
-        print(f"  [TRADE_DB] Erreur update {field} : {e}")
-
-
-def update_trade_field_guarded(trade_id: str, field: str, value) -> int:
-    """
-    Met à jour un champ uniquement si sa valeur actuelle est 0/False (garde atomique).
-    Retourne le nombre de lignes modifiées (1 si succès, 0 si déjà mis à jour).
-    Utilisé pour éviter la race condition sur be_set.
-    """
-    if field not in _ALLOWED_TRADE_FIELDS:
-        print(f"  [TRADE_DB] ⛔ Champ non autorisé : {field}")
-        return 0
-    try:
-        con = sqlite3.connect(TRADE_DB, check_same_thread=False)
-        cur = con.execute(
-            f"UPDATE active_trades SET {field}=? WHERE trade_id=? AND ({field}=0 OR {field} IS NULL)",
-            (value, trade_id)
-        )
-        con.commit()
-        rows = cur.rowcount
-        con.close()
-        return rows
-    except Exception as e:
-        print(f"  [TRADE_DB] Erreur update_guarded {field} : {e}")
-        return 0
-
-
-def get_current_price_live(symbol: str) -> Optional[float]:
-    """
-    [v10] Récupère le prix actuel via yfinance OU requests direct (5m, fallback 1m).
-    Deriv (R_75/R_25) → API WebSocket Deriv dédiée : ces indices synthétiques
-    n'existent PAS sur Yahoo Finance (yfinance renvoie 404 "Quote not found").
-    Utilisé uniquement par le trade monitor.
-    """
-    if is_deriv_symbol(symbol):
-        df = fetch_deriv(symbol, "1m", count=5)
-        if not df.empty:
-            return float(df["close"].iloc[-1])
-        return None
-
-    for interval in ("5m", "1m"):
-        try:
-            if _HAS_YFINANCE:
-                df = yf.download(symbol, period="1d", interval=interval,
-                                 auto_adjust=True, progress=False, threads=False)
-                if df.empty:
-                    continue
-                if isinstance(df.columns, pd.MultiIndex):
-                    df.columns = df.columns.get_level_values(0).str.lower()
-                else:
-                    df.columns = df.columns.str.lower()
-            else:
-                df = _yahoo_chart_json(symbol, interval, "1d")
-                if df.empty:
-                    continue
-            df.dropna(subset=["close"], inplace=True)
-            if not df.empty:
-                return float(df["close"].iloc[-1])
-        except Exception:
+        r = _r_result(row)
+        if r is None:
             continue
-    return None
 
+        total_r += r
+        cum += r
+        peak = max(peak, cum)
+        max_dd = max(max_dd, peak - cum)
 
-# ── Formatage des alertes trade ───────────────────────────────
+        if r > 0:
+            wins += 1
+            sym_stats["wins"] += 1
+        elif r < 0:
+            losses += 1
+            sym_stats["losses"] += 1
+        else:
+            be += 1
 
-def _fmt_trade_alert(trade: dict, event: str, price: float) -> str:
-    """Formate le message Telegram d'alerte de trade."""
-    dec = 2 if trade["entry"] > 100 else 5
-    sym_map = {
-        "GC=F"   : "XAUUSD / GOLD",
-        "BTC-USD": "BTCUSD / Bitcoin",
+        entry = {"r": r, "symbol": row["symbol"], "direction": row["direction"]}
+        if best is None or r > best["r"]:
+            best = entry
+        if worst is None or r < worst["r"]:
+            worst = entry
+
+    decided = wins + losses
+    win_rate = (wins / decided * 100) if decided else 0.0
+
+    return {
+        "total_signals": total, "wins": wins, "losses": losses, "be": be,
+        "win_rate": win_rate, "total_r": total_r, "max_drawdown_r": max_dd,
+        "best": best, "worst": worst, "by_symbol": by_symbol,
     }
-    sym_display = sym_map.get(
-        trade["symbol"],
-        trade["symbol"].replace("=X","").replace("-USD","").replace("^","")
-    )
-    dir_emoji = "🟢" if trade["direction"] == "LONG" else "🔴"
-    dir_label = "BUY / LONG" if trade["direction"] == "LONG" else "SELL / SHORT"
-    num_str   = f"#{trade['signal_num']}" if trade.get("signal_num") else ""
-
-    entry = round(trade["entry"], dec)
-    sl    = round(trade["sl"],    dec)
-    tp1   = round(trade["tp1"],   dec)
-    tp2   = round(trade["tp2"],   dec) if trade.get("tp2") and trade["tp2"] > 0 else None
-    tp3   = round(trade["tp3"],   dec) if trade.get("tp3") and trade["tp3"] > 0 else None
-    tp2_s = f"<code>{tp2}</code>" if tp2 else "—"
-    tp3_s = f"<code>{tp3}</code>" if tp3 else "—"
-    p_now = round(price, dec)
-
-    SEP = "─" * 28
-
-    if event == "RR1":
-        return (
-            f"🔒 <b>RR1 ATTEINT — Sécurise si tu veux</b>  {num_str}\n"
-            f"{SEP}\n"
-            f"{dir_emoji} <b>{sym_display}</b>  {dir_label}\n"
-            f"💰 Entrée : <code>{entry}</code>\n"
-            f"📍 Prix actuel : <code>{p_now}</code>\n"
-            f"{SEP}\n"
-            f"⚡ <b>Possibilité :</b> déplacer le SL sur <code>{entry}</code> "
-            f"(Break Even) pour sécuriser — au choix\n"
-            f"{SEP}\n"
-            f"<i>@smcsignalspro</i>"
-        )
-    elif event == "RR2":
-        return (
-            f"💰 <b>RR2 ATTEINT — Clôture partielle possible</b>  {num_str}\n"
-            f"{SEP}\n"
-            f"{dir_emoji} <b>{sym_display}</b>  {dir_label}\n"
-            f"📍 Prix actuel : <code>{p_now}</code>\n"
-            f"{SEP}\n"
-            f"⚡ <b>Possibilité :</b> clôturer une partie de la position ici, "
-            f"pour ceux qui veulent sécuriser des gains — au choix\n"
-            f"{SEP}\n"
-            f"<i>@smcsignalspro</i>"
-        )
-    elif event == "TP1":
-        return (
-            f"🎯 <b>TP1 TOUCHÉ (RR3) !</b>  {num_str}\n"
-            f"{SEP}\n"
-            f"{dir_emoji} <b>{sym_display}</b>  {dir_label}\n"
-            f"💰 Entrée : <code>{entry}</code>\n"
-            f"✅ TP1 atteint : <code>{tp1}</code>  (RR ≥ 3)\n"
-            f"📍 Prix actuel : <code>{p_now}</code>\n"
-            f"{SEP}\n"
-            f"⚡ <b>2 OPTIONS AU CHOIX :</b>\n"
-            f"  1️⃣ <b>Clôture totale ici</b> — sécurise le RR3 en entier\n"
-            f"  2️⃣ <b>Laisser courir</b> vers TP2 ({tp2_s}) / TP3 ({tp3_s})\n"
-            f"      → 🔒 Déplace alors le SL sur <code>{entry}</code> (Break Even)\n"
-            f"{SEP}\n"
-            f"💡 Les deux options sont valables — à toi de choisir selon ta gestion\n"
-            f"<i>@smcsignalspro</i>"
-        )
-    elif event == "TP2":
-        return (
-            f"🚀 <b>TP2 TOUCHÉ !</b>  {num_str}\n"
-            f"{SEP}\n"
-            f"{dir_emoji} <b>{sym_display}</b>  {dir_label}\n"
-            f"✅ TP1 : <code>{tp1}</code>  ✓\n"
-            f"🚀 TP2 atteint : <code>{tp2}</code>\n"
-            f"📍 Prix actuel : <code>{p_now}</code>\n"
-            f"💵 Gain cumulé estimé : <b>+$300</b>\n"
-            f"{SEP}\n"
-            f"⚡ <b>ACTIONS IMMÉDIATES :</b>\n"
-            f"  • Ferme <b>50–70%</b> du restant\n"
-            f"  • 🔒 Déplace SL → <code>{tp1}</code> (sécurise TP1)\n"
-            f"  • Laisse le runner courir vers TP3 : {tp3_s}\n"
-            f"{SEP}\n"
-            f"💎 Excellent — gère ton runner !\n"
-            f"<i>@smcsignalspro</i>"
-        )
-    elif event == "TP3":
-        return (
-            f"💎 <b>TP3 TOUCHÉ — TRADE COMPLET !</b>  {num_str}\n"
-            f"{SEP}\n"
-            f"{dir_emoji} <b>{sym_display}</b>  {dir_label}\n"
-            f"✅ TP1 : <code>{tp1}</code>  ✓\n"
-            f"✅ TP2 : {tp2_s}  ✓\n"
-            f"💎 TP3 atteint : <code>{tp3}</code>\n"
-            f"📍 Prix actuel : <code>{p_now}</code>\n"
-            f"💵 Gain estimé : <b>+$600</b> 🏆\n"
-            f"{SEP}\n"
-            f"⚡ <b>ACTION :</b>\n"
-            f"  • <b>Ferme TOUTE la position maintenant</b>\n"
-            f"  • Objectif maximum atteint — trade parfait 🎯\n"
-            f"{SEP}\n"
-            f"🧠 Patience • Discipline • Résultat\n"
-            f"<i>@smcsignalspro</i>"
-        )
-    elif event == "SL":
-        return (
-            f"❌ <b>STOP LOSS TOUCHÉ</b>  {num_str}\n"
-            f"{SEP}\n"
-            f"{dir_emoji} <b>{sym_display}</b>  {dir_label}\n"
-            f"🔴 SL atteint : <code>{sl}</code>\n"
-            f"📍 Prix actuel : <code>{p_now}</code>\n"
-            f"💸 Perte : <b>-$100</b>  (risque contrôlé ✅)\n"
-            f"{SEP}\n"
-            f"⚡ <b>ACTION IMMÉDIATE :</b>\n"
-            f"  • <b>Ferme la position maintenant</b>\n"
-            f"  • ⛔ Ne pas moyenner à la baisse\n"
-            f"  • Prochain setup sera meilleur 💪\n"
-            f"{SEP}\n"
-            f"📊 Le setup a été invalidé — risque maîtrisé\n"
-            f"<i>@smcsignalspro</i>"
-        )
-    elif event == "BE_REMINDER":
-        return (
-            f"🔔 <b>RAPPEL : SL en BREAK EVEN</b>  {num_str}\n"
-            f"{SEP}\n"
-            f"{dir_emoji} <b>{sym_display}</b>  {dir_label}\n"
-            f"✅ TP1 touché — protège ton trade maintenant\n"
-            f"📍 Prix actuel : <code>{p_now}</code>\n"
-            f"{SEP}\n"
-            f"⚡ <b>Si ce n'est pas encore fait :</b>\n"
-            f"  🔒 Déplace SL → <code>{entry}</code> <b>(Break Even)</b>\n"
-            f"  • Position <b>risque zéro</b> — laisse le marché travailler\n"
-            f"  • TP2 : {tp2_s}  |  TP3 : {tp3_s}\n"
-            f"{SEP}\n"
-            f"<i>@smcsignalspro</i>"
-        )
-    return f"⚡ Événement {event} — {sym_display} @ {p_now}"
 
 
-def _send_trade_alert(trade: dict, event: str, price: float) -> None:
-    """Envoie l'alerte trade par Telegram (leader + groupe)."""
-    if not _TG_ENABLED:
-        print(c(f"  [TRADE] {event} {trade['symbol']} @ {price} (TG désactivé)", "yellow"))
-        return
-    msg  = _fmt_trade_alert(trade, event, price)
-    sent = False
-    if TELEGRAM_LEADER_ID:
-        ok = tg_send(msg, TELEGRAM_LEADER_ID)
-        if ok:
-            sent = True
-    target_group = get_group_id_for_symbol(trade.get("symbol", ""))
-    if target_group:
-        tg_send(msg, target_group)
-        sent = True
-    icon = "✓" if sent else "✗"
-    col  = "cyan" if sent else "red"
-    print(c(f"  [TRADE] {icon} Alerte {event} — {trade['symbol']} @ {round(price, 5)}", col))
+def get_all_time_stats() -> Dict:
+    """Stats sur toute l'historique (pas de bornes de date)."""
+    return get_period_stats(0, time.time() + 1)
 
 
-# ── Boucle de surveillance des trades actifs ──────────────────
+def get_dashboard_overview() -> Dict:
+    """Agrège réglages + stats globales + équivalent $ pour les cartes du
+    dashboard (capital actuel, profits, pertes, drawdown, winrate)."""
+    settings = get_settings()
+    overall = get_all_time_stats()
+    capital = settings["capital"]
+    risk_percent = settings["risk_percent"]
 
-def _monitor_trades_loop() -> None:
-    """
-    Thread de fond — vérifie toutes les TRADE_MONITOR_INTERVAL secondes
-    si un TP ou SL a été touché pour chaque trade actif.
+    # NB : le $ par trade est estimé avec le risque par trade ACTUEL des
+    # réglages (le risque effectif historique par trade n'est pas persisté
+    # en base) — cohérent avec l'approche "raisonnement en R" déjà en place.
+    dollar_per_r = capital * (risk_percent / 100.0)
+    total_pnl = overall["total_r"] * dollar_per_r
+    max_drawdown_dollar = overall["max_drawdown_r"] * dollar_per_r
+    current_capital = capital + total_pnl
 
-    Logique de surveillance :
-      SL  → ferme et archive le trade
-      TP1 → alerte + rappel BE 5 min après
-      TP2 → alerte
-      TP3 → alerte + ferme le trade
-    """
-    time.sleep(30)   # laisse le bot démarrer proprement
-    print(c(f"  ✓ Trade Monitor actif — intervalle {TRADE_MONITOR_INTERVAL}s", "cyan"))
-
-    while True:
-        try:
-            trades = get_active_trades()
-            for trade in trades:
-                try:
-                    sym       = trade["symbol"]
-                    direction = trade["direction"]
-                    price     = get_current_price_live(sym)
-                    if price is None:
-                        continue
-
-                    # ── SL touché ─────────────────────────────
-                    if not trade["sl_hit"] and not trade["closed"]:
-                        sl_hit = (
-                            (direction == "LONG"  and price <= trade["sl"]) or
-                            (direction == "SHORT" and price >= trade["sl"])
-                        )
-                        if sl_hit:
-                            update_trade_field(trade["trade_id"], "sl_hit", 1)
-                            update_trade_field(trade["trade_id"], "closed",  1)
-                            _send_trade_alert(trade, "SL", price)
-                            _update_stat_result(trade["trade_id"], "sl", price)
-                            trade["sl_hit"] = 1
-                            trade["closed"] = 1
-                            continue   # trade clôturé
-
-                    # ── [v14] RR1 touché (sécuriser / BE possible) ─
-                    if not trade.get("rr1_hit", 0) and trade.get("rr1", 0):
-                        rr1_hit = (
-                            (direction == "LONG"  and price >= trade["rr1"]) or
-                            (direction == "SHORT" and price <= trade["rr1"])
-                        )
-                        if rr1_hit:
-                            update_trade_field(trade["trade_id"], "rr1_hit", 1)
-                            _send_trade_alert(trade, "RR1", price)
-                            trade["rr1_hit"] = 1
-
-                    # ── [v14] RR2 touché (clôture partielle possible) ─
-                    if not trade.get("rr2_hit", 0) and trade.get("rr2", 0):
-                        rr2_hit = (
-                            (direction == "LONG"  and price >= trade["rr2"]) or
-                            (direction == "SHORT" and price <= trade["rr2"])
-                        )
-                        if rr2_hit:
-                            update_trade_field(trade["trade_id"], "rr2_hit", 1)
-                            _send_trade_alert(trade, "RR2", price)
-                            trade["rr2_hit"] = 1
-
-                    # ── TP1 touché ────────────────────────────
-                    if not trade["tp1_hit"] and trade["tp1"] > 0:
-                        tp1_hit = (
-                            (direction == "LONG"  and price >= trade["tp1"]) or
-                            (direction == "SHORT" and price <= trade["tp1"])
-                        )
-                        if tp1_hit:
-                            update_trade_field(trade["trade_id"], "tp1_hit", 1)
-                            _send_trade_alert(trade, "TP1", price)
-                            _update_stat_result(trade["trade_id"], "tp1", price)
-                            trade["tp1_hit"] = 1
-
-                    # ── Rappel Break Even (5 min après TP1) ───
-                    if (trade["tp1_hit"] and not trade.get("be_set", 0)
-                            and not trade["tp2_hit"] and not trade["closed"]):
-                        rows_updated = update_trade_field_guarded(trade["trade_id"], "be_set", 1)
-                        if rows_updated:
-                            # Rappel décalé dans un thread séparé pour ne pas bloquer
-                            def _delayed_be(t=trade, p=price):
-                                time.sleep(300)
-                                # Re-vérifie que le trade est encore ouvert
-                                refreshed = get_active_trades()
-                                t_ref = next(
-                                    (x for x in refreshed if x["trade_id"] == t["trade_id"]),
-                                    None
-                                )
-                                if t_ref and not t_ref["tp2_hit"] and not t_ref["closed"]:
-                                    new_price = get_current_price_live(t["symbol"]) or p
-                                    _send_trade_alert(t, "BE_REMINDER", new_price)
-                            threading.Thread(target=_delayed_be, daemon=True).start()
-
-                    # ── TP2 touché ────────────────────────────
-                    if (trade["tp1_hit"] and not trade["tp2_hit"]
-                            and trade.get("tp2", 0) > 0):
-                        tp2_hit = (
-                            (direction == "LONG"  and price >= trade["tp2"]) or
-                            (direction == "SHORT" and price <= trade["tp2"])
-                        )
-                        if tp2_hit:
-                            update_trade_field(trade["trade_id"], "tp2_hit", 1)
-                            _send_trade_alert(trade, "TP2", price)
-                            _update_stat_result(trade["trade_id"], "tp2", price)
-                            trade["tp2_hit"] = 1
-
-                    # ── TP3 touché → clôture complète ─────────
-                    if (trade["tp2_hit"] and not trade["tp3_hit"]
-                            and trade.get("tp3", 0) > 0):
-                        tp3_hit = (
-                            (direction == "LONG"  and price >= trade["tp3"]) or
-                            (direction == "SHORT" and price <= trade["tp3"])
-                        )
-                        if tp3_hit:
-                            update_trade_field(trade["trade_id"], "tp3_hit", 1)
-                            update_trade_field(trade["trade_id"], "closed",  1)
-                            _send_trade_alert(trade, "TP3", price)
-                            _update_stat_result(trade["trade_id"], "tp3", price)
-
-                    time.sleep(2)   # pause entre chaque symbole
-
-                except Exception as e_trade:
-                    print(f"  [TRADE] Erreur {trade.get('symbol','?')} : {e_trade}")
-
-        except Exception as e_loop:
-            print(f"  [TRADE] Erreur boucle monitor : {e_loop}")
-
-        time.sleep(TRADE_MONITOR_INTERVAL)
+    return {
+        "settings": settings,
+        "capital_initial": capital,
+        "capital_actuel": round(current_capital, 2),
+        "profit_net_total": round(total_pnl, 2),
+        "drawdown_max": round(max_drawdown_dollar, 2),
+        "winrate": round(overall["win_rate"], 1),
+        "total_signals": overall["total_signals"],
+        "wins": overall["wins"],
+        "losses": overall["losses"],
+        "be": overall["be"],
+        "total_r": round(overall["total_r"], 2),
+        "open_positions": count_open_positions(),
+    }
 
 
-def _monitor_trades_thread() -> None:
-    """Lance le thread de surveillance des trades."""
-    t = threading.Thread(
-        target=_monitor_trades_loop, daemon=True, name="trade-monitor"
-    )
-    t.start()
-    return t
-
-
-# ─────────────────────────────────────────────────────────────
-#  RAPPORT JOURNALIER — envoi Telegram à 21h00 UTC ⭐⭐⭐⭐⭐
-#
-#  Calcule et envoie chaque jour à 21h00 UTC le winrate
-#  de la journée + résumé cumulé de la semaine.
-#  Format identique aux alertes du bot (lisible sur mobile).
-# ─────────────────────────────────────────────────────────────
-
-def _build_daily_report(date_str: str | None = None) -> str:
-    """
-    Construit le message du rapport journalier.
-    date_str : format 'YYYY-MM-DD'. Si None → aujourd'hui UTC.
-    """
-    from collections import defaultdict
-
-    if date_str is None:
-        date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-
-    stats  = get_signal_stats(500)
-    today  = [s for s in stats if s["timestamp"].startswith(date_str) and s["result"] != "open"]
-    open_t = [s for s in stats if s["result"] == "open"]
-
-    # Calculs du jour
-    wins_d  = [s for s in today if s["pnl_r"] > 0]
-    loss_d  = [s for s in today if s["pnl_r"] <= 0]
-    wr_d    = round(len(wins_d) / max(len(today), 1) * 100, 0)
-    total_r = round(sum(s["pnl_r"] for s in today), 2)
-    avg_r   = round(sum(s["pnl_r"] for s in today) / max(len(today), 1), 2)
-
-    # Calculs de la semaine (7 derniers jours)
-    from datetime import timedelta
-    week_ago  = (datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%d")
-    week_cl   = [s for s in stats if s["result"] != "open" and s["timestamp"] >= week_ago]
-    wins_w    = [s for s in week_cl if s["pnl_r"] > 0]
-    wr_w      = round(len(wins_w) / max(len(week_cl), 1) * 100, 0)
-    total_r_w = round(sum(s["pnl_r"] for s in week_cl), 2)
-
-    # Emoji résultat
-    if not today:
-        bilan_emoji = "😶"
-        bilan_txt   = "Aucun trade clôturé aujourd'hui"
-    elif wr_d >= 70:
-        bilan_emoji = "🔥"
-        bilan_txt   = "Excellente journée !"
-    elif wr_d >= 50:
-        bilan_emoji = "✅"
-        bilan_txt   = "Journée positive"
-    else:
-        bilan_emoji = "⚠️"
-        bilan_txt   = "Journée difficile — analyser les setups"
-
-    # Détail par setup
-    by_setup: dict = defaultdict(list)
-    for s in today:
-        by_setup[s["setup_type"]].append(s["pnl_r"])
-
-    setup_lines = ""
-    for stype, rs in sorted(by_setup.items(), key=lambda x: -sum(x[1])):
-        w  = sum(1 for r in rs if r > 0)
-        wr = int(w / len(rs) * 100)
-        emo = "✅" if wr >= 50 else "❌"
-        setup_lines += f"  {emo} {stype:<12} {len(rs)}t  WR {wr}%  {round(sum(rs),2):+.1f}R\n"
-
-    if not setup_lines:
-        setup_lines = "  — aucun trade\n"
-
-    # Construction du message
-    msg = (
-        f"📊 <b>RAPPORT JOURNALIER SMC</b>\n"
-        f"📅 {date_str}  —  21h00 UTC\n"
-        f"{'─'*32}\n"
-        f"{bilan_emoji}  <b>{bilan_txt}</b>\n\n"
-        f"<b>Aujourd'hui :</b>\n"
-        f"  📈 Trades clôturés : <b>{len(today)}</b>  "
-        f"({len(wins_d)} ✅  {len(loss_d)} ❌)\n"
-        f"  🎯 Winrate : <b>{int(wr_d)}%</b>\n"
-        f"  💰 Total R : <b>{total_r:+.2f}R</b>  (moy {avg_r:+.2f}R)\n"
-        f"  ⏳ Ouverts : {len(open_t)} signal(s) en cours\n\n"
-        f"<b>7 derniers jours :</b>\n"
-        f"  🗓️ {len(week_cl)} trades  WR <b>{int(wr_w)}%</b>  "
-        f"Total <b>{total_r_w:+.2f}R</b>\n\n"
-        f"<b>Par setup (aujourd'hui) :</b>\n"
-        f"{setup_lines}"
-        f"{'─'*32}\n"
-        f"🧠 Patience • Discipline • Résultat\n"
-        f"@smcsignalspro"
-    )
-    return msg
-
-
-def _category_symbols(category: str) -> set:
-    """Renvoie l'ensemble des symboles ('GC=F','BTC-USD',...) d'une catégorie."""
-    if category == "gold_btc":
-        return {s for s, _ in TIER_1_PRIORITY}
-    return {s for s, _ in DERIV_SYMBOLS}
-
-
-def _build_perf_report(category: str, period: str = "daily") -> str:
-    """
-    Construit le rapport de performance texte pour une catégorie
-    ('gold_btc' ou 'deriv') sur une période ('daily' ou 'weekly').
-    Détail complet : winrate, R total, par instrument (Gold vs BTC /
-    V75 vs V25) et par setup.
-    """
-    from collections import defaultdict
-    from datetime import timedelta
-
-    cat_symbols = _category_symbols(category)
-    sym_labels  = dict(TIER_1_PRIORITY + DERIV_SYMBOLS)
-
-    stats  = [s for s in get_signal_stats(2000) if s["symbol"] in cat_symbols]
-    now    = datetime.now(timezone.utc)
-
-    if period == "daily":
-        date_str      = now.strftime("%Y-%m-%d")
-        period_trades = [s for s in stats if s["result"] != "open"
-                          and s["timestamp"].startswith(date_str)]
-        period_label  = f"📅 {date_str}  —  21h00 UTC"
-        period_word   = "Aujourd'hui"
-        compare_word   = "7 derniers jours"
-        compare_days   = 7
-    else:
-        week_start    = (now - timedelta(days=7)).strftime("%Y-%m-%d")
-        period_trades = [s for s in stats if s["result"] != "open"
-                          and s["timestamp"] >= week_start]
-        period_label  = f"📅 Semaine du {week_start} au {now.strftime('%Y-%m-%d')}"
-        period_word   = "Cette semaine"
-        compare_word   = "28 derniers jours"
-        compare_days   = 28
-
-    open_t = [s for s in stats if s["result"] == "open"]
-
-    wins   = [s for s in period_trades if s["pnl_r"] > 0]
-    losses = [s for s in period_trades if s["pnl_r"] <= 0]
-    wr     = round(len(wins) / max(len(period_trades), 1) * 100)
-    total_r= round(sum(s["pnl_r"] for s in period_trades), 2)
-    avg_r  = round(sum(s["pnl_r"] for s in period_trades) / max(len(period_trades), 1), 2)
-
-    ref_start   = (now - timedelta(days=compare_days)).strftime("%Y-%m-%d")
-    ref_trades  = [s for s in stats if s["result"] != "open" and s["timestamp"] >= ref_start]
-    ref_wins    = [s for s in ref_trades if s["pnl_r"] > 0]
-    ref_wr      = round(len(ref_wins) / max(len(ref_trades), 1) * 100)
-    ref_total_r = round(sum(s["pnl_r"] for s in ref_trades), 2)
-
-    if not period_trades:
-        emoji, bilan = "😶", "Aucun trade clôturé"
-    elif wr >= 70:
-        emoji, bilan = "🔥", "Excellente performance !"
-    elif wr >= 50:
-        emoji, bilan = "✅", "Performance positive"
-    else:
-        emoji, bilan = "⚠️", "Période difficile — à analyser"
-
-    # ── Détail par instrument (Gold vs BTC / V75 vs V25) ──────
-    by_symbol: dict = defaultdict(list)
-    for s in period_trades:
-        by_symbol[s["symbol"]].append(s["pnl_r"])
-    symbol_lines = ""
-    for sym, rs in sorted(by_symbol.items(), key=lambda x: -sum(x[1])):
-        w      = sum(1 for r in rs if r > 0)
-        w_rate = int(w / len(rs) * 100)
-        emo    = "✅" if w_rate >= 50 else "❌"
-        label  = sym_labels.get(sym, sym)
-        symbol_lines += f"  {emo} {label:<20} {len(rs)}t  WR {w_rate}%  {round(sum(rs),2):+.1f}R\n"
-    if not symbol_lines:
-        symbol_lines = "  — aucun trade\n"
-
-    # ── Détail par setup ───────────────────────────────────────
-    by_setup: dict = defaultdict(list)
-    for s in period_trades:
-        by_setup[s["setup_type"]].append(s["pnl_r"])
-    setup_lines = ""
-    for stype, rs in sorted(by_setup.items(), key=lambda x: -sum(x[1])):
-        w      = sum(1 for r in rs if r > 0)
-        w_rate = int(w / len(rs) * 100)
-        emo    = "✅" if w_rate >= 50 else "❌"
-        setup_lines += f"  {emo} {stype:<12} {len(rs)}t  WR {w_rate}%  {round(sum(rs),2):+.1f}R\n"
-    if not setup_lines:
-        setup_lines = "  — aucun trade\n"
-
-    title = ("🥇 <b>RAPPORT PERFORMANCE — GOLD + BTC</b>" if category == "gold_btc"
-              else "📡 <b>RAPPORT PERFORMANCE — DERIV (V75 / V25)</b>")
-
-    msg = (
-        f"{title}\n"
-        f"{period_label}\n"
-        f"{'─'*32}\n"
-        f"{emoji}  <b>{bilan}</b>\n\n"
-        f"<b>{period_word} :</b>\n"
-        f"  📈 Trades clôturés : <b>{len(period_trades)}</b>  "
-        f"({len(wins)} ✅  {len(losses)} ❌)\n"
-        f"  🎯 Winrate : <b>{wr}%</b>\n"
-        f"  💰 Total R : <b>{total_r:+.2f}R</b>  (moy {avg_r:+.2f}R)\n"
-        f"  ⏳ Ouverts : {len(open_t)} signal(s) en cours\n\n"
-        f"<b>{compare_word} :</b>\n"
-        f"  🗓️ {len(ref_trades)} trades  WR <b>{ref_wr}%</b>  "
-        f"Total <b>{ref_total_r:+.2f}R</b>\n\n"
-        f"<b>Par instrument :</b>\n{symbol_lines}\n"
-        f"<b>Par setup :</b>\n{setup_lines}"
-        f"{'─'*32}\n"
-        f"🧠 Patience • Discipline • Résultat\n"
-        f"@smcsignalspro"
-    )
-    return msg
-
-
-def generate_perf_chart(category: str, period: str = "daily") -> Optional[str]:
-    """
-    Génère une image claire (barres R, thème sombre) résumant la performance
-    d'une catégorie sur les 14 derniers jours (daily) ou 8 dernières semaines
-    (weekly), et retourne le chemin /tmp/*.png (ou None si échec/pas de data).
-    """
-    try:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-        from collections import defaultdict
-        from datetime import timedelta
-
-        cat_symbols = _category_symbols(category)
-        stats = [s for s in get_signal_stats(3000)
-                 if s["symbol"] in cat_symbols and s["result"] != "open"]
-
-        now = datetime.now(timezone.utc)
-        buckets: dict = defaultdict(float)
-
-        if period == "daily":
-            for i in range(13, -1, -1):
-                d = (now - timedelta(days=i)).strftime("%Y-%m-%d")
-                buckets[d] = 0.0
-            for s in stats:
-                d = s["timestamp"][:10]
-                if d in buckets:
-                    buckets[d] += s["pnl_r"]
-            labels   = list(buckets.keys())
-            x_labels = [d[5:] for d in labels]
-            chart_title = "Performance quotidienne (14 derniers jours)"
+def get_stats_by_asset() -> Dict[str, Dict]:
+    """Statistiques détaillées par actif : total, winrate, R cumulé, moyenne R."""
+    with get_conn() as conn:
+        rows = conn.execute("SELECT * FROM signals").fetchall()
+    by_symbol: Dict[str, Dict] = {sym: {"total": 0, "wins": 0, "losses": 0, "be": 0, "total_r": 0.0}
+                                   for sym in ASSETS}
+    for row in rows:
+        sym = row["symbol"]
+        if sym not in by_symbol:
+            by_symbol[sym] = {"total": 0, "wins": 0, "losses": 0, "be": 0, "total_r": 0.0}
+        by_symbol[sym]["total"] += 1
+        r = _r_result(row)
+        if r is None:
+            continue
+        by_symbol[sym]["total_r"] += r
+        if r > 0:
+            by_symbol[sym]["wins"] += 1
+        elif r < 0:
+            by_symbol[sym]["losses"] += 1
         else:
-            for i in range(7, -1, -1):
-                wk = now - timedelta(weeks=i)
-                key = wk.strftime("%Y-S%W")
-                buckets[key] = 0.0
-            for s in stats:
-                ts  = datetime.fromisoformat(s["timestamp"])
-                key = ts.strftime("%Y-S%W")
-                if key in buckets:
-                    buckets[key] += s["pnl_r"]
-            labels   = list(buckets.keys())
-            x_labels = [l[-3:] for l in labels]
-            chart_title = "Performance hebdomadaire (8 dernières semaines)"
+            by_symbol[sym]["be"] += 1
 
-        values = [buckets[k] for k in labels]
-        if not any(values):
-            pass  # on affiche quand même le graphique vide plutôt que rien
-
-        BG, BG2  = "#0a0c10", "#0d1117"
-        GREEN, RED, GRAY, FG = "#22c55e", "#ef4444", "#94a3b8", "#e2e8f0"
-
-        fig, ax = plt.subplots(figsize=(10, 5.2), dpi=110, facecolor=BG)
-        ax.set_facecolor(BG2)
-        colors = [GREEN if v >= 0 else RED for v in values]
-        ax.bar(range(len(values)), values, color=colors, width=0.6, zorder=3)
-        ax.axhline(0, color="#334155", lw=0.8, zorder=2)
-        ax.set_xticks(range(len(x_labels)))
-        ax.set_xticklabels(x_labels, color=GRAY, fontsize=9, rotation=45, ha="right")
-        ax.tick_params(colors=GRAY, labelsize=9)
-        for spine in ax.spines.values():
-            spine.set_color("#1e293b")
-        cumul = round(sum(values), 2)
-        cat_name = "Gold + BTC" if category == "gold_btc" else "Deriv — V75 / V25"
-        ax.set_title(f"{cat_name}\n{chart_title}  •  Cumul {cumul:+.2f}R",
-                     color=FG, fontsize=13, fontweight="bold")
-        ax.set_ylabel("R", color=GRAY)
-        ax.grid(axis="y", color="#1e293b", lw=0.5, ls="--", alpha=0.6, zorder=0)
-        plt.tight_layout()
-
-        path = f"/tmp/perf_{category}_{period}_{int(time.time())}.png"
-        fig.savefig(path, dpi=110, facecolor=BG, bbox_inches="tight")
-        plt.close(fig)
-        import gc as _gc; _gc.collect()
-        return path
-
-    except Exception as e:
-        print(f"  [CHART] Erreur génération graphique perf : {e}")
-        return None
+    for sym, s in by_symbol.items():
+        decided = s["wins"] + s["losses"]
+        s["win_rate"] = round((s["wins"] / decided * 100) if decided else 0.0, 1)
+        s["total_r"] = round(s["total_r"], 2)
+        s["display_name"] = ASSETS[sym].display_name if sym in ASSETS else sym
+    return by_symbol
 
 
-def _send_perf_report(category: str, period: str = "daily") -> None:
-    """
-    Construit et envoie le rapport de performance complet (image claire +
-    texte détaillé) pour une catégorie, au groupe Telegram dédié et en privé
-    à l'admin.
-    """
-    if not _TG_ENABLED:
-        log.info(f"  [RAPPORT] {category}/{period} ignoré — TG_ENABLED=false")
-        return
-
-    group_id = TELEGRAM_GROUP_DERIV_ID if category == "deriv" else TELEGRAM_GROUP_GOLD_BTC_ID
-    full_msg = _build_perf_report(category, period)
-    chart_path = generate_perf_chart(category, period)
-
-    cat_name    = "Gold + BTC" if category == "gold_btc" else "Deriv V75/V25"
-    period_name = "Quotidien" if period == "daily" else "Hebdomadaire"
-    caption = (f"📊 <b>Rapport {period_name} — {cat_name}</b>\n"
-               f"📈 Graphique de performance ci-dessus — détail complet ⬇️")
-
-    targets = [t for t in (group_id, TELEGRAM_LEADER_ID) if t]
-    for chat_id in targets:
-        if chart_path:
-            ok = tg_send_photo(chart_path, caption, chat_id)
-            if not ok:
-                tg_send(full_msg, chat_id)
-                continue
-        tg_send(full_msg, chat_id)
-
-    if chart_path:
-        try:
-            os.remove(chart_path)
-        except OSError:
-            pass
-
-    log.info(f"  [RAPPORT] ✓ {period}/{category} envoyé ({len(targets)} destinataire(s))")
+def get_monthly_performance(n_months: int = 6) -> List[Dict]:
+    """Performance des `n_months` derniers mois (le mois courant inclus, en
+    dernier dans la liste)."""
+    now = datetime.now(timezone.utc)
+    months = []
+    for i in range(n_months - 1, -1, -1):
+        year = now.year
+        month = now.month - i
+        while month <= 0:
+            month += 12
+            year -= 1
+        start = datetime(year, month, 1, tzinfo=timezone.utc)
+        if month == 12:
+            end = datetime(year + 1, 1, 1, tzinfo=timezone.utc)
+        else:
+            end = datetime(year, month + 1, 1, tzinfo=timezone.utc)
+        stats = get_period_stats(start.timestamp(), end.timestamp())
+        months.append({
+            "period_key": f"{year}-{month:02d}",
+            "total_signals": stats["total_signals"],
+            "wins": stats["wins"], "losses": stats["losses"], "be": stats["be"],
+            "win_rate": round(stats["win_rate"], 1),
+            "total_r": round(stats["total_r"], 2),
+        })
+    return months
 
 
-def _daily_report_loop() -> None:
-    """
-    Thread qui attend chaque jour 21h00 UTC et envoie 2 rapports séparés
-    (Gold+BTC puis Deriv V75/V25), chacun avec un graphique clair + le
-    détail texte complet. Utilise un sleep adaptatif pour viser 21:00:00 UTC.
-    """
-    print(c("  ✓ Rapport journalier activé — envoi chaque jour à 21h00 UTC "
-            "(Gold+BTC et Deriv séparément)", "cyan"))
-    while True:
-        try:
-            now   = datetime.now(timezone.utc)
-            # Prochain 21h UTC
-            next_21 = now.replace(hour=21, minute=0, second=0, microsecond=0)
-            if now >= next_21:
-                from datetime import timedelta
-                next_21 += timedelta(days=1)
-            wait_sec = (next_21 - now).total_seconds()
-            log.info(f"  [RAPPORT] Prochain rapport dans {int(wait_sec//3600)}h{int((wait_sec%3600)//60)}m")
-            time.sleep(wait_sec)
-
-            date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-            _send_perf_report("gold_btc", "daily")
-            _send_perf_report("deriv", "daily")
-
-            # Affichage console
-            print(c(f"\n  📊 RAPPORT JOURNALIER {date_str} ─────────────────", "cyan"))
-            print_stats_summary()
-            time.sleep(60)   # évite double envoi en cas de drift
-
-        except Exception as e:
-            log.error(f"  [RAPPORT] Erreur : {e}")
-            time.sleep(300)
+def get_trade_history(limit: int = 100, symbol: Optional[str] = None,
+                       status: Optional[str] = None) -> List[Dict]:
+    query = "SELECT * FROM signals WHERE 1=1"
+    params: List = []
+    if symbol:
+        query += " AND symbol = ?"
+        params.append(symbol)
+    if status:
+        query += " AND status = ?"
+        params.append(status)
+    query += " ORDER BY created_at DESC LIMIT ?"
+    params.append(limit)
+    with get_conn() as conn:
+        rows = conn.execute(query, params).fetchall()
+    return [dict(r) for r in rows]
 
 
-def _daily_report_thread() -> None:
-    """Lance le thread du rapport journalier."""
-    t = threading.Thread(target=_daily_report_loop, daemon=True, name="daily-report")
-    t.start()
-    return t
+def _day_bounds(now: datetime):
+    start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    return start.timestamp(), now.timestamp()
 
 
-def _weekly_report_loop() -> None:
-    """
-    Thread qui attend chaque dimanche 21h05 UTC (juste après le rapport
-    quotidien) et envoie 2 rapports hebdomadaires séparés (Gold+BTC puis
-    Deriv V75/V25), chacun avec graphique + détail texte complet.
-    """
-    print(c("  ✓ Rapport hebdomadaire activé — envoi chaque dimanche à 21h05 UTC "
-            "(Gold+BTC et Deriv séparément)", "cyan"))
-    while True:
-        try:
-            from datetime import timedelta
-            now = datetime.now(timezone.utc)
-            days_until_sunday = (6 - now.weekday()) % 7  # weekday(): lundi=0 ... dimanche=6
-            next_run = (now + timedelta(days=days_until_sunday)).replace(
-                hour=21, minute=5, second=0, microsecond=0)
-            if next_run <= now:
-                next_run += timedelta(days=7)
-            wait_sec = (next_run - now).total_seconds()
-            log.info(f"  [RAPPORT HEBDO] Prochain rapport dans "
-                     f"{int(wait_sec//86400)}j {int((wait_sec % 86400)//3600)}h")
-            time.sleep(wait_sec)
-
-            _send_perf_report("gold_btc", "weekly")
-            _send_perf_report("deriv", "weekly")
-
-            print(c(f"\n  📊 RAPPORT HEBDOMADAIRE ─────────────────", "cyan"))
-            time.sleep(60)
-
-        except Exception as e:
-            log.error(f"  [RAPPORT HEBDO] Erreur : {e}")
-            time.sleep(300)
+def _week_bounds(now: datetime):
+    start = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+    iso_year, iso_week, _ = now.isocalendar()
+    return start.timestamp(), now.timestamp(), f"{iso_year}-W{iso_week:02d}"
 
 
-def _weekly_report_thread() -> None:
-    """Lance le thread du rapport hebdomadaire."""
-    t = threading.Thread(target=_weekly_report_loop, daemon=True, name="weekly-report")
-    t.start()
-    return t
+def _month_bounds(now: datetime):
+    start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    return start.timestamp(), now.timestamp()
 
 
-# ─────────────────────────────────────────────────────────────
-#  COMMANDE ADMIN  /rapport  — 2 rapports indépendants
-#  Deriv (V75/V25) → TELEGRAM_GROUP_DERIV_ID
-#  Gold + BTC      → TELEGRAM_GROUP_GOLD_BTC_ID
-# ─────────────────────────────────────────────────────────────
+def _is_last_day_of_month(now: datetime) -> bool:
+    return (now + timedelta(days=1)).month != now.month
 
-def _build_category_report(category: str) -> str:
-    """Construit le rapport /rapport pour une catégorie ('deriv' ou 'gold_btc') :
-    catégorie → état du marché → signaux disponibles → trades actifs →
-    derniers signaux."""
-    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
-    if category == "deriv":
-        title       = "📡 <b>RAPPORT DERIV — Volatility 75 / Volatility 25</b>"
-        cat_symbols = DERIV_SYMBOLS
-        cat_labels  = {"Volatility 75 Index", "Volatility 25 Index"}
-    else:
-        title       = "🥇 <b>RAPPORT GOLD + BTC</b>"
-        cat_symbols = TIER_1_PRIORITY
-        cat_labels  = {"Gold", "Bitcoin"}
-
-    sep = "─" * 30
-    lines = [title, f"🕐 <code>{ts}</code>", sep, "<b>📊 État du marché :</b>"]
-
-    for sym, label in cat_symbols:
-        ok, reason = is_kill_zone_active(sym)
-        icon = "🟢" if ok else "🔴"
-        lines.append(f"{icon} {label} ({sym}) — {reason}")
-
-    lines.append(sep)
-    lines.append("<b>⚡ Signaux disponibles aujourd'hui :</b>")
-    for sym, label in cat_symbols:
-        used = _daily_counts.get(sym, 0)
-        lines.append(f"• {label} : {used}/{MAX_SIGNALS_PER_DAY} signaux/jour")
-    if category == "deriv":
-        lines.append(f"• Cumul Deriv (V75+V25) : {_daily_deriv_count}/{MAX_SIGNALS_DERIV_PER_DAY}")
-    lines.append(f"• Cumul global (4 marchés) : {_daily_global_count}/{MAX_SIGNALS_GLOBAL_PER_DAY}")
-
-    lines.append(sep)
-    lines.append("<b>📈 Trades actifs :</b>")
-    cat_sym_set = {s for s, _ in cat_symbols}
-    try:
-        active = [t for t in get_active_trades() if t.get("symbol") in cat_sym_set]
-    except Exception as e:
-        active = []
-        lines.append(f"⚠ Erreur lecture trades actifs : {e}")
-    if active:
-        for t in active:
-            dir_emoji = "🟢" if t["direction"] in ("LONG", "BUY") else "🔴"
-            lines.append(
-                f"{dir_emoji} {t['symbol']} {t['direction']} — Entry <code>{t['entry']}</code> "
-                f"| SL <code>{t['sl']}</code> | TP1 <code>{t['tp1']}</code>"
-            )
-    else:
-        lines.append("Aucun trade actif")
-
-    lines.append(sep)
-    lines.append("<b>🕓 Derniers signaux envoyés :</b>")
-    with _STATUS_LOCK:
-        recent = [s for s in reversed(_STATUS["last_signals"]) if s.get("market") in cat_labels][:5]
-    if recent:
-        for s in recent:
-            lines.append(
-                f"• {s['ts']} — {s['market']} {s['direction']} "
-                f"[{s.get('mode','')}] score {s['score']}/100 RR 1:{s['rr']}"
-            )
-    else:
-        lines.append("Aucun signal récent")
-
+def format_daily_report(stats: Dict, day_key: str) -> str:
+    lines = [
+        "📅 *RAPPORT JOURNALIER*", f"🗓 {day_key}", "",
+        f"📊 Signaux publiés : {stats['total_signals']}",
+        f"✅ Gagnants : {stats['wins']} · ❌ Perdants : {stats['losses']} · ⚪ BE : {stats['be']}",
+        f"🎯 Taux de réussite (winrate) : {stats['win_rate']:.1f}%",
+        f"💰 Profit net : {stats['total_r']:+.2f} R",
+        f"📉 Drawdown : {stats['max_drawdown_r']:.2f} R",
+    ]
+    if stats["best"]:
+        b = stats["best"]
+        lines.append(f"🏆 Meilleur trade : {b['symbol']} {b['direction']} ({b['r']:+.2f} R)")
+    if stats["worst"]:
+        w = stats["worst"]
+        lines.append(f"💀 Pire trade : {w['symbol']} {w['direction']} ({w['r']:+.2f} R)")
     return "\n".join(lines)
 
 
-def send_admin_report() -> None:
-    """Génère et envoie les 2 rapports /rapport, chacun dans son groupe dédié."""
-    if not _TG_ENABLED:
-        log.info("  [CMD] /rapport ignoré — TG_ENABLED=false")
+def format_weekly_report(stats: Dict, period_key: str) -> str:
+    lines = [
+        "🗓 *RAPPORT HEBDOMADAIRE*", f"Semaine {period_key}", "",
+        f"📊 Signaux publiés : {stats['total_signals']}",
+        f"✅ Gagnants : {stats['wins']} · ❌ Perdants : {stats['losses']} · ⚪ BE : {stats['be']}",
+        f"🎯 Taux de réussite : {stats['win_rate']:.1f}%",
+        f"💰 Résultat net : {stats['total_r']:+.2f} R",
+        f"📉 Drawdown max : {stats['max_drawdown_r']:.2f} R", "",
+        "*Par actif :*",
+    ]
+    for symbol, s in stats["by_symbol"].items():
+        lines.append(f"  • {symbol} : {s['total']} signaux ({s['wins']}✅ / {s['losses']}❌)")
+    if stats["best"]:
+        b = stats["best"]
+        lines.append(f"🏆 Meilleur trade : {b['symbol']} {b['direction']} ({b['r']:+.2f} R)")
+    if stats["worst"]:
+        w = stats["worst"]
+        lines.append(f"💀 Pire trade : {w['symbol']} {w['direction']} ({w['r']:+.2f} R)")
+    return "\n".join(lines)
+
+
+def format_monthly_report(stats: Dict, period_key: str) -> str:
+    lines = [
+        "📆 *BILAN MENSUEL*", f"{period_key}", "",
+        f"📊 Signaux publiés : {stats['total_signals']}",
+        f"✅ Gagnants : {stats['wins']} · ❌ Perdants : {stats['losses']} · ⚪ BE : {stats['be']}",
+        f"🎯 Taux de réussite : {stats['win_rate']:.1f}%",
+        f"💰 Profit net cumulé : {stats['total_r']:+.2f} R",
+        f"📉 Drawdown maximal : {stats['max_drawdown_r']:.2f} R", "",
+        "*Performance par actif :*",
+    ]
+    for symbol, s in stats["by_symbol"].items():
+        lines.append(f"  • {symbol} : {s['total']} signaux ({s['wins']}✅ / {s['losses']}❌)")
+    if stats["best"]:
+        b = stats["best"]
+        lines.append(f"🏆 Meilleur trade du mois : {b['symbol']} {b['direction']} ({b['r']:+.2f} R)")
+    if stats["worst"]:
+        w = stats["worst"]
+        lines.append(f"💀 Pire trade du mois : {w['symbol']} {w['direction']} ({w['r']:+.2f} R)")
+    return "\n".join(lines)
+
+
+def _try_claim_report(report_type: str, period_key: str) -> bool:
+    """Retourne True si ce rapport n'a pas encore été envoyé pour cette période
+    (et l'enregistre comme envoyé), False s'il l'a déjà été -> évite les doublons."""
+    with get_conn() as conn:
+        try:
+            conn.execute(
+                "INSERT INTO report_log (report_type, period_key, sent_at) VALUES (?, ?, ?)",
+                (report_type, period_key, time.time()),
+            )
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
+
+def _dispatch_report(message: str):
+    """Envoie sur TG_CHAT_REPORTS si configuré, sinon sur les deux groupes de signaux."""
+    reports_env = TELEGRAM_GROUPS["reports"]["chat_id_env"]
+    reports_chat_id = os.environ.get(reports_env)
+    if reports_chat_id:
+        try:
+            token = _bot_token("reports")
+            url = TELEGRAM_API.format(token=token, method="sendMessage")
+            resp = requests.post(
+                url, data={"chat_id": reports_chat_id, "text": message, "parse_mode": "Markdown"},
+                timeout=15,
+            )
+            resp.raise_for_status()
+            return
+        except Exception:
+            log.error(f"Échec d'envoi du rapport sur {reports_env}:\n{traceback.format_exc()}")
+    for group in ("btc_gold", "deriv"):
+        try:
+            send_telegram_signal(group, message)
+        except Exception:
+            log.error(f"Échec d'envoi du rapport sur le groupe '{group}':\n{traceback.format_exc()}")
+
+
+def _maybe_send_daily_report(now: datetime):
+    day_key = now.strftime("%Y-%m-%d")
+    if not _try_claim_report("daily", day_key):
         return
-    try:
-        deriv_msg = _build_category_report("deriv")
-        if TELEGRAM_GROUP_DERIV_ID:
-            ok1 = tg_send(deriv_msg, TELEGRAM_GROUP_DERIV_ID)
-            log.info(f"  [CMD] {'✓' if ok1 else '✗'} Rapport Deriv → {TELEGRAM_GROUP_DERIV_ID}")
-    except Exception as e:
-        log.error(f"  [CMD] Erreur rapport Deriv : {e}")
-
-    try:
-        gb_msg = _build_category_report("gold_btc")
-        if TELEGRAM_GROUP_GOLD_BTC_ID:
-            ok2 = tg_send(gb_msg, TELEGRAM_GROUP_GOLD_BTC_ID)
-            log.info(f"  [CMD] {'✓' if ok2 else '✗'} Rapport Gold+BTC → {TELEGRAM_GROUP_GOLD_BTC_ID}")
-    except Exception as e:
-        log.error(f"  [CMD] Erreur rapport Gold+BTC : {e}")
+    start_ts, end_ts = _day_bounds(now)
+    stats = get_period_stats(start_ts, end_ts)
+    _dispatch_report(format_daily_report(stats, day_key))
+    log.info(f"Rapport journalier envoyé ({day_key}).")
 
 
-_TG_UPDATE_OFFSET = 0
-
-# ── [v14] Menu Paramètres — état "en attente de saisie" par admin ─────────
-# Quand l'admin tape un bouton comme "💰 Solde", on attend son prochain
-# message texte comme étant la nouvelle valeur pour ce paramètre.
-_AWAITING_INPUT: dict = {}   # {from_id: "account_balance" | "risk_value" | "leverage" | "profit_target"}
-
-
-def _is_admin(from_id: str) -> bool:
-    return bool(TELEGRAM_LEADER_ID) and str(from_id) == str(TELEGRAM_LEADER_ID)
-
-
-def _settings_menu_text() -> str:
-    balance   = get_account_balance()
-    mode, val = get_risk_config()
-    risk_lbl  = f"{val}%" if mode == "percent" else f"${val}"
-    risk_usd  = get_base_risk_usd()
-    leverage  = get_leverage()
-    target    = get_profit_target()
-    recovery  = "✅ Activé" if is_recovery_enabled() else "❌ Désactivé"
-    max_vol   = get_max_volume()
-    tf        = get_timeframe_setting()
-    session   = get_session_mode()
-    markets_lbl = {"all": "Tous (Gold+BTC+V75+V25)", "gold_btc": "Gold + BTC",
-                   "deriv": "Volatility 75 + 25"}.get(get_active_markets_setting(), "Tous")
-    profile   = get_profile_label()
-    prop_firm = "✅ Actif" if is_prop_firm_mode() else "❌ Inactif"
-    atr_mult  = get_atr_sl_mult()
-    return (
-        "⚙️ <b>MENU PARAMÈTRES — AlphaBot</b>\n"
-        "─────────────────────────\n"
-        f"💰 Solde du compte : <code>${balance:,.2f}</code>\n"
-        f"🎯 Risque par trade : <code>{risk_lbl}</code> (≈ ${risk_usd:.2f})\n"
-        f"⚖️ Levier : <code>1:{leverage}</code>\n"
-        f"🏆 Objectif de profit : <code>{'$'+format(target, ',.2f') if target > 0 else 'non défini'}</code>\n"
-        f"🔁 Recovery : {recovery}\n"
-        f"📊 Volume max : <code>{max_vol if max_vol > 0 else 'illimité'}</code>\n"
-        f"⏱ Timeframe : <code>{tf}</code>\n"
-        f"🌎 Session : <code>{session}</code>\n"
-        f"📈 Marchés actifs : <code>{markets_lbl}</code>\n"
-        f"👤 Profil : <code>{profile}</code>\n"
-        f"🏢 Mode Prop Firm : {prop_firm}\n"
-        f"📐 ATR SL (×) : <code>{atr_mult}</code>\n"
-        "─────────────────────────\n"
-        "Touche un bouton pour modifier un paramètre."
-    )
-
-
-def _settings_menu_keyboard() -> dict:
-    return {
-        "inline_keyboard": [
-            [{"text": "💰 Solde", "callback_data": "set:account_balance"},
-             {"text": "🎯 Risque %", "callback_data": "set:risk_value"}],
-            [{"text": "⚖️ Levier", "callback_data": "set:leverage"},
-             {"text": "🏆 Objectif profit", "callback_data": "set:profit_target"}],
-            [{"text": "🔁 Recovery ON/OFF", "callback_data": "toggle:recovery"},
-             {"text": "📊 Volume max", "callback_data": "set:max_volume"}],
-            [{"text": "⏱ Timeframe (M5/M15)", "callback_data": "toggle:timeframe"},
-             {"text": "🌎 Session (NY/24H)", "callback_data": "toggle:session"}],
-            [{"text": "📈 Marchés actifs", "callback_data": "toggle:markets"},
-             {"text": "👤 Profil", "callback_data": "set:profile_label"}],
-            [{"text": "🏢 Mode Prop Firm ON/OFF", "callback_data": "toggle:propfirm"},
-             {"text": "📐 ATR SL (×)", "callback_data": "set:atr_sl_mult"}],
-            [{"text": "🔄 Actualiser", "callback_data": "refresh"},
-             {"text": "❌ Fermer", "callback_data": "close"}],
-        ]
-    }
-
-
-def tg_send_menu(chat_id: str) -> None:
-    try:
-        requests.post(
-            _tg_url("sendMessage"),
-            json={
-                "chat_id": chat_id, "text": _settings_menu_text(),
-                "parse_mode": "HTML", "reply_markup": _settings_menu_keyboard(),
-            },
-            timeout=10,
-        )
-    except Exception as e:
-        print(c(f"  [TG] Erreur menu : {e}", "red"))
-
-
-_SETTING_PROMPTS = {
-    "account_balance": "💰 Envoie le nouveau <b>solde du compte</b> (en $), ex: <code>10000</code>",
-    "risk_value":       "🎯 Envoie le nouveau <b>risque par trade</b> — un %, ex: <code>0.65%</code>, "
-                        "ou un montant fixe, ex: <code>$50</code>",
-    "leverage":         "⚖️ Envoie le nouveau <b>levier</b>, ex: <code>100</code> pour 1:100",
-    "profit_target":    "🏆 Envoie le nouvel <b>objectif de profit</b> en $, ex: <code>500</code> "
-                        "(<code>0</code> pour désactiver)",
-    "max_volume":       "📊 Envoie le nouveau <b>volume (lot) max</b> par trade, ex: <code>0.5</code> "
-                        "(<code>0</code> pour illimité)",
-    "profile_label":    "👤 Envoie le nouveau <b>nom de profil</b> (libre), ex: <code>Compte Prop 10k</code>",
-    "atr_sl_mult":      "📐 Envoie le nouveau <b>multiplicateur ATR pour le SL</b>, ex: <code>0.6</code>",
-}
-
-
-def _handle_callback_query(cq: dict) -> None:
-    cq_id   = cq.get("id", "")
-    data    = cq.get("data", "")
-    from_id = str(cq.get("from", {}).get("id", ""))
-    chat_id = str(cq.get("message", {}).get("chat", {}).get("id", ""))
-
-    try:
-        requests.post(_tg_url("answerCallbackQuery"), json={"callback_query_id": cq_id}, timeout=10)
-    except Exception:
-        pass
-
-    if not _is_admin(from_id):
+def _maybe_send_weekly_report(now: datetime):
+    start_ts, end_ts, period_key = _week_bounds(now)
+    if not _try_claim_report("weekly", period_key):
         return
+    stats = get_period_stats(start_ts, end_ts)
+    _dispatch_report(format_weekly_report(stats, period_key))
+    log.info(f"Rapport hebdomadaire envoyé ({period_key}).")
 
-    if data == "close":
+
+def _maybe_send_monthly_report(now: datetime):
+    period_key = now.strftime("%Y-%m")
+    if not _try_claim_report("monthly", period_key):
         return
-    if data == "refresh":
-        tg_send_menu(chat_id)
-        return
-    if data == "toggle:recovery":
-        new_val = "0" if is_recovery_enabled() else "1"
-        set_setting("recovery_enabled", new_val)
-        log.info(f"  [MENU] Recovery → {'ON' if new_val=='1' else 'OFF'}")
-        tg_send_menu(chat_id)
-        return
-    if data == "toggle:timeframe":
-        new_val = "M15" if get_timeframe_setting() == "M5" else "M5"
-        set_setting("timeframe", new_val)
-        log.info(f"  [MENU] Timeframe → {new_val}")
-        tg_send_menu(chat_id)
-        return
-    if data == "toggle:session":
-        new_val = "24H" if get_session_mode() == "NY" else "NY"
-        set_setting("session_mode", new_val)
-        log.info(f"  [MENU] Session → {new_val}")
-        tg_send_menu(chat_id)
-        return
-    if data == "toggle:markets":
-        order = ["all", "gold_btc", "deriv"]
-        cur   = get_active_markets_setting()
-        new_val = order[(order.index(cur) + 1) % len(order)] if cur in order else "all"
-        set_setting("active_markets", new_val)
-        log.info(f"  [MENU] Marchés actifs → {new_val}")
-        tg_send_menu(chat_id)
-        return
-    if data == "toggle:propfirm":
-        new_val = "0" if is_prop_firm_mode() else "1"
-        set_setting("prop_firm_mode", new_val)
-        log.info(f"  [MENU] Mode Prop Firm → {'ON' if new_val=='1' else 'OFF'}")
-        tg_send_menu(chat_id)
-        return
-    if data.startswith("set:"):
-        key = data.split(":", 1)[1]
-        _AWAITING_INPUT[from_id] = key
-        tg_send(_SETTING_PROMPTS.get(key, "Envoie la nouvelle valeur :"), chat_id)
-        return
+    start_ts, end_ts = _month_bounds(now)
+    stats = get_period_stats(start_ts, end_ts)
+    _dispatch_report(format_monthly_report(stats, period_key))
+    log.info(f"Rapport mensuel envoyé ({period_key}).")
 
 
-def _parse_risk_value_input(raw: str) -> Optional[tuple]:
-    """Parse '0.65%' → ('percent', 0.65) ; '$50' ou '50' → ('fixed', 50.0)."""
-    raw = raw.strip()
-    try:
-        if raw.endswith("%"):
-            return "percent", float(raw[:-1].strip())
-        if raw.startswith("$"):
-            return "fixed", float(raw[1:].strip())
-        # pas de symbole : on garde le mode actuel
-        mode, _ = get_risk_config()
-        return mode, float(raw)
-    except Exception:
-        return None
-
-
-def _handle_awaiting_input(text: str, from_id: str, chat_id: str) -> bool:
-    """Si l'admin a un paramètre en attente de saisie, traite `text` comme
-    la nouvelle valeur. Retourne True si consommé."""
-    key = _AWAITING_INPUT.get(from_id)
-    if not key:
-        return False
-    del _AWAITING_INPUT[from_id]
-
-    try:
-        if key == "account_balance":
-            set_setting("account_balance", str(float(text.strip().replace("$", "").replace(",", ""))))
-            tg_send("✅ Solde du compte mis à jour.", chat_id)
-        elif key == "risk_value":
-            parsed = _parse_risk_value_input(text)
-            if parsed is None:
-                tg_send("⚠️ Valeur invalide. Réessaie, ex: <code>0.65%</code> ou <code>$50</code>", chat_id)
-                return True
-            mode, value = parsed
-            set_setting("risk_mode", mode)
-            set_setting("risk_value", str(value))
-            tg_send("✅ Risque par trade mis à jour.", chat_id)
-        elif key == "leverage":
-            set_setting("leverage", str(int(float(text.strip()))))
-            tg_send("✅ Levier mis à jour.", chat_id)
-        elif key == "profit_target":
-            set_setting("profit_target", str(float(text.strip().replace("$", "").replace(",", ""))))
-            tg_send("✅ Objectif de profit mis à jour.", chat_id)
-        elif key == "max_volume":
-            set_setting("max_volume", str(float(text.strip().replace(",", "."))))
-            tg_send("✅ Volume max mis à jour.", chat_id)
-        elif key == "profile_label":
-            set_setting("profile_label", text.strip()[:64])
-            tg_send("✅ Profil mis à jour.", chat_id)
-        elif key == "atr_sl_mult":
-            val = float(text.strip().replace(",", "."))
-            if val <= 0:
-                tg_send("⚠️ Valeur invalide, doit être > 0.", chat_id)
-                return True
-            set_setting("atr_sl_mult", str(val))
-            tg_send("✅ Multiplicateur ATR SL mis à jour.", chat_id)
-    except Exception:
-        tg_send("⚠️ Valeur invalide, paramètre inchangé.", chat_id)
-        return True
-
-    tg_send_menu(chat_id)
-    return True
-
-
-def _handle_incoming_message(text: str, from_id: str, chat_id: str = "") -> None:
-    """Route les commandes admin reçues par Telegram."""
-    chat_id = chat_id or from_id
-
-    # Seul l'admin (TG_LEADER_ID) peut piloter le bot par message privé.
-    if not _is_admin(from_id):
-        return
-
-    # Si un paramètre est en attente de saisie, ce message est sa valeur.
-    if _handle_awaiting_input(text, from_id, chat_id):
-        return
-
-    cmd = (text or "").strip().split()[0].lower() if text else ""
-    if cmd == "/rapport":
-        log.info("  [CMD] ✓ /rapport reçu — génération des 2 rapports")
-        send_admin_report()
-    elif cmd in ("/parametres", "/menu", "/settings", "/start"):
-        log.info("  [CMD] ✓ /parametres reçu — envoi du menu")
-        tg_send_menu(chat_id)
-
-
-def _telegram_command_listener() -> None:
-    """Long-polling Telegram getUpdates() pour écouter /rapport et le menu
-    /parametres (boutons inline). Aucune URL publique/webhook requise →
-    compatible Render Background Worker (tourne dans un thread daemon,
-    comme le Trade Monitor et le rapport journalier)."""
-    global _TG_UPDATE_OFFSET
-    if not _TG_ENABLED:
-        log.info("  [CMD] Écoute commandes désactivée (TG_ENABLED=false)")
-        return
-    log.info("  ✓ Commandes admin /rapport + /parametres activées (long-polling)")
+def report_scheduler_loop():
+    """Vérifie chaque minute si un rapport doit être déclenché. L'idempotence
+    est garantie par report_log (via _try_claim_report), donc une vérification
+    sur toute la minute (pas seulement minute==0 pile) reste sûre."""
+    log.info("Planificateur de rapports démarré.")
     while True:
         try:
-            r = requests.get(
-                _tg_url("getUpdates"),
-                params={"offset": _TG_UPDATE_OFFSET + 1, "timeout": 25},
-                timeout=30,
+            now = datetime.now(timezone.utc)
+            if now.hour == REPORT_DAILY_HOUR_UTC:
+                _maybe_send_daily_report(now)
+            if now.weekday() == 6 and now.hour == REPORT_WEEKLY_HOUR_UTC and now.minute >= REPORT_WEEKLY_MINUTE_UTC:
+                _maybe_send_weekly_report(now)
+            if _is_last_day_of_month(now) and now.hour == REPORT_MONTHLY_HOUR_UTC:
+                _maybe_send_monthly_report(now)
+        except Exception:
+            log.error(f"Erreur planificateur de rapports:\n{traceback.format_exc()}")
+        time.sleep(60)
+
+
+def _today_key() -> str:
+    return time.strftime("%Y-%m-%d", time.gmtime())
+
+
+def can_publish_today(symbol: str) -> bool:
+    day = _today_key()
+    with get_conn() as conn:
+        global_count = conn.execute(
+            "SELECT COALESCE(SUM(count),0) c FROM daily_counters WHERE day=?", (day,)
+        ).fetchone()["c"]
+        if global_count >= MAX_SIGNALS_PER_DAY_GLOBAL:
+            return False
+        row = conn.execute(
+            "SELECT count FROM daily_counters WHERE day=? AND symbol=?", (day, symbol)
+        ).fetchone()
+        symbol_count = row["count"] if row else 0
+        return symbol_count < MAX_SIGNALS_PER_DAY_PER_ASSET
+
+
+OPEN_STATUSES = ("pending", "taken", "be", "secured", "tp1_hit")
+
+
+def count_open_positions() -> int:
+    """Nombre de positions actuellement considérées comme 'ouvertes'
+    (pas encore fermées/invalidées), utilisé pour plafonner via
+    settings['max_open_positions']."""
+    with get_conn() as conn:
+        row = conn.execute(
+            f"SELECT COUNT(*) c FROM signals WHERE status IN "
+            f"({','.join('?' for _ in OPEN_STATUSES)})",
+            OPEN_STATUSES,
+        ).fetchone()
+        return row["c"]
+
+
+def last_closed_result(symbol: Optional[str] = None) -> Optional[float]:
+    """Résultat en R du dernier trade clôturé (tous actifs, ou un actif
+    précis si `symbol` est fourni). Utilisé pour le calcul martingale/recovery."""
+    query = "SELECT * FROM signals WHERE status IN ('tp1_hit','tp2_hit','secured','invalidated','be')"
+    params: List = []
+    if symbol:
+        query += " AND symbol = ?"
+        params.append(symbol)
+    query += " ORDER BY COALESCE(closed_at, updated_at) DESC LIMIT 1"
+    with get_conn() as conn:
+        row = conn.execute(query, params).fetchone()
+    return _r_result(row) if row else None
+
+
+def get_effective_risk_percent(symbol: Optional[str] = None, settings: Optional[Dict] = None) -> float:
+    """Calcule le risque par trade (%) réellement appliqué, en tenant compte
+    du mode risque de base, de la martingale (augmente après une perte) et
+    du recovery (augmente progressivement tant que le compte est en drawdown).
+    Les deux logiques ne se cumulent pas au-delà du plafond recovery_max_multiplier
+    / martingale_multiplier, pour ne jamais s'emballer."""
+    s = settings or get_settings()
+    base_risk = s["risk_percent"]
+
+    if s.get("martingale_enabled"):
+        r = last_closed_result(symbol)
+        if r is not None and r < 0:
+            return round(base_risk * s.get("martingale_multiplier", 2.0), 4)
+
+    if s.get("recovery_enabled"):
+        now = datetime.now(timezone.utc)
+        start_ts, end_ts = _month_bounds(now)
+        month_stats = get_period_stats(start_ts, end_ts)
+        if month_stats["total_r"] < 0:
+            # Plus le drawdown du mois est marqué, plus on augmente le risque,
+            # borné par recovery_max_multiplier.
+            factor = min(1 + abs(month_stats["total_r"]) / 10.0, s.get("recovery_max_multiplier", 1.5))
+            return round(base_risk * factor, 4)
+
+    return base_risk
+
+
+def increment_daily_counter(symbol: str):
+    day = _today_key()
+    with get_conn() as conn:
+        conn.execute(
+            """INSERT INTO daily_counters (day, symbol, count) VALUES (?, ?, 1)
+               ON CONFLICT(day, symbol) DO UPDATE SET count = count + 1""",
+            (day, symbol),
+        )
+
+
+def record_heartbeat(mark_scan: bool = True):
+    """Appelé à chaque itération de la boucle de scan (et périodiquement par
+    le watchdog) pour prouver que le processus est vivant."""
+    now = time.time()
+    with get_conn() as conn:
+        if mark_scan:
+            conn.execute(
+                "UPDATE watchdog_heartbeat SET last_scan_at=?, last_heartbeat_at=? WHERE id=1",
+                (now, now),
             )
-            for upd in r.json().get("result", []):
-                _TG_UPDATE_OFFSET = max(_TG_UPDATE_OFFSET, upd.get("update_id", 0))
-
-                if "callback_query" in upd:
-                    _handle_callback_query(upd["callback_query"])
-                    continue
-
-                msg     = upd.get("message") or upd.get("channel_post") or {}
-                text    = msg.get("text", "")
-                from_id = str(msg.get("from", {}).get("id", ""))
-                chat_id = str(msg.get("chat", {}).get("id", from_id))
-                if text:
-                    _handle_incoming_message(text, from_id, chat_id)
-        except Exception as e:
-            log.error(f"  [CMD] Erreur listener commandes : {e}")
-            time.sleep(5)
-        time.sleep(1)
-
-
-def _telegram_command_thread() -> None:
-    """Lance le thread d'écoute des commandes admin (/rapport, /parametres)."""
-    t = threading.Thread(target=_telegram_command_listener, daemon=True, name="tg-commands")
-    t.start()
-    return t
-
-
-# ─────────────────────────────────────────────────────────────
-
-def tg_format_signal(sig: "Signal", tier: str = "", mode: str = "SMC",
-                     signal_num: int = 0) -> str:
-    """Format Telegram correspondant au screenshot du groupe SMC SIGNALS PRO."""
-    dec = 2 if sig.entry > 100 else 5
-
-    risk = abs(sig.entry - sig.sl)
-
-    # RR réels calculés sur les cibles structurelles
-    def _rr(tp_val: float) -> str:
-        if risk <= 0:
-            return "—"
-        if sig.direction == "LONG":
-            r = (tp_val - sig.entry) / risk
         else:
-            r = (sig.entry - tp_val) / risk
-        return f"1:{round(r, 1)}"
+            conn.execute(
+                "UPDATE watchdog_heartbeat SET last_heartbeat_at=? WHERE id=1",
+                (now,),
+            )
 
-    def _pct(tp_val: float) -> str:
-        if sig.entry <= 0:
-            return "—"
-        v = (tp_val - sig.entry) / sig.entry * 100
-        return f"+{round(v,2)}%" if v > 0 else f"{round(v,2)}%"
 
-    def _sl_pct() -> str:
-        if sig.entry <= 0:
-            return "—"
-        v = (sig.sl - sig.entry) / sig.entry * 100
-        return f"+{round(v,2)}%" if v > 0 else f"{round(v,2)}%"
-
-    # Lot basé sur SL distance réelle pour $100 de risque
-    base_lot = compute_lot(sig.symbol, sig.entry, sig.sl, risk_usd=100.0)
-
-    # TP2 et TP3 structurels (depuis sig, sinon fallback mathématique)
-    tp2 = sig.tp2 if sig.tp2 and sig.tp2 != sig.tp else (
-        round(sig.entry + 3 * risk, dec) if sig.direction == "LONG"
-        else round(sig.entry - 3 * risk, dec)
-    )
-    tp3 = sig.tp3 if sig.tp3 and sig.tp3 != sig.tp else (
-        round(sig.entry + 6 * risk, dec) if sig.direction == "LONG"
-        else round(sig.entry - 6 * risk, dec)
-    )
-
-    # Gain potentiel par TP en $
-    def _gain(tp_val: float) -> str:
-        if risk <= 0 or base_lot <= 0:
-            return "—"
-        if sig.direction == "LONG":
-            r = (tp_val - sig.entry) / risk
-        else:
-            r = (sig.entry - tp_val) / risk
-        gain = round(r * 100.0, 0)
-        return f"+${int(gain)}"
-
-    if sig.direction == "LONG":
-        mom    = "haussier"
-        struct = "haussière"
-    else:
-        mom    = "baissier"
-        struct = "baissière"
-
-    # Nom affichage
-    sym_map = {"GC=F": "XAUUSD / GOLD", "BTC-USD": "BTCUSD / Bitcoin"}
-    sym_display = sym_map.get(sig.symbol,
-        sig.symbol.replace("=X", "").replace("-USD", "").replace("^", ""))
-
-    dir_arrow = "🟢 BUY / LONG" if sig.direction == "LONG" else "🔴 SELL / SHORT"
-    num_str   = f"#{signal_num}" if signal_num else ""
-
-    # ── Description setup + confirmations utilisées ──────────
-    # v13 — stratégie unique : Sweep de liquidité + Cassure de structure
-    SETUP_DESCRIPTIONS = {
-        "MSS": ("SWEEP + CASSURE DE STRUCTURE",
-                "Zone H4 (OB jaune/Breaker/Balance) + Sweep + BOS+CHoCH M15 + RR≥3",
-                "✔ Zone H4 : OB jaune, Breaker Block ou Balance\n✔ BOS M15 dans le sens attendu\n✔ CHoCH M15 (cassure de structure)\n✔ Sweep de liquidité (bonus de score)\n✔ RR minimum 1:3"),
+def get_heartbeat_status() -> Dict:
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM watchdog_heartbeat WHERE id=1").fetchone()
+    now = time.time()
+    if not row:
+        return {"last_scan_at": None, "seconds_since_scan": None, "healthy": False,
+                "restart_count": 0}
+    last_scan = row["last_scan_at"]
+    seconds_since = (now - last_scan) if last_scan else None
+    return {
+        "last_scan_at": last_scan,
+        "last_heartbeat_at": row["last_heartbeat_at"],
+        "seconds_since_scan": seconds_since,
+        "healthy": seconds_since is not None and seconds_since < WATCHDOG_MAX_SILENCE_SECONDS,
+        "restart_count": row["restart_count"],
+        "last_restart_at": row["last_restart_at"],
+        "last_restart_reason": row["last_restart_reason"],
     }
-    s_title, s_logic, s_conf = SETUP_DESCRIPTIONS.get(
-        mode, (mode, "SMC confluence", "✔ Critères SMC validés"))
-
-    msg = (
-        f"<b>⭐ SMC SIGNALS PRO</b>\n"
-        f"🟢 <b>NOUVEAU SIGNAL {num_str}</b>\n"
-        f"<b>{sym_display}</b>\n"
-        f"{'─'*30}\n"
-        f"💎  <b>SETUP :</b> {s_title}\n"
-        f"📐  <b>LOGIQUE :</b> <i>{s_logic}</i>\n"
-        f"{'⭐'*max(getattr(sig,'stars',3),1)}  <b>QUALITÉ ENTRÉE :</b> "
-        f"{'Confirmée (retest + rejet)' if getattr(sig,'stars',3) >= 3 else 'Directe (sweep + CHoCH)'}\n"
-        f"🎯  <b>DIRECTION :</b> <b>{dir_arrow}</b>\n"
-        f"💰  <b>ENTRY M15 :</b> <code>{sig.entry}</code>\n"
-        f"📦  <b>LOT :</b> <code>{base_lot}</code>  <i>(risque $100)</i>\n"
-        f"{'─'*30}\n"
-        f"🎯  <b>TP1 :</b> <code>{sig.tp}</code>  {_rr(sig.tp)}  {_pct(sig.tp)}  <b>{_gain(sig.tp)}</b>\n"
-        f"🚀  <b>TP2 :</b> <code>{tp2}</code>  {_rr(tp2)}  {_pct(tp2)}  <b>{_gain(tp2)}</b>\n"
-        f"💎  <b>TP3 :</b> <code>{tp3}</code>  {_rr(tp3)}  {_pct(tp3)}  <b>{_gain(tp3)}</b>\n"
-        f"🔴  <b>SL :</b> <code>{sig.sl}</code>  {_sl_pct()}  <b>-$100</b>\n"
-        f"{'─'*30}\n"
-        f"✅ <b>CONFIRMATIONS :</b>\n{s_conf}\n"
-        f"{'─'*30}\n"
-        f"📈 Momentum {mom} + Structure {struct}\n"
-        f"🧠 Patience • Discipline • Liquidité\n\n"
-        f"<i>@smcsignalspro</i>"
-    )
-    return msg
 
 
-# ── Génération du graphique SMC ────────────────────────────────────────────
-def generate_chart_image(sig: "Signal") -> Optional[str]:
-    """Génère un graphique SMC dark-theme 1280×720 optimisé Telegram et retourne le chemin /tmp/*.png."""
+def record_watchdog_restart(reason: str):
+    now = time.time()
+    with get_conn() as conn:
+        conn.execute(
+            """UPDATE watchdog_heartbeat
+               SET restart_count = restart_count + 1, last_restart_at=?, last_restart_reason=?
+               WHERE id=1""",
+            (now, reason),
+        )
+
+
+# ============================================================================
+# 3. SOURCES DE DONNÉES
+# ============================================================================
+
+def fetch_candles(symbol: str, limit: int = 200) -> List[Dict]:
+    asset = ASSETS[symbol]
+    if asset.data_source == "yfinance":
+        return _fetch_yfinance(symbol, limit)
+    elif asset.data_source == "binance":
+        return _fetch_binance(symbol, limit)
+    elif asset.data_source == "deriv_ws":
+        return _fetch_deriv(symbol, limit)
+    raise ValueError(f"Source de données inconnue pour {symbol}")
+
+
+def _fetch_yfinance(symbol: str, limit: int) -> List[Dict]:
+    import yfinance as yf
+    ticker_map = {"XAUUSD": "GC=F"}
+    ticker = ticker_map.get(symbol, symbol)
+    data = yf.download(ticker, period="2d", interval="5m", progress=False)
+    candles = []
+    for idx, row in data.tail(limit).iterrows():
+        candles.append({
+            "time": idx.timestamp(),
+            "open": float(row["Open"]), "high": float(row["High"]),
+            "low": float(row["Low"]), "close": float(row["Close"]),
+        })
+    return candles
+
+
+def _fetch_binance(symbol: str, limit: int) -> List[Dict]:
+    pair = "BTCUSDT"
+    url = f"https://api.binance.com/api/v3/klines?symbol={pair}&interval=5m&limit={limit}"
+    with urllib.request.urlopen(url, timeout=10) as resp:
+        raw = json.loads(resp.read().decode())
+    return [{
+        "time": k[0] / 1000, "open": float(k[1]), "high": float(k[2]),
+        "low": float(k[3]), "close": float(k[4]),
+    } for k in raw]
+
+
+DERIV_SYMBOL_MAP = {"V75": "R_75", "V25": "R_25"}
+DERIV_WS_URL = "wss://ws.derivws.com/websockets/v3?app_id={app_id}"
+DERIV_GRANULARITY_SECONDS = 300  # M5
+
+
+def _deriv_app_id() -> str:
+    # 1089 = App ID public de démo Deriv, utilisable tel quel pour des requêtes
+    # en lecture seule (ticks_history). Remplace par ton propre App ID gratuit
+    # (https://api.deriv.com -> "Register Application") pour la prod, via la
+    # variable d'environnement DERIV_APP_ID.
+    return DERIV_APP_ID
+
+
+def _fetch_deriv_snapshot(symbol: str, limit: int = 200) -> List[Dict]:
+    """Requête ponctuelle (one-shot) à l'API publique Deriv, ticks_history en
+    style 'candles'. Utilisée comme filet de sécurité si le flux WebSocket
+    persistant (DerivFeed) n'a pas encore de données fraîches en cache."""
+    import websocket  # pip install websocket-client
+
+    deriv_symbol = DERIV_SYMBOL_MAP.get(symbol)
+    if not deriv_symbol:
+        raise ValueError(f"Pas de mapping Deriv pour le symbole '{symbol}'.")
+
+    url = DERIV_WS_URL.format(app_id=_deriv_app_id())
+    payload = {
+        "ticks_history": deriv_symbol,
+        "adjust_start_time": 1,
+        "count": limit,
+        "end": "latest",
+        "start": 1,
+        "style": "candles",
+        "granularity": DERIV_GRANULARITY_SECONDS,
+    }
+
+    ws = None
     try:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-        import matplotlib.ticker as mticker
-        from matplotlib.patches import Rectangle
-        from matplotlib.lines  import Line2D
+        ws = websocket.create_connection(url, timeout=DERIV_WS_TIMEOUT_SECONDS)
+        ws.send(json.dumps(payload))
+        raw = ws.recv()
+    finally:
+        if ws is not None:
+            try:
+                ws.close()
+            except Exception:
+                pass
 
-        df = sig.df_chart
-        if df is None or len(df) < 10:
-            return None
+    data = json.loads(raw)
+    if "error" in data:
+        raise RuntimeError(
+            f"Erreur API Deriv pour {symbol}: {data['error'].get('message', data['error'])}"
+        )
 
-        df = df.tail(80).reset_index(drop=True)
-        n  = len(df)
-
-        # ── Palette dark theme ────────────────────────────────
-        BG     = "#0a0c10"; BG2 = "#0d1117"
-        GREEN  = "#22c55e"; RED = "#ef4444"
-        BLUE   = "#3b82f6"; PURPLE = "#a855f7"
-        GOLD   = "#f59e0b"; ORANGE = "#f97316"
-        GRAY   = "#64748b"; LGRAY  = "#94a3b8"
-        MONO   = "DejaVu Sans Mono"
-
-        # ── Figure 1280×720 — optimisé Telegram sendPhoto ────
-        fig, ax = plt.subplots(figsize=(13.33, 7.5), dpi=96, facecolor=BG)
-        ax.set_facecolor(BG2)
-        for s in ax.spines.values():
-            s.set_color("#1e293b"); s.set_linewidth(0.4)
-
-        prices = pd.concat([df["high"], df["low"]])
-        p_min  = prices.min() * 0.9992
-        p_max  = prices.max() * 1.0008
-
-        # ── Grid ─────────────────────────────────────────────
-        import numpy as _np
-        for p in _np.linspace(p_min, p_max, 12):
-            ax.axhline(p, color="#1e293b", lw=0.5, ls="--", alpha=0.6)
-
-        # ── FVG ───────────────────────────────────────────────
-        fvg = sig.fvg_chart
-        if fvg and p_min <= fvg.top <= p_max:
-            x0 = max(0, fvg.index - 2)
-            ax.add_patch(Rectangle((x0, fvg.bottom), n - x0, fvg.top - fvg.bottom,
-                facecolor=BLUE, alpha=0.15, zorder=1))
-            ax.add_patch(Rectangle((x0, fvg.bottom), n - x0, fvg.top - fvg.bottom,
-                edgecolor=BLUE, facecolor="none", lw=1.0, ls="--", alpha=0.7, zorder=2))
-            ax.text((x0 + min(x0 + 15, n)) / 2, (fvg.top + fvg.bottom) / 2, "FVG",
-                color=BLUE, fontsize=7, fontweight="bold", ha="center", va="center",
-                fontfamily=MONO, bbox=dict(fc=BG2, ec=BLUE, boxstyle="round,pad=0.3", alpha=0.9))
-
-        # ── OB ────────────────────────────────────────────────
-        ob = sig.ob_chart
-        if ob and p_min <= ob.top <= p_max:
-            x0 = max(0, ob.index - 2); x1 = min(n, ob.index + 12)
-            ax.add_patch(Rectangle((x0, ob.bottom), x1 - x0, ob.top - ob.bottom,
-                facecolor=PURPLE, alpha=0.18, zorder=1))
-            ax.add_patch(Rectangle((x0, ob.bottom), x1 - x0, ob.top - ob.bottom,
-                edgecolor=PURPLE, facecolor="none", lw=1.0, zorder=2))
-            ax.text((x0 + x1) / 2, (ob.top + ob.bottom) / 2, "OB",
-                color=PURPLE, fontsize=7, fontweight="bold", ha="center", va="center",
-                fontfamily=MONO, bbox=dict(fc=BG2, ec=PURPLE, boxstyle="round,pad=0.3", alpha=0.9))
-
-        # ── BOS / CHoCH ───────────────────────────────────────
-        if sig.bos_lv and p_min <= sig.bos_lv <= p_max:
-            ax.axhline(sig.bos_lv, color=RED, lw=0.8, ls="--",
-                       xmin=0.0, xmax=0.55, zorder=3)
-            ax.text(n * 0.25, sig.bos_lv * (1 + 0.00012), "BOS",
-                color=RED, fontsize=6, fontweight="bold", fontfamily=MONO)
-
-        if sig.choch_lv and p_min <= sig.choch_lv <= p_max:
-            ax.axhline(sig.choch_lv, color=ORANGE, lw=0.8, ls=":",
-                       xmin=0.50, xmax=0.80, zorder=3)
-            ax.text(n * 0.62, sig.choch_lv * (1 + 0.00012), "CHoCH",
-                color=ORANGE, fontsize=6, fontweight="bold", fontfamily=MONO)
-
-        # ── TP / SL / Entry — niveaux structurels réels ───────
-        dec  = 2 if sig.entry > 100 else 5
-        risk = abs(sig.entry - sig.sl)
-
-        # TP2 / TP3 : structurels depuis sig, fallback math
-        tp2 = sig.tp2 if (sig.tp2 and sig.tp2 != sig.tp and sig.tp2 > 0) else (
-            round(sig.entry + 3 * risk, dec) if sig.direction == "LONG"
-            else round(sig.entry - 3 * risk, dec))
-        tp3 = sig.tp3 if (sig.tp3 and sig.tp3 != sig.tp and sig.tp3 > 0) else (
-            round(sig.entry + 6 * risk, dec) if sig.direction == "LONG"
-            else round(sig.entry - 6 * risk, dec))
-
-        def _rr_label(tp_val: float) -> str:
-            if risk <= 0: return ""
-            r = (tp_val - sig.entry) / risk if sig.direction == "LONG" \
-                else (sig.entry - tp_val) / risk
-            return f"  1:{round(r,1)}"
-
-        levels = [
-            (tp3,       f"TP3 {tp3}{_rr_label(tp3)}",        GREEN),
-            (tp2,       f"TP2 {tp2}{_rr_label(tp2)}",        GREEN),
-            (sig.tp,    f"TP1 {sig.tp}{_rr_label(sig.tp)}",  "#86efac"),
-            (sig.entry, f"ENTRY {sig.entry}",                  GOLD),
-            (sig.sl,    f"SL   {sig.sl}   -$100",             RED),
-        ]
-        for price, lbl, col in levels:
-            if p_min <= price <= p_max:
-                ax.axhline(price, color=col, lw=0.9, ls="--", alpha=0.9,
-                           xmin=0.45, zorder=2)
-                ax.text(n - 0.2, price, lbl, color=col, fontsize=5.5,
-                    va="center", ha="right", fontfamily=MONO,
-                    bbox=dict(fc=BG2, alpha=0.88, pad=1.5, ec="none"))
-
-        # ── Flèche d'entrée ───────────────────────────────────
-        entry_x  = max(n - 14, n // 2)
-        dist     = abs(sig.entry - sig.sl)
-        arr_start = sig.entry - dist * 0.6 if sig.direction == "LONG" \
-                    else sig.entry + dist * 0.6
-        ax.annotate("", xy=(entry_x, sig.entry), xytext=(entry_x, arr_start),
-            arrowprops=dict(arrowstyle="->", color=GREEN if sig.direction == "LONG"
-                            else RED, lw=1.5))
-        ax.text(entry_x, arr_start - (p_max - p_min) * 0.004,
-            sig.direction, color=GREEN if sig.direction == "LONG" else RED,
-            fontsize=7, ha="center", fontweight="bold", fontfamily=MONO)
-
-        # ── Bougies ───────────────────────────────────────────
-        w = 0.38  # largeur corps
-        for i, row in df.iterrows():
-            o, h, l, cl = row["open"], row["high"], row["low"], row["close"]
-            up  = cl >= o
-            col = GREEN if up else RED
-            bh  = max(abs(cl - o), (p_max - p_min) * 0.0005)
-            ax.plot([i, i], [l, h], color=col, lw=0.8, zorder=4)
-            ax.add_patch(Rectangle((i - w, min(cl, o)), w * 2, bh,
-                fc=col if up else "none", ec=col, lw=0.8, zorder=5))
-
-        # ── Titre & watermark ─────────────────────────────────
-        sym_display = ({"GC=F": "XAUUSD", "BTC-USD": "BTCUSD"}
-                       .get(sig.symbol,
-                            sig.symbol.replace("=X","").replace("-USD","").replace("^","")))
-        ax.text(0.013, 0.975, f"{sym_display}  •  M15  •  SMC v3",
-            transform=ax.transAxes, color=LGRAY, fontsize=9,
-            va="top", fontfamily=MONO, fontweight="bold")
-        ax.text(0.013, 0.935, f"Score {sig.score}/100  •  {sig.mode}  •  {sig.direction}",
-            transform=ax.transAxes, color=GRAY, fontsize=7, va="top", fontfamily=MONO)
-        ax.text(0.99, 0.015, "@smcsignalspro",
-            transform=ax.transAxes, color="#334155", fontsize=6,
-            va="bottom", ha="right", fontfamily=MONO)
-
-        ax.set_xlim(-1, n + 2)
-        ax.set_ylim(p_min, p_max)
-        ax.tick_params(colors=GRAY, labelsize=5, length=2, width=0.4)
-        ax.yaxis.set_visible(False)
-        ax.set_xticks([])
-
-        plt.tight_layout(pad=0.4)
-        safe = (sig.symbol.replace("=X","").replace("-","")
-                          .replace("^","").replace(".",""))
-        path = f"/tmp/smc_{safe}_{int(time.time())}.png"
-        fig.savefig(path, dpi=96, bbox_inches="tight", facecolor=BG,
-                    metadata={"Software": "SMC Signal Engine v3"})
-        plt.close(fig)
-        import gc as _gc; _gc.collect()
-        return path
-
-    except Exception as e:
-        print(f"  [CHART] Erreur génération graphique : {e}")
-        return None
+    candles_raw = data.get("candles") or []
+    return [{
+        "time": float(c["epoch"]),
+        "open": float(c["open"]),
+        "high": float(c["high"]),
+        "low": float(c["low"]),
+        "close": float(c["close"]),
+    } for c in candles_raw]
 
 
-# ── Envoi photo Telegram ───────────────────────────────────────────────────
-def tg_send_photo(image_path: str, caption: str, chat_id: str) -> bool:
-    """Envoie une image avec caption HTML via sendPhoto."""
-    try:
-        with open(image_path, "rb") as img:
-            r = requests.post(
-                _tg_url("sendPhoto"),
-                data={"chat_id": chat_id, "caption": caption,
-                      "parse_mode": "HTML"},
-                files={"photo": img},
-                timeout=30,
-            )
-        if r.status_code != 200:
-            print(f"  [TG] sendPhoto HTTP {r.status_code} : {r.text[:200]}")
-        return r.status_code == 200
-    except Exception as e:
-        print(f"  [TG] sendPhoto erreur : {e}")
-        return False
+class DerivFeed:
+    """Client WebSocket persistant pour l'API publique Deriv.
 
+    Maintient une connexion permanente (avec reconnexion automatique, gestion
+    des timeouts et des erreurs réseau) et s'abonne en continu (`subscribe: 1`)
+    aux bougies M5 de Volatility 75 (R_75) et Volatility 25 (R_25). Les
+    dernières bougies reçues sont mises en cache en mémoire (thread-safe) pour
+    que `fetch_candles()` n'ait jamais besoin d'attendre un aller-retour
+    réseau pendant un scan.
 
-def tg_notify(sig: "Signal", tier: str = "", mode: str = "SMC",
-              chat_id: Optional[str] = None) -> None:
-    global TELEGRAM_CHAT_ID, TELEGRAM_LEADER_ID
+    Robustesse :
+      - reconnexion automatique avec backoff exponentiel borné
+        (DERIV_RECONNECT_MIN/MAX_SECONDS) ;
+      - timeout de connexion/réception (DERIV_WS_TIMEOUT_SECONDS) ;
+      - ping applicatif régulier pour détecter une socket morte ;
+      - toute exception réseau est capturée -> log + reconnexion, jamais de
+        crash du thread ;
+      - expose un heartbeat (`last_message_at`) consommé par le watchdog.
+    """
 
-    # ── FLAG GLOBAL — mettre TG_ENABLED = True pour activer l'envoi ──
-    TG_ENABLED = _TG_ENABLED
-    if not TG_ENABLED:
-        # Log local uniquement — aucun appel API Telegram
-        num = _next_signal_number()
-        msg = tg_format_signal(sig, tier, mode, signal_num=num)
-        print(c(f"\n  [TG] 🔕 Envoi désactivé (TG_ENABLED=false) — signal #{num} prêt", "yellow"))
-        print(f"  [TG] Preview message :\n{msg[:300]}...")
-        # Génère quand même le graphique pour vérification locale
-        chart_path = generate_chart_image(sig)
-        if chart_path:
-            print(c(f"  [TG] 📊 Graphique 1280×720 généré : {chart_path}", "cyan"))
-        return
+    def __init__(self, symbols: List[str]):
+        self.symbols = symbols
+        self._lock = threading.Lock()
+        self._cache: Dict[str, Dict] = {
+            sym: {"candles": [], "updated_at": 0.0} for sym in symbols
+        }
+        self._ws = None
+        self._connected = False
+        self._last_message_at = 0.0
+        self._stop = False
+        self._thread: Optional[threading.Thread] = None
 
-    # Récupérer l'ID leader si pas encore connu
-    if not TELEGRAM_LEADER_ID:
-        TELEGRAM_LEADER_ID = tg_get_chat_id() or ""
-    if not TELEGRAM_CHAT_ID:
-        TELEGRAM_CHAT_ID = TELEGRAM_LEADER_ID
+    # -- API publique --------------------------------------------------
+    def start(self):
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop = False
+        self._thread = threading.Thread(target=self._run_forever, daemon=True,
+                                         name="deriv-ws-feed")
+        self._thread.start()
+        log.info("DerivFeed : thread WebSocket démarré pour %s.", self.symbols)
 
-    # Numéro du signal
-    num = _next_signal_number()
-    msg = tg_format_signal(sig, tier, mode, signal_num=num)
-
-    # Générer le graphique
-    chart_path = generate_chart_image(sig)
-
-    # ── Envoi en DM au leader — TOUJOURS (pas de filtre doublon) ─────
-    if TELEGRAM_LEADER_ID:
-        if chart_path:
-            ok_dm = tg_send_photo(chart_path, msg, TELEGRAM_LEADER_ID)
-        else:
-            ok_dm = tg_send(msg, TELEGRAM_LEADER_ID)
-        print(c(f"  [TG] {'✓ DM leader' if ok_dm else '✗ DM leader échoué'}", "green" if ok_dm else "red"))
-    else:
-        print(c("  [TG] ⚠ Aucun ID leader — ajoute TG_LEADER_ID dans Render", "yellow"))
-
-    # ── Envoi au GROUPE — filtre doublon actif ────────────────────────
-    if is_setup_already_sent(sig.symbol, sig.direction, sig.score):
-        print(c(f"  [TG] ⏭ Groupe — setup déjà envoyé ({sig.symbol} {sig.direction})", "yellow"))
-    elif is_price_level_duplicate(sig.symbol, sig.direction, sig.entry):
-        print(c(f"  [TG] ⏭ Groupe — niveau de prix quasi-identique ({sig.symbol} {sig.entry})", "yellow"))
-    else:
-        mark_setup_sent(sig.symbol, sig.direction, sig.score)
-        target_group = get_group_id_for_symbol(sig.symbol)
-        if target_group:
-            if chart_path:
-                ok_grp = tg_send_photo(chart_path, msg, target_group)
-                print(c(f"  [TG] {'✓ Groupe (photo)' if ok_grp else '✗ Groupe photo échoué'}", "green" if ok_grp else "red"))
-            else:
-                ok_grp = tg_send(msg, target_group)
-                print(c(f"  [TG] {'✓ Groupe (texte)' if ok_grp else '✗ Groupe texte échoué'}", "green" if ok_grp else "red"))
-            if ok_grp:
-                record_price_level(sig.symbol, sig.direction, sig.entry)
-        else:
-            print(c("  [TG] ⚠ Aucun groupe cible défini pour ce marché", "red"))
-
-    # Nettoyage fichier temporaire
-    if chart_path:
+    def stop(self):
+        self._stop = True
         try:
-            import os as _os
-            _os.remove(chart_path)
+            if self._ws is not None:
+                self._ws.close()
         except Exception:
             pass
 
-    # ── Enregistrement du trade pour suivi automatique ────────
-    # Le monitor vérifiera TP1/TP2/TP3/SL et enverra les alertes
-    try:
-        setup_t = getattr(sig, "mode", "SMC")
-        register_trade(sig, num, setup_type=setup_t)
-    except Exception as _reg_e:
-        print(c(f"  [TRADE] ⚠ Enregistrement échoué : {_reg_e}", "yellow"))
+    def is_connected(self) -> bool:
+        return self._connected
+
+    def seconds_since_last_message(self) -> Optional[float]:
+        if not self._last_message_at:
+            return None
+        return time.time() - self._last_message_at
+
+    def get_candles(self, symbol: str, limit: int = 200) -> Optional[List[Dict]]:
+        """Retourne les bougies en cache si elles sont assez fraîches, sinon None
+        (l'appelant doit alors utiliser le fallback one-shot)."""
+        with self._lock:
+            entry = self._cache.get(symbol)
+        if not entry or not entry["candles"]:
+            return None
+        if time.time() - entry["updated_at"] > DERIV_CACHE_STALE_SECONDS:
+            return None
+        return entry["candles"][-limit:]
+
+    # -- Boucle interne --------------------------------------------------
+    def _run_forever(self):
+        import websocket  # pip install websocket-client
+        backoff = DERIV_RECONNECT_MIN_SECONDS
+        while not self._stop:
+            try:
+                url = DERIV_WS_URL.format(app_id=_deriv_app_id())
+                ws = websocket.create_connection(url, timeout=DERIV_WS_TIMEOUT_SECONDS)
+                self._ws = ws
+                self._connected = True
+                self._last_message_at = time.time()
+                backoff = DERIV_RECONNECT_MIN_SECONDS  # connexion OK -> reset du backoff
+                log.info("DerivFeed : connecté à %s.", url)
+
+                for sym in self.symbols:
+                    deriv_symbol = DERIV_SYMBOL_MAP.get(sym)
+                    if not deriv_symbol:
+                        continue
+                    ws.send(json.dumps({
+                        "ticks_history": deriv_symbol,
+                        "adjust_start_time": 1,
+                        "count": 200,
+                        "end": "latest",
+                        "start": 1,
+                        "style": "candles",
+                        "granularity": DERIV_GRANULARITY_SECONDS,
+                        "subscribe": 1,
+                        "req_id": self.symbols.index(sym) + 1,
+                    }))
+
+                last_ping = time.time()
+                while not self._stop:
+                    if time.time() - last_ping > DERIV_PING_INTERVAL_SECONDS:
+                        try:
+                            ws.ping()
+                        except Exception:
+                            raise ConnectionError("échec du ping Deriv, reconnexion nécessaire.")
+                        last_ping = time.time()
+
+                    try:
+                        raw = ws.recv()
+                    except Exception as exc:
+                        # Timeout, coupure réseau, socket fermée... : on
+                        # considère la socket potentiellement morte -> on la
+                        # recycle proprement pour forcer une reconnexion.
+                        raise ConnectionError(f"timeout/erreur de réception Deriv : {exc}")
+
+                    if not raw:
+                        continue
+                    self._last_message_at = time.time()
+                    self._handle_message(raw)
+
+            except Exception as exc:
+                self._connected = False
+                log.warning(f"DerivFeed : connexion perdue/erreur ({exc}). "
+                            f"Reconnexion dans {backoff:.0f}s.")
+            finally:
+                try:
+                    if self._ws is not None:
+                        self._ws.close()
+                except Exception:
+                    pass
+                self._ws = None
+                self._connected = False
+
+            if self._stop:
+                break
+            time.sleep(backoff)
+            backoff = min(backoff * 2, DERIV_RECONNECT_MAX_SECONDS)
+
+        log.info("DerivFeed : thread arrêté proprement.")
+
+    def _handle_message(self, raw: str):
+        try:
+            data = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            return
+
+        if data.get("msg_type") == "error" or "error" in data:
+            err = data.get("error", {})
+            log.warning(f"DerivFeed : message d'erreur reçu ({err.get('message', err)}).")
+            return
+
+        req_id = data.get("echo_req", {}).get("req_id")
+        deriv_symbol = data.get("echo_req", {}).get("ticks_history")
+        symbol = next((s for s, d in DERIV_SYMBOL_MAP.items() if d == deriv_symbol), None)
+        if symbol is None and req_id:
+            idx = req_id - 1
+            if 0 <= idx < len(self.symbols):
+                symbol = self.symbols[idx]
+        if symbol is None:
+            return
+
+        # Snapshot initial (history) : liste de bougies.
+        candles_raw = data.get("candles")
+        if candles_raw:
+            candles = [{
+                "time": float(c["epoch"]), "open": float(c["open"]),
+                "high": float(c["high"]), "low": float(c["low"]), "close": float(c["close"]),
+            } for c in candles_raw]
+            with self._lock:
+                self._cache[symbol] = {"candles": candles, "updated_at": time.time()}
+            return
+
+        # Mise à jour incrémentale (ohlc) envoyée en continu grâce à subscribe:1.
+        ohlc = data.get("ohlc")
+        if ohlc:
+            try:
+                new_candle = {
+                    "time": float(ohlc["open_time"]),
+                    "open": float(ohlc["open"]), "high": float(ohlc["high"]),
+                    "low": float(ohlc["low"]), "close": float(ohlc["close"]),
+                }
+            except (KeyError, TypeError, ValueError):
+                return
+            with self._lock:
+                entry = self._cache.setdefault(symbol, {"candles": [], "updated_at": 0.0})
+                candles = entry["candles"]
+                if candles and candles[-1]["time"] == new_candle["time"]:
+                    candles[-1] = new_candle
+                else:
+                    candles.append(new_candle)
+                    if len(candles) > 500:
+                        del candles[: len(candles) - 500]
+                entry["updated_at"] = time.time()
 
 
-# ═════════════════════════════════════════════════════════════
-#  DATA CLASSES
-# ═════════════════════════════════════════════════════════════
+# Instance unique partagée par tout le process (démarrée dans le bloc __main__).
+deriv_feed = DerivFeed(list(DERIV_SYMBOL_MAP.keys()))
+
+
+def _fetch_deriv(symbol: str, limit: int = 200) -> List[Dict]:
+    """Point d'entrée utilisé par fetch_candles(). Sert en priorité les
+    bougies en cache du flux WebSocket persistant (rapide, pas d'aller-retour
+    réseau bloquant) ; si le cache est absent/périmé (flux pas encore connecté,
+    coupure réseau prolongée...), retombe sur une requête one-shot classique,
+    elle-même protégée par un try/except au niveau de process_asset()."""
+    cached = deriv_feed.get_candles(symbol, limit)
+    if cached:
+        return cached
+    log.info(f"[{symbol}] cache Deriv WS indisponible/périmé -> requête one-shot de secours.")
+    return _fetch_deriv_snapshot(symbol, limit)
+
+
+# ============================================================================
+# 4. STRUCTURE : SWING POINTS, LIQUIDITÉ, SWEEP
+# ============================================================================
 
 @dataclass
-class FVG:
-    direction: str
-    top:       float
-    bottom:    float
-    index:     int
-    filled:    bool = False
-
-
-@dataclass
-class OrderBlock:
-    direction: str
-    top:       float
-    bottom:    float
-    index:     int
+class SwingPoint:
+    index: int
+    price: float
+    kind: str          # "high" | "low"
     mitigated: bool = False
 
 
 @dataclass
-class SupplyDemandZone:
-    """Zone Supply ou Demand institutionnelle."""
-    zone_type:  str    # "supply" | "demand"
-    top:        float
-    bottom:     float
-    index:      int
-    impulse_size: float  # taille de la bougie impulsive (force de la zone)
-    tested:     bool = False
+class LiquiditySweep:
+    swept_point: SwingPoint
+    sweep_index: int
+    sweep_wick_price: float
+    direction: str      # "bullish" | "bearish"
 
+
+def find_swing_points(candles: List[Dict], lookback: int = 3) -> List[SwingPoint]:
+    points = []
+    n = len(candles)
+    for i in range(lookback, n - lookback):
+        window = candles[i - lookback:i + lookback + 1]
+        high_i, low_i = candles[i]["high"], candles[i]["low"]
+        if high_i == max(c["high"] for c in window):
+            points.append(SwingPoint(index=i, price=high_i, kind="high"))
+        if low_i == min(c["low"] for c in window):
+            points.append(SwingPoint(index=i, price=low_i, kind="low"))
+    return points
+
+
+def detect_liquidity_sweep(
+    candles: List[Dict], swing_points: List[SwingPoint], search_window: int = 8
+) -> Optional[LiquiditySweep]:
+    """Cherche un sweep sur les `search_window` dernières bougies (pas seulement
+    la toute dernière — nécessaire en scan continu pour ne pas perdre le setup
+    le temps que la BOS se confirme sur les bougies suivantes)."""
+    if not candles:
+        return None
+    n = len(candles)
+    start_scan = max(0, n - search_window)
+
+    for idx in range(n - 1, start_scan - 1, -1):
+        candle = candles[idx]
+        body_high = max(candle["open"], candle["close"])
+        body_low = min(candle["open"], candle["close"])
+        candidates = sorted(
+            [p for p in swing_points if not p.mitigated and p.index < idx],
+            key=lambda p: -p.index,
+        )
+        for point in candidates:
+            if point.kind == "high" and candle["high"] > point.price and body_high <= point.price:
+                return LiquiditySweep(point, idx, candle["high"], "bearish")
+            if point.kind == "low" and candle["low"] < point.price and body_low >= point.price:
+                return LiquiditySweep(point, idx, candle["low"], "bullish")
+    return None
+
+
+# ============================================================================
+# 5. BOS / CHoCH + FVG
+# ============================================================================
 
 @dataclass
-class AmdPhase:
-    """
-    Résultat de l'analyse de phase AMD.
-    phase : "accumulation" | "manipulation" | "distribution" | "unknown"
-    sub_phase : "bull_manipulation" | "bear_manipulation" | etc.
-    """
-    phase:       str
-    sub_phase:   str
-    direction:   str    # "LONG" | "SHORT" — direction attendue après AMD
-    confidence:  int    # 0–100
-    range_high:  float
-    range_low:   float
-    sweep_level: Optional[float] = None
-    reasons:     list = field(default_factory=list)
-
-
-@dataclass
-class Signal:
-    symbol:    str
+class BOSConfirmation:
+    confirmed: bool
+    break_index: int
+    break_level: float
     direction: str
-    entry:     float
-    sl:        float
-    tp:        float
-    rr:        float
-    score:     int
-    timestamp: datetime
-    htf_bias:  str
-    lot:       float = 0.0
-    risk_usd:  float = RISK_USD
-    mode:      str   = "SMC"   # "SMC" | "AMD" | "SEPTUPLE" | "SD" | "PRE-BOS"
-    reasons:   list  = field(default_factory=list)
-    # Champs pour la génération du graphique
-    df_chart:   object = field(default=None, repr=False)   # pd.DataFrame M5
-    fvg_chart:  object = field(default=None, repr=False)   # FVG | None
-    ob_chart:   object = field(default=None, repr=False)   # OrderBlock | None
-    bos_lv:     float  = 0.0
-    choch_lv:   float  = 0.0
-    tp2:        float  = 0.0   # cible structurelle RR5-6 (swing suivant)
-    tp3:        float  = 0.0   # extension max RR8-10 (liquidité majeure)
-    stars:      int    = 3     # 2⭐ = entrée directe (sweep+CHoCH) | 3⭐ = entrée confirmée (retest+rejet)
 
 
-# ═════════════════════════════════════════════════════════════
-#  HELPERS
-# ═════════════════════════════════════════════════════════════
-
-def c(text: str, color: str = "green") -> str:
-    if not COLOR:
-        return text
-    colors = {
-        "green": Fore.GREEN, "red": Fore.RED, "yellow": Fore.YELLOW,
-        "cyan": Fore.CYAN,   "white": Fore.WHITE, "magenta": Fore.MAGENTA,
-        "blue": Fore.BLUE,
-    }
-    return colors.get(color, "") + text + Style.RESET_ALL
+@dataclass
+class FVGZone:
+    top: float
+    bottom: float
+    index: int
+    direction: str
+    mitigated: bool = False
 
 
-def compute_lot(symbol: str, entry: float, sl: float,
-                risk_usd: float = RISK_USD) -> float:
-    """Calcule la taille de lot pour les 4 marchés actifs : Gold, BTC, Deriv (R_75/R_25)."""
-    sl_distance = abs(entry - sl)
-    if sl_distance == 0:
+def _find_structure_level(swing_points: List[SwingPoint], sweep: LiquiditySweep) -> Optional[float]:
+    """Le niveau à casser pour valider le BOS = dernier swing OPPOSÉ avant le sweep
+    (pas le niveau balayé lui-même, qui serait trivialement toujours franchi)."""
+    opposite_kind = "high" if sweep.direction == "bullish" else "low"
+    prior_points = [p for p in swing_points if p.kind == opposite_kind and p.index < sweep.sweep_index]
+    if not prior_points:
+        return None
+    return max(prior_points, key=lambda p: p.index).price
+
+
+def confirm_bos(
+    candles: List[Dict], sweep: LiquiditySweep, swing_points: List[SwingPoint], max_lookahead: int = 6
+) -> Optional[BOSConfirmation]:
+    """RÈGLE STRICTE : validée uniquement par clôture du CORPS au-delà du niveau.
+    Une mèche seule ne valide jamais -> signal ignoré."""
+    level = _find_structure_level(swing_points, sweep)
+    if level is None:
+        return None
+    start = sweep.sweep_index + 1
+    end = min(len(candles), start + max_lookahead)
+    for i in range(start, end):
+        c = candles[i]
+        if sweep.direction == "bullish" and c["close"] > level and c["close"] > c["open"]:
+            return BOSConfirmation(True, i, level, "bullish")
+        if sweep.direction == "bearish" and c["close"] < level and c["close"] < c["open"]:
+            return BOSConfirmation(True, i, level, "bearish")
+    return None
+
+
+def detect_fvg(candles: List[Dict], around_index: int, direction: str) -> Optional[FVGZone]:
+    """FVG sur la séquence à 3 bougies de la cassure (méthode ICT)."""
+    i = around_index
+    if i < 2 or i >= len(candles):
+        return None
+    c0, c2 = candles[i - 2], candles[i]
+    if direction == "bullish" and c2["low"] > c0["high"]:
+        return FVGZone(top=c2["low"], bottom=c0["high"], index=i, direction="bullish")
+    if direction == "bearish" and c2["high"] < c0["low"]:
+        return FVGZone(top=c0["low"], bottom=c2["high"], index=i, direction="bearish")
+    return None
+
+
+def scan_all_fvgs(candles: List[Dict]) -> List[FVGZone]:
+    """Scanne TOUTES les bougies (pas seulement autour de la cassure) pour
+    lister les FVG (Fair Value Gap / imbalance) présentes sur la fenêtre, avec
+    leur statut de mitigation (comblée ou non par le prix depuis sa formation)."""
+    zones: List[FVGZone] = []
+    n = len(candles)
+    for i in range(2, n):
+        c0, c2 = candles[i - 2], candles[i]
+        if c2["low"] > c0["high"]:
+            zones.append(FVGZone(top=c2["low"], bottom=c0["high"], index=i, direction="bullish"))
+        elif c2["high"] < c0["low"]:
+            zones.append(FVGZone(top=c0["low"], bottom=c2["high"], index=i, direction="bearish"))
+    for z in zones:
+        for c in candles[z.index + 1:]:
+            if c["low"] <= z.top and c["high"] >= z.bottom:
+                z.mitigated = True
+                break
+    return zones
+
+
+# ============================================================================
+# 5bis. ORDER BLOCKS (pour la sélection intelligente de TP2)
+# ============================================================================
+
+@dataclass
+class OBZone:
+    top: float
+    bottom: float
+    index: int
+    direction: str      # "bullish" (support) | "bearish" (résistance)
+    mitigated: bool = False
+
+
+def find_order_blocks(candles: List[Dict]) -> List[OBZone]:
+    """Order Block ICT simplifié : dernière bougie de couleur opposée juste
+    avant un déplacement impulsif (corps > ATR x facteur). Bullish OB = zone
+    de support (dernière bougie baissière avant une impulsion haussière) ;
+    Bearish OB = zone de résistance (dernière bougie haussière avant une
+    impulsion baissière)."""
+    n = len(candles)
+    if n < ATR_PERIOD + 3:
+        return []
+    atr = compute_atr(candles)
+    if atr <= 0:
+        return []
+
+    zones: List[OBZone] = []
+    for i in range(1, n):
+        c = candles[i]
+        body = abs(c["close"] - c["open"])
+        if body < atr * OB_IMPULSE_ATR_MULTIPLIER:
+            continue
+        prev = candles[i - 1]
+        is_impulse_bullish = c["close"] > c["open"]
+        is_impulse_bearish = c["close"] < c["open"]
+        prev_bearish = prev["close"] < prev["open"]
+        prev_bullish = prev["close"] > prev["open"]
+
+        if is_impulse_bullish and prev_bearish:
+            zones.append(OBZone(top=prev["high"], bottom=prev["low"], index=i - 1, direction="bullish"))
+        elif is_impulse_bearish and prev_bullish:
+            zones.append(OBZone(top=prev["high"], bottom=prev["low"], index=i - 1, direction="bearish"))
+
+    for z in zones:
+        for c in candles[z.index + 1:]:
+            if c["low"] <= z.top and c["high"] >= z.bottom:
+                z.mitigated = True
+                break
+    return zones
+
+
+# ============================================================================
+# 5ter. TP2 INTELLIGENT SMC/ICT — sélection dynamique de la cible
+# ============================================================================
+
+@dataclass
+class TP2Target:
+    price: Optional[float]
+    label: Optional[str]
+
+
+def select_smart_tp2(candles: List[Dict], swing_points: List["SwingPoint"],
+                      entry_price: float, direction: str,
+                      tp1_price: float) -> "TP2Target":
+    """Choisit le TP2 parmi les cibles SMC/ICT réellement disponibles sur le
+    graphique au lieu d'un simple multiple de RR fixe :
+      - Order Block non mitigé
+      - Fair Value Gap non mitigée
+      - Liquidité (Buy Side / Sell Side) non balayée
+    Règle de sélection : la cible non mitigée la plus proche AU-DELÀ de TP1
+    dans le sens du trade l'emporte ; en cas d'égalité de distance (< 0.05%
+    d'écart), l'empreinte la plus fiable gagne (Order Block > FVG > liquidité
+    pool), conformément à la hiérarchie SMC/ICT usuelle. Si rien n'existe
+    au-delà de TP1, on retombe sur la cible non mitigée la plus proche
+    au-delà de l'entrée."""
+    candidates = []  # (price, kind, priority)
+
+    for ob in find_order_blocks(candles):
+        if ob.mitigated:
+            continue
+        if direction == "BUY" and ob.direction == "bearish" and ob.bottom > entry_price:
+            candidates.append((ob.bottom, "order_block", TP2_TARGET_PRIORITY["order_block"]))
+        elif direction == "SELL" and ob.direction == "bullish" and ob.top < entry_price:
+            candidates.append((ob.top, "order_block", TP2_TARGET_PRIORITY["order_block"]))
+
+    for fvg in scan_all_fvgs(candles):
+        if fvg.mitigated:
+            continue
+        if direction == "BUY" and fvg.bottom > entry_price:
+            candidates.append((fvg.bottom, "fvg", TP2_TARGET_PRIORITY["fvg"]))
+        elif direction == "SELL" and fvg.top < entry_price:
+            candidates.append((fvg.top, "fvg", TP2_TARGET_PRIORITY["fvg"]))
+
+    unswept_highs = [p.price for p in swing_points if p.kind == "high"
+                      and p.price > entry_price
+                      and not any(c["high"] > p.price for c in candles[p.index + 1:])]
+    unswept_lows = [p.price for p in swing_points if p.kind == "low"
+                     and p.price < entry_price
+                     and not any(c["low"] < p.price for c in candles[p.index + 1:])]
+    if direction == "BUY":
+        for price in unswept_highs:
+            candidates.append((price, "liquidity_buy", TP2_TARGET_PRIORITY["liquidity"]))
+    else:
+        for price in unswept_lows:
+            candidates.append((price, "liquidity_sell", TP2_TARGET_PRIORITY["liquidity"]))
+
+    if not candidates:
+        return TP2Target(None, None)
+
+    def _beyond(price):
+        return price > tp1_price if direction == "BUY" else price < tp1_price
+
+    beyond_tp1 = [c for c in candidates if _beyond(c[0])]
+    pool = beyond_tp1 if beyond_tp1 else candidates
+
+    def _distance(price):
+        return abs(price - entry_price)
+
+    min_dist = min(_distance(c[0]) for c in pool)
+    tolerance = min_dist * 0.0005 if min_dist else 0.0
+    near_best = [c for c in pool if _distance(c[0]) - min_dist <= tolerance]
+    best = max(near_best, key=lambda c: c[2])  # priorité SMC/ICT en cas d'égalité
+
+    label = TP2_TARGET_LABELS[best[1]]
+    return TP2Target(best[0], label)
+
+
+# ============================================================================
+# 6. RISQUE : ATR, SL, TP1/TP2, LOT
+# ============================================================================
+
+@dataclass
+class TradeLevels:
+    entry: float
+    stop_loss: float
+    tp1: float
+    tp2: Optional[float]
+    rr_tp1: float
+    rr_tp2: Optional[float]
+    high_rr_warning: bool
+    tp2_source: Optional[str] = None
+
+
+def compute_atr(candles: List[Dict], period: int = ATR_PERIOD) -> float:
+    if len(candles) < period + 1:
         return 0.0
-
-    if symbol == "GC=F":
-        lot = risk_usd / (sl_distance * 100.0)
-        return max(0.01, round(lot, 2))
-    if is_deriv_symbol(symbol):
-        # ⚠️ Approximatif : je n'ai pas de spec de contrat Deriv vérifiée
-        # pour ces indices (taille de lot / valeur du point varie selon
-        # le broker/plateforme). Formule générique $ risqué ÷ distance SL,
-        # comme pour BTC. À CALIBRER avec la fiche "spécification du
-        # symbole" de ton MT5 Deriv avant tout trade réel.
-        return round(risk_usd / sl_distance, 4)
-    if symbol == "BTC-USD":
-        return round(risk_usd / sl_distance, 6)
-
-    # Fallback (ne devrait jamais être atteint avec les 4 marchés actifs)
-    sl_pips = sl_distance / 0.0001
-    return max(0.01, round(risk_usd / (sl_pips * 10.0), 2))
+    trs = []
+    for i in range(1, len(candles)):
+        h, l, prev_c = candles[i]["high"], candles[i]["low"], candles[i - 1]["close"]
+        trs.append(max(h - l, abs(h - prev_c), abs(l - prev_c)))
+    return sum(trs[-period:]) / period
 
 
-# ─────────────────────────────────────────────────────────────
-#  DERIV — INDICES SYNTHÉTIQUES (Volatility 100/50/25, 24/7)
-# ─────────────────────────────────────────────────────────────
-# Données de marché publiques : aucun token API requis (juste un app_id).
-# ─────────────────────────────────────────────────────────────
-#  FETCH YAHOO FINANCE — API JSON brut (sans yfinance) [v8.6/v10]
-#
-#  Permet de faire tourner le bot sur Pydroid/Android sans yfinance
-#  (lxml/curl_cffi/peewee échouent souvent à se compiler sur Android).
-#  Même source de données que yfinance — exactement la même API Yahoo.
-#
-#  Si yfinance est installé (_HAS_YFINANCE=True), fetch() l'utilise.
-#  Sinon, fetch() bascule automatiquement sur _yahoo_chart_json().
-# ─────────────────────────────────────────────────────────────
+def compute_levels(entry, direction, invalidation_price, candles, swing_points=None,
+                    spread_commission_buffer=0.0) -> TradeLevels:
+    """TP2 n'est plus un simple multiple de RR fixe : il est choisi
+    dynamiquement parmi les cibles SMC/ICT non mitigées disponibles
+    (Order Block / FVG / Liquidité) via select_smart_tp2()."""
+    atr = compute_atr(candles)
+    sl_distance = max(atr * ATR_SL_MULTIPLIER, 1e-9)
+    if INCLUDE_SPREAD_COMMISSION_BUFFER:
+        sl_distance += spread_commission_buffer
 
-def _period_to_seconds(period: str) -> int:
-    """Convertit '5d' / '1mo' / '30d' / '1y' en secondes. Tolérant, jamais d'exception."""
-    p = (period or "5d").strip().lower()
-    try:
-        if p.endswith("mo"):
-            return int(p[:-2]) * 30 * 86400
-        if p.endswith("y"):
-            return int(p[:-1]) * 365 * 86400
-        if p.endswith("d"):
-            return int(p[:-1]) * 86400
-        return int(p) * 86400
-    except ValueError:
-        return 5 * 86400
-
-
-_YAHOO_HEADERS = {
-    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"),
-}
-
-
-def _yahoo_chart_json(symbol: str, interval: str, period: str) -> pd.DataFrame:
-    """
-    Télécharge des bougies via l'API JSON publique de Yahoo Finance en
-    HTTP brut (requests uniquement, sans yfinance). Compatible Pydroid/Android.
-    C'est la même source de données que yfinance — mêmes résultats.
-    """
-    period2 = int(time.time())
-    period1 = period2 - _period_to_seconds(period)
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
-    params = {
-        "interval": interval,
-        "period1": period1,
-        "period2": period2,
-        "includePrePost": "false",
-        "events": "div,splits",
-    }
-    try:
-        r = requests.get(url, params=params, headers=_YAHOO_HEADERS, timeout=15)
-        data = r.json()
-    except Exception:
-        return pd.DataFrame()
-
-    try:
-        result = data["chart"]["result"][0]
-        ts     = result["timestamp"]
-        quote  = result["indicators"]["quote"][0]
-    except (KeyError, IndexError, TypeError):
-        return pd.DataFrame()
-
-    df = pd.DataFrame({
-        "open":   quote.get("open"),
-        "high":   quote.get("high"),
-        "low":    quote.get("low"),
-        "close":  quote.get("close"),
-        "volume": quote.get("volume"),
-    }, index=pd.to_datetime(ts, unit="s", utc=True))
-
-    for col in ("open", "high", "low", "close", "volume"):
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-    df = df.dropna(subset=["close", "high", "low"])
-    return df
-
-
-# app_id 1089 = app_id public/démo fourni par Deriv pour les requêtes en
-# lecture (candles/ticks). Pour de la prod plus stable, créer son propre
-# app_id gratuit sur https://developers.deriv.com (Manage Applications)
-# et le mettre dans la variable d'env DERIV_APP_ID.
-DERIV_APP_ID = os.environ.get("DERIV_APP_ID", "1089")
-DERIV_WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
-
-DERIV_SYMBOLS: list[tuple[str, str]] = [
-    ("R_75", "Volatility 75 Index"),
-    ("R_25", "Volatility 25 Index"),
-]
-
-# Filtre haute-TF utilisé comme "biais" pour les indices Deriv (équivalent
-# du H4 utilisé en Forex). Mettre "30m" si tu préfères M30 plutôt que H1.
-DERIV_BIAS_TF = os.environ.get("DERIV_BIAS_TF", "15m")   # [v11] M15 pour tous les indices Volatility (V100/V50/V25)
-
-_DERIV_GRANULARITY: dict[str, int] = {
-    "1m": 60, "5m": 300, "15m": 900, "30m": 1800,
-    "1h": 3600, "4h": 14400, "1d": 86400,
-}
-
-
-def is_deriv_symbol(symbol: str) -> bool:
-    """Indices synthétiques Deriv (Volatility, et variantes 1s type 1HZ100V)."""
-    return symbol.startswith("R_") or symbol.startswith("1HZ")
-
-
-def fetch_deriv(symbol: str, interval: str, count: int = 300,
-               retries: int = 3, retry_delay: int = 5) -> pd.DataFrame:
-    """
-    Récupère des bougies OHLC depuis l'API publique Deriv (WebSocket).
-    Pas d'auth nécessaire — lecture de marché uniquement.
-    Nécessite : pip install websocket-client
-    """
-    try:
-        import websocket  # websocket-client
-    except ImportError:
-        log.warning("  ⚠️ Module 'websocket-client' manquant — pip install websocket-client")
-        return pd.DataFrame()
-
-    granularity = _DERIV_GRANULARITY.get(interval, 900)
-    req = {
-        "ticks_history": symbol,
-        "style": "candles",
-        "granularity": granularity,
-        "count": count,
-        "end": "latest",
-        "adjust_start_time": 1,
-    }
-
-    for attempt in range(1, retries + 1):
-        ws = None
-        try:
-            ws = websocket.create_connection(DERIV_WS_URL, timeout=15)
-            ws.send(json.dumps(req))
-            raw = ws.recv()
-            ws.close()
-            data = json.loads(raw)
-
-            if "error" in data:
-                raise RuntimeError(data["error"].get("message", "Erreur API Deriv"))
-
-            candles = data.get("candles", [])
-            if not candles:
-                raise RuntimeError("réponse Deriv vide (pas de candles)")
-
-            df = pd.DataFrame(candles)
-            df.rename(columns={"epoch": "time"}, inplace=True)
-            df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
-            df.set_index("time", inplace=True)
-            for col in ("open", "high", "low", "close"):
-                df[col] = pd.to_numeric(df[col], errors="coerce")
-            df["volume"] = 0.0  # pas de volume réel sur un indice synthétique
-            df.dropna(subset=["close", "high", "low"], inplace=True)
-            if not df.empty:
-                return df
-            raise RuntimeError("DataFrame vide après nettoyage")
-        except Exception as e:
-            try:
-                if ws:
-                    ws.close()
-            except Exception:
-                pass
-            if attempt < retries:
-                time.sleep(retry_delay * attempt)
-            else:
-                log.warning(f"  ⚠️ Deriv fetch échec {symbol} ({interval}) : {e}")
-    return pd.DataFrame()
-
-
-def fetch(symbol: str, interval: str, period: str = "5d",
-          retries: int = 3, retry_delay: int = 15) -> pd.DataFrame:
-    """
-    [v10] Fetch dual-mode :
-      • Mode A (par défaut)  : yfinance si disponible (_HAS_YFINANCE=True)
-      • Mode B (fallback)    : _yahoo_chart_json() via requests pur
-        → compatible Pydroid/Android (pas de lxml/curl_cffi/peewee requis)
-    Les deux modes retournent le même format de DataFrame.
-    """
-    # Indices synthétiques Deriv → API dédiée (pas de Yahoo Finance)
-    if is_deriv_symbol(symbol):
-        return fetch_deriv(symbol, interval)
-
-    periods_fallback = list(dict.fromkeys([period, "5d", "10d", "1mo"]))
-
-    for p in periods_fallback:
-        for attempt in range(1, retries + 1):
-            try:
-                # ── Mode A : yfinance ──────────────────────────────────
-                if _HAS_YFINANCE:
-                    try:
-                        df = yf.download(symbol, interval=interval, period=p,
-                                         auto_adjust=True, progress=False,
-                                         threads=False,
-                                         multi_level_index=False)
-                    except TypeError:
-                        df = yf.download(symbol, interval=interval, period=p,
-                                         auto_adjust=True, progress=False,
-                                         threads=False)
-                    if not df.empty:
-                        if isinstance(df.columns, pd.MultiIndex):
-                            df.columns = df.columns.get_level_values(0).str.lower()
-                        else:
-                            df.columns = df.columns.str.lower()
-                # ── Mode B : requests direct (sans yfinance) ───────────
-                else:
-                    df = _yahoo_chart_json(symbol, interval, p)
-
-                if not df.empty:
-                    # Normalise les colonnes minimales requises
-                    for col in ("open", "high", "low", "close", "volume"):
-                        if col not in df.columns:
-                            df[col] = float("nan")
-                    for _col in ("open", "high", "low", "close", "volume"):
-                        if _col in df.columns:
-                            df[_col] = pd.to_numeric(df[_col], errors="coerce")
-                    df.dropna(subset=["close", "high", "low"], inplace=True)
-                    if not df.empty:
-                        return df
-                time.sleep(retry_delay * attempt)
-            except Exception as e:
-                err_str = str(e).lower()
-                if ("rate" in err_str or "too many" in err_str or "429" in err_str) \
-                        and attempt < retries:
-                    time.sleep(retry_delay * attempt)
-                    continue
-                time.sleep(retry_delay)
-        # Période échouée → on tente la suivante
-    return pd.DataFrame()
-
-
-def swing_highs(df: pd.DataFrame) -> list[tuple[int, float]]:
-    """Retourne les swing highs (index, valeur) dans les n dernières bougies."""
-    result = []
-    for i in range(1, len(df) - 1):
-        try:
-            h_prev = df["high"].iloc[i-1]
-            h_curr = df["high"].iloc[i]
-            h_next = df["high"].iloc[i+1]
-            if pd.isna(h_prev) or pd.isna(h_curr) or pd.isna(h_next):
-                continue
-            if h_curr > h_prev and h_curr > h_next:
-                result.append((i, float(h_curr)))
-        except (TypeError, ValueError):
-            continue
-    return result
-
-
-def swing_lows(df: pd.DataFrame) -> list[tuple[int, float]]:
-    """Retourne les swing lows (index, valeur)."""
-    result = []
-    for i in range(1, len(df) - 1):
-        try:
-            l_prev = df["low"].iloc[i-1]
-            l_curr = df["low"].iloc[i]
-            l_next = df["low"].iloc[i+1]
-            if pd.isna(l_prev) or pd.isna(l_curr) or pd.isna(l_next):
-                continue
-            if l_curr < l_prev and l_curr < l_next:
-                result.append((i, float(l_curr)))
-        except (TypeError, ValueError):
-            continue
-    return result
-
-
-# ═════════════════════════════════════════════════════════════
-#  ★ SETUP PRIORITAIRE — SÉQUENCE SMC TRADER (H4 → M15 → M5)
-#  BOS H4 → Sweep (bougie X) → MSS M15 → FVG/OB M5
-# ═════════════════════════════════════════════════════════════
-
-def next_liquidity_target(df_h4: pd.DataFrame, direction: str, price_now: float) -> float:
-    """Retourne la prochaine liquidité BSL (LONG) ou SSL (SHORT) sur H4."""
-    if len(df_h4) < 5:
-        return price_now
-    if direction == "LONG":
-        candidates = [v for _, v in swing_highs(df_h4) if v > price_now]
-        return min(candidates) if candidates else df_h4["high"].iloc[-20:].max()
+    if direction == "BUY":
+        stop_loss = min(invalidation_price, entry) - sl_distance
+        risk = entry - stop_loss
+        tp1 = entry + risk * TP1_RR
     else:
-        candidates = [v for _, v in swing_lows(df_h4) if v < price_now]
-        return max(candidates) if candidates else df_h4["low"].iloc[-20:].min()
-
-
-@dataclass
-class SmcTraderResult:
-    detected:      bool
-    direction:     str
-    sweep_low:     float
-    sweep_high:    float
-    mss_level:     float
-    entry_top:     float
-    entry_bottom:  float
-    tp_liquidity:  float
-    score:         int
-    reasons:       list
-
-
-def detect_smc_trader(
-    df_h4:  pd.DataFrame,   # H4  — BOS biais + sweep
-    df_m15: pd.DataFrame,   # M15 — MSS confirmation
-    df_m5:  pd.DataFrame,   # M5  — FVG/OB entrée précise
-    direction: str,
-) -> SmcTraderResult:
-    """
-    Séquence SMC Trader adaptée H4 :
-    ① BOS H4 → ② Sweep (bougie X) → ③ MSS M15 → ④ FVG/OB M5
-    """
-    empty = SmcTraderResult(False, direction, 0, 0, 0, 0, 0, 0, 0, [])
-    if len(df_h4) < 20 or len(df_m15) < 15 or len(df_m5) < 10:
-        return empty
-
-    atr_h4 = (df_h4["high"] - df_h4["low"]).rolling(14).mean().iloc[-1]
-    atr_m5 = (df_m5["high"] - df_m5["low"]).rolling(14).mean().iloc[-1]
-    if pd.isna(atr_h4) or atr_h4 == 0:
-        return empty
-
-    price_now = df_m5["close"].iloc[-1]
-    bos_type  = "bullish" if direction == "LONG" else "bearish"
-    reasons   = []
-    score     = 0
-
-    # ── ① BOS H4 — biais confirmé ─────────────────────────────
-    bos_h4 = detect_bos(df_h4)
-    recent_bos = [b for b in bos_h4[-6:] if b["type"] == bos_type]
-    if not recent_bos:
-        return empty
-    score += 15
-    reasons.append(f"✅ BOS {bos_type.upper()} H4 confirmé → biais {direction}  (+15)")
-
-    # ── ② SWEEP de liquidité — bougie X ──────────────────────
-    sweep_found = False
-    sweep_low   = 0.0
-    sweep_high  = 0.0
-
-    for i in range(-20, -1):
-        abs_i = len(df_h4) + i
-        if abs_i < 12:
-            continue
-        lookback = df_h4.iloc[abs_i - 12: abs_i]
-        if len(lookback) < 5:
-            continue
-        h  = df_h4["high"].iloc[i]
-        l  = df_h4["low"].iloc[i]
-        cl = df_h4["close"].iloc[i]
-        if direction == "LONG":
-            prev_low = lookback["low"].min()
-            if l < prev_low - atr_h4 * 0.03 and cl > prev_low:
-                sweep_found = True
-                sweep_low   = l
-                sweep_high  = h
-                break
-        else:
-            prev_high = lookback["high"].max()
-            if h > prev_high + atr_h4 * 0.03 and cl < prev_high:
-                sweep_found = True
-                sweep_low   = l
-                sweep_high  = h
-                break
-
-    if not sweep_found:
-        return empty
-
-    score += 25
-    sl_anchor = sweep_low if direction == "LONG" else sweep_high
-    dec = 2 if price_now > 100 else 5
-    reasons.append(
-        f"🔥 Sweep {'SSL' if direction == 'LONG' else 'BSL'} — bougie X "
-        f"@ {round(sl_anchor, dec)}  → SL anchor  (+25)"
-    )
-
-    # ── ③ MSS — Market Structure Shift (M15) ─────────────────
-    bos_m15 = detect_bos(df_m15)
-    mss_candidates = [b for b in bos_m15[-8:] if b["type"] == bos_type]
-    if not mss_candidates:
-        return empty
-
-    mss = mss_candidates[-1]
-    score += 20
-    reasons.append(
-        f"📐 MSS M15 — BOS {bos_type} @ {round(mss['level'], dec)}  (+20)"
-    )
-
-    # ── ④ FVG ou OB M5 — zone d'entrée ──────────────────────
-    fvgs_m5 = detect_fvg(df_m5)
-    bos_m5  = detect_bos(df_m5)
-    obs_m5  = detect_order_blocks(df_m5, bos_m5)
-
-    entry_top    = 0.0
-    entry_bottom = 0.0
-
-    fvg_active = active_fvg(df_m5, fvgs_m5, bos_type)
-    if fvg_active:
-        entry_top    = max(fvg_active.top, fvg_active.bottom)
-        entry_bottom = min(fvg_active.top, fvg_active.bottom)
-        score += 15
-        reasons.append(f"📍 FVG M5 actif [{round(entry_bottom, dec)} — {round(entry_top, dec)}]  (+15)")
-    else:
-        ob_match = next((o for o in reversed(obs_m5) if o.direction == bos_type), None)
-        if ob_match:
-            entry_top    = ob_match.top
-            entry_bottom = ob_match.bottom
-            score += 12
-            reasons.append(f"🧱 OB M5 [{round(entry_bottom, dec)} — {round(entry_top, dec)}]  (+12)")
-        else:
-            entry_top    = price_now + atr_m5 * 0.3
-            entry_bottom = price_now - atr_m5 * 0.3
-            score += 5
-            reasons.append("⚠️ Entrée au marché (pas de FVG/OB M5)  (+5)")
-
-    # ── TP — prochaine liquidité BSL/SSL ──────────────────────
-    tp_liq = next_liquidity_target(df_h4, direction, price_now)
-    reasons.append(
-        f"🎯 TP → Liquidité {'BSL' if direction == 'LONG' else 'SSL'} "
-        f"@ {round(tp_liq, dec)}"
-    )
-
-    return SmcTraderResult(
-        detected=True,
-        direction=direction,
-        sweep_low=sweep_low,
-        sweep_high=sweep_high,
-        mss_level=mss["level"],
-        entry_top=entry_top,
-        entry_bottom=entry_bottom,
-        tp_liquidity=tp_liq,
-        score=score,
-        reasons=reasons,
-    )
-
-
-# ═════════════════════════════════════════════════════════════
-#  ① AMD — ACCUMULATION · MANIPULATION · DISTRIBUTION
-#
-#  Logique institutionnelle (Wyckoff + SMC moderne) :
-#
-#  ACCUMULATION  = range comprimé (faible volatilité H4)
-#                  Les institutions accumulent des positions long
-#                  → Range high/low clairement défini
-#
-#  MANIPULATION  = faux mouvement qui chasse les stops
-#                  • Bull Manipulation : spike sous le range low (BSL sweep)
-#                    → institutions achètent les stops des bears
-#                  • Bear Manipulation : spike au-dessus du range high
-#                    → institutions vendent les stops des bulls
-#
-#  DISTRIBUTION  = mouvement directionnel APRÈS la manipulation
-#                  → C'est là qu'on trade : dans le sens institutionnel
-#
-#  Signal AMD :
-#    Accumulation identifiée + Manipulation validée (sweep) → Long/Short
-#    dans la phase Distribution avec confluence H4 + M15
-# ═════════════════════════════════════════════════════════════
-
-def detect_amd_phase(df_h4: pd.DataFrame) -> AmdPhase:
-    """
-    Détecte la phase AMD courante sur H4.
-
-    Algorithme :
-    1. Identifie le range des 20 dernières bougies H4
-    2. Vérifie si le range est "comprimé" (ATR faible = accumulation)
-    3. Détecte le sweep (manipulation) : spike H/L hors range + retour dedans
-    4. Si sweep détecté → phase Distribution confirmée
-    5. Direction : bullish si sweep du range LOW (chasse bears), bearish si sweep du HIGH
-
-    Score de confiance (0–100) :
-      • Range bien défini (plusieurs tests) : +30
-      • Sweep clair (clôture dans le range après spike) : +30
-      • Volume/impulsion post-sweep : +20
-      • Biais H4 aligné : +20
-    """
-    if len(df_h4) < AMD_LOOKBACK + 5:
-        return AmdPhase("unknown", "", "LONG", 0, 0, 0)
-
-    # Fenêtre d'analyse : AMD_LOOKBACK dernières bougies H4
-    window    = df_h4.iloc[-AMD_LOOKBACK:]
-    atr_full  = (df_h4["high"] - df_h4["low"]).rolling(14).mean()
-    atr_now   = atr_full.iloc[-1]
-
-    # ── 1. RANGE (Accumulation zone) ──────────────────────────
-    # FIX v3.1 : fenêtres proportionnelles à AMD_LOOKBACK
-    split         = AMD_LOOKBACK * 2 // 3   # = 20 pour lookback=30
-    range_window  = window.iloc[:split]      # historique du range
-    recent_window = window.iloc[split:]      # manipulation + distribution récentes
-
-    range_high = range_window["high"].quantile(0.80)   # 80e percentile des hauts
-    range_low  = range_window["low"].quantile(0.20)    # 20e percentile des bas
-    range_size = range_high - range_low
-
-    if range_size <= 0:
-        return AmdPhase("unknown", "", "LONG", 0, 0, 0)
-
-    # ── 2. COMPRESSION ATR (signature accumulation) ───────────
-    atr_range    = (range_window["high"] - range_window["low"]).mean()
-    atr_recent   = (recent_window["high"] - recent_window["low"]).mean() if len(recent_window) > 0 else atr_range
-    is_compressed = atr_range < atr_now * 0.85   # volatilité du range < ATR actuel
-
-    # ── 3. SWEEP DÉTECTION (Manipulation) ─────────────────────
-    # Un sweep = dernières bougies H4 qui piquent hors du range PUIS reviennent
-    sweep_up   = False  # spike au-dessus du range high → bear manipulation
-    sweep_down = False  # spike en-dessous du range low → bull manipulation
-    sweep_level = None
-
-    for i in range(len(recent_window) - 1, max(len(recent_window) - 8, 0), -1):
-        h = recent_window["high"].iloc[i]
-        l = recent_window["low"].iloc[i]
-        cl = recent_window["close"].iloc[i]
-
-        # Bull Manipulation : spike sous range_low + retour au-dessus
-        if l < range_low - atr_now * 0.1 and cl > range_low:
-            sweep_down  = True
-            sweep_level = range_low
-            break
-        # Bear Manipulation : spike au-dessus range_high + retour en-dessous
-        if h > range_high + atr_now * 0.1 and cl < range_high:
-            sweep_up    = True
-            sweep_level = range_high
-            break
-
-    # ── 4. PHASE et DIRECTION ──────────────────────────────────
-    if not sweep_up and not sweep_down:
-        # Pas encore de manipulation détectée → accumulation en cours
-        phase     = "accumulation"
-        sub_phase = "range_forming"
-        direction = "LONG"  # neutre pour l'instant
-        confidence = 30 if is_compressed else 15
-        reasons = ["📦 Accumulation en cours — range comprimé" if is_compressed
-                   else "📦 Range en formation — accumulation possible"]
-        return AmdPhase(phase, sub_phase, direction, confidence,
-                        range_high, range_low, None, reasons)
-
-    # Manipulation détectée !
-    phase     = "distribution"
-    direction = "LONG" if sweep_down else "SHORT"
-    sub_phase = "bull_manipulation_complete" if sweep_down else "bear_manipulation_complete"
-
-    # ── 5. CONFIANCE (scoring AMD) ────────────────────────────
-    confidence = 0
-    reasons    = []
-
-    # Range bien défini
-    if range_size > atr_now * 2:
-        confidence += 30
-        reasons.append(f"📦 Range AMD bien défini ({round(range_size, 5)})  (+30)")
-
-    # Sweep propre
-    if sweep_up or sweep_down:
-        confidence += 35
-        sweep_type = "Bull (sweep du bas)" if sweep_down else "Bear (sweep du haut)"
-        reasons.append(f"🔥 Manipulation {sweep_type} complète @ {round(sweep_level, 5)}  (+35)")
-
-    # Compression ATR = accumulation authentique
-    if is_compressed:
-        confidence += 20
-        reasons.append("📊 ATR comprimé = accumulation institutionnelle  (+20)")
-
-    # Post-sweep : impulsion (distribution en cours ?)
-    last_close  = df_h4["close"].iloc[-1]
-    last_open   = df_h4["open"].iloc[-1]
-    post_impulse = abs(last_close - last_open) > atr_now * 0.8
-    if post_impulse:
-        confidence += 15
-        reasons.append("⚡ Impulsion post-sweep détectée  (+15)")
-
-    confidence = min(confidence, 100)
-
-    return AmdPhase(
-        phase=phase, sub_phase=sub_phase, direction=direction,
-        confidence=confidence, range_high=range_high, range_low=range_low,
-        sweep_level=sweep_level, reasons=reasons
-    )
-
-
-# ═════════════════════════════════════════════════════════════
-#  ② SEPTUPLE TRACTION H4
-#
-#  N bougies consécutives dans la même direction sur H4
-#  = momentum institutionnel fort = "train en marche"
-#
-#  Les institutions utilisent les retracements dans ce trend
-#  pour rentrer, PAS contre le mouvement.
-#
-#  Setup : Septuple Traction H4 + retracement M15 50–61.8%
-#          + FVG M5 dans la zone → ENTRÉE
-#
-#  Score bonus : +25 si 5+ bougies, +35 si 7+ bougies
-# ═════════════════════════════════════════════════════════════
-
-def detect_septuple_traction(df_h4: pd.DataFrame) -> dict:
-    """
-    Détecte le momentum institutionnel H4 (Septuple Traction).
-
-    Critères STRICTS (institutionnel) :
-    • Corps ≥ 50% de la bougie (peu de mèches = conviction)
-    • Bougies consécutives (pas d'interruption)
-    • Direction uniforme (all bullish ou all bearish)
-    • Momentum croissant (chaque bougie ≥ 80% de la précédente)
-
-    Retourne dict {detected, direction, count, strength, first_open, last_close}
-    """
-    if len(df_h4) < 10:
-        return {"detected": False, "count": 0}
-
-    atr = (df_h4["high"] - df_h4["low"]).rolling(14).mean().iloc[-1]
-
-    # Cherche depuis la dernière bougie clôturée vers l'arrière
-    max_streak      = 0
-    best_direction  = None
-    best_first_open = None
-    best_last_close = None
-
-    # Teste les 20 dernières bougies
-    search_end = min(len(df_h4) - 1, 20)  # dernière bougie en cours = exclue
-
-    for start in range(1, search_end):
-        direction = None
-        count     = 0
-        momentum_ok = True
-        prev_body = None
-
-        for i in range(start, search_end + 1):
-            idx = -(i + 1)  # bougie clôturée (on évite la courante)
-            if abs(idx) > len(df_h4):
-                break
-
-            o  = df_h4["open"].iloc[idx]
-            h  = df_h4["high"].iloc[idx]
-            l  = df_h4["low"].iloc[idx]
-            cl = df_h4["close"].iloc[idx]
-
-            body      = abs(cl - o)
-            rng       = h - l
-            is_bull   = cl > o
-            body_ratio = body / rng if rng > 0 else 0
-
-            # Corps minimum : 50% de la bougie
-            if body_ratio < 0.50:
-                break
-
-            cur_direction = "LONG" if is_bull else "SHORT"
-
-            if direction is None:
-                direction = cur_direction
-            elif cur_direction != direction:
-                break
-
-            # Momentum : corps ≥ 80% du précédent (pas de ralentissement brutal)
-            if prev_body is not None and body < prev_body * 0.60:
-                momentum_ok = False
-                break
-
-            count    += 1
-            prev_body = body
-
-            if count > max_streak:
-                max_streak      = count
-                best_direction  = direction
-                best_first_open = df_h4["open"].iloc[-(start + count)]
-                best_last_close = df_h4["close"].iloc[-(start + 1)]
-
-        if count >= SEPTUPLE_MIN_CANDLES:
-            break
-
-    if max_streak < SEPTUPLE_MIN_CANDLES:
-        return {"detected": False, "count": max_streak}
-
-    # Force du mouvement
-    strength = "EXTREME" if max_streak >= 7 else ("FORT" if max_streak >= 6 else "MODÉRÉ")
-
-    return {
-        "detected"   : True,
-        "direction"  : best_direction,
-        "count"      : max_streak,
-        "strength"   : strength,
-        "first_open" : best_first_open,
-        "last_close" : best_last_close,
-    }
-
-
-# ═════════════════════════════════════════════════════════════
-#  ③ SUPPLY & DEMAND ZONES
-#
-#  Une vraie zone Supply/Demand institutionnelle n'est PAS
-#  simplement un Order Block. Elle est créée par :
-#
-#  DEMAND ZONE = base d'un mouvement haussier impulsif
-#    → Dernière consolidation AVANT la grande bougie haussière
-#    → Prix revient tester cette zone → acheteurs institutionnels
-#
-#  SUPPLY ZONE = base d'un mouvement baissier impulsif
-#    → Dernière consolidation AVANT la grande bougie baissière
-#    → Prix revient tester cette zone → vendeurs institutionnels
-#
-#  Critères de qualité :
-#    • Taille de la bougie impulsive ≥ ATR × 1.5
-#    • La zone n'a pas encore été "mitigée" (prix n'est pas revenu)
-#    • Fresh zone (testée 0 fois) > Tested once > Tested twice (trop faible)
-# ═════════════════════════════════════════════════════════════
-
-def detect_supply_demand_zones(df: pd.DataFrame, direction: str) -> list[SupplyDemandZone]:
-    """
-    Détecte les zones Supply (bearish) et Demand (bullish) institutionnelles.
-
-    Algorithme :
-    1. Cherche les bougies impulsives (corps ≥ ATR × 1.5)
-    2. La zone = corps de la DERNIÈRE PETITE bougie avant l'impulsion
-       (c'est là que les institutions ont placé leurs ordres)
-    3. Vérifie que la zone n'est pas mitigée (prix n'y est pas revenu)
-    4. Retourne les zones actives dans le sens du biais
-    """
-    if len(df) < 20:
-        return []
-
-    atr = (df["high"] - df["low"]).rolling(14).mean()
-    zones: list[SupplyDemandZone] = []
-    zone_type = "supply" if direction == "SHORT" else "demand"
-
-    for i in range(2, len(df) - 2):
-        o  = df["open"].iloc[i]
-        cl = df["close"].iloc[i]
-        body = abs(cl - o)
-        atr_i = atr.iloc[i]
-
-        if atr_i <= 0 or np.isnan(atr_i):
-            continue
-
-        # Bougie impulsive ?
-        if body < atr_i * SD_MIN_IMPULSE_RATIO:
-            continue
-
-        is_bull_impulse = cl > o
-        # Direction correcte ?
-        if direction == "LONG"  and not is_bull_impulse:
-            continue
-        if direction == "SHORT" and is_bull_impulse:
-            continue
-
-        # Zone = corps de la bougie JUSTE AVANT l'impulsion (base institutionnelle)
-        base_idx = i - 1
-        if base_idx < 0:
-            continue
-
-        base_o  = df["open"].iloc[base_idx]
-        base_cl = df["close"].iloc[base_idx]
-        base_h  = df["high"].iloc[base_idx]
-        base_l  = df["low"].iloc[base_idx]
-
-        zone_top    = max(base_o, base_cl, base_h)
-        zone_bottom = min(base_o, base_cl, base_l)
-
-        # La zone ne doit pas être mitigée (prix n'est pas REVENU dedans après l'impulsion)
-        mitigated = False
-        for j in range(i + 1, len(df)):
-            close_j = df["close"].iloc[j]
-            if zone_bottom <= close_j <= zone_top:
-                mitigated = True
-                break
-
-        if not mitigated:
-            zones.append(SupplyDemandZone(
-                zone_type=zone_type,
-                top=zone_top,
-                bottom=zone_bottom,
-                index=base_idx,
-                impulse_size=body / atr_i,   # ratio force de l'impulsion
-                tested=False
-            ))
-
-    # Tri par proximité au prix actuel
-    current_price = df["close"].iloc[-1]
-    zones.sort(key=lambda z: abs(current_price - (z.top + z.bottom) / 2))
-
-    return zones[:5]   # retourne les 5 zones les plus proches
-
-
-def price_in_sd_zone(price: float, zones: list[SupplyDemandZone],
-                     atr: float) -> Optional[SupplyDemandZone]:
-    """
-    Retourne la première zone S/D dans laquelle le prix se trouve.
-    Tolérance : ±15% de l'ATR autour de la zone.
-    """
-    buf = atr * SD_ZONE_BUFFER
-    for zone in zones:
-        if (zone.bottom - buf) <= price <= (zone.top + buf):
-            return zone
-    return None
-
-
-# ═════════════════════════════════════════════════════════════
-#  ④ LIQUIDITY MAP AVANCÉE
-#
-#  Les institutions traquent les liquidités RÉELLES, pas juste
-#  les swing highs/lows. On identifie :
-#
-#  BSL (Buy Side Liquidity)  = stops des SHORTS au-dessus des highs
-#  SSL (Sell Side Liquidity) = stops des LONGS en-dessous des lows
-#
-#  Equal Highs (EQH) = double top = pool de liquidité visé par les institutions
-#  Equal Lows  (EQL) = double bottom = idem en sens inverse
-#
-#  Liquidity Void = zone de déséquilibre (FVG = liquidity void)
-#
-#  Intraday Liquidity = high/low du jour précédent (PDH/PDL)
-#                       = première cible intraday des institutions
-# ═════════════════════════════════════════════════════════════
-
-@dataclass
-class LiquidityMap:
-    bsl_levels:  list[float]   # Buy Side Liquidity (above highs)
-    ssl_levels:  list[float]   # Sell Side Liquidity (below lows)
-    eqh_levels:  list[float]   # Equal Highs
-    eql_levels:  list[float]   # Equal Lows
-    pdh:         Optional[float]  # Previous Day High
-    pdl:         Optional[float]  # Previous Day Low
-    swept_bsl:   bool          # BSL récemment sweepée (signal SHORT)
-    swept_ssl:   bool          # SSL récemment sweepée (signal LONG)
-    nearest_bsl: Optional[float]
-    nearest_ssl: Optional[float]
-
-
-def build_liquidity_map(df_h4: pd.DataFrame, df_ltf: pd.DataFrame) -> LiquidityMap:
-    """
-    Construit la carte complète de liquidité sur H4 + LTF.
-
-    BSL/SSL : 5 derniers swing H/L H4 significatifs
-    EQH/EQL : niveaux proches à ±0.02% (institutionnellement = "même niveau")
-    PDH/PDL  : high/low de la session précédente H4 (4 bougies = 1 jour environ)
-    Swept    : spike + retour dans la dernière bougie LTF
-    """
-    # ── SWING HIGHS / LOWS H4 ─────────────────────────────────
-    shs = swing_highs(df_h4)
-    sls = swing_lows(df_h4)
-
-    bsl_levels = [v for _, v in shs[-8:]]
-    ssl_levels = [v for _, v in sls[-8:]]
-
-    # ── EQUAL HIGHS / LOWS (EQH/EQL) ──────────────────────────
-    # Deux niveaux sont "égaux" si leur écart est < 0.025%
-    eqh_levels = []
-    eql_levels = []
-    tolerance  = 0.00025   # 2.5 pips sur forex
-
-    for i, h1 in enumerate(bsl_levels):
-        for h2 in bsl_levels[i+1:]:
-            if abs(h1 - h2) / max(h1, 0.0001) < tolerance:
-                eqh_levels.append((h1 + h2) / 2)
-
-    for i, l1 in enumerate(ssl_levels):
-        for l2 in ssl_levels[i+1:]:
-            if abs(l1 - l2) / max(l1, 0.0001) < tolerance:
-                eql_levels.append((l1 + l2) / 2)
-
-    # ── PDH / PDL (Previous Day High/Low) ─────────────────────
-    # H4 : 6 bougies ≈ 24h. On prend les 6 bougies précédentes.
-    pdh, pdl = None, None
-    if len(df_h4) >= 12:
-        pd_window = df_h4.iloc[-12:-6]
-        pdh = pd_window["high"].max()
-        pdl = pd_window["low"].min()
-
-    # ── SWEPT BSL/SSL ? ───────────────────────────────────────
-    price    = df_ltf["close"].iloc[-1]
-    last_h   = df_ltf["high"].iloc[-2]   # dernière bougie clôturée
-    last_l   = df_ltf["low"].iloc[-2]
-    last_c   = df_ltf["close"].iloc[-2]
-    atr      = (df_ltf["high"] - df_ltf["low"]).rolling(14).mean().iloc[-1]
-
-    swept_bsl = False
-    swept_ssl = False
-
-    for level in bsl_levels[-5:]:
-        if last_h > level + atr * 0.05 and last_c < level:
-            swept_bsl = True
-            break
-
-    for level in ssl_levels[-5:]:
-        if last_l < level - atr * 0.05 and last_c > level:
-            swept_ssl = True
-            break
-
-    # ── NEAREST BSL/SSL ───────────────────────────────────────
-    above_bsl = [l for l in bsl_levels if l > price]
-    below_ssl = [l for l in ssl_levels if l < price]
-    nearest_bsl = min(above_bsl) if above_bsl else None
-    nearest_ssl = max(below_ssl) if below_ssl else None
-
-    return LiquidityMap(
-        bsl_levels=bsl_levels, ssl_levels=ssl_levels,
-        eqh_levels=eqh_levels, eql_levels=eql_levels,
-        pdh=pdh, pdl=pdl,
-        swept_bsl=swept_bsl, swept_ssl=swept_ssl,
-        nearest_bsl=nearest_bsl, nearest_ssl=nearest_ssl,
-    )
-
-
-# ═════════════════════════════════════════════════════════════
-#  ⑤ BOUGIES D'ENTRÉE INSTITUTIONNELLES
-#
-#  Les grandes institutions n'entrent PAS sur n'importe quelle bougie.
-#  Les setups d'entrée qui donnent le meilleur timing :
-#
-#  1. DISPLACEMENT CANDLE
-#     Corps ≥ ATR × 2 + clôture dans le sens du trade
-#     = bougie de "déplacement institutionnel" qui efface le désordre
-#
-#  2. ORDER FLOW SHIFT (OFS)
-#     Série de 3 bougies : bear → bull → close above bear high (LONG)
-#     = renversement micro-structure = premier signal d'intent
-#
-#  3. IMBALANCE CANDLE (FVG micro)
-#     Gap entre bougie[i-2].low et bougie[i].high > 0 (bullish)
-#     = déséquilibre = les institutions ont acheté agressivement
-#
-#  4. REJECTION WICK
-#     Mèche ≥ corps × 3 dans le sens opposé = rejet institutionnel
-#     Seule une mèche AVEC volume = authentique (pas de fakeout)
-#
-#  5. ENGULFING INSTITUTIONNEL
-#     Close > open + close > prev_high (bullish engulfing fort)
-#     = absorbe TOUT le mouvement précédent = conviction totale
-# ═════════════════════════════════════════════════════════════
-
-@dataclass
-class EntryCandle:
-    candle_type: str    # "displacement" | "ofs" | "imbalance" | "rejection" | "engulfing"
-    quality:     str    # "premium" | "standard"
-    score_bonus: int
-    index:       int
-
-
-def detect_institutional_entry_candles(df: pd.DataFrame,
-                                        direction: str) -> list[EntryCandle]:
-    """
-    Détecte les bougies d'entrée institutionnelles sur les 5 dernières bougies
-    CLÔTURÉES (on évite la bougie courante = données incomplètes).
-
-    Retourne toutes les bougies valides détectées (peut en avoir plusieurs).
-    """
-    if len(df) < 6:
-        return []
-
-    atr     = (df["high"] - df["low"]).rolling(14).mean().iloc[-1]
-    entries = []
-
-    for i in range(-2, -6, -1):   # [-2, -3, -4, -5] = 4 dernières clôturées
-        if abs(i) > len(df) - 1:
-            break
-
-        o   = df["open"].iloc[i]
-        h   = df["high"].iloc[i]
-        l   = df["low"].iloc[i]
-        cl  = df["close"].iloc[i]
-        body        = abs(cl - o)
-        full_range  = h - l
-        upper_wick  = h - max(o, cl)
-        lower_wick  = min(o, cl) - l
-        is_bull     = cl > o
-
-        # ── 1. DISPLACEMENT ───────────────────────────────────
-        if body >= atr * 1.8:
-            if (direction == "LONG" and is_bull) or (direction == "SHORT" and not is_bull):
-                quality = "premium" if body >= atr * 2.5 else "standard"
-                entries.append(EntryCandle("displacement", quality, 20 if quality == "premium" else 15, i))
-                continue
-
-        # ── 2. ORDER FLOW SHIFT ───────────────────────────────
-        if abs(i) < len(df) - 2:
-            prev_o  = df["open"].iloc[i - 1]
-            prev_cl = df["close"].iloc[i - 1]
-            if direction == "LONG":
-                # Bear → Bull → close above prev_high
-                prev_is_bear = prev_cl < prev_o
-                if prev_is_bear and is_bull and cl > df["high"].iloc[i - 1]:
-                    entries.append(EntryCandle("ofs", "premium", 18, i))
-                    continue
-            elif direction == "SHORT":
-                prev_is_bull = prev_cl > prev_o
-                if prev_is_bull and not is_bull and cl < df["low"].iloc[i - 1]:
-                    entries.append(EntryCandle("ofs", "premium", 18, i))
-                    continue
-
-        # ── 3. IMBALANCE (Micro-FVG) ──────────────────────────
-        if abs(i) >= 2 and abs(i) < len(df) - 2:
-            if direction == "LONG":
-                prev2_low = df["low"].iloc[i - 2]
-                if h > prev2_low and (h - prev2_low) / max(h, 0.0001) > 0.0001:
-                    entries.append(EntryCandle("imbalance", "standard", 12, i))
-                    continue
-            elif direction == "SHORT":
-                prev2_high = df["high"].iloc[i - 2]
-                if l < prev2_high and (prev2_high - l) / max(l, 0.0001) > 0.0001:
-                    entries.append(EntryCandle("imbalance", "standard", 12, i))
-                    continue
-
-        # ── 4. REJECTION WICK ─────────────────────────────────
-        if body > 0:
-            if direction == "LONG" and lower_wick >= body * 2.5 and is_bull:
-                quality = "premium" if lower_wick >= body * 4 else "standard"
-                entries.append(EntryCandle("rejection", quality, 15 if quality == "premium" else 10, i))
-                continue
-            elif direction == "SHORT" and upper_wick >= body * 2.5 and not is_bull:
-                quality = "premium" if upper_wick >= body * 4 else "standard"
-                entries.append(EntryCandle("rejection", quality, 15 if quality == "premium" else 10, i))
-                continue
-
-        # ── 5. ENGULFING INSTITUTIONNEL ───────────────────────
-        if abs(i) < len(df) - 1:
-            prev_h = df["high"].iloc[i - 1]
-            prev_l = df["low"].iloc[i - 1]
-            if direction == "LONG" and is_bull and cl > prev_h:
-                entries.append(EntryCandle("engulfing", "premium", 20, i))
-            elif direction == "SHORT" and not is_bull and cl < prev_l:
-                entries.append(EntryCandle("engulfing", "premium", 20, i))
-
-    return entries
-
-
-# ═════════════════════════════════════════════════════════════
-#  DÉTECTEURS CLASSIQUES (BOS, FVG, OB, Breaker, Liquidité)
-#  — Conservés et améliorés depuis v2
-# ═════════════════════════════════════════════════════════════
-
-def htf_bias(df: pd.DataFrame) -> str:
-    """
-    Biais H4 via scoring multi-facteurs (plus robuste que EMA seul).
-
-    Facteurs BULLISH (+1 chacun) :
-      • Close > EMA8
-      • Close > EMA21
-      • Dernier HH (high[-1] > max des 3 bougies précédentes)
-      • Dernier HL (low[-1] > low[-5])
-      • 3+ closes haussiers sur les 5 dernières bougies
-
-    Facteurs BEARISH (-1 chacun) — inverse.
-
-    Score ≥ +2  → BULLISH
-    Score ≤ -2  → BEARISH
-    Sinon       → NEUTRAL (marché latéral, on attend)
-    """
-    if len(df) < 25:
-        return "NEUTRAL"
-
-    closes = df["close"].values
-    highs  = df["high"].values
-    lows   = df["low"].values
-
-    ema8  = np.convolve(closes, np.ones(8)  / 8,  mode="valid")
-    ema21 = np.convolve(closes, np.ones(21) / 21, mode="valid")
-
-    c_last  = closes[-1]
-    score   = 0
-
-    # EMA
-    if c_last > ema8[-1]:  score += 1
-    else:                  score -= 1
-    if c_last > ema21[-1]: score += 1
-    else:                  score -= 1
-
-    # Higher High / Lower Low
-    if highs[-1] > highs[-4:-1].max():  score += 1   # HH
-    else:                               score -= 1   # LH
-    if lows[-1] > lows[-6:-1].min():    score += 1   # HL
-    else:                               score -= 1   # LL
-
-    # Momentum : nombre de bougies haussières sur les 5 dernières
-    bull_candles = sum(closes[-5:] > closes[-6:-1])
-    if bull_candles >= 3:   score += 1
-    elif bull_candles <= 2: score -= 1
-
-    if   score >=  2: return "BULLISH"
-    elif score <= -2: return "BEARISH"
-    return "NEUTRAL"
-
-
-def detect_bos(df: pd.DataFrame) -> list[dict]:
-    bos_list = []
-    lookback = 10
-    for i in range(lookback, len(df)):
-        window     = df.iloc[i - lookback:i]
-        close      = df["close"].iloc[i]
-        swing_low  = window["low"].min()
-        swing_high = window["high"].max()
-        if close < swing_low:
-            bos_list.append({"index": i, "type": "bearish", "level": swing_low})
-        elif close > swing_high:
-            bos_list.append({"index": i, "type": "bullish", "level": swing_high})
-    return bos_list
-
-
-def detect_fvg(df: pd.DataFrame) -> list[FVG]:
-    fvgs = []
-    for i in range(2, len(df)):
-        mid_price = df["close"].iloc[i]
-        top    = df["high"].iloc[i - 2]
-        bottom = df["low"].iloc[i]
-        if bottom > top and (bottom - top) / mid_price > FVG_MIN_RATIO:
-            fvgs.append(FVG("bearish", bottom, top, i))
-        top    = df["high"].iloc[i]
-        bottom = df["low"].iloc[i - 2]
-        if top > bottom and (top - bottom) / mid_price > FVG_MIN_RATIO:
-            fvgs.append(FVG("bullish", top, bottom, i))
-    return fvgs
-
-
-def detect_order_blocks(df: pd.DataFrame, bos_list: list[dict]) -> list[OrderBlock]:
-    obs = []
-    for bos in bos_list[-5:]:
-        idx = bos["index"]
-        if idx < OB_LOOKBACK:
-            continue
-        if bos["type"] == "bearish":
-            for j in range(idx - 1, idx - OB_LOOKBACK - 1, -1):
-                if df["close"].iloc[j] > df["open"].iloc[j]:
-                    obs.append(OrderBlock("bearish", df["high"].iloc[j], df["low"].iloc[j], j))
-                    break
-        elif bos["type"] == "bullish":
-            for j in range(idx - 1, idx - OB_LOOKBACK - 1, -1):
-                if df["close"].iloc[j] < df["open"].iloc[j]:
-                    obs.append(OrderBlock("bullish", df["high"].iloc[j], df["low"].iloc[j], j))
-                    break
-    return obs
-
-
-def detect_breaker_blocks(df: pd.DataFrame, bos_list: list[dict]) -> list[dict]:
-    """Breaker Block = OB mitiqué qui flippe de direction (amélioré v3)."""
-    breakers = []
-    for bos in bos_list[-6:]:
-        idx = bos["index"]
-        if idx < OB_LOOKBACK + 2 or idx + 3 >= len(df):
-            continue
-        for j in range(idx - 1, max(idx - OB_LOOKBACK - 1, 0), -1):
-            is_bull = df["close"].iloc[j] > df["open"].iloc[j]
-            ob_hi   = df["high"].iloc[j]
-            ob_lo   = df["low"].iloc[j]
-            if bos["type"] == "bearish" and is_bull:
-                post_high = df["high"].iloc[idx: min(idx + 15, len(df))].max()
-                if ob_lo <= post_high <= ob_hi * 1.001:
-                    breakers.append({"direction": "bearish", "top": ob_hi,
-                                      "bottom": ob_lo, "index": j})
-                    break
-            elif bos["type"] == "bullish" and not is_bull:
-                post_low = df["low"].iloc[idx: min(idx + 15, len(df))].min()
-                if ob_lo * 0.999 <= post_low <= ob_hi:
-                    breakers.append({"direction": "bullish", "top": ob_hi,
-                                      "bottom": ob_lo, "index": j})
-                    break
-    return breakers
-
-
-# ═════════════════════════════════════════════════════════════
-#  ORDER FLOW SHIFT STRUCTUREL (M15 / H4)
-#
-#  Différent du micro-OFS sur bougie unique.
-#  Ici on détecte un CHANGEMENT D'INTENT institutionnel sur M15 :
-#
-#  LONG  : série de HL montants (higher lows) + BOS haussier récent
-#           = les institutions accumulent → demande structurelle
-#
-#  SHORT : série de LH descendants (lower highs) + BOS baissier récent
-#           = les institutions distribuent → pression vendeuse
-#
-#  Bonus : +12 si OFS structurel aligné avec le biais H4
-# ═════════════════════════════════════════════════════════════
-
-def detect_order_flow_structural(df: pd.DataFrame, direction: str,
-                                  bos_list: list[dict]) -> dict:
-    """
-    Détecte un Order Flow Shift structurel sur M15 ou H4.
-
-    Critères LONG :
-      • Au moins 3 Higher Lows consécutifs sur les 20 dernières bougies
-      • BOS haussier récent (dans les 10 dernières bougies)
-      • Pas de cassure baissière après le dernier HL
-
-    Critères SHORT :
-      • Au moins 3 Lower Highs consécutifs sur les 20 dernières bougies
-      • BOS baissier récent (dans les 10 dernières bougies)
-      • Pas de cassure haussière après le dernier LH
-
-    Retourne dict {detected, hl_count/lh_count, bos_aligned, score_bonus, reason}
-    """
-    empty = {"detected": False, "count": 0, "bos_aligned": False,
-             "score_bonus": 0, "reason": ""}
-
-    if len(df) < 20:
-        return empty
-
-    window = df.iloc[-25:]
-
-    # ── Détecter Higher Lows ou Lower Highs ────────────────────
-    if direction == "LONG":
-        # Higher Lows : chaque swing low > swing low précédent
-        lows = []
-        for i in range(1, len(window) - 1):
-            if window["low"].iloc[i] < window["low"].iloc[i-1] and \
-               window["low"].iloc[i] < window["low"].iloc[i+1]:
-                lows.append(window["low"].iloc[i])
-
-        # Compte les HL consécutifs depuis la fin
-        hl_count = 0
-        for k in range(len(lows) - 1, 0, -1):
-            if lows[k] > lows[k-1]:
-                hl_count += 1
-            else:
-                break
-
-        if hl_count < 2:
-            return empty
-
-        # BOS haussier récent aligné
-        bos_aligned = any(
-            b["type"] == "bullish"
-            for b in bos_list[-10:]
-        )
-
-        score_bonus = 0
-        if hl_count >= 3:
-            score_bonus = 12
-        elif hl_count >= 2:
-            score_bonus = 8
-
-        if bos_aligned:
-            score_bonus += 3
-
-        reason = (
-            f"📈 Order Flow Shift LONG — {hl_count} Higher Lows structurels"
-            f"{'  + BOS haussier aligné' if bos_aligned else ''}  (+{score_bonus})"
-        )
-        return {"detected": True, "count": hl_count, "bos_aligned": bos_aligned,
-                "score_bonus": score_bonus, "reason": reason}
-
-    else:  # SHORT
-        # Lower Highs : chaque swing high < swing high précédent
-        highs = []
-        for i in range(1, len(window) - 1):
-            if window["high"].iloc[i] > window["high"].iloc[i-1] and \
-               window["high"].iloc[i] > window["high"].iloc[i+1]:
-                highs.append(window["high"].iloc[i])
-
-        lh_count = 0
-        for k in range(len(highs) - 1, 0, -1):
-            if highs[k] < highs[k-1]:
-                lh_count += 1
-            else:
-                break
-
-        if lh_count < 2:
-            return empty
-
-        bos_aligned = any(
-            b["type"] == "bearish"
-            for b in bos_list[-10:]
-        )
-
-        score_bonus = 0
-        if lh_count >= 3:
-            score_bonus = 12
-        elif lh_count >= 2:
-            score_bonus = 8
-
-        if bos_aligned:
-            score_bonus += 3
-
-        reason = (
-            f"📉 Order Flow Shift SHORT — {lh_count} Lower Highs structurels"
-            f"{'  + BOS baissier aligné' if bos_aligned else ''}  (+{score_bonus})"
-        )
-        return {"detected": True, "count": lh_count, "bos_aligned": bos_aligned,
-                "score_bonus": score_bonus, "reason": reason}
-
-
-def detect_breaker_block_htf(df_htf: pd.DataFrame, df_mtf: pd.DataFrame,
-                              direction: str) -> dict:
-    """
-    Breaker Block MULTI-TIMEFRAME (H4 + M15).
-
-    Un Breaker Block H4 est le setup le plus puissant :
-    • OB haussier H4 cassé vers le bas (BOS bearish H4) → devient Supply (Breaker bearish)
-    • Prix revient tester ce niveau sur M15 → entrée SHORT de haute conviction
-    • Inverse pour LONG (OB baissier H4 cassé → Demand Breaker)
-
-    Score bonus :
-      +10 si Breaker M15 seul
-      +15 si Breaker H4 (niveau institutionnel)
-      +18 si Breaker H4 + prix revient tester sur M15
-
-    Retourne dict {detected, level_top, level_bottom, tf, score_bonus, reason}
-    """
-    empty = {"detected": False, "level_top": None, "level_bottom": None,
-             "tf": None, "score_bonus": 0, "reason": ""}
-
-    # ── Breaker Block H4 ──────────────────────────────────────
-    bos_htf = detect_bos(df_htf)
-    bkr_htf = detect_breaker_blocks(df_htf, bos_htf)
-
-    htf_bias_dir = "bearish" if direction == "SHORT" else "bullish"
-    htf_breakers = [b for b in bkr_htf if b["direction"] == htf_bias_dir]
-
-    if htf_breakers:
-        bb = htf_breakers[-1]  # le plus récent
-        price_now = df_mtf["close"].iloc[-1]
-        atr_mtf   = (df_mtf["high"] - df_mtf["low"]).rolling(14).mean().iloc[-1]
-
-        # Le prix reteste-t-il le Breaker H4 sur M15 ?
-        in_bb = (bb["bottom"] - atr_mtf * 0.2) <= price_now <= (bb["top"] + atr_mtf * 0.2)
-
-        if in_bb:
-            reason = (
-                f"🔥 Breaker Block H4 retesté sur M15 @ "
-                f"{round((bb['top']+bb['bottom'])/2, 5)}  (+18)"
-            )
-            return {"detected": True, "level_top": bb["top"], "level_bottom": bb["bottom"],
-                    "tf": "H4+M15", "score_bonus": 18, "reason": reason}
-        else:
-            reason = (
-                f"🔥 Breaker Block H4 actif @ "
-                f"{round((bb['top']+bb['bottom'])/2, 5)}  (+15)"
-            )
-            return {"detected": True, "level_top": bb["top"], "level_bottom": bb["bottom"],
-                    "tf": "H4", "score_bonus": 15, "reason": reason}
-
-    return empty
-
-
-def detect_h4_balance_zone(df_h4: pd.DataFrame, direction: str,
-                            lookback: int = 12) -> dict:
-    """
-    Détecte une zone de BALANCE / ÉQUILIBRE H4 (range de consolidation
-    institutionnel) — alternative au Breaker Block H4 et à l'OB H4.
-
-    Une "balance" = série de bougies H4 dont les hauts/bas restent
-    compressés dans une bande étroite (≤ 1.6×ATR H4), signe d'accumulation
-    ou de distribution avant un mouvement directionnel (AMD).
-
-    Score bonus :
-      +15 si le prix est actuellement DANS la balance (retest de l'équilibre)
-      +10 si le prix vient tout juste de sortir de la balance dans le
-          sens attendu (cassure directionnelle récente)
-
-    Retourne dict {detected, top, bottom, mid, score_bonus, reason}
-    """
-    empty = {"detected": False, "top": None, "bottom": None, "mid": None,
-              "score_bonus": 0, "reason": ""}
-
-    if len(df_h4) < lookback + 5:
-        return empty
-
-    atr_h4 = (df_h4["high"] - df_h4["low"]).rolling(14).mean().iloc[-1]
-    if pd.isna(atr_h4) or atr_h4 <= 0:
-        return empty
-
-    # Fenêtre de balance : on exclut les 3 dernières bougies (mouvement
-    # récent éventuel de sortie de range)
-    window = df_h4.iloc[-(lookback + 3):-3]
-    if len(window) < lookback:
-        return empty
-
-    zone_top    = window["high"].max()
-    zone_bottom = window["low"].min()
-    zone_height = zone_top - zone_bottom
-
-    # Une vraie balance = range compressé (pas une tendance étendue)
-    if zone_height <= 0 or zone_height > atr_h4 * 1.6:
-        return empty
-
-    price_now = df_h4["close"].iloc[-1]
-    zone_mid  = (zone_top + zone_bottom) / 2
-    tol       = atr_h4 * 0.25
-
-    in_zone = (zone_bottom - tol) <= price_now <= (zone_top + tol)
-
-    # Cassure directionnelle récente (3 dernières bougies) hors de la balance
-    recent = df_h4.iloc[-3:]
-    if direction == "LONG":
-        broke_out = recent["close"].iloc[-1] > zone_top
-    else:
-        broke_out = recent["close"].iloc[-1] < zone_bottom
-
-    if in_zone:
-        reason = (f"⚖️ Balance H4 [{round(zone_bottom, 5)}–{round(zone_top, 5)}] "
-                   f"— prix en zone d'équilibre  (+15)")
-        return {"detected": True, "top": zone_top, "bottom": zone_bottom,
-                 "mid": zone_mid, "score_bonus": 15, "reason": reason}
-    elif broke_out:
-        reason = (f"⚖️ Balance H4 [{round(zone_bottom, 5)}–{round(zone_top, 5)}] "
-                   f"— cassure directionnelle {direction}  (+10)")
-        return {"detected": True, "top": zone_top, "bottom": zone_bottom,
-                 "mid": zone_mid, "score_bonus": 10, "reason": reason}
-
-    return empty
-
-
-# ═════════════════════════════════════════════════════════════
-#  CHART PATTERNS DETECTION  (Images 1 & 2)
-#
-#  Bullish Continuation  : Ascending Triangle · Bull Flag · Bull Wedge · Sym Triangle
-#  Bearish Continuation  : Descending Triangle · Bear Flag · Bear Wedge · Sym Triangle
-#  Bullish Reversal      : Double Bottom · Triple Bottom · Inverted H&S · Falling Wedge
-#  Bearish Reversal      : Double Top   · Triple Top    · H&S           · Rising Wedge
-#
-#  OB Retest (3 types)   : Continuation Pattern · Consolidation · BSL/PDL Retest
-# ═════════════════════════════════════════════════════════════
-
-@dataclass
-class PatternResult:
-    detected:      bool
-    pattern_name:  str
-    direction:     str   # "LONG" | "SHORT"
-    score_bonus:   int
-    description:   str
-
-
-@dataclass
-class OBRetestResult:
-    detected:     bool
-    retest_type:  str    # "continuation" | "consolidation" | "bsl_retest"
-    direction:    str
-    score_bonus:  int
-    description:  str
-
-
-def _swing_points(df: pd.DataFrame, col_high: bool = True) -> list[tuple[int, float]]:
-    """Retourne les swing highs ou lows (index, valeur)."""
-    result = []
-    col = "high" if col_high else "low"
-    for i in range(1, len(df) - 1):
-        v  = df[col].iloc[i]
-        v1 = df[col].iloc[i - 1]
-        v2 = df[col].iloc[i + 1]
-        if col_high and v > v1 and v > v2:
-            result.append((i, v))
-        elif not col_high and v < v1 and v < v2:
-            result.append((i, v))
-    return result
-
-
-def detect_double_top_bottom(df: pd.DataFrame, direction: str) -> PatternResult:
-    """Double Top (SHORT) / Double Bottom (LONG)."""
-    empty = PatternResult(False, "", direction, 0, "")
-    if len(df) < 30:
-        return empty
-    window = df.iloc[-50:]
-    atr = (window["high"] - window["low"]).rolling(14).mean().iloc[-1]
-    tol = atr * 1.5
-    if direction == "SHORT":
-        pts = _swing_points(window, col_high=True)
-        for i in range(len(pts) - 1, 0, -1):
-            idx1, h1 = pts[i]
-            for j in range(i - 1, max(i - 8, 0), -1):
-                idx2, h2 = pts[j]
-                if abs(h1 - h2) < tol and (idx1 - idx2) >= 5:
-                    neckline = window["low"].iloc[idx2:idx1].min()
-                    if window["close"].iloc[-1] < neckline + atr * 0.5:
-                        return PatternResult(True, "Double Top", "SHORT", 18,
-                            f"Double Top @ {round((h1+h2)/2,5)} | Neckline {round(neckline,5)}")
-    else:
-        pts = _swing_points(window, col_high=False)
-        for i in range(len(pts) - 1, 0, -1):
-            idx1, l1 = pts[i]
-            for j in range(i - 1, max(i - 8, 0), -1):
-                idx2, l2 = pts[j]
-                if abs(l1 - l2) < tol and (idx1 - idx2) >= 5:
-                    neckline = window["high"].iloc[idx2:idx1].max()
-                    if window["close"].iloc[-1] > neckline - atr * 0.5:
-                        return PatternResult(True, "Double Bottom", "LONG", 18,
-                            f"Double Bottom @ {round((l1+l2)/2,5)} | Neckline {round(neckline,5)}")
-    return empty
-
-
-def detect_triple_top_bottom(df: pd.DataFrame, direction: str) -> PatternResult:
-    """Triple Top (SHORT) / Triple Bottom (LONG)."""
-    empty = PatternResult(False, "", direction, 0, "")
-    if len(df) < 40:
-        return empty
-    window = df.iloc[-60:]
-    atr = (window["high"] - window["low"]).rolling(14).mean().iloc[-1]
-    tol = atr * 1.5
-    if direction == "SHORT":
-        pts = _swing_points(window, col_high=True)
-        for i in range(len(pts) - 1, 1, -1):
-            idx1, h1 = pts[i]
-            for j in range(i - 1, max(i - 6, 1), -1):
-                idx2, h2 = pts[j]
-                if abs(h1 - h2) > tol:
-                    continue
-                for k in range(j - 1, max(j - 6, 0), -1):
-                    idx3, h3 = pts[k]
-                    if abs(h1 - h3) < tol and (idx2 - idx3) >= 4:
-                        neckline = window["low"].iloc[idx3:idx1].min()
-                        if window["close"].iloc[-1] < neckline + atr * 0.5:
-                            return PatternResult(True, "Triple Top", "SHORT", 22,
-                                f"Triple Top @ {round((h1+h2+h3)/3,5)}")
-    else:
-        pts = _swing_points(window, col_high=False)
-        for i in range(len(pts) - 1, 1, -1):
-            idx1, l1 = pts[i]
-            for j in range(i - 1, max(i - 6, 1), -1):
-                idx2, l2 = pts[j]
-                if abs(l1 - l2) > tol:
-                    continue
-                for k in range(j - 1, max(j - 6, 0), -1):
-                    idx3, l3 = pts[k]
-                    if abs(l1 - l3) < tol and (idx2 - idx3) >= 4:
-                        neckline = window["high"].iloc[idx3:idx1].max()
-                        if window["close"].iloc[-1] > neckline - atr * 0.5:
-                            return PatternResult(True, "Triple Bottom", "LONG", 22,
-                                f"Triple Bottom @ {round((l1+l2+l3)/3,5)}")
-    return empty
-
-
-def detect_head_shoulders(df: pd.DataFrame, direction: str) -> PatternResult:
-    """
-    Épaule-Tête-Épaule M15 — VERSION AMÉLIORÉE (priorité maximale).
-
-    Critères stricts :
-      SHORT : 3 swing highs (L épaule < Tête > R épaule), épaules symétriques ±30%,
-              neckline cassée (close < neckline), retest neckline en cours = entrée.
-      LONG  : Inverse H&S — 3 swing lows symétriques, neckline cassée à la hausse.
-
-    Amélioration vs version originale :
-      • Fenêtre élargie à 80 bougies M15 (= 20h, capture patterns complets)
-      • Symétrie épaules validée (hauteurs ± 30%)
-      • Retest neckline détecté (= entrée optimale = prix revient sur neckline après cassure)
-      • Score : 30 pts (standard) → 38 pts (avec retest neckline) → 42 pts (symétrie parfaite)
-      • Neckline inclinée acceptée (max 15° de pente)
-    """
-    empty = PatternResult(False, "", direction, 0, "")
-    if len(df) < 40:
-        return empty
-
-    window = df.iloc[-80:]   # 80 bougies M15 = ~20h
-    atr    = (window["high"] - window["low"]).rolling(14).mean().iloc[-1]
-    if pd.isna(atr) or atr == 0:
-        return empty
-
-    price_now = window["close"].iloc[-1]
-
-    if direction == "SHORT":
-        pts = _swing_points(window, col_high=True)
-        if len(pts) < 3:
-            return empty
-        for i in range(len(pts) - 1, 1, -1):
-            idx_r, h_r = pts[i]
-            idx_h, h_h = pts[i - 1]
-            idx_l, h_l = pts[i - 2]
-
-            # Structure ETE : tête plus haute que les deux épaules
-            if not (h_h > h_r and h_h > h_l):
-                continue
-            # Espacement minimal entre les points (au moins 4 bougies chacun)
-            if not ((idx_h - idx_l) >= 4 and (idx_r - idx_h) >= 4):
-                continue
-            # Symétrie épaules : écart max 30% de la hauteur de tête
-            shoulder_sym = abs(h_r - h_l) / (h_h - min(h_l, h_r) + 1e-10)
-            if shoulder_sym > 0.30:
-                continue
-
-            # Neckline : ligne reliant les creux entre épaules et tête
-            neckline_left  = window["low"].iloc[idx_l:idx_h].min()
-            neckline_right = window["low"].iloc[idx_h:idx_r].min()
-            neckline       = (neckline_left + neckline_right) / 2
-
-            # Cassure de la neckline (close en dessous)
-            neckline_broken = price_now < neckline + atr * 0.3
-
-            if not neckline_broken:
-                continue
-
-            # Retest neckline = entrée optimale (prix revient sur neckline après cassure)
-            retest = (neckline - atr * 0.5) <= price_now <= (neckline + atr * 0.8)
-
-            # Score selon qualité
-            if retest and shoulder_sym < 0.15:
-                score = 42   # Symétrie parfaite + retest = setup premium
-                desc  = f"⭐ ETE M15 PREMIUM — retest neckline @ {round(neckline,5)}"
-            elif retest:
-                score = 38   # Retest neckline = entrée optimale
-                desc  = f"🎯 ETE M15 — retest neckline @ {round(neckline,5)}"
-            else:
-                score = 30   # Cassure sans retest
-                desc  = f"📐 ETE M15 — neckline cassée @ {round(neckline,5)}"
-
-            desc += f" | tête={round(h_h,5)} épaules≈{round((h_l+h_r)/2,5)}"
-            return PatternResult(True, "Épaule-Tête-Épaule 🏔️", "SHORT", score, desc)
-
-    else:  # LONG — ETE inversé
-        pts = _swing_points(window, col_high=False)
-        if len(pts) < 3:
-            return empty
-        for i in range(len(pts) - 1, 1, -1):
-            idx_r, l_r = pts[i]
-            idx_h, l_h = pts[i - 1]
-            idx_l, l_l = pts[i - 2]
-
-            if not (l_h < l_r and l_h < l_l):
-                continue
-            if not ((idx_h - idx_l) >= 4 and (idx_r - idx_h) >= 4):
-                continue
-
-            shoulder_sym = abs(l_r - l_l) / (min(l_l, l_r) - l_h + 1e-10)
-            if shoulder_sym > 0.30:
-                continue
-
-            neckline_left  = window["high"].iloc[idx_l:idx_h].max()
-            neckline_right = window["high"].iloc[idx_h:idx_r].max()
-            neckline       = (neckline_left + neckline_right) / 2
-
-            neckline_broken = price_now > neckline - atr * 0.3
-            if not neckline_broken:
-                continue
-
-            retest = (neckline - atr * 0.8) <= price_now <= (neckline + atr * 0.5)
-
-            if retest and shoulder_sym < 0.15:
-                score = 42
-                desc  = f"⭐ ETE Inversé M15 PREMIUM — retest neckline @ {round(neckline,5)}"
-            elif retest:
-                score = 38
-                desc  = f"🎯 ETE Inversé M15 — retest neckline @ {round(neckline,5)}"
-            else:
-                score = 30
-                desc  = f"📐 ETE Inversé M15 — neckline cassée @ {round(neckline,5)}"
-
-            desc += f" | tête={round(l_h,5)} épaules≈{round((l_l+l_r)/2,5)}"
-            return PatternResult(True, "ETE Inversé 🏔️", "LONG", score, desc)
-
-    return empty
-
-
-def detect_wedge(df: pd.DataFrame, direction: str) -> PatternResult:
-    """Falling Wedge (LONG reversal) / Rising Wedge (SHORT reversal)."""
-    empty = PatternResult(False, "", direction, 0, "")
-    if len(df) < 20:
-        return empty
-    window = df.iloc[-30:]
-    atr    = (window["high"] - window["low"]).rolling(14).mean().iloc[-1]
-    x      = np.arange(len(window))
-    slope_h = np.polyfit(x, window["high"].values, 1)[0]
-    slope_l = np.polyfit(x, window["low"].values,  1)[0]
-    # Falling Wedge : deux pentes négatives, lows moins négatifs que highs → convergent vers le bas
-    if slope_h < -atr * 0.004 and slope_l < -atr * 0.004 and slope_l > slope_h and direction == "LONG":
-        return PatternResult(True, "Falling Wedge 📐", "LONG", 16,
-            f"Falling Wedge haussier — pentes H={round(slope_h,5)} L={round(slope_l,5)}")
-    # Rising Wedge : deux pentes positives, highs moins positifs que lows → convergent vers le haut
-    if slope_h > atr * 0.004 and slope_l > atr * 0.004 and slope_h < slope_l and direction == "SHORT":
-        return PatternResult(True, "Rising Wedge 📐", "SHORT", 16,
-            f"Rising Wedge baissier — pentes H={round(slope_h,5)} L={round(slope_l,5)}")
-    return empty
-
-
-def detect_triangle(df: pd.DataFrame, direction: str) -> PatternResult:
-    """Ascending / Descending / Symmetrical Triangle."""
-    empty = PatternResult(False, "", direction, 0, "")
-    if len(df) < 20:
-        return empty
-    window  = df.iloc[-35:]
-    atr     = (window["high"] - window["low"]).rolling(14).mean().iloc[-1]
-    x       = np.arange(len(window))
-    slope_h = np.polyfit(x, window["high"].values, 1)[0]
-    slope_l = np.polyfit(x, window["low"].values,  1)[0]
-    if abs(slope_h) < atr * 0.003 and slope_l > atr * 0.004 and direction == "LONG":
-        return PatternResult(True, "Ascending Triangle 📐", "LONG", 15,
-            f"Ascending Triangle — résistance plate + lows ascendants")
-    if abs(slope_l) < atr * 0.003 and slope_h < -atr * 0.004 and direction == "SHORT":
-        return PatternResult(True, "Descending Triangle 📐", "SHORT", 15,
-            f"Descending Triangle — support plat + highs descendants")
-    if slope_h < -atr * 0.003 and slope_l > atr * 0.003:
-        name = "Sym. Triangle 📐 (haussier)" if direction == "LONG" else "Sym. Triangle 📐 (baissier)"
-        return PatternResult(True, name, direction, 12,
-            f"Triangle symétrique — convergence imminente")
-    return empty
-
-
-def detect_flag(df: pd.DataFrame, direction: str) -> PatternResult:
-    """Bull Flag (LONG continuation) / Bear Flag (SHORT continuation)."""
-    empty = PatternResult(False, "", direction, 0, "")
-    if len(df) < 20:
-        return empty
-    pole_window = df.iloc[-20:-8]
-    flag_window = df.iloc[-8:]
-    atr         = (df["high"] - df["low"]).rolling(14).mean().iloc[-1]
-    pole_move   = abs(pole_window["close"].iloc[-1] - pole_window["open"].iloc[0])
-    if pole_move < atr * 3:
-        return empty
-    pole_bull  = pole_window["close"].iloc[-1] > pole_window["open"].iloc[0]
-    flag_slope = np.polyfit(np.arange(len(flag_window)), flag_window["close"].values, 1)[0]
-    if pole_bull and flag_slope < 0 and abs(flag_slope) < atr * 0.08 and direction == "LONG":
-        return PatternResult(True, "Bull Flag 🚩", "LONG", 14,
-            f"Bull Flag — mât={round(pole_move,5)} / drapeau légèrement baissier")
-    if not pole_bull and flag_slope > 0 and abs(flag_slope) < atr * 0.08 and direction == "SHORT":
-        return PatternResult(True, "Bear Flag 🚩", "SHORT", 14,
-            f"Bear Flag — mât={round(pole_move,5)} / drapeau légèrement haussier")
-    return empty
-
-
-def detect_all_patterns(df_h4: pd.DataFrame, df_ltf: pd.DataFrame,
-                         direction: str) -> list[PatternResult]:
-    """
-    Lance tous les détecteurs sur H4 + M15.
-
-    PRIORITÉ DES SETUPS (ordre de score décroissant) :
-      1. ETE M15 premium (retest neckline)          → 42 pts
-      2. ETE M15 standard (neckline cassée)          → 30–38 pts
-      3. Double/Triple Top/Bottom                    → 20–22 pts
-      4. Wedge, Flag, Triangle                       → 12–16 pts
-
-    M15 est scanné EN PREMIER — priorité sur H4.
-    """
-    results = []
-
-    # ── M15 EN PRIORITÉ (ton timeframe d'entrée) ──────────────
-    results.append(detect_head_shoulders(df_ltf, direction))   # ETE M15 — priorité max
-    results.append(detect_double_top_bottom(df_ltf, direction))
-    results.append(detect_triple_top_bottom(df_ltf, direction))
-    results.append(detect_wedge(df_ltf, direction))
-    results.append(detect_triangle(df_ltf, direction))
-    results.append(detect_flag(df_ltf, direction))
-
-    # ── H4 EN SUPPORT (confirmation HTF) ──────────────────────
-    results.append(detect_head_shoulders(df_h4, direction))
-    results.append(detect_double_top_bottom(df_h4, direction))
-    results.append(detect_triple_top_bottom(df_h4, direction))
-    results.append(detect_wedge(df_h4, direction))
-    results.append(detect_triangle(df_h4, direction))
-    results.append(detect_flag(df_h4, direction))
-
-    detected = [p for p in results if p.detected]
-
-    # Bonus si ETE M15 + autre confluence H4
-    ete_m15   = any("Épaule" in p.pattern_name or "ETE" in p.pattern_name for p in detected[:6])
-    h4_confirm = any(p for p in detected[6:])
-    if ete_m15 and h4_confirm:
-        # Boost le score ETE de 5 pts supplémentaires (confluence HTF)
-        for p in detected:
-            if "Épaule" in p.pattern_name or "ETE" in p.pattern_name:
-                object.__setattr__(p, 'score_bonus', min(p.score_bonus + 5, 50))
-                object.__setattr__(p, 'description', p.description + " + confluence H4 ✓")
-                break
-
-    return detected
-
-
-def detect_ob_retest(df_h4: pd.DataFrame, df_ltf: pd.DataFrame,
-                     direction: str, sd_zones: list) -> OBRetestResult:
-    """
-    Détecte les 3 types de retest OB/Demand Zone (Image 2) :
-    1. CONTINUATION PATTERN  — canal descendant / bear flag sur la zone
-    2. CONSOLIDATION         — range serré au-dessus/dessous de la zone
-    3. BSL RETEST (PDL/PDH)  — chasse de liquidité puis rebond sur la zone
-    """
-    empty = OBRetestResult(False, "", direction, 0, "")
-    if len(df_ltf) < 20 or not sd_zones:
-        return empty
-    atr    = (df_ltf["high"] - df_ltf["low"]).rolling(14).mean().iloc[-1]
-    price  = df_ltf["close"].iloc[-1]
-    zone   = sd_zones[0]
-    in_zone = (zone.bottom - atr * 0.3) <= price <= (zone.top + atr * 0.5)
-    if not in_zone:
-        return empty
-    zone_mid = (zone.top + zone.bottom) / 2
-    recent   = df_ltf.iloc[-12:]
-    x        = np.arange(len(recent))
-    slope_h  = np.polyfit(x, recent["high"].values, 1)[0]
-    slope_l  = np.polyfit(x, recent["low"].values,  1)[0]
-    # 1. Continuation pattern (canal / flag vers la zone)
-    if direction == "LONG" and slope_h < -atr * 0.002 and slope_l < -atr * 0.002:
-        return OBRetestResult(True, "continuation", direction, 15,
-            f"🔁 Continuation Pattern sur Demand Zone @ {round(zone_mid,5)}")
-    if direction == "SHORT" and slope_h > atr * 0.002 and slope_l > atr * 0.002:
-        return OBRetestResult(True, "continuation", direction, 15,
-            f"🔁 Continuation Pattern sur Supply Zone @ {round(zone_mid,5)}")
-    # 2. Consolidation
-    recent_range = (recent["high"] - recent["low"]).mean()
-    if recent_range < atr * 0.6:
-        return OBRetestResult(True, "consolidation", direction, 12,
-            f"📦 Consolidation sur zone @ {round(zone_mid,5)} — range={round(recent_range,5)}")
-    # 3. BSL/PDL Retest
-    if len(df_h4) >= 12:
-        pd_window = df_h4.iloc[-12:-6]
-        pdl = pd_window["low"].min()
-        pdh = pd_window["high"].max()
-        last_low   = df_ltf["low"].iloc[-3:-1].min()
-        last_high  = df_ltf["high"].iloc[-3:-1].max()
-        last_close = df_ltf["close"].iloc[-1]
-        if direction == "LONG" and last_low < pdl and last_close > pdl:
-            return OBRetestResult(True, "bsl_retest", direction, 18,
-                f"💧 BSL Retest — PDL swept @ {round(pdl,5)} → rebond Demand Zone")
-        if direction == "SHORT" and last_high > pdh and last_close < pdh:
-            return OBRetestResult(True, "bsl_retest", direction, 18,
-                f"💧 BSL Retest — PDH swept @ {round(pdh,5)} → rebond Supply Zone")
-    return empty
-
-
-def best_pattern(patterns: list[PatternResult]) -> Optional[PatternResult]:
-    """Retourne le pattern avec le score bonus le plus élevé."""
-    return max(patterns, key=lambda p: p.score_bonus) if patterns else None
-
-
-def detect_liquidity_sweep(df: pd.DataFrame) -> dict:
-    result  = {"bullish_sweep": False, "bearish_sweep": False, "level": None}
-    window  = df.iloc[-30:]
-    swing_high = window["high"].max()
-    swing_low  = window["low"].min()
-    last_high  = df["high"].iloc[-1]
-    last_low   = df["low"].iloc[-1]
-    last_close = df["close"].iloc[-1]
-    if last_high > swing_high * (1 + LIQ_THRESHOLD) and last_close < swing_high:
-        result["bearish_sweep"] = True
-        result["level"]         = swing_high
-    if last_low < swing_low * (1 - LIQ_THRESHOLD) and last_close > swing_low:
-        result["bullish_sweep"] = True
-        result["level"]         = swing_low
-    return result
-
-
-def active_fvg(df: pd.DataFrame, fvgs: list[FVG], direction: str) -> Optional[FVG]:
-    price = df["close"].iloc[-1]
-    for fvg in reversed(fvgs):
-        if fvg.direction != direction:
-            continue
-        lo, hi = min(fvg.top, fvg.bottom), max(fvg.top, fvg.bottom)
-        if lo <= price <= hi:
-            return fvg
-    return None
-
-
-def is_fvg_unmitigated(df: pd.DataFrame, fvg: FVG) -> bool:
-    if fvg.index + 1 >= len(df):
-        return True
-    lo = min(fvg.top, fvg.bottom)
-    hi = max(fvg.top, fvg.bottom)
-    for i in range(fvg.index + 1, len(df)):
-        if lo <= df["close"].iloc[i] <= hi:
-            return False
-    return True
-
-
-def detect_confirmation_candle(df: pd.DataFrame, direction: str) -> bool:
-    if len(df) < 4:
-        return False
-    for i in range(-2, -5, -1):
-        o  = df["open"].iloc[i]
-        h  = df["high"].iloc[i]
-        l  = df["low"].iloc[i]
-        cl = df["close"].iloc[i]
-        body       = abs(cl - o)
-        if body == 0:
-            continue
-        upper_wick = h - max(o, cl)
-        lower_wick = min(o, cl) - l
-        if direction == "LONG":
-            if cl > o and i > -3:
-                prev_o = df["open"].iloc[i - 1]
-                prev_c = df["close"].iloc[i - 1]
-                if prev_c < prev_o and cl > prev_o and o < prev_c:
-                    return True
-            if lower_wick >= body * 2 and cl > o:
-                return True
-        elif direction == "SHORT":
-            if cl < o and i > -3:
-                prev_o = df["open"].iloc[i - 1]
-                prev_c = df["close"].iloc[i - 1]
-                if prev_c > prev_o and cl < prev_o and o > prev_c:
-                    return True
-            if upper_wick >= body * 2 and cl < o:
-                return True
-    return False
-
-
-# ═════════════════════════════════════════════════════════════
-#  ⑦ SETUP : 4H SWEEP + 5M SHIFT + TARGET 4H HIGH/LOW
-#
-#  Logique (Image 1 — Instagram Reel) :
-#  ─────────────────────────────────────
-#  H4  : Le prix casse brièvement un swing Low/High récent
-#         (sweep de la liquidité SSL ou BSL), puis CLÔTURE de retour
-#         dans le range → manipulation institutionnelle confirmée.
-#
-#  5M  : Dans les bougies suivant le sweep H4, un BOS/CHoCH bullish
-#         (ou bearish) se forme → shift de structure = confirmation
-#         que les institutionnels ont inversé la direction.
-#
-#  TP  : Prochain High H4 (LONG) ou prochain Low H4 (SHORT)
-#         = la "distribution" institutionnelle vise le côté opposé.
-#
-#  Score bonus : +22 si sweep + shift confirmés
-# ═════════════════════════════════════════════════════════════
-
-def detect_h4_sweep_5m_shift(
-    df_h4: pd.DataFrame,
-    df_m5: pd.DataFrame,
-    direction: str,
-) -> dict:
-    """
-    Détecte le setup 4H Sweep + 5M Shift.
-
-    Retourne :
-      detected      : bool
-      sweep_level   : float | None   — niveau sweepé sur H4
-      target_h4     : float | None   — prochain H/L H4 visé
-      score_bonus   : int
-      reasons       : list[str]
-    """
-    empty = {"detected": False, "sweep_level": None,
-             "target_h4": None, "score_bonus": 0, "reasons": []}
-
-    if len(df_h4) < 20 or len(df_m5) < 20:
-        return empty
-
-    atr_h4 = (df_h4["high"] - df_h4["low"]).rolling(14).mean().iloc[-1]
-    if pd.isna(atr_h4) or atr_h4 == 0:
-        return empty
-
-    sweep_level = None
-    sweep_found = False
-
-    # ── Cherche un sweep dans les 6 dernières bougies H4 ────────
-    for i in range(-6, -1):
-        abs_i = len(df_h4) + i
-        if abs_i < 15:
-            continue
-
-        h   = df_h4["high"].iloc[i]
-        l   = df_h4["low"].iloc[i]
-        cl  = df_h4["close"].iloc[i]
-
-        lookback = df_h4.iloc[abs_i - 15: abs_i]
-        if len(lookback) < 5:
-            continue
-
-        prev_low  = lookback["low"].min()
-        prev_high = lookback["high"].max()
-
-        if direction == "LONG":
-            # SSL sweep : mèche basse sous prev_low, clôture au-dessus
-            if l < prev_low - atr_h4 * 0.05 and cl > prev_low:
-                sweep_level = prev_low
-                sweep_found = True
-                break
-        else:
-            # BSL sweep : mèche haute au-dessus prev_high, clôture en-dessous
-            if h > prev_high + atr_h4 * 0.05 and cl < prev_high:
-                sweep_level = prev_high
-                sweep_found = True
-                break
-
-    if not sweep_found or sweep_level is None:
-        return empty
-
-    # ── Vérifie le Shift M5 (BOS aligné) dans les 10 dernières bougies ─
-    bos_m5 = detect_bos(df_m5)
-    target_bos_type = "bullish" if direction == "LONG" else "bearish"
-    recent_bos = [b for b in bos_m5[-10:] if b["type"] == target_bos_type]
-
-    if not recent_bos:
-        return empty   # Pas de shift M5 → setup invalide
-
-    # ── Target : prochain High/Low H4 non cassé ─────────────────
-    window_h4 = df_h4.iloc[-30:]
-    if direction == "LONG":
-        # Vise le plus récent swing High H4 au-dessus du prix actuel
-        price_now = df_m5["close"].iloc[-1]
-        candidates = [
-            window_h4["high"].iloc[k]
-            for k in range(1, len(window_h4) - 1)
-            if window_h4["high"].iloc[k] > window_h4["high"].iloc[k-1]
-               and window_h4["high"].iloc[k] > window_h4["high"].iloc[k+1]
-               and window_h4["high"].iloc[k] > price_now
-        ]
-        target_h4 = min(candidates) if candidates else round(window_h4["high"].max(), 2)
-    else:
-        price_now = df_m5["close"].iloc[-1]
-        candidates = [
-            window_h4["low"].iloc[k]
-            for k in range(1, len(window_h4) - 1)
-            if window_h4["low"].iloc[k] < window_h4["low"].iloc[k-1]
-               and window_h4["low"].iloc[k] < window_h4["low"].iloc[k+1]
-               and window_h4["low"].iloc[k] < price_now
-        ]
-        target_h4 = max(candidates) if candidates else round(window_h4["low"].min(), 2)
-
-    sweep_type = "SSL (bas de range) → LONG" if direction == "LONG" \
-                 else "BSL (haut de range) → SHORT"
-    reasons = [
-        f"🔄 4H Sweep {sweep_type} @ {round(sweep_level, 5)}  (+15)",
-        f"📐 5M Shift confirmé (BOS {target_bos_type})  (+7)",
-        f"🎯 Target H4 : {round(target_h4, 5)}",
-    ]
-
-    return {
-        "detected"   : True,
-        "sweep_level": sweep_level,
-        "target_h4"  : target_h4,
-        "score_bonus": 22,
-        "reasons"    : reasons,
-    }
-
-
-# ═════════════════════════════════════════════════════════════
-#  ⑧ SETUP : EQUAL HIGHS/LOWS + CHoCH + FVG + OB RETEST
-#             (SMC Liquidity School — Image 2)
-#
-#  Logique :
-#  ─────────
-#  1. Equal Highs (EQH) ou Equal Lows (EQL) = pool de liquidité
-#     Les institutionnels SAVENT que les stops sont là.
-#
-#  2. Sweep/Manipulation : le prix dépasse brièvement l'EQH ou EQL
-#     puis revient → liquidity grab ("draw on liquidity").
-#
-#  3. Change of Character (CHoCH) : premier BOS CONTRAIRE après
-#     le sweep = les institutionnels ont pris la liquidité et
-#     inversent maintenant → signal de retournement.
-#
-#  4. Liquidity void / FVG formé après le CHoCH = zone de valeur.
-#
-#  5. Entrée : retest de l'OB baissier (ou haussier) ≈ 50% OB.
-#     Target : prochain OB institutionnel de l'autre côté.
-#
-#  Score bonus : +25 si tous les critères sont réunis
-# ═════════════════════════════════════════════════════════════
-
-def detect_choch_eql_setup(
-    df_h4:    pd.DataFrame,
-    df_m5:    pd.DataFrame,
-    liq_map:  "LiquidityMap",
-    direction: str,
-) -> dict:
-    """
-    Détecte le setup Equal Liq + CHoCH + FVG + OB.
-
-    Retourne :
-      detected      : bool
-      choch_level   : float | None
-      fvg_present   : bool
-      score_bonus   : int
-      reasons       : list[str]
-    """
-    empty = {"detected": False, "choch_level": None,
-             "fvg_present": False, "score_bonus": 0, "reasons": []}
-
-    if len(df_h4) < 20 or len(df_m5) < 20:
-        return empty
-
-    # ── 1. Equal Highs/Lows présents (liquidité institutionnelle) ─
-    has_eqh = bool(liq_map.eqh_levels)
-    has_eql = bool(liq_map.eql_levels)
-
-    if direction == "SHORT" and not has_eqh:
-        return empty   # SHORT : il faut des EQH pour sweeper
-    if direction == "LONG" and not has_eql:
-        return empty   # LONG : il faut des EQL pour sweeper
-
-    eq_levels = liq_map.eqh_levels if direction == "SHORT" else liq_map.eql_levels
-    eq_level  = eq_levels[0] if eq_levels else None
-
-    # ── 2. Le prix a-t-il sweepé le niveau EQH/EQL ? ─────────────
-    price_now = df_m5["close"].iloc[-1]
-    atr_m5    = (df_m5["high"] - df_m5["low"]).rolling(14).mean().iloc[-1]
-    if pd.isna(atr_m5) or atr_m5 == 0 or eq_level is None:
-        return empty
-
-    if direction == "SHORT":
-        # Prix a dépassé l'EQH puis est redescendu
-        swept = any(
-            df_m5["high"].iloc[i] > eq_level + atr_m5 * 0.05
-            and df_m5["close"].iloc[i] < eq_level
-            for i in range(-10, -1)
-            if abs(i) <= len(df_m5)
-        )
-    else:
-        # Prix a cassé l'EQL puis est remonté
-        swept = any(
-            df_m5["low"].iloc[i] < eq_level - atr_m5 * 0.05
-            and df_m5["close"].iloc[i] > eq_level
-            for i in range(-10, -1)
-            if abs(i) <= len(df_m5)
-        )
-
-    if not swept:
-        return empty
-
-    # ── 3. CHoCH (premier BOS contraire après sweep) ──────────────
-    bos_m5 = detect_bos(df_m5)
-    choch_type   = "bullish" if direction == "LONG" else "bearish"
-    choch_recent = [b for b in bos_m5[-8:] if b["type"] == choch_type]
-    choch_level  = choch_recent[-1]["level"] if choch_recent else None
-
-    if choch_level is None:
-        return empty
-
-    # ── 4. FVG post-CHoCH ─────────────────────────────────────────
-    fvgs_m5     = detect_fvg(df_m5)
-    fvg_dir     = "bullish" if direction == "LONG" else "bearish"
-    fvg_present = any(f.direction == fvg_dir for f in fvgs_m5[-10:])
-
-    # ── Score ─────────────────────────────────────────────────────
-    score  = 15   # base : EQL sweep + CHoCH
-    score += 5 if fvg_present else 0
-    score += 5 if (has_eqh and direction == "SHORT") or (has_eql and direction == "LONG") else 0
-
-    eq_type_str = "EQH (equal highs)" if direction == "SHORT" else "EQL (equal lows)"
-    choch_str   = "bearish CHoCH" if direction == "SHORT" else "bullish CHoCH"
-
-    reasons = [
-        f"💰 {eq_type_str} = pool de liquidité sweepé @ {round(eq_level, 5)}  (+15)",
-        f"🔃 {choch_str} confirmé @ {round(choch_level, 5)}  (+5)",
-    ]
-    if fvg_present:
-        reasons.append(f"🕳️ Liquidity void / FVG post-CHoCH présent  (+5)")
-
-    return {
-        "detected"    : True,
-        "choch_level" : choch_level,
-        "fvg_present" : fvg_present,
-        "score_bonus" : min(score, 25),
-        "reasons"     : reasons,
-    }
-
-
-
-#  Architecture :
-#    Base H4 (biais + AMD + Septuple)        → 0–45 pts
-#    Structure M15 (BOS + OB + Liquidité)    → 0–30 pts
-#    Entrée M5 (FVG + S/D Zone + Bougie)     → 0–25 pts
-#    Total max = 100 pts
-# ═════════════════════════════════════════════════════════════
-
-def compute_score_v3(
-    # H4
-    bias_aligned:       bool = False,
-    amd_detected:       bool = False,
-    amd_confidence:     int  = 0,
-    septuple_detected:  bool = False,
-    septuple_count:     int  = 0,
-    # M15
-    mtf_bos:            bool = False,
-    mtf_ob:             bool = False,
-    liquidity_taken:    bool = False,
-    breaker_block:      bool = False,
-    bsl_ssl_swept:      bool = False,   # BSL ou SSL sweepée (liquidity map)
-    eqh_eql_present:    bool = False,   # Equal Highs/Lows = pool de liquidité
-    # M5 Entry
-    ltf_fvg:            bool = False,
-    fvg_unmitigated:    bool = False,
-    sd_zone_active:     bool = False,   # Supply/Demand zone active
-    entry_candle_score: int  = 0,       # bonus des bougies institutionnelles
-    older_block_htf:    bool = False,   # OB H4 actif
-    # Chart Patterns + OB Retest
-    pattern_bonus:      int  = 0,
-    pattern_name:       str  = "",
-    ob_retest_bonus:    int  = 0,
-    ob_retest_desc:     str  = "",
-    # ── Nouveaux setups ──────────────────────────────────────
-    sweep_shift_bonus:  int  = 0,    # Setup 4H Sweep + 5M Shift
-    choch_eql_bonus:    int  = 0,    # Setup CHoCH + Equal Liq
-    # ── Order Flow + Breaker HTF ─────────────────────────────
-    ofs_structural_bonus: int = 0,   # Order Flow Shift structurel M15
-    ofs_structural_reason: str = "", # Raison OFS
-    breaker_htf_bonus:  int  = 0,   # Breaker Block H4 (niveau institutionnel)
-    breaker_htf_reason: str  = "",  # Raison Breaker HTF
-) -> tuple[int, list[str]]:
-    score   = 0
-    reasons = []
-
-    # ── H4 BASE (45 pts max) ──────────────────────────────────
-    if bias_aligned:
-        score += 15
-        reasons.append("✅ Biais H4 aligné  (+15)")
-
-    if amd_detected:
-        amd_pts = min(20, int(amd_confidence * 0.20))
-        score  += amd_pts
-        reasons.append(f"🔮 AMD confirmé (confiance {amd_confidence}%)  (+{amd_pts})")
-
-    if septuple_detected:
-        sep_pts = 10 if septuple_count >= 7 else (8 if septuple_count >= 6 else 6)
-        score  += sep_pts
-        reasons.append(f"⚡ Septuple Traction H4 ({septuple_count} bougies)  (+{sep_pts})")
-
-    # ── M15 STRUCTURE (30 pts max) ────────────────────────────
-    if mtf_bos:
-        score += 10
-        reasons.append("✅ BOS M15 confirmé  (+10)")
-
-    if mtf_ob:
-        score += 7
-        reasons.append("✅ Order Block M15 validé  (+7)")
-
-    if liquidity_taken:
-        score += 8
-        reasons.append("✅ Liquidité M15 prise (stop hunt)  (+8)")
-
-    if breaker_block:
-        score += 10
-        reasons.append("🔥 Breaker Block M15 détecté  (+10)")
-
-    if bsl_ssl_swept:
-        score += 8
-        reasons.append("💧 BSL/SSL sweepée — pool de liquidité visé  (+8)")
-
-    if eqh_eql_present:
-        score += 4
-        reasons.append("⚡ Equal High/Low (EQH/EQL) = liquidité institutionnelle  (+4)")
-
-    # ── ORDER FLOW SHIFT STRUCTUREL (max 15 pts) ──────────────
-    if ofs_structural_bonus > 0 and ofs_structural_reason:
-        ofs_pts = min(ofs_structural_bonus, 15)
-        score  += ofs_pts
-        reasons.append(ofs_structural_reason)
-
-    # ── BREAKER BLOCK H4 (max 18 pts) ─────────────────────────
-    if breaker_htf_bonus > 0 and breaker_htf_reason:
-        bb_pts = min(breaker_htf_bonus, 18)
-        score += bb_pts
-        reasons.append(breaker_htf_reason)
-
-    # ── M5 ENTRÉE (25 pts max) ────────────────────────────────
-    if sd_zone_active:
-        score += 12
-        reasons.append("🏛️ Prix dans zone Supply/Demand institutionnelle  (+12)")
-
-    if ltf_fvg:
-        score += 6
-        reasons.append("📍 FVG M5 actif — zone de valeur  (+6)")
-
-    if fvg_unmitigated:
-        score += 3
-        reasons.append("✅ FVG valid non mitiqué  (+3)")
-
-    if older_block_htf:
-        score += 5
-        reasons.append("🏛️ Older Block H4 actif — confluence HTF  (+5)")
-
-    # Bonus bougies institutionnelles (max 20 pts plafonné)
-    if entry_candle_score > 0:
-        ec_pts = min(entry_candle_score, 20)
-        score += ec_pts
-        reasons.append(f"🕯️ Bougie d'entrée institutionnelle  (+{ec_pts})")
-
-    # ── CHART PATTERNS (max 25 pts) ───────────────────────────
-    if pattern_bonus > 0 and pattern_name:
-        p_pts = min(pattern_bonus, 25)
-        score += p_pts
-        reasons.append(f"📐 Pattern détecté : {pattern_name}  (+{p_pts})")
-
-    # ── OB RETEST (max 18 pts) ────────────────────────────────
-    if ob_retest_bonus > 0 and ob_retest_desc:
-        r_pts = min(ob_retest_bonus, 18)
-        score += r_pts
-        reasons.append(f"{ob_retest_desc}  (+{r_pts})")
-
-    # ── 4H SWEEP + 5M SHIFT (max 22 pts) ─────────────────────
-    if sweep_shift_bonus > 0:
-        ss_pts = min(sweep_shift_bonus, 22)
-        score += ss_pts
-        # raisons déjà dans reasons via detect_h4_sweep_5m_shift
-
-    # ── CHoCH + EQUAL LIQ (max 25 pts) ───────────────────────
-    if choch_eql_bonus > 0:
-        ce_pts = min(choch_eql_bonus, 25)
-        score += ce_pts
-        # raisons déjà dans reasons via detect_choch_eql_setup
-
-    return min(score, 100), reasons
-
-
-# ─────────────────────────────────────────────────────────────
-#  CALCUL NIVEAUX — ENTRY / SL / TP
-# ─────────────────────────────────────────────────────────────
-
-def _sl_in_liquidity_zone(
-    sl:        float,
-    direction: str,
-    atr:       float,
-    df_m5:     pd.DataFrame,
-    liq_map:   Optional[LiquidityMap],
-    ob:        Optional[OrderBlock],
-    tol:       float = 0.15,
-) -> bool:
-    """
-    Vérifie si le SL calculé tombe dans une zone de liquidité évidente :
-      1. Juste derrière un plus haut/bas structurel connu (BSL/SSL/EQH/EQL H4)
-      2. Accumulation de mèches M5 récentes autour du niveau du SL
-      3. À l'intérieur de l'Order Block
-
-    tol = tolérance en multiples d'ATR pour considérer un niveau "proche" du SL.
-    """
-    band = atr * tol
-
-    # ── 1. Proche d'un plus haut/bas structurel évident ────────
-    if liq_map is not None:
-        levels = []
-        if direction == "LONG":
-            levels = list(liq_map.ssl_levels) + list(liq_map.eql_levels)
-            if liq_map.nearest_ssl is not None:
-                levels.append(liq_map.nearest_ssl)
-            if liq_map.pdl is not None:
-                levels.append(liq_map.pdl)
-        else:
-            levels = list(liq_map.bsl_levels) + list(liq_map.eqh_levels)
-            if liq_map.nearest_bsl is not None:
-                levels.append(liq_map.nearest_bsl)
-            if liq_map.pdh is not None:
-                levels.append(liq_map.pdh)
-        if any(abs(sl - lvl) <= band for lvl in levels if lvl is not None):
-            return True
-
-    # ── 2. Accumulation de mèches M5 autour du SL ───────────────
-    if len(df_m5) >= 10:
-        recent = df_m5.iloc[-15:]
-        wick_hits = 0
-        for i in range(len(recent)):
-            h, l = recent["high"].iloc[i], recent["low"].iloc[i]
-            level = l if direction == "LONG" else h   # mèche du côté du SL
-            if abs(level - sl) <= band:
-                wick_hits += 1
-        if wick_hits >= 3:   # ≥3 mèches proches = accumulation
-            return True
-
-    # ── 3. SL à l'intérieur de l'Order Block ────────────────────
-    if ob is not None:
-        lo, hi = min(ob.bottom, ob.top), max(ob.bottom, ob.top)
-        if lo <= sl <= hi:
-            return True
-
-    return False
-
-
-def compute_sl_tp_v3(
-    df_m5:     pd.DataFrame,
-    df_m15:    pd.DataFrame,
-    direction: str,
-    ob:        Optional[OrderBlock],
-    fvg:       Optional[FVG],
-    sd_zone:   Optional[SupplyDemandZone],
-    liq_map:   Optional[LiquidityMap],
-    symbol:    str = "",
-    score:     int = 0,
-) -> tuple[float, float, float, float, float, float]:
-    """
-    Entry / SL / TP1 / TP2 / TP3 v3+ — cibles structurelles réelles.
-
-    ENTRÉE (priorité décroissante) :
-      1. Milieu de la zone Supply/Demand
-      2. Milieu du FVG M5
-      3. Close M5 courant
-
-    STOP LOSS (palier selon la qualité du setup — `score`) :
-      score ≥ 90     : derrière l'OB + 1.0×ATR
-      score 80–89    : derrière l'OB + 0.6×ATR
-      score 70–79    : 0.6×ATR fixe depuis l'entrée (pas de référence OB)
-      (score < 70 : aucun signal — filtré en amont)
-      Puis règle anti-liquidité : si le SL tombe derrière un plus haut/bas
-      évident, dans une accumulation de mèches, ou à l'intérieur de l'OB,
-      il est repoussé de +0.10 à 0.20×ATR au-delà de cette zone.
-
-    TAKE PROFIT (3 niveaux structurels) :
-      TP1 : RR3 min — BSL/SSL nearest ou PDH/PDL ou swing M15
-      TP2 : RR5-6  — swing H/L M15 suivant au-delà de TP1
-      TP3 : RR8-10 — liquidité majeure H4 / swing H4 / extension max
-    """
-    atr    = (df_m5["high"] - df_m5["low"]).rolling(14).mean().iloc[-1]
-    close  = df_m5["close"].iloc[-1]
-    spread = get_spread(symbol) if symbol else 0.0
-    dec    = 2 if close > 100 else 5
-
-    # ── 1. ENTRÉE ─────────────────────────────────────────────
-    if sd_zone is not None:
-        entry = round((sd_zone.top + sd_zone.bottom) / 2, dec)
-    elif fvg is not None:
-        entry = round((max(fvg.top, fvg.bottom) + min(fvg.top, fvg.bottom)) / 2, dec)
-    else:
-        entry = round(close, dec)
-
-    # ── 2. STOP LOSS — palier de base selon le score ────────────
-    # Setups haute qualité : SL ancré derrière l'OB (probabilité élevée
-    # que le prix ne revienne pas dedans). Setups standards : SL fixe
-    # depuis l'entrée, comme avant.
-    atr_sl_mult = get_atr_sl_mult()
-    if score >= 90 and ob is not None:
-        anchor, sl_distance = (ob.bottom if direction == "LONG" else ob.top), atr * 1.0
-    elif score >= 80 and ob is not None:
-        anchor, sl_distance = (ob.bottom if direction == "LONG" else ob.top), atr * atr_sl_mult
-    else:
-        anchor, sl_distance = entry, atr * atr_sl_mult
-
-    if direction == "LONG":
-        sl = round(anchor - sl_distance, dec)
-    else:  # SHORT
-        sl = round(anchor + sl_distance, dec)
-
-    # ── 2b. Règle anti-liquidité ─────────────────────────────
-    # Si le SL tombe dans une zone de liquidité évidente (plus haut/bas
-    # structurel, accumulation de mèches, ou intérieur de l'OB), on le
-    # repousse de 0.10 à 0.20×ATR au-delà de cette zone plutôt que de le
-    # laisser exposé à un simple retest.
-    if _sl_in_liquidity_zone(sl, direction, atr, df_m5, liq_map, ob):
-        extra = atr * 0.15   # milieu de la fourchette 0.10–0.20×ATR
-        sl = round(sl - extra, dec) if direction == "LONG" else round(sl + extra, dec)
-
-    risk = abs(entry - sl)
-    if risk <= 0:
-        return entry, sl, entry, entry, entry, 0.0
-
-    # ── 3. COLLECTE des cibles structurelles réelles ──────────
-    # Tous les niveaux au-delà de entry dans la bonne direction
-    targets: list[float] = []
-
-    # BSL/SSL depuis la liquidity map
-    if liq_map is not None:
-        if direction == "LONG":
-            if liq_map.nearest_bsl and liq_map.nearest_bsl > entry + risk:
-                targets.append(liq_map.nearest_bsl)
-            if liq_map.pdh and liq_map.pdh > entry + risk:
-                targets.append(liq_map.pdh)
-            for lvl in (liq_map.bsl_levels or []):
-                if lvl > entry + risk:
-                    targets.append(lvl)
-        else:
-            if liq_map.nearest_ssl and liq_map.nearest_ssl < entry - risk:
-                targets.append(liq_map.nearest_ssl)
-            if liq_map.pdl and liq_map.pdl < entry - risk:
-                targets.append(liq_map.pdl)
-            for lvl in (liq_map.ssl_levels or []):
-                if lvl < entry - risk:
-                    targets.append(lvl)
-
-    # Swing highs/lows M15
-    window_m15 = df_m15.iloc[-80:]
-    if direction == "LONG":
-        for i in range(1, len(window_m15) - 1):
-            h = window_m15["high"].iloc[i]
-            if (h > window_m15["high"].iloc[i-1]
-                    and h > window_m15["high"].iloc[i+1]
-                    and h > entry + risk):
-                targets.append(h)
-    else:
-        for i in range(1, len(window_m15) - 1):
-            lo = window_m15["low"].iloc[i]
-            if (lo < window_m15["low"].iloc[i-1]
-                    and lo < window_m15["low"].iloc[i+1]
-                    and lo < entry - risk):
-                targets.append(lo)
-
-    # Trier les cibles du plus proche au plus loin
-    if direction == "LONG":
-        targets = sorted(set(round(t, dec) for t in targets if t > entry + risk))
-    else:
-        targets = sorted(set(round(t, dec) for t in targets if t < entry - risk), reverse=True)
-
-    # ── 4. ASSIGNATION TP1 / TP2 / TP3 ───────────────────────
-    # TP1 = RR3 minimum, TP2 = RR5, TP3 = RR6+
-    rr3_min = entry + risk * 3.0 if direction == "LONG" else entry - risk * 3.0
-    rr5_min = entry + risk * 5.0 if direction == "LONG" else entry - risk * 5.0
-    rr6_min = entry + risk * 6.0 if direction == "LONG" else entry - risk * 6.0
-
-    if targets:
-        # TP1 : première cible structurelle >= RR3
-        tp1_cands = [t for t in targets if (t >= rr3_min if direction == "LONG" else t <= rr3_min)]
-        tp1 = round(tp1_cands[0], dec) if tp1_cands else round(rr3_min, dec)
-    else:
-        tp1 = round(rr3_min, dec)
-
-    # TP2 : cible structurelle suivante >= RR5, sinon RR5 mathematique
-    if targets:
-        tp2_cands = [t for t in targets if (t >= rr5_min if direction == "LONG" else t <= rr5_min)
-                     and t != tp1]
-        tp2 = round(tp2_cands[0], dec) if tp2_cands else round(rr5_min, dec)
-    else:
-        tp2 = round(rr5_min, dec)
-
-    # TP3 : extension max ≥ RR6 — swing H4 ou liquidité lointaine
-    window_h4 = df_m15.iloc[-200:] if len(df_m15) >= 200 else df_m15
-    tp3 = round(rr6_min, dec)  # fallback RR6
-    if direction == "LONG":
-        far_highs = [
-            window_h4["high"].iloc[i]
-            for i in range(1, len(window_h4) - 1)
-            if window_h4["high"].iloc[i] > window_h4["high"].iloc[i-1]
-               and window_h4["high"].iloc[i] > window_h4["high"].iloc[i+1]
-               and window_h4["high"].iloc[i] >= rr6_min
-        ]
-        if far_highs:
-            tp3 = round(max(far_highs), dec)
-    else:
-        far_lows = [
-            window_h4["low"].iloc[i]
-            for i in range(1, len(window_h4) - 1)
-            if window_h4["low"].iloc[i] < window_h4["low"].iloc[i-1]
-               and window_h4["low"].iloc[i] < window_h4["low"].iloc[i+1]
-               and window_h4["low"].iloc[i] <= rr6_min
-        ]
-        if far_lows:
-            tp3 = round(min(far_lows), dec)
-
-    # ── 5. GARANTIR L'ORDRE TP1 < TP2 < TP3 (LONG) / TP1 > TP2 > TP3 (SHORT) ──
-    if direction == "LONG":
-        tp1, tp2, tp3 = tuple(sorted([tp1, tp2, tp3]))
-    else:
-        tp1, tp2, tp3 = tuple(sorted([tp1, tp2, tp3], reverse=True))
-
-    # ── 6. RR net sur TP1 ─────────────────────────────────────
-    if direction == "LONG":
-        gain_net = (tp1 - entry) - spread
-    else:
-        gain_net = (entry - tp1) - spread
-
-    rr_net = round(gain_net / risk, 2) if gain_net > 0 and risk > 0 else 0.0
-    return entry, sl, tp1, rr_net, tp2, tp3
-
-
-# ═════════════════════════════════════════════════════════════
-#  SETUP BOS RETEST — BOS → X (sweep) → OB/FVG → Continuation
-#  + toutes confluences : Order Flow, Breaker, BSL/SSL, OB H4
-# ═════════════════════════════════════════════════════════════
-
-def detect_bos_retest_setup(
-    df_m15:       pd.DataFrame,
-    df_m5:        pd.DataFrame,
-    direction:    str,
-    bos_list:     list,
-    obs_m15:      list,
-    fvg_active,
-    liq_taken:    bool,
-    price_now:    float,
-    atr:          float,
-    ofs_detected: bool = False,
-    ofs_bonus:    int  = 0,
-    breaker_ok:   bool = False,
-    bsl_ssl_swept:bool = False,
-    ob_htf_active:bool = False,
-) -> dict:
-    """BOS → X (stop hunt) → retracement OB/FVG → continuation."""
-    result = {"detected": False, "score_bonus": 0, "reasons": [], "retest_zone": None}
-    if not bos_list:
-        return result
-
-    last_bos = bos_list[-1]
-    expected = "bearish" if direction == "SHORT" else "bullish"
-    if last_bos.get("type", "") != expected:
-        return result
-
-    bos_level = last_bos.get("level", 0.0)
-    score, reasons = 0, []
-    reasons.append(f"✅ BOS M15 {direction} @ {round(bos_level,5)}  (+15)")
-    score += 15
-
-    ob_zone = next((o for o in reversed(obs_m15) if o.direction == expected), None)
-    in_ob   = False
-    if ob_zone:
-        ob_lo = min(ob_zone.top, ob_zone.bottom)
-        ob_hi = max(ob_zone.top, ob_zone.bottom)
-        if (ob_lo - atr*0.5) <= price_now <= (ob_hi + atr*0.5):
-            in_ob = True
-            reasons.append(f"🏛️ Older Block M15 [{round(ob_lo,5)}–{round(ob_hi,5)}]  (+12)")
-            score += 12
-            result["retest_zone"] = ob_zone
-
-    in_fvg = False
-    if fvg_active is not None:
-        flo = min(fvg_active.top, fvg_active.bottom)
-        fhi = max(fvg_active.top, fvg_active.bottom)
-        if (flo - atr*0.3) <= price_now <= (fhi + atr*0.3):
-            in_fvg = True
-            reasons.append(f"📍 Valid FVG M15 [{round(flo,5)}–{round(fhi,5)}]  (+10)")
-            score += 10
-
-    if liq_taken:
-        reasons.append("💧 Liquidité prise — point X (stop hunt)  (+10)")
-        score += 10
-    if in_ob and in_fvg:
-        reasons.append("⚡ Confluence OB + FVG = zone institutionnelle  (+8)")
-        score += 8
-    if ofs_detected and ofs_bonus > 0:
-        pts = min(ofs_bonus, 12)
-        reasons.append(f"📈 Order Flow Shift M15 aligné  (+{pts})")
-        score += pts
-    if breaker_ok:
-        reasons.append("🔥 Breaker Block M15  (+7)")
-        score += 7
-    if bsl_ssl_swept:
-        reasons.append("💧 BSL/SSL sweepée — hunt institutionnel  (+8)")
-        score += 8
-    if ob_htf_active:
-        reasons.append("🏛️ Older Block H4 actif — confluence HTF  (+5)")
-        score += 5
-
-    if not (in_ob or in_fvg):
-        return result
-
-    result.update({"detected": True, "score_bonus": score, "reasons": reasons})
-    return result
-
-
-# ═════════════════════════════════════════════════════════════
-#  SETUP PURE M15 : SWEEP SSL/BSL → BOS M15 → PULLBACK BREAKER
-#
-#  Séquence obligatoire (celle visible dans toutes tes images) :
-#    ① Le prix sweep un SSL (LONG) ou BSL (SHORT) sur M15
-#       → chasse les stops institutionnels
-#    ② Juste après le sweep : BOS M15 dans la direction opposée
-#       → premier signe de changement de structure
-#    ③ Le prix pullback dans la zone naturelle (Breaker naturel =
-#       dernière bougie qui a causé le BOS, ou FVG créé lors du BOS)
-#       → zone d'entrée institutionnelle (point X)
-#    ④ Entrée sur bougie de confirmation dans la zone pullback
-#
-#  Ce setup est différent de :
-#    - detect_smc_trader   : nécessite H4 → M15 → M5 et MSS
-#    - detect_bos_retest   : pas de sweep SSL/BSL obligatoire
-#
-#  Score bonus max : 30 pts
-#    +12 sweep SSL/BSL confirmé
-#    +10 BOS M15 post-sweep validé
-#    +8  prix dans zone pullback (OB naturel / FVG post-BOS)
-# ═════════════════════════════════════════════════════════════
-
-def detect_sweep_bos_m15_setup(
-    df_m15:    pd.DataFrame,
-    direction: str,
-    liq_map:   "LiquidityMap",
-    atr:       float,
-) -> dict:
-    """
-    Détecte la séquence pure M15 :
-      ① Sweep SSL (LONG) ou BSL (SHORT) sur M15
-      ② BOS M15 post-sweep dans la direction du trade
-      ③ Pullback dans la zone naturelle (Breaker / FVG post-BOS)
-
-    Paramètres :
-      df_m15    : données M15 (au moins 40 bougies)
-      direction : "LONG" | "SHORT"
-      liq_map   : LiquidityMap (pour vérifier swept_ssl/swept_bsl)
-      atr       : ATR M15 courant
-
-    Retourne dict :
-      detected      : bool
-      sweep_level   : float | None  — niveau SSL/BSL sweepé
-      bos_level     : float | None  — niveau BOS post-sweep
-      pullback_zone : tuple[float,float] | None  — zone naturelle (low, high)
-      score_bonus   : int
-      reasons       : list[str]
-    """
-    empty = {
-        "detected"     : False,
-        "sweep_level"  : None,
-        "bos_level"    : None,
-        "pullback_zone": None,
-        "score_bonus"  : 0,
-        "reasons"      : [],
-    }
-
-    if len(df_m15) < 40 or atr <= 0:
-        return empty
-
-    window    = df_m15.iloc[-60:].reset_index(drop=True)
-    n         = len(window)
-    price_now = window["close"].iloc[-1]
-    score     = 0
-    reasons   = []
-
-    # ── ① SWEEP SSL (LONG) ou BSL (SHORT) ────────────────────────
-    # On cherche une bougie récente (dans les 20 dernières) qui a
-    # percé un swing low/high puis clôturé au-dessus/dessous.
-    sweep_idx   = None
-    sweep_level = None
-
-    if direction == "LONG":
-        # Chercher un SSL sweep : low perce un swing low récent puis close >  swing low
-        for i in range(n - 20, n - 1):
-            if i < 5:
-                continue
-            swing_lo = window["low"].iloc[max(0, i-10):i].min()
-            bar_lo   = window["low"].iloc[i]
-            bar_cl   = window["close"].iloc[i]
-            # Bougie a percé sous le swing low puis refermé au-dessus → sweep
-            if bar_lo < swing_lo - atr * 0.05 and bar_cl > swing_lo - atr * 0.10:
-                sweep_idx   = i
-                sweep_level = swing_lo
-                break   # on prend le plus récent
-
-    else:  # SHORT
-        # Chercher un BSL sweep : high perce un swing high récent puis close < swing high
-        for i in range(n - 20, n - 1):
-            if i < 5:
-                continue
-            swing_hi = window["high"].iloc[max(0, i-10):i].max()
-            bar_hi   = window["high"].iloc[i]
-            bar_cl   = window["close"].iloc[i]
-            if bar_hi > swing_hi + atr * 0.05 and bar_cl < swing_hi + atr * 0.10:
-                sweep_idx   = i
-                sweep_level = swing_hi
-                break
-
-    if sweep_idx is None or sweep_level is None:
-        return empty
-
-    score += 12
-    sweep_dir = "SSL" if direction == "LONG" else "BSL"
-    reasons.append(
-        f"💧 Sweep {sweep_dir} M15 @ {round(sweep_level, 5)}  (+12)"
-    )
-
-    # ── ② BOS M15 POST-SWEEP ──────────────────────────────────────
-    # On cherche un BOS dans la bonne direction APRÈS la bougie sweep
-    bos_idx   = None
-    bos_level = None
-    search_from = sweep_idx + 1
-
-    if direction == "LONG":
-        # BOS haussier : close > swing high des N bougies avant
-        for i in range(search_from, n):
-            lookback_start = max(sweep_idx - 5, 0)
-            swing_hi_ref   = window["high"].iloc[lookback_start:i].max()
-            if window["close"].iloc[i] > swing_hi_ref:
-                bos_idx   = i
-                bos_level = swing_hi_ref
-                break
-    else:  # SHORT
-        # BOS baissier : close < swing low des N bougies avant
-        for i in range(search_from, n):
-            lookback_start = max(sweep_idx - 5, 0)
-            swing_lo_ref   = window["low"].iloc[lookback_start:i].min()
-            if window["close"].iloc[i] < swing_lo_ref:
-                bos_idx   = i
-                bos_level = swing_lo_ref
-                break
-
-    if bos_idx is None or bos_level is None:
-        return empty   # Pas de BOS post-sweep → séquence invalide
-
-    score += 10
-    bos_dir_lbl = "haussier" if direction == "LONG" else "baissier"
-    reasons.append(
-        f"📐 BOS M15 {bos_dir_lbl} post-sweep @ {round(bos_level, 5)}  (+10)"
-    )
-
-    # ── ③ ZONE PULLBACK = BREAKER NATUREL ────────────────────────
-    # La zone naturelle est la dernière bougie impulse qui a causé le BOS
-    # (ou le FVG créé lors de l'impulsion post-sweep).
-    # On cherche la bougie de BOS elle-même et la bougie juste avant.
-    pullback_zone = None
-
-    if bos_idx >= 1:
-        # Bougie qui a cassé la structure
-        bos_candle_hi = window["high"].iloc[bos_idx]
-        bos_candle_lo = window["low"].iloc[bos_idx]
-        # Bougie précédente (OB naturel)
-        prev_hi = window["high"].iloc[bos_idx - 1]
-        prev_lo = window["low"].iloc[bos_idx - 1]
-
-        if direction == "LONG":
-            # Zone pullback = corps de la bougie OB naturel (dernière bougie baissière avant le BOS haussier)
-            ob_hi = max(bos_candle_hi, prev_hi)
-            ob_lo = min(bos_candle_lo, prev_lo)
-            pullback_zone = (ob_lo, ob_hi)
-        else:
-            ob_hi = max(bos_candle_hi, prev_hi)
-            ob_lo = min(bos_candle_lo, prev_lo)
-            pullback_zone = (ob_lo, ob_hi)
-
-    # Vérifier si le prix courant est dans la zone pullback (ou proche)
-    in_pullback = False
-    if pullback_zone is not None:
-        pb_lo, pb_hi = pullback_zone
-        tol = atr * 0.5
-        in_pullback = (pb_lo - tol) <= price_now <= (pb_hi + tol)
-
-    if in_pullback and pullback_zone is not None:
-        score += 8
-        reasons.append(
-            f"🏛️ Prix dans zone pullback / Breaker naturel "
-            f"[{round(pullback_zone[0], 5)}–{round(pullback_zone[1], 5)}]  (+8)"
-        )
-    else:
-        # Pas dans la zone → séquence détectée mais entrée non encore optimale
-        # On retourne quand même "detected" pour le mode, mais score réduit
-        reasons.append(
-            f"⏳ Attente pullback dans Breaker naturel "
-            f"[{round(pullback_zone[0] if pullback_zone else 0, 5)}–"
-            f"{round(pullback_zone[1] if pullback_zone else 0, 5)}]"
-        )
-        # Séquence ①② valide mais ③ pas encore → score sans bonus pullback
-        # On retourne quand même si score ≥ 22 (sweep + BOS)
-        if score < 20:
-            return empty
-
-    return {
-        "detected"     : True,
-        "sweep_level"  : sweep_level,
-        "bos_level"    : bos_level,
-        "pullback_zone": pullback_zone,
-        "in_pullback"  : in_pullback,
-        "score_bonus"  : min(score, 30),
-        "reasons"      : reasons,
-    }
-
-
-# ═════════════════════════════════════════════════════════════
-#  MOTEUR PRINCIPAL v3 — H4 → M15 → M5
-# ═════════════════════════════════════════════════════════════
-
-
-# ═════════════════════════════════════════════════════════════
-#   SMC SIGNAL ENGINE  v4  — MULTI-SETUP INDÉPENDANT
-#   ─────────────────────────────────────────────────────────
-#   Architecture :
-#     Chaque setup est autonome — aucun ne dépend des autres.
-#     Un signal BREAKER peut partir sans AMD.
-#     Un signal AMD peut partir sans Breaker.
-#
-#   Priorités (T = Tier) :
-#     T1 🥇  BREAKER     Sweep BSL/SSL + Breaker + Retest + Bougie
-#     T2 🥈  ORDER BLOCK OB H4/M15 + BOS + FVG
-#     T3 🥉  BOS_RETEST  BOS M15 + Retest + Confirmation
-#     T4     AMD         Accumulation + Manipulation + Distribution
-#     T5     FVG         FVG non mitiqué + Prix dans zone
-#     T6     MSS/CHoCH   CHoCH M15 + Equal Liq sweep
-# ═════════════════════════════════════════════════════════════
-
-# ─────────────────────────────────────────────────────────────
-#  DATACLASS SIGNAL v4 — commun à tous les setups
-# ─────────────────────────────────────────────────────────────
-
-@dataclass
-class SetupSignal:
-    """Signal produit par un module indépendant."""
-    symbol:     str
-    setup_type: str      # "BREAKER" | "OB" | "BOS" | "AMD" | "FVG" | "MSS"
-    tier:       int      # 1 (meilleur) → 6
-    direction:  str      # "LONG" | "SHORT"
-    entry:      float
-    sl:         float
-    tp:         float
-    tp2:        float
-    tp3:        float
-    rr:         float
-    score:      int      # 0–100
-    reasons:    list     = field(default_factory=list)
-    timestamp:  object   = field(default_factory=lambda: datetime.now(timezone.utc))
-    htf_bias:   str      = "NEUTRAL"
-    lot:        float    = 0.0
-    df_chart:   object   = field(default=None, repr=False)
-    fvg_ref:    object   = field(default=None, repr=False)
-    ob_ref:     object   = field(default=None, repr=False)
-    stars:      int      = 3   # 2⭐ = entrée directe (sweep+CHoCH) | 3⭐ = entrée confirmée (retest+rejet)
-
-    def to_signal(self) -> "Signal":
-        """Convertit en Signal v3 pour réutiliser tg_notify et generate_chart_image."""
-        return Signal(
-            symbol    = self.symbol,
-            direction = self.direction,
-            entry     = self.entry,
-            sl        = self.sl,
-            tp        = self.tp,
-            rr        = self.rr,
-            score     = self.score,
-            timestamp = self.timestamp,
-            htf_bias  = self.htf_bias,
-            lot       = self.lot,
-            mode      = self.setup_type,
-            reasons   = self.reasons,
-            df_chart  = self.df_chart,
-            fvg_chart = self.fvg_ref,
-            ob_chart  = self.ob_ref,
-            tp2       = self.tp2,
-            tp3       = self.tp3,
-            stars     = self.stars,
-        )
-
-
-# ─────────────────────────────────────────────────────────────
-#  HELPERS PARTAGÉS PAR LES 6 MODULES
-# ─────────────────────────────────────────────────────────────
-
-def _fetch_data(symbol: str) -> tuple:
-    """
-    Télécharge H4 / H1 / M15 / M5 (+ M1 pour Gold/BTC) une seule fois.
-    Retourne (df_h4, df_h1, df_m15, df_m5, df_m1).
-    df_m1 est vide (DataFrame) pour tous les symboles SAUF Gold et BTC.
-    H1 est utilisé par le module Supply/Demand (T2) pour détecter les zones institutionnelles.
-
-    Indices Deriv (Volatility) : pas de session réelle (24/7), H4 est moins
-    pertinent comme filtre que sur du Forex classique. On utilise H1 (ou M30
-    via DERIV_BIAS_TF) comme biais — placé à la fois dans le slot H4 et H1
-    pour ne rien casser dans les modules qui lisent l'un ou l'autre.
-
-    [v11] Gold (GC=F) et BTC (BTC-USD) : pipeline dédié M15→M1.
-    Sur ces 2 actifs uniquement, le module Supply/Demand (T2) utilise le
-    M15 comme timeframe de référence de zone/tendance (à la place du H1)
-    et le M1 comme timeframe de confirmation d'entrée (à la place du M5),
-    pour une réactivité accrue sur ces marchés très volatils.
-    """
-    if is_deriv_symbol(symbol):
-        df_bias = fetch(symbol, DERIV_BIAS_TF, period="n/a")
-        df_m15  = fetch(symbol, "15m", period="n/a")
-        df_m5   = fetch(symbol, "5m",  period="n/a")
-        if df_bias.empty or df_m15.empty or df_m5.empty:
-            return None, None, None, None, None
-        return df_bias, df_bias, df_m15, df_m5, pd.DataFrame()
-
-    ltf_p   = "2d"
-    mtf_p   = "5d"
-    h1_p    = "15d"
-
-    df_h4  = fetch(symbol, "4h",  period="30d")
-    df_h1  = fetch(symbol, "1h",  period=h1_p)
-    df_m15 = fetch(symbol, "15m", period=mtf_p)
-    df_m5  = fetch(symbol, "5m",  period=ltf_p)
-
-    if df_h4.empty or df_m15.empty or df_m5.empty:
-        return None, None, None, None, None
-    # df_h1 peut être vide sur certains instruments — on retourne un df vide plutôt que None
-    if df_h1.empty:
-        df_h1 = pd.DataFrame()
-
-    # ── [v13] M1 non utilisé par la stratégie unique (Sweep+Cassure) ──
-    # Conservé vide pour ne pas casser la signature de retour à 5 éléments.
-    df_m1 = pd.DataFrame()
-
-    return df_h4, df_h1, df_m15, df_m5, df_m1
-
-
-def _direction_from_bias(bias: str) -> Optional[str]:
-    if bias == "BULLISH": return "LONG"
-    if bias == "BEARISH": return "SHORT"
-    return None
-
-
-def _compute_levels(
-    symbol: str, direction: str,
-    df_m5: pd.DataFrame, df_m15: pd.DataFrame,
-    ob: Optional[OrderBlock] = None,
-    fvg: Optional[FVG] = None,
-    sd_zone: Optional[SupplyDemandZone] = None,
-    liq_map: Optional[LiquidityMap] = None,
-    score: int = 0,
-) -> tuple:
-    """Wrapper compute_sl_tp_v3 → (entry, sl, tp1, rr, tp2, tp3)"""
-    return compute_sl_tp_v3(
-        df_m5=df_m5, df_m15=df_m15, direction=direction,
-        ob=ob, fvg=fvg, sd_zone=sd_zone, liq_map=liq_map, symbol=symbol,
-        score=score,
-    )
-
-
-def _m15_candle_confirmed(df_m15: pd.DataFrame, direction: str) -> bool:
-    """Vérifie que la dernière bougie M15 est clôturée dans la bonne direction (corps ≥ 40%)."""
-    if len(df_m15) < 2:
-        return False
-    o  = df_m15["open"].iloc[-1]
-    cl = df_m15["close"].iloc[-1]
-    rng = df_m15["high"].iloc[-1] - df_m15["low"].iloc[-1]
-    body_ratio = abs(cl - o) / rng if rng > 0 else 0
-    if direction == "LONG"  and cl > o and body_ratio >= 0.40: return True
-    if direction == "SHORT" and cl < o and body_ratio >= 0.40: return True
-    return False
-
-
-# ─────────────────────────────────────────────────────────────
-#  v7 — VALIDATEUR CENTRAL D'ENTRÉE STRATÉGIQUE M15
-#  Appliqué sur TOUS les 7 modules avant d'envoyer un signal
-# ─────────────────────────────────────────────────────────────
-
-def _validate_strategic_entry_m15(
-    symbol: str,
-    direction: str,
-    df_m15: pd.DataFrame,
-    df_m5: pd.DataFrame,
-    df_h4: pd.DataFrame,
-    df_h1: Optional[pd.DataFrame] = None,
-) -> tuple[bool, list[str], int]:
-    """
-    Filtre d'entrée stratégique M15 — v7.
-
-    Règles OBLIGATOIRES (si l'une échoue → retourne False) :
-      ① Prix dans OB M15/H4  OU  Zone S/D H1/H4
-      ② Bougie M15 : Englobante OU Mèche de rejet (wick ≥ 2× corps)
-      ③ BOS M15 présent dans les 5 dernières bougies (avant ou après entrée)
-
-    Bonus (ne bloque pas) :
-      ④ Liquidité sweepée avant l'entrée → +15 pts
-
-    Retourne : (valide: bool, raisons: list[str], bonus_score: int)
-    """
-    reasons: list[str] = []
-    bonus   = 0
-    expected = "bullish" if direction == "LONG" else "bearish"
-
-    if len(df_m15) < 5 or len(df_m5) < 5 or len(df_h4) < 10:
-        return False, ["⛔ Données insuffisantes pour validation entrée"], 0
-
-    price_now = df_m5["close"].iloc[-1]
-    atr_m5    = (df_m5["high"] - df_m5["low"]).rolling(14).mean().iloc[-1]
-    atr_m15   = (df_m15["high"] - df_m15["low"]).rolling(14).mean().iloc[-1]
-    if pd.isna(atr_m5) or atr_m5 == 0:
-        return False, ["⛔ ATR M5 invalide"], 0
-
-    # ── ① Zone stratégique : OB ou S/D ───────────────────────
-    in_strategic_zone = False
-    zone_label        = ""
-
-    # Test OB M15
-    bos_m15_list = detect_bos(df_m15)
-    obs_m15      = detect_order_blocks(df_m15, bos_m15_list)
-    ob_m15_match = next(
-        (o for o in reversed(obs_m15)
-         if o.direction == expected and
-            (min(o.top, o.bottom) - atr_m5 * 0.4) <= price_now <= (max(o.top, o.bottom) + atr_m5 * 0.4)),
-        None
-    )
-    if ob_m15_match:
-        in_strategic_zone = True
-        zone_label = f"OB M15 [{round(ob_m15_match.bottom, 5)}–{round(ob_m15_match.top, 5)}]"
-
-    # Test OB H4 si OB M15 absent
-    if not in_strategic_zone:
-        bos_h4  = detect_bos(df_h4)
-        obs_h4  = detect_order_blocks(df_h4, bos_h4)
-        ob_h4_match = next(
-            (o for o in reversed(obs_h4)
-             if o.direction == expected and
-                min(o.top, o.bottom) <= price_now <= max(o.top, o.bottom)),
-            None
-        )
-        if ob_h4_match:
-            in_strategic_zone = True
-            zone_label = f"OB H4 [{round(ob_h4_match.bottom, 5)}–{round(ob_h4_match.top, 5)}]"
-
-    # Test Zone S/D H1 si disponible
-    if not in_strategic_zone and df_h1 is not None and not df_h1.empty and len(df_h1) >= 10:
-        atr_h1 = (df_h1["high"] - df_h1["low"]).rolling(14).mean().iloc[-1]
-        if not pd.isna(atr_h1) and atr_h1 > 0:
-            sd_zone_type = "demand" if direction == "LONG" else "supply"
-            zones_h1 = detect_supply_demand_zones(df_h1, sd_zone_type)
-            active_z = price_in_sd_zone(price_now, zones_h1, atr_h1)
-            if active_z is None:
-                tol = atr_h1 * 0.5
-                for z in zones_h1[:3]:
-                    if (z.bottom - tol) <= price_now <= (z.top + tol):
-                        active_z = z
-                        break
-            if active_z:
-                in_strategic_zone = True
-                zone_label = f"Zone S/D H1 [{round(active_z.bottom, 5)}–{round(active_z.top, 5)}]"
-
-    # Test Zone S/D H4 en dernier recours
-    if not in_strategic_zone:
-        atr_h4 = (df_h4["high"] - df_h4["low"]).rolling(14).mean().iloc[-1]
-        if not pd.isna(atr_h4) and atr_h4 > 0:
-            sd_zone_type = "demand" if direction == "LONG" else "supply"
-            zones_h4 = detect_supply_demand_zones(df_h4, sd_zone_type)
-            active_z = price_in_sd_zone(price_now, zones_h4, atr_h4)
-            if active_z:
-                in_strategic_zone = True
-                zone_label = f"Zone S/D H4 [{round(active_z.bottom, 5)}–{round(active_z.top, 5)}]"
-
-    if not in_strategic_zone:
-        return False, ["⛔ REJETÉ v7 : prix hors zone stratégique (OB/S&D requis)"], 0
-
-    reasons.append(f"📍 Zone stratégique : {zone_label}  ✅")
-
-    # ── ② Bougie M15 : Englobante OU Mèche de rejet ──────────
-    o   = df_m15["open"].iloc[-1]
-    h   = df_m15["high"].iloc[-1]
-    l   = df_m15["low"].iloc[-1]
-    cl  = df_m15["close"].iloc[-1]
-    rng = h - l
-
-    body       = abs(cl - o)
-    lower_wick = min(o, cl) - l
-    upper_wick = h - max(o, cl)
-    is_bull    = cl > o
-
-    # Bougie précédente pour englobante
-    p_o  = df_m15["open"].iloc[-2]
-    p_cl = df_m15["close"].iloc[-2]
-    p_h  = df_m15["high"].iloc[-2]
-    p_l  = df_m15["low"].iloc[-2]
-
-    candle_valid = False
-    candle_label = ""
-
-    if direction == "LONG":
-        # Englobante haussière
-        if is_bull and cl > p_h and o <= p_cl and (body / rng if rng > 0 else 0) >= 0.45:
-            candle_valid = True
-            candle_label = "Bullish Engulfing M15"
-        # Marteau / Mèche de rejet basse ≥ 2× corps
-        elif lower_wick >= body * 2.0 and upper_wick <= body * 0.7 and body > 0:
-            candle_valid = True
-            candle_label = "Hammer / Wick Rejet M15"
-        # Hammer inversé haussier (mèche haute + clôture positive)
-        elif is_bull and upper_wick >= body * 1.5 and lower_wick <= body * 0.5 and body > 0:
-            candle_valid = True
-            candle_label = "Inverted Hammer haussier M15"
-
-    elif direction == "SHORT":
-        # Englobante baissière
-        if not is_bull and cl < p_l and o >= p_cl and (body / rng if rng > 0 else 0) >= 0.45:
-            candle_valid = True
-            candle_label = "Bearish Engulfing M15"
-        # Shooting Star / Mèche de rejet haute ≥ 2× corps
-        elif upper_wick >= body * 2.0 and lower_wick <= body * 0.7 and body > 0:
-            candle_valid = True
-            candle_label = "Shooting Star / Wick Rejet M15"
-        # Pin Bar baissière
-        elif not is_bull and lower_wick >= body * 1.5 and upper_wick <= body * 0.5 and body > 0:
-            candle_valid = True
-            candle_label = "Pin Bar baissière M15"
-
-    if not candle_valid:
-        return False, [
-            f"📍 Zone stratégique : {zone_label}  ✅",
-            "⛔ REJETÉ v7 : bougie M15 non confirmée (Englobante ou Mèche rejet requise)"
-        ], 0
-
-    reasons.append(f"🕯️ Bougie M15 : {candle_label}  ✅")
-
-    # ── ③ BOS M15 dans les 5 dernières bougies ───────────────
-    bos_recent = [b for b in bos_m15_list[-5:] if b["type"] == expected]
-    # Accepter aussi les 5 dernières bougies pour le BOS "post-entrée"
-    if not bos_recent:
-        bos_recent = [b for b in bos_m15_list[-8:] if b["type"] == expected]
-
-    if not bos_recent:
-        return False, reasons + [
-            "⛔ REJETÉ v7 : pas de BOS M15 dans les 5 dernières bougies"
-        ], 0
-
-    bos_level = bos_recent[-1]["level"]
-    reasons.append(f"✅ BOS M15 {expected} @ {round(bos_level, 5)}  ✅")
-
-    # ── ④ Bonus liquidité sweepée ─────────────────────────────
-    liq = detect_liquidity_sweep(df_m15)
-    liq_swept = liq["bullish_sweep"] if direction == "LONG" else liq["bearish_sweep"]
-    if liq_swept:
+        stop_loss = max(invalidation_price, entry) + sl_distance
+        risk = stop_loss - entry
+        tp1 = entry - risk * TP1_RR
+
+    tp2, tp2_source = None, None
+    if swing_points is not None:
+        target = select_smart_tp2(candles, swing_points, entry, direction, tp1)
+        valid = target.price and (target.price > tp1 if direction == "BUY" else target.price < tp1)
+        if valid:
+            tp2, tp2_source = target.price, target.label
+
+    rr_tp2, high_rr_warning = None, False
+    if tp2 is not None and risk > 0:
+        rr_tp2 = abs(tp2 - entry) / risk
+        high_rr_warning = rr_tp2 >= TP2_MIN_RR_WARNING
+
+    return TradeLevels(entry, stop_loss, tp1, tp2, TP1_RR, rr_tp2, high_rr_warning, tp2_source)
+
+
+def compute_lot_size(capital, risk_percent, entry, stop_loss,
+                      pip_value_per_lot=10.0, pip_size=0.01) -> float:
+    risk_amount = capital * (risk_percent / 100)
+    sl_pips = abs(entry - stop_loss) / pip_size
+    if sl_pips <= 0:
+        return 0.0
+    return round(risk_amount / (sl_pips * pip_value_per_lot), 2)
+
+
+# ============================================================================
+# 7. SCORING
+# ============================================================================
+
+def compute_score(entry_type: str, rr_tp2: Optional[float], sweep_clean: bool = True) -> int:
+    base = ENTRY_TYPES[entry_type]["score_weight"]
+    bonus = 0
+    if rr_tp2 and rr_tp2 >= 5:
         bonus += 15
-        reasons.append("💧 Liquidité sweepée avant entrée  (+15 bonus)")
-
-    return True, reasons, bonus
-
-
-def _rr_ok(entry: float, sl: float, tp: float, direction: str, min_rr: float) -> bool:
-    risk = abs(entry - sl)
-    if risk <= 0:
-        return False
-    gain = (tp - entry) if direction == "LONG" else (entry - tp)
-    return (gain / risk) >= min_rr
+    elif rr_tp2 and rr_tp2 >= 3:
+        bonus += 8
+    if sweep_clean:
+        bonus += 5
+    return min(100, base + bonus)
 
 
-def _rr_ok_flexible(
-    entry: float, sl: float,
-    tp1: float, tp2: float, tp3: float,
-    direction: str,
-    min_rr: float = MIN_RR,
-) -> bool:
-    """
-    [v9 MOD-5b] Validation RR flexible sur 3 cibles.
-
-    Règle standard : TP1 doit offrir RR ≥ min_rr (ex: 2.5).
-
-    Règle assouplie : si TP1 offre un RR ≥ 1.8 (minimum viable),
-    on accepte le signal à condition que TP3 offre un RR ≥ 3.0.
-    Cela permet de valider des setups où l'entrée est légèrement avancée
-    mais où le potentiel global (TP2/TP3) est largement positif.
-
-    Paramètres :
-      tp2, tp3 : 0.0 si non disponibles → on utilise uniquement la règle standard.
-    """
-    risk = abs(entry - sl)
-    if risk <= 0:
-        return False
-
-    def _rr_val(tp: float) -> float:
-        gain = (tp - entry) if direction == "LONG" else (entry - tp)
-        return gain / risk
-
-    rr_tp1 = _rr_val(tp1)
-
-    # Règle standard : TP1 ≥ min_rr
-    if rr_tp1 >= min_rr:
-        return True
-
-    # Règle assouplie : TP1 entre 1.8 et min_rr, ET TP3 ≥ 3.0
-    if rr_tp1 >= 1.8 and tp3 > 0:
-        rr_tp3 = _rr_val(tp3)
-        if rr_tp3 >= 3.0:
-            return True
-
-    return False
+def get_stars(entry_type: str) -> str:
+    return ENTRY_TYPES[entry_type]["stars"]
 
 
-def detect_sd_entry_candle_m15(df_m15: pd.DataFrame, direction: str) -> tuple:
-    """
-    Détecte les bougies d'entrée M15 spécifiques au scanner Supply/Demand.
-
-    BUY  : Bullish Engulfing · Hammer · Morning Star
-    SELL : Bearish Engulfing · Shooting Star · Evening Star
-
-    Retourne (True, "nom_pattern") ou (False, "").
-    """
-    if len(df_m15) < 4:
-        return False, ""
-
-    o   = df_m15["open"].iloc[-1]
-    h   = df_m15["high"].iloc[-1]
-    l   = df_m15["low"].iloc[-1]
-    cl  = df_m15["close"].iloc[-1]
-    rng = h - l
-
-    body        = abs(cl - o)
-    lower_wick  = min(o, cl) - l
-    upper_wick  = h - max(o, cl)
-    is_bull     = cl > o
-    body_ratio  = body / rng if rng > 0 else 0
-
-    p_o  = df_m15["open"].iloc[-2]
-    p_h  = df_m15["high"].iloc[-2]
-    p_l  = df_m15["low"].iloc[-2]
-    p_cl = df_m15["close"].iloc[-2]
-
-    if direction == "LONG":
-
-        # ── Bullish Engulfing ─────────────────────────────────
-        if is_bull and cl > p_h and o <= p_cl and body_ratio >= 0.5:
-            return True, "Bullish Engulfing"
-
-        # ── Hammer (marteau) ──────────────────────────────────
-        # Corps en haut de la bougie, mèche basse ≥ 2× corps
-        if lower_wick >= body * 2.0 and upper_wick <= body * 0.6 and body_ratio >= 0.15:
-            return True, "Hammer"
-
-        # ── Morning Star (3 bougies) ──────────────────────────
-        if len(df_m15) >= 5:
-            pp_o  = df_m15["open"].iloc[-3]
-            pp_cl = df_m15["close"].iloc[-3]
-            pp_is_bear   = pp_cl < pp_o
-            mid_is_small = abs(p_cl - p_o) < abs(pp_cl - pp_o) * 0.5
-            confirms_up  = is_bull and cl > (pp_o + pp_cl) / 2
-            if pp_is_bear and mid_is_small and confirms_up:
-                return True, "Morning Star"
-
-    elif direction == "SHORT":
-
-        # ── Bearish Engulfing ─────────────────────────────────
-        if not is_bull and cl < p_l and o >= p_cl and body_ratio >= 0.5:
-            return True, "Bearish Engulfing"
-
-        # ── Shooting Star ─────────────────────────────────────
-        # Corps en bas de la bougie, mèche haute ≥ 2× corps
-        if upper_wick >= body * 2.0 and lower_wick <= body * 0.6 and body_ratio >= 0.15:
-            return True, "Shooting Star"
-
-        # ── Evening Star (3 bougies) ──────────────────────────
-        if len(df_m15) >= 5:
-            pp_o  = df_m15["open"].iloc[-3]
-            pp_cl = df_m15["close"].iloc[-3]
-            pp_is_bull   = pp_cl > pp_o
-            mid_is_small = abs(p_cl - p_o) < abs(pp_cl - pp_o) * 0.5
-            confirms_dn  = not is_bull and cl < (pp_o + pp_cl) / 2
-            if pp_is_bull and mid_is_small and confirms_dn:
-                return True, "Evening Star"
-
-    return False, ""
+def passes_threshold(score: int, settings: Optional[Dict] = None) -> bool:
+    min_score = (settings or get_settings())["min_score_to_publish"]
+    return score >= min_score
 
 
-# ─────────────────────────────────────────────────────────────
-#  ENTRÉE CONFIRMÉE — retest OB/FVG + bougie de rejet (3⭐)
-#
-#  Séquence complète : Sweep → CHoCH → retour dans l'OB/FVG →
-#  bougie de rejet claire → entrée.
-#  Sans cette confirmation, l'entrée reste "directe" (2⭐) :
-#  Sweep + CHoCH suffisent, sans attendre le retour en zone.
-# ─────────────────────────────────────────────────────────────
+# ============================================================================
+# 8. TELEGRAM
+# ============================================================================
 
-def detect_ob_retest_rejection(
-    df_m5:     pd.DataFrame,
-    ob:        Optional["OrderBlock"],
-    fvg:       Optional["FVG"],
-    direction: str,
-    lookback:  int = 6,
-) -> dict:
-    """
-    Vérifie si, après le CHoCH, le prix est revenu retester l'OB/FVG
-    ET qu'une bougie de rejet claire (mèche + clôture dans le sens du
-    trade, corps ≥ 35% du range) s'est formée dans les `lookback`
-    dernières bougies M5.
-
-    Retourne {"confirmed": bool, "reason": str | None}.
-    """
-    zone = None
-    if ob is not None:
-        zone = (min(ob.bottom, ob.top), max(ob.bottom, ob.top))
-    elif fvg is not None:
-        zone = (min(fvg.bottom, fvg.top), max(fvg.bottom, fvg.top))
-
-    if zone is None or len(df_m5) < lookback + 1:
-        return {"confirmed": False, "reason": None}
-
-    lo, hi = zone
-    recent = df_m5.iloc[-lookback:]
-
-    for i in range(len(recent)):
-        o, h, l, cl = (recent["open"].iloc[i], recent["high"].iloc[i],
-                        recent["low"].iloc[i], recent["close"].iloc[i])
-        rng = h - l
-        if rng <= 0:
-            continue
-        body = abs(cl - o)
-        touched_zone = (l <= hi) and (h >= lo)   # bougie a touché la zone OB/FVG
-        if not touched_zone:
-            continue
-        body_ratio = body / rng
-        if direction == "LONG":
-            # rejet haussier : mèche basse dans la zone, clôture au-dessus, corps significatif
-            rejection = (cl > o) and (body_ratio >= 0.35) and (cl > lo)
-        else:
-            # rejet baissier : mèche haute dans la zone, clôture en dessous, corps significatif
-            rejection = (cl < o) and (body_ratio >= 0.35) and (cl < hi)
-        if rejection:
-            return {
-                "confirmed": True,
-                "reason": f"🔁 Retest OB/FVG + bougie de rejet confirmée (corps {round(body_ratio*100)}%)  → entrée 3⭐",
-            }
-
-    return {"confirmed": False, "reason": None}
+def _bot_token(group: str = "btc_gold") -> str:
+    """Chaque groupe Telegram a son propre bot (donc son propre token).
+    'reports' retombe sur le token du groupe 'btc_gold' si
+    TELEGRAM_BOT_TOKEN_REPORTS n'est pas défini. Si la variable d'env n'est
+    pas définie du tout, on retombe sur token_default (cf. avertissement de
+    sécurité au niveau de TELEGRAM_GROUPS)."""
+    group_cfg = TELEGRAM_GROUPS[group]
+    env_key = group_cfg["token_env"]
+    token = os.environ.get(env_key) or group_cfg.get("token_default")
+    if not token and group == "reports":
+        bg = TELEGRAM_GROUPS["btc_gold"]
+        token = os.environ.get(bg["token_env"]) or bg.get("token_default")
+    if not token:
+        raise RuntimeError(f"Variable d'environnement {env_key} manquante pour le groupe '{group}'.")
+    return token
 
 
-# ─────────────────────────────────────────────────────────────
-#  T6 — MSS/CHoCH  Market Structure Shift + Equal Liquidity
-# ─────────────────────────────────────────────────────────────
+def _chat_id_for_group(group: str) -> str:
+    group_cfg = TELEGRAM_GROUPS[group]
+    env_key = group_cfg["chat_id_env"]
+    chat_id = os.environ.get(env_key) or group_cfg.get("chat_id_default")
+    if not chat_id:
+        raise RuntimeError(f"Variable d'environnement {env_key} manquante pour le groupe '{group}'.")
+    return chat_id
 
-def check_mss_setup(
-    symbol: str, df_m5: pd.DataFrame, direction: str,
-    liq_map: Optional[LiquidityMap] = None,
-    min_rr: float = MIN_RR,
-) -> Optional[SetupSignal]:
-    """
-    Stratégie unique — 100% M5, AUCUN ancrage H4, AUCUN biais de tendance (v16)
 
-    Critères OBLIGATOIRES (si l'un échoue → setup invalide) :
-      ① BOS M5 dans le sens attendu (cassure de structure, corps de bougie
-         — pas la mèche)                                    → +20 pts
-      ② CHoCH M5 (changement de structure), exigé EN PLUS du BOS
-                                                              → +25 à +35 pts
-      RR ≥ 3.0 imposé (min_rr forcé à 3.0 minimum pour ce setup)
+def format_signal_message(symbol, display_name, direction, entry_type_label, stars, score,
+                           entry, sl, tp1, tp2, rr_tp1, rr_tp2, high_rr_warning,
+                           tp2_source=None) -> str:
+    direction_emoji = "🟢 ACHAT" if direction == "BUY" else "🔴 VENTE"
+    ts = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())
+    lines = [
+        "⚡ *ALPHABOT SMC PRO* ⚡", "",
+        f"📊 *Actif* : {display_name} ({TIMEFRAME})",
+        f"🎯 *Setup* : {entry_type_label} {stars}",
+        f"{direction_emoji}", "",
+        f"🔹 *Entrée* : `{entry:.5f}`",
+        f"🛑 *Stop Loss* : `{sl:.5f}`",
+        f"✅ *TP1 (RR{rr_tp1:g})* : `{tp1:.5f}`",
+    ]
+    if tp2:
+        rr2_txt = f"RR{rr_tp2:.1f}" + (" 🔥" if high_rr_warning else "")
+        source_txt = f" — {tp2_source}" if tp2_source else ""
+        lines.append(f"🚀 *TP2 ({rr2_txt}){source_txt}* : `{tp2:.5f}`")
+    lines += ["", f"⭐ *Score* : {score}/100",
+              "🔁 BE proposé à RR1 · Sécurisation proposée à RR2", "", f"🕒 {ts}"]
+    return "\n".join(lines)
 
-    Bonus (ne bloquent pas, s'ajoutent au score) :
-      ③ Sweep de liquidité (Equal High/Low ou BSL/SSL, calculés sur M5)
-      ④ OB ou FVG M5 post-CHoCH                             → +15 à +20 pts
-      ⑤ Bougie M5 clôturée (corps ≥ 40% du range)            → +15 pts
 
-    Seuil : score ≥ 55/100.
-    Entrée directe (sweep + CHoCH confirmés, sans retest)     = 2⭐
-    Entrée confirmée (+ retest OB/FVG avec bougie de rejet)   = 3⭐
-    """
-    score, reasons = 0, []
-    min_rr = max(min_rr, 3.0)   # RR3 minimum imposé sur ce setup
+def _cleanup_old_charts():
+    """Garde uniquement les CHARTS_KEEP_LAST images les plus récentes pour ne
+    pas saturer le disque sur un déploiement de longue durée."""
+    try:
+        files = [os.path.join(CHARTS_DIR, f) for f in os.listdir(CHARTS_DIR) if f.endswith(".png")]
+        files.sort(key=os.path.getmtime, reverse=True)
+        for f in files[CHARTS_KEEP_LAST:]:
+            os.remove(f)
+    except Exception:
+        pass
 
-    if len(df_m5) < 20:
+
+def generate_signal_chart(symbol: str, display_name: str, direction: str,
+                           candles: List[Dict], sweep: "LiquiditySweep", bos: "BOSConfirmation",
+                           entry: float, sl: float, tp1: float, tp2: Optional[float],
+                           tp2_source: Optional[str] = None, lookback: int = 60,
+                           signal_id: Optional[int] = None) -> Optional[str]:
+    """Génère une image professionnelle du setup AVANT l'envoi Telegram :
+    chandeliers, sweep de liquidité, BOS, zone d'entrée, SL, TP1, TP2 —
+    avec annotations couleurs + labels + emojis. Retourne le chemin du
+    fichier PNG, ou None en cas d'échec (le signal reste envoyé en texte)."""
+    try:
+        view = candles[-lookback:] if len(candles) > lookback else candles
+        offset = len(candles) - len(view)
+        x = list(range(len(view)))
+
+        fig, ax = plt.subplots(figsize=(11, 6.5), dpi=150)
+        fig.patch.set_facecolor("#0f1420")
+        ax.set_facecolor("#0f1420")
+
+        up_color, down_color = "#22c55e", "#ef4444"
+        for i, c in enumerate(view):
+            color = up_color if c["close"] >= c["open"] else down_color
+            ax.plot([i, i], [c["low"], c["high"]], color=color, linewidth=1, zorder=2)
+            body_bottom = min(c["open"], c["close"])
+            body_height = max(abs(c["close"] - c["open"]), 1e-9)
+            ax.add_patch(Rectangle((i - 0.3, body_bottom), 0.6, body_height,
+                                    facecolor=color, edgecolor=color, zorder=3))
+
+        # --- Sweep de liquidité 💧 ---
+        sweep_i = sweep.sweep_index - offset
+        if 0 <= sweep_i < len(view):
+            ax.scatter([sweep_i], [sweep.sweep_wick_price], color="#38bdf8", s=90,
+                       marker="D", zorder=5, edgecolors="white", linewidths=0.8)
+            ax.annotate("💧 Liquidity Sweep", xy=(sweep_i, sweep.sweep_wick_price),
+                        xytext=(sweep_i, sweep.sweep_wick_price), textcoords="data",
+                        color="#38bdf8", fontsize=10, fontweight="bold",
+                        va="bottom" if direction == "SELL" else "top", ha="left")
+
+        # --- BOS confirmé 📈 ---
+        ax.axhline(bos.break_level, color="#f59e0b", linestyle="--", linewidth=1.2, zorder=1)
+        ax.text(len(view) - 1, bos.break_level, "  📈 BOS confirmé", color="#f59e0b",
+                fontsize=10, fontweight="bold", va="bottom", ha="left")
+
+        # --- Zone d'entrée / SL / TP1 / TP2 ---
+        entry_emoji = "🟢 BUY" if direction == "BUY" else "🔴 SELL"
+        ax.axhline(entry, color="#3b82f6", linewidth=1.4, zorder=1)
+        ax.text(len(view) - 1, entry, f"  {entry_emoji}  Entrée {entry:.5f}", color="#3b82f6",
+                fontsize=10, fontweight="bold", va="center", ha="left")
+
+        ax.axhline(sl, color="#ef4444", linewidth=1.4, zorder=1)
+        ax.text(len(view) - 1, sl, f"  🛑 SL {sl:.5f}", color="#ef4444",
+                fontsize=10, fontweight="bold", va="center", ha="left")
+
+        ax.axhline(tp1, color="#22c55e", linewidth=1.4, zorder=1)
+        ax.text(len(view) - 1, tp1, f"  🎯 TP1 {tp1:.5f}", color="#22c55e",
+                fontsize=10, fontweight="bold", va="center", ha="left")
+
+        if tp2:
+            ax.axhline(tp2, color="#a855f7", linewidth=1.4, linestyle=":", zorder=1)
+            label = f"  🚀 TP2 {tp2:.5f}" + (f" ({tp2_source})" if tp2_source else "")
+            ax.text(len(view) - 1, tp2, label, color="#a855f7",
+                    fontsize=10, fontweight="bold", va="center", ha="left")
+
+        ax.set_xlim(-1, len(view) + 22)
+        ax.tick_params(colors="#8b93a7")
+        for spine in ax.spines.values():
+            spine.set_color("#262e42")
+        ax.set_xticks([])
+        ax.grid(axis="y", color="#262e42", linewidth=0.5, alpha=0.5)
+
+        title_emoji = "🟢 BUY" if direction == "BUY" else "🔴 SELL"
+        ax.set_title(f"⚡ ALPHABOT SMC PRO — {display_name} ({TIMEFRAME})  ·  {title_emoji}",
+                     color="#e8ecf4", fontsize=13, fontweight="bold", loc="left", pad=14)
+
+        fname = f"{symbol}_{signal_id or int(time.time())}_{int(time.time())}.png"
+        path = os.path.join(CHARTS_DIR, fname)
+        fig.tight_layout()
+        fig.savefig(path, facecolor=fig.get_facecolor())
+        plt.close(fig)
+        _cleanup_old_charts()
+        return path
+    except Exception:
+        log.error(f"[{symbol}] échec de génération de l'image du signal:\n{traceback.format_exc()}")
+        try:
+            plt.close("all")
+        except Exception:
+            pass
         return None
 
-    if liq_map is None:
-        liq_map = build_liquidity_map(df_m5, df_m5)
 
-    price_now = df_m5["close"].iloc[-1]
-    atr_m5    = (df_m5["high"] - df_m5["low"]).rolling(14).mean().iloc[-1]
-    expected  = "bullish" if direction == "LONG" else "bearish"
-
-    # ── ① BOS M5 dans le sens attendu (obligatoire) ───────────
-    bos_m5     = detect_bos(df_m5)
-    bos_recent = [b for b in bos_m5[-8:] if b["type"] == expected]
-    if not bos_recent:
-        return None   # Pas de BOS M5 → confirmation d'entrée incomplète
-    score += 20
-    reasons.append(f"📐 BOS M5 {expected} @ {round(bos_recent[-1]['level'], 5)}  (+20)")
-
-    # ── ② CHoCH M5 (obligatoire — exigé EN PLUS du BOS) ───────
-    choch_res = detect_choch_eql_setup(df_m5, df_m5, liq_map, direction)
-    if choch_res["detected"] and choch_res["score_bonus"] >= 15:
-        choch_pts = min(choch_res["score_bonus"], 35)
-        score += choch_pts
-        reasons += choch_res.get("reasons", [])
-        reasons.append(f"🔄 CHoCH M5 détecté  (+{choch_pts})")
-    else:
-        # Fallback strict : BOS contraire suivi d'un BOS dans notre sens
-        # (= CHoCH structurel équivalent)
-        opp = "bearish" if direction == "LONG" else "bullish"
-        recents  = bos_m5[-6:]
-        has_opp  = any(b["type"] == opp      for b in recents)
-        has_same = any(b["type"] == expected  for b in recents[-3:])
-        if has_opp and has_same:
-            score += 25
-            reasons.append(f"🔄 CHoCH M5 : retournement {opp}→{expected}  (+25)")
-        else:
-            return None   # BOS + CHoCH requis ENSEMBLE → sans CHoCH, invalide
-
-    # ── ③ Sweep de liquidité — OPTIONNEL (bonus non bloquant) ─
-    eqh_ok = bool(liq_map.eqh_levels) and direction == "SHORT"
-    eql_ok = bool(liq_map.eql_levels) and direction == "LONG"
-    bsl_ssl_swept = (liq_map.swept_bsl and direction == "SHORT") or \
-                    (liq_map.swept_ssl and direction == "LONG")
-
-    if eqh_ok or eql_ok:
-        score += 30
-        lbl = "EQH sweepé" if eqh_ok else "EQL sweepé"
-        reasons.append(f"💧 {lbl} — pool de liquidité institutionnel  (+30)")
-    elif bsl_ssl_swept:
-        score += 20
-        reasons.append(f"💧 BSL/SSL sweepée  (+20)")
-
-    # ── ④ OB ou FVG post-CHoCH ────────────────────────────────
-    fvgs_m5    = detect_fvg(df_m5)
-    fvg_active = active_fvg(df_m5, fvgs_m5, expected)
-    obs_m5     = detect_order_blocks(df_m5, bos_m5)
-    ob_match   = next(
-        (o for o in reversed(obs_m5)
-         if o.direction == expected and
-            (min(o.top,o.bottom)-atr_m5*0.3) <= price_now <= (max(o.top,o.bottom)+atr_m5*0.3)),
-        None
-    )
-
-    if fvg_active:
-        score += 20
-        reasons.append(f"📍 FVG M5 post-CHoCH  (+20)")
-    elif ob_match:
-        score += 15
-        reasons.append(f"🏛️ OB M5 post-CHoCH  (+15)")
-
-    # ── ⑤ Bougie M5 clôturée ──────────────────────────────────
-    if _m15_candle_confirmed(df_m5, direction):
-        score += 15
-        reasons.append(f"🕯️ Bougie M5 clôturée  (+15)")
-
-    if score < 55:
-        return None
-
-    # ── ⑥ Entrée directe (2⭐) vs entrée confirmée par retest (3⭐) ──
-    # Les 2 systèmes tournent en parallèle : Sweep+CHoCH suffit pour
-    # tirer un signal (2⭐) ; si en plus le prix est revenu retester
-    # l'OB/FVG avec une bougie de rejet, le signal passe en 3⭐.
-    retest = detect_ob_retest_rejection(df_m5, ob_match, fvg_active, direction)
-    stars  = 3 if retest["confirmed"] else 2
-    if retest["confirmed"]:
-        reasons.append(retest["reason"])
-    else:
-        reasons.append("⚡ Entrée directe — Sweep+CHoCH sans retest OB/FVG  → 2⭐")
-
-    entry, sl, tp1, rr, tp2, tp3 = _compute_levels(
-        symbol, direction, df_m5, df_m5, ob_match, fvg_active, None, liq_map, score=score
-    )
-
-    if not _rr_ok(entry, sl, tp1, direction, min_rr):
-        return None
-
-    lot  = compute_lot(symbol, entry, sl, risk_usd=get_current_risk_usd())
-    max_vol = get_max_volume()
-    if max_vol > 0 and lot > max_vol:
-        lot = max_vol
-    bias = "BULLISH" if direction == "LONG" else "BEARISH"
-
-    return SetupSignal(
-        symbol=symbol, setup_type="MSS", tier=5,
-        direction=direction, entry=entry, sl=sl, tp=tp1, tp2=tp2, tp3=tp3,
-        rr=rr, score=score, reasons=reasons,
-        htf_bias=bias, lot=lot,
-        df_chart=df_m5, fvg_ref=fvg_active, ob_ref=ob_match,
-        stars=stars,
-    )
-
-
-# ─────────────────────────────────────────────────────────────
-#  ORCHESTRATEUR — scan_symbol()
-#  Stratégie unique : Sweep de liquidité + Cassure de structure
-#  (BOS/CHoCH), LONG et SHORT. Entrée directe = 2⭐, entrée sur
-#  retest OB/FVG confirmé par bougie de rejet = 3⭐.
-# ─────────────────────────────────────────────────────────────
-
-SETUP_LABELS = {
-    "MSS": "SWEEP + CASSURE DE STRUCTURE",
+# --- Boutons interactifs -------------------------------------------------
+# Actions disponibles sous chaque signal Telegram. callback_data suit le
+# format compact "act:<signal_id>:<action>" (largement sous la limite de 64
+# octets imposée par Telegram pour callback_data).
+TRADE_ACTIONS = {
+    "taken":   {"emoji": "✅", "label": "Trade pris",   "status": "taken"},
+    "ignored": {"emoji": "❌", "label": "Trade ignoré",  "status": "ignored"},
+    "be":      {"emoji": "🟡", "label": "Break Even",   "status": "be"},
+    "secured": {"emoji": "🔒", "label": "Sécuriser",    "status": "secured"},
+    "closed":  {"emoji": "🔴", "label": "Clôturer",     "status": "closed"},
 }
 
 
-def scan_symbol(symbol: str, mkt: str, min_rr: float = MIN_RR) -> list[SetupSignal]:
-    """
-    v16 — Stratégie unique, 100% M5, sans ancrage H4, sans biais de tendance.
+def _signal_inline_keyboard(signal_id: int) -> Dict:
+    """Construit le clavier inline Telegram (2 boutons par ligne) affiché
+    sous chaque signal, pour permettre au trader de reporter en un tap ce
+    qu'il a réellement fait du trade."""
+    buttons = [
+        {"text": f"{a['emoji']} {a['label']}", "callback_data": f"act:{signal_id}:{key}"}
+        for key, a in TRADE_ACTIONS.items()
+    ]
+    rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
+    return {"inline_keyboard": rows}
 
-    Fonctionnement :
-      1. Téléchargement des données M5 (une seule fois)
-      2. Filtres communs (volatilité, news)
-      3. Carte de liquidité construite uniquement sur M5
-      4. Test des deux directions (LONG et SHORT) : la direction est
-         déterminée UNIQUEMENT par le sweep + la cassure de structure
-         (BOS + CHoCH, corps de bougie) sur M5 — aucun filtre de biais
-         H4/H1, aucune notion de "tendance de fond"
-           → entrée directe (2⭐) ou entrée confirmée par retest
-             OB/FVG + bougie de rejet (3⭐)
-      5. Retourne le(s) signal(aux) qui passent le score et le RR minimum
-    """
-    # ── 1. Téléchargement des données (une seule fois) ────────
-    df_h4, df_h1, df_m15, df_m5, df_m1 = _fetch_data(symbol)
-    if df_m5 is None or df_m5.empty:
-        return []
 
-    # ── 2. Filtre volatilité + volume ─────────────────────────
-    vol_ok, _ = check_volatility(symbol, df_m5, df_m15)
-    if not vol_ok:
-        return []
+def send_telegram_signal(group: str, text: str, image_path: str = None, signal_id: int = None):
+    chat_id = _chat_id_for_group(group)
+    token = _bot_token(group)
+    reply_markup = _signal_inline_keyboard(signal_id) if signal_id is not None else None
+    if image_path:
+        url = TELEGRAM_API.format(token=token, method="sendPhoto")
+        data = {"chat_id": chat_id, "caption": text, "parse_mode": "Markdown"}
+        if reply_markup:
+            data["reply_markup"] = json.dumps(reply_markup)
+        with open(image_path, "rb") as img:
+            resp = requests.post(url, data=data, files={"photo": img}, timeout=15)
+    else:
+        url = TELEGRAM_API.format(token=token, method="sendMessage")
+        data = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
+        if reply_markup:
+            data["reply_markup"] = json.dumps(reply_markup)
+        resp = requests.post(url, data=data, timeout=15)
+    resp.raise_for_status()
+    return resp.json()
 
-    # ── 2b. FILTRE NEWS ÉCONOMIQUES ───────────────────────────
-    news_blocked, news_reason = is_news_blackout(symbol)
-    if news_blocked:
-        log.info(f"  ⛔ {symbol} — {news_reason}")
-        return []
 
-    # ── 3. Carte de liquidité — 100% M5, aucun ancrage H4 ─────
-    liq_map = build_liquidity_map(df_m5, df_m5)
+# --- Message de démarrage --------------------------------------------------
+# Envoyé sur les 2 groupes de signaux (btc_gold + deriv) à chaque lancement OU
+# redémarrage du process, pour que tu saches immédiatement sur Telegram que le
+# bot est bien en ligne (et pas seulement silencieusement en train de tourner
+# côté serveur). Si le redémarrage a été forcé par le watchdog, le message le
+# précise avec la raison, pour distinguer un déploiement normal d'un incident.
+STARTUP_NOTIFY_GROUPS = ("btc_gold", "deriv")
 
-    # ── 4. Test des deux directions — Sweep + Cassure de structure M5 ─
-    signals: list[SetupSignal] = []
-    for direction in ("LONG", "SHORT"):
-        # ── [Cahier des charges] SHORT UNIQUEMENT ──────────────
-        if SHORT_ONLY and direction != "SHORT":
-            continue
+
+def format_startup_message() -> str:
+    hb = get_heartbeat_status()
+    now = time.time()
+    forced_restart = bool(hb.get("last_restart_at")) and (now - hb["last_restart_at"]) < 300
+    ts = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())
+
+    lines = ["🟢 *ALPHABOT SMC PRO* — bot en ligne", ""]
+    if forced_restart:
+        lines += [
+            "⚠️ *Redémarrage automatique* déclenché par le watchdog.",
+            f"Raison : {hb.get('last_restart_reason') or 'inconnue'}",
+            f"Nombre total de redémarrages forcés : {hb.get('restart_count', 0)}",
+            "",
+        ]
+    lines += [
+        f"📊 *Actifs surveillés* : {', '.join(a.display_name for a in ASSETS.values())} ({TIMEFRAME})",
+        f"🛰️ *Flux Deriv WS* : connexion en cours…",
+        f"🕒 {ts}",
+    ]
+    return "\n".join(lines)
+
+
+def send_startup_notification():
+    """Diffuse le message de démarrage sur les groupes Telegram configurés.
+    Best-effort : une erreur (token manquant, réseau...) est loggée mais ne
+    doit jamais empêcher le bot de démarrer/scanner."""
+    message = format_startup_message()
+    for group in STARTUP_NOTIFY_GROUPS:
         try:
-            sig = check_mss_setup(symbol, df_m5, direction, liq_map, min_rr)
-            if sig is not None:
-                stars = getattr(sig, "stars", 2)
-                log.info(
-                    f"  ✅ Signal validé {symbol} [SWEEP+CASSURE] "
-                    f"{'⭐' * stars} {direction} score={sig.score} RR={sig.rr}"
-                )
-                signals.append(sig)
-        except Exception as e:
-            log.debug(f"  {symbol} [SWEEP+CASSURE] {direction} erreur : {e}")
-
-    return signals
+            send_telegram_signal(group, message)
+            log.info(f"Message de démarrage envoyé sur le groupe Telegram '{group}'.")
+        except Exception:
+            log.warning(f"Échec d'envoi du message de démarrage sur '{group}':\n{traceback.format_exc()}")
 
 
+def _telegram_answer_callback(group: str, callback_query_id: str, text: str = "", show_alert: bool = False):
+    token = _bot_token(group)
+    url = TELEGRAM_API.format(token=token, method="answerCallbackQuery")
+    resp = requests.post(url, data={
+        "callback_query_id": callback_query_id, "text": text[:200], "show_alert": show_alert,
+    }, timeout=10)
+    resp.raise_for_status()
+    return resp.json()
 
 
-
-# ─────────────────────────────────────────────────────────────
-#  WATCHLIST (réutilisée depuis v3)
-# ─────────────────────────────────────────────────────────────
-
-# ── v8 : Paires MAJEURES uniquement — suppression des exotiques ──
-# Résultat analyse : AUDCHF/AUDNZD/CADCHF/USDNOK/USDZAR/USDMXN = trop de SL
-# On garde : 7 forex majeurs + Gold + BTC + 4 crosses liquides
-
-TIER_1_PRIORITY: list[tuple[str, str]] = [
-    ("GC=F",    "Gold"),
-    ("BTC-USD", "Bitcoin"),
-]
-
-# SUPPRIMÉS (demande utilisateur — plus aucun Forex / indice US) :
-# EURUSD, GBPUSD, USDJPY, USDCHF, AUDUSD, NZDUSD, USDCAD (TIER_2_FOREX)
-# EURGBP, EURJPY, GBPJPY, GBPAUD, ^GSPC, ^NDX (TIER_3_EXTRA)
-# R_100, R_50 (Deriv — remplacés par R_75)
-#
-# Seuls 4 marchés restent actifs : XAUUSD (Gold), BTC, Volatility 75 Index,
-# Volatility 25 Index.
+def _telegram_edit_reply_markup(group: str, chat_id, message_id: int, reply_markup: Optional[Dict]):
+    token = _bot_token(group)
+    url = TELEGRAM_API.format(token=token, method="editMessageReplyMarkup")
+    payload = {"chat_id": chat_id, "message_id": message_id}
+    payload["reply_markup"] = json.dumps(reply_markup or {"inline_keyboard": []})
+    resp = requests.post(url, data=payload, timeout=10)
+    # best-effort : un message déjà édité/supprimé ne doit jamais faire planter le webhook.
+    if not resp.ok:
+        log.warning(f"Telegram editMessageReplyMarkup a échoué ({resp.status_code}): {resp.text[:200]}")
+    return resp
 
 
-def get_symbols(cat: str = "all") -> list[tuple[str, str]]:
-    if cat == "gold":     return [("GC=F", "Gold")]
-    if cat == "btc":      return [("BTC-USD", "Bitcoin")]
-    if cat == "deriv":    return DERIV_SYMBOLS
-    if cat == "priority": return TIER_1_PRIORITY
-    # "all" = respecte le réglage 📈 Marchés actifs du menu Telegram
-    active = get_active_markets_setting()
-    if active == "gold_btc":
-        return TIER_1_PRIORITY
-    if active == "deriv":
-        return DERIV_SYMBOLS
-    # "all" (défaut) = les 4 marchés conservés : Gold + BTC + Volatility 75/25
-    return TIER_1_PRIORITY + DERIV_SYMBOLS
+# ============================================================================
+# 9. SIGNAL PIPELINE
+# ============================================================================
+
+def is_session_open(asset_symbol: str) -> bool:
+    asset = ASSETS[asset_symbol]
+    if asset.session_continuous:
+        return True
+    hour_utc = datetime.now(timezone.utc).hour
+    if asset.session_start_utc <= asset.session_end_utc:
+        return asset.session_start_utc <= hour_utc < asset.session_end_utc
+    return hour_utc >= asset.session_start_utc or hour_utc < asset.session_end_utc
 
 
-# ─────────────────────────────────────────────────────────────
-#  LOGGING + COMPTEURS JOURNALIERS
-# ─────────────────────────────────────────────────────────────
+def process_asset(symbol: str):
+    asset = ASSETS[symbol]
+    if not is_session_open(symbol):
+        return
+    if not can_publish_today(symbol):
+        return
 
-def setup_logging() -> logging.Logger:
-    logger = logging.getLogger("smc_v4")
-    if not logger.handlers:
-        logger.setLevel(logging.INFO)
-        h = logging.StreamHandler(sys.stdout)
-        h.setFormatter(logging.Formatter("%(asctime)s  %(message)s", datefmt="%H:%M:%S"))
-        logger.addHandler(h)
-    return logger
+    settings = get_settings()
+    if count_open_positions() >= settings["max_open_positions"]:
+        return
 
+    candles = fetch_candles(symbol, limit=200)
+    if len(candles) < 30:
+        log.warning(f"[{symbol}] pas assez de données ({len(candles)} bougies)")
+        return
 
-log = setup_logging()
+    swing_points = find_swing_points(candles)
+    sweep = detect_liquidity_sweep(candles, swing_points)
+    if not sweep:
+        return
 
-MAX_SIGNALS_PER_DAY        = 3   # [v11] légèrement relevé (2→3) pour accompagner le passage à 8 signaux/jour globaux
-MAX_SIGNALS_GLOBAL_PER_DAY = 8   # [v11] relevé de 2 → 8 signaux/jour GLOBAL (demande utilisateur, tous marchés confondus)
-                                  # Règle absolue : jamais plus de 4 alertes par journée UTC.
-MAX_SIGNALS_PER_SESSION    = 4   # [v11] max 4 signaux par session (Londres et New York comptés séparément)
-MAX_SIGNALS_DERIV_PER_DAY  = 5   # [v11] indices synthétiques Deriv (Volatility) : max 5 signaux/jour, tous ensemble
+    bos = confirm_bos(candles, sweep, swing_points)
+    if not bos or not bos.confirmed:
+        return
 
-_daily_counts:        dict[str, int] = {}
-_daily_global_count:  int            = 0   # compteur global journalier
-_daily_deriv_count:   int            = 0   # [v11] compteur dédié indices Volatility (V100/V50/V25)
-_session_counts:      dict[str, int] = {}  # [v11] {"LONDON": n, "NY": n}
-_last_session_label:  str            = ""
-_daily_date:          str            = ""
+    direction = "BUY" if bos.direction == "bullish" else "SELL"
+    entry_price = candles[bos.break_index]["close"]
 
-def _current_session_label() -> str:
-    """[v11] Retourne 'LONDON', 'NY' ou '' si on est hors des deux kill zones."""
-    now_min = datetime.now(timezone.utc).hour * 60 + datetime.now(timezone.utc).minute
-    if LONDON_KZ_MIN[0] <= now_min < LONDON_KZ_MIN[1]:
-        return "LONDON"
-    if NY_KZ_MIN[0] <= now_min < NY_KZ_MIN[1]:
-        return "NY"
-    return ""
+    fvg = detect_fvg(candles, bos.break_index, bos.direction)
+    entry_type = "fvg_return" if fvg else "direct"
 
-def _reset_session_if_needed() -> None:
-    """[v11] Remet à zéro le compteur d'une session dès l'entrée dans une nouvelle fenêtre."""
-    global _last_session_label
-    label = _current_session_label()
-    if label and label != _last_session_label:
-        _session_counts[label] = 0
-        _last_session_label = label
-    elif not label:
-        _last_session_label = ""
+    levels = compute_levels(entry_price, direction, sweep.sweep_wick_price, candles, swing_points)
 
-def _reset_daily_if_needed() -> None:
-    """
-    [v9 MOD-1] Remet à zéro tous les compteurs si le jour UTC a changé.
-    Reset automatique à 00h00 UTC — aucune action manuelle requise.
-    """
-    global _daily_date, _daily_global_count, _daily_deriv_count
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    if today != _daily_date:
-        _daily_counts.clear()
-        _session_counts.clear()
-        _daily_global_count = 0
-        _daily_deriv_count  = 0
-        _daily_date = today
-        log.info(f"  🔄 [v9] Compteurs journaliers remis à zéro — nouveau jour UTC : {today}")
+    score = compute_score(entry_type, levels.rr_tp2)
+    if not passes_threshold(score, settings):
+        return
 
-def check_daily_limit(symbol: str) -> bool:
-    """
-    [v11] Retourne True si on peut encore envoyer un signal.
-    Vérifie QUATRE limites :
-      • Limite par symbole  : max MAX_SIGNALS_PER_DAY signaux/jour/paire
-      • Limite globale      : max MAX_SIGNALS_GLOBAL_PER_DAY signaux/jour (toutes paires)
-      • Limite par session  : max MAX_SIGNALS_PER_SESSION signaux (Londres et NY séparément)
-      • Limite indices Deriv: max MAX_SIGNALS_DERIV_PER_DAY signaux/jour (V100/V50/V25 confondus)
-    Si l'une ou l'autre est dépassée → retourne False, signal bloqué.
-    """
-    _reset_daily_if_needed()
-    _reset_session_if_needed()
+    setup_key = f"{symbol}:{direction}:{round(sweep.swept_point.price, 5)}"
+    if has_active_setup(setup_key):
+        return
 
-    per_symbol_ok = _daily_counts.get(symbol, 0) < MAX_SIGNALS_PER_DAY
-    global_ok     = _daily_global_count < MAX_SIGNALS_GLOBAL_PER_DAY
+    # Anti-doublon temporel : même si le setup précédent est déjà clôturé,
+    # on n'autorise pas un nouveau signal sur le même actif avant
+    # SIGNAL_COOLDOWN_SECONDS (défaut 15 min) — évite qu'un même niveau
+    # re-balayé à quelques minutes d'intervalle ne spamme le groupe Telegram.
+    age = seconds_since_last_signal(symbol)
+    if age is not None and age < SIGNAL_COOLDOWN_SECONDS:
+        log.info(f"[{symbol}] signal ignoré : dernier signal il y a {age:.0f}s "
+                 f"(cooldown = {SIGNAL_COOLDOWN_SECONDS:.0f}s).")
+        return
 
-    session_label = _current_session_label()
-    session_ok    = (_session_counts.get(session_label, 0) < MAX_SIGNALS_PER_SESSION) if session_label else True
-
-    deriv_ok = (_daily_deriv_count < MAX_SIGNALS_DERIV_PER_DAY) if is_deriv_symbol(symbol) else True
-
-    if not global_ok:
-        log.info(
-            f"  ⏹ [v9] Limite globale atteinte : {_daily_global_count}/{MAX_SIGNALS_GLOBAL_PER_DAY} "
-            f"signaux envoyés aujourd'hui — aucun signal supplémentaire jusqu'à 00h00 UTC."
-        )
-    if session_label and not session_ok:
-        log.info(
-            f"  ⏹ [v11] Limite session {session_label} atteinte : "
-            f"{_session_counts.get(session_label, 0)}/{MAX_SIGNALS_PER_SESSION}"
-        )
-    if is_deriv_symbol(symbol) and not deriv_ok:
-        log.info(
-            f"  ⏹ [v11] Limite indices synthétiques atteinte : "
-            f"{_daily_deriv_count}/{MAX_SIGNALS_DERIV_PER_DAY} — plus de signal Volatility aujourd'hui."
-        )
-
-    return per_symbol_ok and global_ok and session_ok and deriv_ok
-
-def increment_daily_count(symbol: str) -> None:
-    """[v11] Incrémente les compteurs : symbole, global, session, et Deriv si applicable."""
-    global _daily_global_count, _daily_deriv_count
-    _reset_daily_if_needed()
-    _reset_session_if_needed()
-    _daily_counts[symbol]  = _daily_counts.get(symbol, 0) + 1
-    _daily_global_count   += 1
-
-    session_label = _current_session_label()
-    if session_label:
-        _session_counts[session_label] = _session_counts.get(session_label, 0) + 1
-
-    if is_deriv_symbol(symbol):
-        _daily_deriv_count += 1
-
-    log.info(
-        f"  📊 [v11] Compteur : {symbol} → {_daily_counts[symbol]}/{MAX_SIGNALS_PER_DAY}  |  "
-        f"Global : {_daily_global_count}/{MAX_SIGNALS_GLOBAL_PER_DAY}  |  "
-        f"Session {session_label or '—'} : {_session_counts.get(session_label, 0)}/{MAX_SIGNALS_PER_SESSION}"
-        + (f"  |  Deriv : {_daily_deriv_count}/{MAX_SIGNALS_DERIV_PER_DAY}" if is_deriv_symbol(symbol) else "")
+    signal_id = insert_signal(
+        symbol, setup_key, direction, entry_type, get_stars(entry_type), score,
+        entry_price, levels.stop_loss, levels.tp1, levels.tp2, levels.rr_tp1, levels.rr_tp2,
+        asset.telegram_group, levels.tp2_source,
     )
+    increment_daily_counter(symbol)
 
-
-# ─────────────────────────────────────────────────────────────
-#  BOUCLE LIVE v4 — MULTI-SETUP
-# ─────────────────────────────────────────────────────────────
-
-_last_bias_v4: dict[str, str] = {}
-
-def run_live_v4(cat: str = "all", min_rr: float = MIN_RR, interval: int = 300) -> None:
-    """
-    Boucle principale v4 — multi-setup indépendant.
-
-    Chaque cycle (5 min par défaut) :
-      1. Récupère les données H4/M15/M5 par actif
-      2. Lance les 6 modules en parallèle
-      3. Collecte tous les signaux valides
-      4. Envoie Telegram par ordre de priorité (T1 avant T6)
-      5. Limite 4 signaux/jour/symbole (limite globale : 3 signaux/cycle)
-    """
-    symbols = get_symbols(cat)
-
-    # Message de démarrage Telegram
-    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    startup_msg = (
-        f"⚡ <b>SMC Signal Engine v10 — FUSION COMPLÈTE (v8.6 + v9.6 + v4)</b>\n"
-        f"{'─'*30}\n"
-        f"🕐 <code>{ts}</code>\n"
-        f"📊 <b>Marchés ({len(symbols)}) :</b> XAUUSD (Gold) · BTC · "
-        f"Volatility 75 Index · Volatility 25 Index\n"
-        f"🥇 T1 Breaker · 🥈 T2 S/D Zone · 🥉 T3 OB\n"
-        f"T4 BOS · T5 MSS · T6 FVG · T7 AMD\n"
-        f"⚡ <b>Max 3 signaux/cycle</b> — 1 signal/paire/cycle\n"
-        f"📆 <b>Max {MAX_SIGNALS_GLOBAL_PER_DAY} signaux/jour GLOBAL</b> — qualité > quantité\n"
-        f"🚫 <b>BTC SELL bloqué</b> — tendance haussière\n"
-        f"📈 <b>Score min :</b> {SCORE_THRESHOLD}/100\n"
-        f"⏱ <b>Cooldown :</b> 30min entre 2 signaux/paire\n"
-        f"⚖️ RR min : 1:{min_rr}  |  Risque : $100/trade\n"
-        f"{'─'*30}\n"
-        f"✅ Bot v8 démarré — scan toutes les {interval//60} minutes"
+    message = format_signal_message(
+        symbol, asset.display_name, direction, ENTRY_TYPES[entry_type]["label"],
+        get_stars(entry_type), score, entry_price, levels.stop_loss, levels.tp1,
+        levels.tp2, levels.rr_tp1, levels.rr_tp2 or 0, levels.high_rr_warning,
+        levels.tp2_source,
+    )
+    image_path = generate_signal_chart(
+        symbol, asset.display_name, direction, candles, sweep, bos,
+        entry_price, levels.stop_loss, levels.tp1, levels.tp2, levels.tp2_source,
+        signal_id=signal_id,
     )
     try:
-        if TELEGRAM_LEADER_ID:
-            r = requests.post(_tg_url("sendMessage"), json={
-                "chat_id": TELEGRAM_LEADER_ID, "text": startup_msg, "parse_mode": "HTML",
-            }, timeout=10)
-            if r.status_code != 200:
-                log.error(f"  [TG] ✗ Message de démarrage → leader ({TELEGRAM_LEADER_ID}) "
-                          f"— HTTP {r.status_code} : {r.text[:300]}")
-    except Exception as e:
-        log.error(f"  [TG] ✗ Message de démarrage → leader — exception : {e}")
+        send_telegram_signal(asset.telegram_group, message, image_path=image_path, signal_id=signal_id)
+        log.info(f"[{symbol}] signal #{signal_id} publié ({direction}, {entry_type}, score={score})")
+    except Exception:
+        log.error(f"[{symbol}] échec d'envoi Telegram pour le signal #{signal_id}:\n{traceback.format_exc()}")
 
-    # ── Confirmation de démarrage dans les DEUX groupes ────────────────
-    for grp_id, grp_label in (
-        (TELEGRAM_GROUP_DERIV_ID,    "Deriv (Volatility 75/25)"),
-        (TELEGRAM_GROUP_GOLD_BTC_ID, "Gold + BTC"),
-    ):
-        if not grp_id:
-            continue
+
+def scan_loop():
+    log.info("AlphaBot SMC PRO (fusion) — démarrage de la boucle de scan.")
+    while True:
+        for symbol in ASSETS:
+            try:
+                process_asset(symbol)
+            except Exception:
+                log.error(f"[{symbol}] erreur inattendue:\n{traceback.format_exc()}")
+        # Heartbeat watchdog : preuve que la boucle de scan tourne toujours.
+        # Écrit en DB (visible via /health et /api/watchdog, survit à un
+        # redémarrage) ET en mémoire (lu par watchdog_loop sans I/O disque).
+        global _LAST_SCAN_MONOTONIC
+        _LAST_SCAN_MONOTONIC = time.monotonic()
         try:
-            r = requests.post(_tg_url("sendMessage"), json={
-                "chat_id": grp_id, "text": startup_msg, "parse_mode": "HTML",
-            }, timeout=10)
-            ok = r.status_code == 200
-            if not ok:
-                log.error(f"  [TG] ✗ Message de démarrage → groupe {grp_label} ({grp_id}) "
-                          f"— HTTP {r.status_code} : {r.text[:300]}")
-        except Exception as e:
-            ok = False
-            log.error(f"  [TG] ✗ Message de démarrage → groupe {grp_label} ({grp_id}) — exception : {e}")
-        log.info(f"  [TG] {'✓' if ok else '✗'} Message de démarrage → groupe {grp_label} ({grp_id})")
+            record_heartbeat(mark_scan=True)
+        except Exception:
+            log.error("watchdog: échec d'écriture du heartbeat en base:\n" + traceback.format_exc())
+        time.sleep(SCAN_INTERVAL_SECONDS)
 
-    with _STATUS_LOCK:
-        _STATUS["started_at"]    = ts
-        _STATUS["symbols_count"] = len(symbols)
-        _STATUS["scan_running"]  = True
 
-    cycle_n = 0
-    consecutive_errors = 0
+# ============================================================================
+# 9bis. WATCHDOG — surveillance du thread principal + auto-redémarrage
+# ============================================================================
+# Le heartbeat en mémoire (horloge monotone, insensible aux changements
+# d'heure système) est mis à jour par scan_loop() à chaque itération.
+_LAST_SCAN_MONOTONIC = time.monotonic()
+_WATCHDOG_LAST_RESTART_MONOTONIC = 0.0
 
+
+def watchdog_loop():
+    """Tourne dans un thread daemon dédié. Vérifie périodiquement que la
+    boucle de scan (thread principal) donne toujours signe de vie. Si elle
+    reste silencieuse plus de WATCHDOG_MAX_SILENCE_SECONDS (bloquée, deadlock,
+    exception non catchée qui aurait échappé à scan_loop, etc.), le watchdog :
+      1. logge l'incident en CRITICAL,
+      2. enregistre l'événement en SQLite (table watchdog_heartbeat),
+      3. force l'arrêt du process via os._exit(1).
+
+    Sur Render (Web/Background service) comme sur un VPS avec un superviseur
+    de process (systemd, supervisord, pm2, ou un simple `while true; do python
+    main.py; done`), un process qui se termine est automatiquement relancé —
+    c'est le mécanisme de redémarrage utilisé ici, volontairement simple et
+    donc fiable (pas de gestion de threads zombies à l'intérieur du même
+    process, qui serait beaucoup plus fragile)."""
+    log.info("Watchdog : thread de surveillance démarré "
+              f"(silence max toléré = {WATCHDOG_MAX_SILENCE_SECONDS}s).")
+    global _WATCHDOG_LAST_RESTART_MONOTONIC
     while True:
         try:
-            cycle_n += 1
-            now_utc = datetime.now(timezone.utc)
-            now_str = now_utc.strftime("%Y-%m-%d %H:%M:%S UTC")
+            time.sleep(WATCHDOG_CHECK_INTERVAL_SECONDS)
+            silence = time.monotonic() - _LAST_SCAN_MONOTONIC
 
-            # Filtrage weekend
-            if is_weekend():
-                symbols_to_scan = [
-                    (s, m) for s, m in symbols
-                    if is_crypto_symbol(s) or is_deriv_symbol(s)
-                    or (s in GOLD_SYMBOLS and is_gold_session_active())
-                ]
-                if not symbols_to_scan:
-                    if cycle_n % 10 == 1:
-                        log.info(f"  💤 [{cycle_n}] {now_utc.strftime('%H:%M UTC')} — Weekend — attente")
-                    with _STATUS_LOCK:
-                        _STATUS["cycle"] = cycle_n
-                        _STATUS["scan_running"] = False
-                    time.sleep(interval)
-                    continue
-            elif not is_session_active():
-                symbols_to_scan = [(s, m) for s, m in symbols if is_crypto_symbol(s) or is_deriv_symbol(s)]
-                if not symbols_to_scan:
-                    if cycle_n % 10 == 1:
-                        log.info(f"  💤 [{cycle_n}] — Hors session")
-                    time.sleep(interval)
-                    continue
-            else:
-                # Filtre indices US hors heures NYSE/NASDAQ (pas de données 15m disponibles)
-                if not is_us_market_open():
-                    symbols_to_scan = [(s, m) for s, m in symbols if s not in US_INDEX_SYMBOLS]
-                    if cycle_n % 20 == 1:
-                        log.info("  ℹ️  Indices US exclus (hors session NYSE 13h30-20h00 UTC)")
-                else:
-                    symbols_to_scan = symbols
+            # Heartbeat "je suis vivant" pour le watchdog lui-même (utile si on
+            # veut un jour distinguer "scan bloqué" de "process entier mort").
+            try:
+                record_heartbeat(mark_scan=False)
+            except Exception:
+                pass
 
-            with _STATUS_LOCK:
-                _STATUS["scan_running"] = True
-                _STATUS["cycle"]        = cycle_n
-                _STATUS["last_scan"]    = now_str
+            if silence <= WATCHDOG_MAX_SILENCE_SECONDS:
+                continue
 
-            log.info(f"  🔍 [{cycle_n}] {now_utc.strftime('%H:%M UTC')} — {len(symbols_to_scan)} marchés")
-            correlation_guard_reset()
+            since_last_restart = time.monotonic() - _WATCHDOG_LAST_RESTART_MONOTONIC
+            if since_last_restart < WATCHDOG_RESTART_COOLDOWN_SECONDS:
+                # Anti rage-restart : on vient déjà de forcer un redémarrage,
+                # on laisse le temps au nouveau process de démarrer proprement.
+                continue
 
-            # ── Tableau d'en-tête du cycle ────────────────────
-            W = 100
-            print(f"\n{'╔'+'═'*W+'╗'}")
-            print(f"║  🔍  CYCLE v8 #{cycle_n}  [{now_str}]  {len(symbols_to_scan)} marchés"
-                  + " " * max(0, W - 3 - len(now_str) - len(str(len(symbols_to_scan))) - 22) + "║")
-            print(f"║  T1=BREAKER · T2=S/D · T3=OB · T4=BOS · T5=MSS · T6=FVG · T7=AMD  [v8-MAJEURS]"
-                  + " " * max(0, W - 67) + "║")
-            print(f"{'╠'+'═'*W+'╣'}")
-            print(f"  {'N°':<4} {'Marché':<14} {'Sym':<12}  {'Biais':>6}  "
-                  f"{'Setups détectés':<40}  {'Statut'}")
-            print(f"  {'─'*W}")
+            reason = f"scan silencieux depuis {silence:.0f}s (seuil={WATCHDOG_MAX_SILENCE_SECONDS}s)"
+            log.critical(f"WATCHDOG : boucle de scan considérée bloquée ({reason}). "
+                         f"Redémarrage forcé du process.")
+            try:
+                record_watchdog_restart(reason)
+            except Exception:
+                log.error("watchdog: échec d'écriture du redémarrage en base:\n" + traceback.format_exc())
 
-            cycle_signals: list[tuple[str, str, SetupSignal]] = []
-
-            for i, (sym, mkt) in enumerate(symbols_to_scan, 1):
-                prefix = f"  {i:<4} {mkt:<14} {c(sym, 'cyan'):<12}"
-                print(prefix + "  … ", end="", flush=True)
-
-                try:
-                    # ── Kill Zone check — filtre horaire par symbole ──
-                    # v8.1 : appliqué à TOUS les marchés (Forex + Gold + Crypto)
-                    # pour bannir les heures de nuit/faible liquidité partout
-                    kz_ok, kz_reason = is_kill_zone_active(sym)
-                    if not kz_ok:
-                        print(f"\r{prefix}  {'—':>6}  {'—':<40}  {kz_reason}")
-                        continue
-
-                    # Diagnostic rapide (affichage console uniquement —
-                    # ne filtre plus rien : plus de biais de tendance H4,
-                    # la direction est décidée uniquement par le sweep +
-                    # la cassure de structure M5 dans scan_symbol())
-                    df_peek = fetch(sym, "4h", period="5d")
-                    if not df_peek.empty:
-                        bias_str = htf_bias(df_peek)
-                    else:
-                        bias_str = "NEUTRAL"
-
-                    bias_col = "green" if bias_str == "BULLISH" else (
-                               "red" if bias_str == "BEARISH" else "yellow")
-
-                    # ── Lancement du module unique (Sweep + Cassure M5) ─
-                    sigs = scan_symbol(sym, mkt, min_rr=min_rr)
-
-                    if not sigs:
-                        print(f"\r{prefix}  {c(bias_str[:4], bias_col):>6}  {'Aucun setup validé':<40}  🔵 Attente")
-                        time.sleep(0.5)
-                        continue
-
-                    # Affichage des setups trouvés
-                    setup_names = " | ".join(
-                    c(f"T{s.tier}:{s.setup_type}({s.score})", "yellow" if s.score >= 75 else "cyan")
-                        for s in sigs
-                    )
-                    print(f"\r{prefix}  {c(bias_str[:4], bias_col):>6}  {setup_names:<40}  "
-                          + c(f"⚡ {len(sigs)} signal(s)", "yellow"))
-
-                    # Mise à jour biais
-                    if _last_bias_v4.get(sym) and _last_bias_v4[sym] != bias_str:
-                        reset_setup(sym)
-                    _last_bias_v4[sym] = bias_str
-
-                    for sig in sigs:
-                        cycle_signals.append((mkt, sym, sig))
-
-                except Exception as e:
-                    print(f"\r{prefix}  {'—':>6}  {'—':<40}  "
-                          + c(f"⚠ {str(e)[:40]}", "red"))
-
-                time.sleep(1)
-
-            # ── Envoi des meilleurs signaux du cycle ──────────
-            print(f"  {'─'*W}")
-
-            # ── v8 : max 3 signaux par cycle — 1 seul module par paire ──
-            # Priorité : T1 > T2 > T3. On ne double plus les signaux OB+BOS+FVG sur la même paire
-            seen_pairs_cycle = set()
-            deduped_signals = []
-            cycle_signals.sort(key=lambda x: (x[2].tier, -x[2].score))
-            for item in cycle_signals:
-                pair_key = item[1]  # symbol
-                if pair_key not in seen_pairs_cycle:
-                    seen_pairs_cycle.add(pair_key)
-                    deduped_signals.append(item)
-            cycle_signals = deduped_signals[:3]  # max 3 par cycle
-
-            if cycle_signals:
-                print(c(f"\n  ⚡ {len(cycle_signals)} SIGNAL(S) — Envoi Telegram…", "yellow"))
-
-            for mkt, sym, setup_sig in cycle_signals:
-                if not check_daily_limit(sym):
-                    # Distinguer : limite symbole ou limite globale
-                    _reset_daily_if_needed()
-                    if _daily_global_count >= MAX_SIGNALS_GLOBAL_PER_DAY:
-                        log.info(f"  ⏹ Limite globale atteinte ({MAX_SIGNALS_GLOBAL_PER_DAY} signaux/jour) — plus aucun signal aujourd'hui")
-                        break   # inutile de continuer la boucle
-                    else:
-                        log.info(f"  ⏭ {sym} — limite {MAX_SIGNALS_PER_DAY} signaux/jour/paire atteinte")
-                    continue
-
-                # v8 : bloquer les SELL sur BTC (tendance macro haussière)
-                if BTC_SELL_BLOCKED and sym == "BTC-USD" and setup_sig.direction in ("SHORT", "SELL"):
-                    log.info(f"  🚫 BTC SELL bloqué (v8 — biais haussier macro)")
-                    continue
-
-                corr_ok, corr_reason = correlation_guard(sym, setup_sig.direction)
-                if not corr_ok:
-                    log.info(f"  🟠 {sym} — corrélation bloquée ({corr_reason})")
-                    continue
-
-                increment_daily_count(sym)
-                tier_lbl = SETUP_LABELS.get(setup_sig.setup_type, setup_sig.setup_type)
-
-                # Conversion en Signal v3 pour tg_notify
-                sig_v3 = setup_sig.to_signal()
-                log.info(f"  ⚡ {setup_sig.direction} {mkt} [{setup_sig.setup_type}]"
-                         f"  score={setup_sig.score}  RR=1:{setup_sig.rr}  lot={setup_sig.lot}")
-                tg_notify(sig_v3, tier=tier_lbl, mode=setup_sig.setup_type)
-
-                with _STATUS_LOCK:
-                    _STATUS["last_signals"].append({
-                        "ts"       : now_utc.strftime("%d/%m %H:%M"),
-                        "market"   : mkt,
-                        "direction": setup_sig.direction,
-                        "entry"    : setup_sig.entry,
-                        "sl"       : setup_sig.sl,
-                        "tp"       : setup_sig.tp,
-                        "rr"       : setup_sig.rr,
-                        "score"    : setup_sig.score,
-                        "lot"      : setup_sig.lot,
-                        "mode"     : setup_sig.setup_type,
-                    })
-                    _STATUS["last_signals"] = _STATUS["last_signals"][-20:]
-
-            if not cycle_signals:
-                print(c(f"  ℹ️  Aucun signal validé ce cycle", "white"))
-
-            print(f"{'╚'+'═'*W+'╝'}")
-            consecutive_errors = 0
-            log.info(f"  ⏳ Prochain scan dans {interval}s\n")
-            time.sleep(interval)
-
-        except KeyboardInterrupt:
-            log.info("\n  Session live v4 terminée.")
-            break
-        except Exception as e:
-            consecutive_errors += 1
-            log.error(f"  ✗ Erreur critique : {e}")
-            wait = min(60 * consecutive_errors, 300)
-            time.sleep(wait)
+            _WATCHDOG_LAST_RESTART_MONOTONIC = time.monotonic()
+            # os._exit() coupe le process immédiatement (pas de cleanup Python
+            # ni d'exceptions relancées) : c'est volontaire, on ne peut pas se
+            # fier à un état potentiellement bloqué/incohérent pour faire un
+            # arrêt "propre". Render / systemd / le superviseur du VPS relance
+            # alors un process neuf.
+            os._exit(1)
+        except Exception:
+            # Le watchdog lui-même ne doit JAMAIS s'arrêter silencieusement.
+            log.error("Erreur inattendue dans watchdog_loop (le watchdog continue):\n"
+                       + traceback.format_exc())
 
 
-# ═════════════════════════════════════════════════════════════
-#  MAIN
-# ═════════════════════════════════════════════════════════════
+# ============================================================================
+# 10. DASHBOARD FLASK
+# ============================================================================
+
+app = Flask(__name__)
+
+
+@app.route("/health")
+def health():
+    hb = get_heartbeat_status()
+    status = "ok" if hb["healthy"] else "degraded"
+    return jsonify({
+        "status": status,
+        "scan_healthy": hb["healthy"],
+        "seconds_since_last_scan": hb["seconds_since_scan"],
+        "restart_count": hb["restart_count"],
+        "deriv_ws_connected": deriv_feed.is_connected(),
+    }), (200 if hb["healthy"] else 503)
+
+
+@app.route("/api/watchdog")
+def watchdog_status():
+    hb = get_heartbeat_status()
+    return jsonify({
+        "heartbeat": hb,
+        "deriv_feed": {
+            "connected": deriv_feed.is_connected(),
+            "seconds_since_last_message": deriv_feed.seconds_since_last_message(),
+            "symbols": deriv_feed.symbols,
+        },
+    })
+
+
+@app.route("/api/lot-size", methods=["POST"])
+def lot_size():
+    data = request.get_json(force=True)
+    settings = get_settings()
+    symbol = data.get("symbol")
+    risk_percent = float(data.get("risk_percent") or get_effective_risk_percent(symbol, settings))
+    lot = compute_lot_size(
+        capital=float(data.get("capital", settings["capital"])),
+        risk_percent=risk_percent,
+        entry=float(data["entry"]), stop_loss=float(data["stop_loss"]),
+        pip_value_per_lot=float(data.get("pip_value_per_lot", 10.0)),
+        pip_size=float(data.get("pip_size", 0.01)),
+    )
+    return jsonify({"lot_size": lot, "risk_percent_used": risk_percent})
+
+
+@app.route("/api/profile", methods=["GET", "POST"])
+def profile():
+    """Conservé pour compatibilité ascendante — délègue maintenant au
+    profil actif du nouveau système (table `profiles`, voir /api/profiles)."""
+    if request.method == "POST":
+        data = request.get_json(force=True)
+        name = data.get("name")
+        match = next((p for p in list_profiles() if p["name"] == name), None)
+        if not match:
+            return jsonify({"error": "profil inconnu"}), 400
+        activate_profile(match["id"])
+    settings = get_settings()
+    active = next((p for p in list_profiles() if p["id"] == settings.get("active_profile_id")), None)
+    return jsonify({"active_profile": active["name"] if active else None, "settings": active})
+
+
+@app.route("/api/profiles", methods=["GET", "POST"])
+def profiles_endpoint():
+    """Liste tous les profils sauvegardés, ou en crée un nouveau.
+    Body POST attendu : {name, capital, leverage, risk_percent, max_open_positions}."""
+    if request.method == "POST":
+        data = request.get_json(force=True) or {}
+        try:
+            p = create_profile(
+                name=data.get("name"),
+                capital=float(data.get("capital", 0)),
+                leverage=float(data.get("leverage", 0)),
+                risk_percent=float(data.get("risk_percent", 0)),
+                max_open_positions=int(data.get("max_open_positions", 0)),
+            )
+        except (ValueError, TypeError) as e:
+            return jsonify({"error": str(e)}), 400
+        return jsonify(p), 201
+    return jsonify(list_profiles())
+
+
+@app.route("/api/profiles/<int:profile_id>", methods=["GET", "PUT", "DELETE"])
+def profile_detail(profile_id):
+    if request.method == "GET":
+        p = get_profile(profile_id)
+        if not p:
+            return jsonify({"error": "profil introuvable"}), 404
+        return jsonify(p)
+    if request.method == "PUT":
+        data = request.get_json(force=True) or {}
+        try:
+            p = update_profile(profile_id, data)
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 400
+        return jsonify(p)
+    try:
+        delete_profile(profile_id)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify({"ok": True})
+
+
+@app.route("/api/profiles/<int:profile_id>/activate", methods=["POST"])
+def profile_activate(profile_id):
+    """Sélectionne ce profil comme actif ET applique immédiatement ses
+    valeurs (capital, levier, risque %, positions max) — sans redémarrage."""
+    try:
+        settings = activate_profile(profile_id)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify({"ok": True, "active_profile_id": profile_id, "settings": settings})
+
+
+@app.route("/api/settings", methods=["GET", "POST"])
+def settings_endpoint():
+    """Point central de configuration du dashboard : capital, levier, risque
+    par trade, mode risque, martingale, recovery, positions max, score min."""
+    if request.method == "POST":
+        data = request.get_json(force=True) or {}
+        try:
+            updated = update_settings(data)
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 400
+        return jsonify(updated)
+    return jsonify(get_settings())
+
+
+@app.route("/api/stats")
+def stats():
+    return jsonify(get_stats())
+
+
+@app.route("/api/overview")
+def overview():
+    return jsonify(get_dashboard_overview())
+
+
+@app.route("/api/stats/by-asset")
+def stats_by_asset():
+    return jsonify(get_stats_by_asset())
+
+
+@app.route("/api/stats/monthly")
+def stats_monthly():
+    n = request.args.get("months", default=6, type=int)
+    return jsonify(get_monthly_performance(n))
+
+
+@app.route("/api/history")
+def history():
+    limit = request.args.get("limit", default=100, type=int)
+    symbol = request.args.get("symbol")
+    status = request.args.get("status")
+    return jsonify(get_trade_history(limit=limit, symbol=symbol, status=status))
+
+
+@app.route("/api/reports/daily")
+def report_daily():
+    now = datetime.now(timezone.utc)
+    start_ts, end_ts = _day_bounds(now)
+    return jsonify(get_period_stats(start_ts, end_ts))
+
+
+@app.route("/api/reports/weekly")
+def report_weekly():
+    now = datetime.now(timezone.utc)
+    start_ts, end_ts, period_key = _week_bounds(now)
+    stats_data = get_period_stats(start_ts, end_ts)
+    stats_data["period_key"] = period_key
+    return jsonify(stats_data)
+
+
+@app.route("/api/reports/monthly")
+def report_monthly():
+    now = datetime.now(timezone.utc)
+    start_ts, end_ts = _month_bounds(now)
+    stats_data = get_period_stats(start_ts, end_ts)
+    stats_data["period_key"] = now.strftime("%Y-%m")
+    return jsonify(stats_data)
+
+
+@app.route("/api/trade/<int:signal_id>/status", methods=["POST"])
+def set_trade_status(signal_id):
+    data = request.get_json(force=True)
+    status = data.get("status")
+    valid = {"taken", "ignored", "closed", "be", "secured", "tp1_hit", "tp2_hit", "invalidated"}
+    if status not in valid:
+        return jsonify({"error": f"status invalide, attendu un de {valid}"}), 400
+    record_trade_action(signal_id, action=status, new_status=status, source="dashboard")
+    return jsonify({"ok": True, "signal_id": signal_id, "status": status})
+
+
+@app.route("/api/trade/<int:signal_id>")
+def get_trade(signal_id):
+    row = get_signal(signal_id)
+    if not row:
+        return jsonify({"error": "introuvable"}), 404
+    return jsonify(dict(row))
+
+
+@app.route("/api/trade/<int:signal_id>/actions")
+def get_trade_actions_endpoint(signal_id):
+    rows = get_trade_actions(signal_id)
+    return jsonify([dict(r) for r in rows])
+
+
+@app.route("/telegram/webhook", methods=["POST"])
+def telegram_webhook():
+    """Reçoit les updates Telegram (callback_query des boutons interactifs
+    ✅❌🟡🔒🔴 sous chaque signal). Voir section DÉPLOIEMENT en bas de fichier
+    pour la commande setWebhook à exécuter une fois par bot."""
+    if TELEGRAM_WEBHOOK_SECRET:
+        header = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+        if header != TELEGRAM_WEBHOOK_SECRET:
+            return jsonify({"error": "secret invalide"}), 403
+
+    update = request.get_json(force=True, silent=True) or {}
+    callback = update.get("callback_query")
+    if not callback:
+        return jsonify({"ok": True})  # autre type d'update (message, etc.) -> ignoré
+
+    try:
+        data = callback.get("data", "")
+        parts = data.split(":")
+        if len(parts) != 3 or parts[0] != "act":
+            return jsonify({"ok": True})
+
+        _, signal_id_str, action_key = parts
+        signal_id = int(signal_id_str)
+        action_def = TRADE_ACTIONS.get(action_key)
+        row = get_signal(signal_id)
+
+        if not action_def or not row:
+            return jsonify({"ok": True})
+
+        actor_info = callback.get("from") or {}
+        actor = actor_info.get("username") or str(actor_info.get("id", "")) or None
+        record_trade_action(signal_id, action=action_key, new_status=action_def["status"],
+                             source="telegram", actor=actor)
+
+        group = row["telegram_group"]
+        confirm_text = f"{action_def['emoji']} {action_def['label']} enregistré pour le signal #{signal_id}."
+        try:
+            _telegram_answer_callback(group, callback["id"], text=confirm_text)
+        except Exception:
+            log.warning("Échec answerCallbackQuery Telegram:\n" + traceback.format_exc())
+
+        message = callback.get("message") or {}
+        chat = message.get("chat") or {}
+        if chat.get("id") and message.get("message_id"):
+            try:
+                _telegram_edit_reply_markup(group, chat["id"], message["message_id"], None)
+            except Exception:
+                log.warning("Échec editMessageReplyMarkup Telegram:\n" + traceback.format_exc())
+
+        return jsonify({"ok": True, "signal_id": signal_id, "action": action_key,
+                         "status": action_def["status"]})
+    except Exception:
+        log.error("Erreur traitement webhook Telegram:\n" + traceback.format_exc())
+        # 200 volontaire : éviter que Telegram ne retente indéfiniment un update cassé.
+        return jsonify({"ok": False}), 200
+
+
+DASHBOARD_HTML = """
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AlphaBot SMC PRO — Dashboard</title>
+<style>
+  :root { --bg:#0f1420; --card:#171d2b; --border:#262e42; --text:#e8ecf4; --muted:#8b93a7;
+          --green:#22c55e; --red:#ef4444; --blue:#3b82f6; --amber:#f59e0b; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: -apple-system, Segoe UI, Roboto, sans-serif; background:var(--bg); color:var(--text); }
+  header { padding:20px 28px; border-bottom:1px solid var(--border); display:flex; justify-content:space-between; align-items:center; }
+  header h1 { font-size:18px; margin:0; }
+  header span { color:var(--muted); font-size:13px; }
+  main { max-width:1180px; margin:0 auto; padding:24px 20px 60px; }
+  .cards { display:grid; grid-template-columns: repeat(auto-fit, minmax(170px,1fr)); gap:14px; margin-bottom:26px; }
+  .card { background:var(--card); border:1px solid var(--border); border-radius:12px; padding:16px; }
+  .card .label { color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.04em; }
+  .card .value { font-size:22px; font-weight:700; margin-top:6px; }
+  .pos { color:var(--green); } .neg { color:var(--red); }
+  section { background:var(--card); border:1px solid var(--border); border-radius:12px; padding:20px; margin-bottom:20px; }
+  section h2 { margin:0 0 16px; font-size:15px; }
+  .grid-form { display:grid; grid-template-columns: repeat(auto-fit, minmax(200px,1fr)); gap:14px; }
+  label { display:block; font-size:12px; color:var(--muted); margin-bottom:5px; }
+  input[type=number], select { width:100%; background:#0f1420; border:1px solid var(--border); color:var(--text);
+        padding:9px 10px; border-radius:8px; font-size:14px; }
+  .toggle-row { display:flex; align-items:center; justify-content:space-between; background:#0f1420;
+        border:1px solid var(--border); border-radius:8px; padding:10px 12px; }
+  .switch { position:relative; width:42px; height:24px; }
+  .switch input { opacity:0; width:0; height:0; }
+  .slider { position:absolute; cursor:pointer; inset:0; background:#333c50; border-radius:24px; transition:.2s; }
+  .slider:before { content:""; position:absolute; height:18px; width:18px; left:3px; bottom:3px; background:white; border-radius:50%; transition:.2s; }
+  input:checked + .slider { background:var(--blue); }
+  input:checked + .slider:before { transform: translateX(18px); }
+  button { background:var(--blue); color:white; border:none; padding:10px 18px; border-radius:8px; font-size:14px;
+        cursor:pointer; font-weight:600; }
+  button:hover { opacity:.9; }
+  #saveMsg { margin-left:12px; font-size:13px; color:var(--green); }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th, td { text-align:left; padding:9px 10px; border-bottom:1px solid var(--border); }
+  th { color:var(--muted); font-weight:600; font-size:12px; text-transform:uppercase; }
+  .badge { padding:2px 8px; border-radius:20px; font-size:11px; font-weight:600; }
+  .b-buy { background:rgba(34,197,94,.15); color:var(--green); }
+  .b-sell { background:rgba(239,68,68,.15); color:var(--red); }
+  .b-status { background:rgba(59,130,246,.15); color:var(--blue); }
+  .filters { display:flex; gap:10px; margin-bottom:14px; flex-wrap:wrap; }
+  .filters select { width:auto; min-width:140px; }
+  .tabs { display:flex; gap:8px; margin-bottom:16px; }
+  .tab-btn { background:#0f1420; border:1px solid var(--border); color:var(--muted); padding:8px 14px;
+        border-radius:8px; cursor:pointer; font-size:13px; }
+  .tab-btn.active { background:var(--blue); color:white; border-color:var(--blue); }
+</style>
+</head>
+<body>
+<header>
+  <h1>⚡ AlphaBot SMC PRO — Dashboard</h1>
+  <span id="lastUpdate">chargement…</span>
+</header>
+<main>
+  <div class="cards" id="overviewCards"></div>
+
+  <section>
+    <h2>👤 Profils (Scalping, Conservative, personnalisés…)</h2>
+    <table id="profilesTable">
+      <thead><tr><th>Nom</th><th>Capital</th><th>Levier</th><th>Risque %</th><th>Pos. max</th><th>Statut</th><th></th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <div class="grid-form" style="margin-top:16px;">
+      <div><label>Nom du profil</label><input type="text" id="p_name" placeholder="ex: Mon setup New York"></div>
+      <div><label>Capital ($)</label><input type="number" step="0.01" id="p_capital" value="1000"></div>
+      <div><label>Levier (x)</label><input type="number" step="1" id="p_leverage" value="100"></div>
+      <div><label>Risque par trade (%)</label><input type="number" step="0.1" id="p_risk_percent" value="1"></div>
+      <div><label>Positions ouvertes max</label><input type="number" step="1" id="p_max_open_positions" value="3"></div>
+    </div>
+    <div style="margin-top:14px;">
+      <button onclick="createOrUpdateProfile()">💾 Enregistrer le profil</button>
+      <button style="background:#333c50; margin-left:8px;" onclick="resetProfileForm()">Annuler l'édition</button>
+      <span id="profileMsg"></span>
+    </div>
+  </section>
+
+  <section>
+    <h2>Réglages (appliqués immédiatement, aucune modification du code nécessaire)</h2>
+    <div class="grid-form">
+      <div><label>Capital du compte ($)</label><input type="number" step="0.01" id="s_capital"></div>
+      <div><label>Levier (x)</label><input type="number" step="1" id="s_leverage"></div>
+      <div><label>Risque par trade (%)</label><input type="number" step="0.1" id="s_risk_percent"></div>
+      <div><label>Positions ouvertes max</label><input type="number" step="1" id="s_max_open_positions"></div>
+      <div><label>Score minimum pour publier</label><input type="number" step="1" min="0" max="100" id="s_min_score_to_publish"></div>
+      <div><label>Multiplicateur martingale</label><input type="number" step="0.1" id="s_martingale_multiplier"></div>
+      <div><label>Multiplicateur max recovery</label><input type="number" step="0.1" id="s_recovery_max_multiplier"></div>
+    </div>
+    <div class="grid-form" style="margin-top:14px;">
+      <div class="toggle-row"><span>Martingale</span>
+        <label class="switch"><input type="checkbox" id="s_martingale_enabled"><span class="slider"></span></label>
+      </div>
+      <div class="toggle-row"><span>Recovery</span>
+        <label class="switch"><input type="checkbox" id="s_recovery_enabled"><span class="slider"></span></label>
+      </div>
+    </div>
+    <div style="margin-top:16px;">
+      <button onclick="saveSettings()">💾 Enregistrer les réglages</button>
+      <span id="saveMsg"></span>
+    </div>
+  </section>
+
+  <section>
+    <h2>Performance par actif</h2>
+    <table id="byAssetTable">
+      <thead><tr><th>Actif</th><th>Total</th><th>Gagnants</th><th>Perdants</th><th>Winrate</th><th>R cumulé</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>Performances mensuelles (6 derniers mois)</h2>
+    <table id="monthlyTable">
+      <thead><tr><th>Mois</th><th>Signaux</th><th>Gagnants</th><th>Perdants</th><th>Winrate</th><th>R</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>Historique des trades</h2>
+    <div class="filters">
+      <select id="f_symbol"><option value="">Tous les actifs</option></select>
+      <select id="f_status">
+        <option value="">Tous les statuts</option>
+        <option value="pending">pending</option><option value="taken">taken</option>
+        <option value="be">be</option><option value="secured">secured</option>
+        <option value="tp1_hit">tp1_hit</option><option value="tp2_hit">tp2_hit</option>
+        <option value="invalidated">invalidated</option><option value="closed">closed</option>
+        <option value="ignored">ignored</option>
+      </select>
+      <button onclick="loadHistory()">Filtrer</button>
+    </div>
+    <table id="historyTable">
+      <thead><tr><th>Date</th><th>Actif</th><th>Sens</th><th>Type</th><th>Score</th><th>Entrée</th><th>SL</th><th>TP1</th><th>Statut</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </section>
+</main>
+
+<script>
+const ASSETS = {{ assets_json | safe }};
+
+let editingProfileId = null;
+
+async function loadProfiles() {
+  const r = await fetch('/api/profiles'); const profiles = await r.json();
+  const tbody = document.querySelector('#profilesTable tbody');
+  tbody.innerHTML = profiles.map(p => `
+    <tr>
+      <td>${p.name}</td><td>$${p.capital}</td><td>${p.leverage}x</td>
+      <td>${p.risk_percent}%</td><td>${p.max_open_positions}</td>
+      <td>${p.active ? '<span class="badge b-buy">✓ actif</span>' : ''}</td>
+      <td>
+        ${p.active ? '' : `<button style="padding:5px 10px;font-size:12px;" onclick="activateProfile(${p.id})">Activer</button>`}
+        <button style="padding:5px 10px;font-size:12px;background:#333c50;margin-left:4px;" onclick="editProfile(${p.id}, '${p.name.replace(/'/g,"\\'")}', ${p.capital}, ${p.leverage}, ${p.risk_percent}, ${p.max_open_positions})">✎</button>
+        ${p.active ? '' : `<button style="padding:5px 10px;font-size:12px;background:var(--red);margin-left:4px;" onclick="deleteProfile(${p.id})">🗑</button>`}
+      </td>
+    </tr>`).join('');
+}
+
+async function activateProfile(id) {
+  const r = await fetch(`/api/profiles/${id}/activate`, {method:'POST'});
+  if (r.ok) { loadProfiles(); loadOverview(); }
+}
+
+function editProfile(id, name, capital, leverage, risk_percent, max_open_positions) {
+  editingProfileId = id;
+  document.getElementById('p_name').value = name;
+  document.getElementById('p_capital').value = capital;
+  document.getElementById('p_leverage').value = leverage;
+  document.getElementById('p_risk_percent').value = risk_percent;
+  document.getElementById('p_max_open_positions').value = max_open_positions;
+}
+
+function resetProfileForm() {
+  editingProfileId = null;
+  document.getElementById('p_name').value = '';
+  document.getElementById('p_capital').value = 1000;
+  document.getElementById('p_leverage').value = 100;
+  document.getElementById('p_risk_percent').value = 1;
+  document.getElementById('p_max_open_positions').value = 3;
+}
+
+async function createOrUpdateProfile() {
+  const payload = {
+    name: document.getElementById('p_name').value,
+    capital: parseFloat(document.getElementById('p_capital').value),
+    leverage: parseFloat(document.getElementById('p_leverage').value),
+    risk_percent: parseFloat(document.getElementById('p_risk_percent').value),
+    max_open_positions: parseInt(document.getElementById('p_max_open_positions').value),
+  };
+  const url = editingProfileId ? `/api/profiles/${editingProfileId}` : '/api/profiles';
+  const method = editingProfileId ? 'PUT' : 'POST';
+  const r = await fetch(url, {method, headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
+  const msg = document.getElementById('profileMsg');
+  if (r.ok) {
+    msg.style.color = 'var(--green)'; msg.textContent = '✓ Profil enregistré';
+    resetProfileForm(); loadProfiles(); loadOverview();
+  } else {
+    const e = await r.json(); msg.style.color = 'var(--red)'; msg.textContent = '✗ ' + e.error;
+  }
+  setTimeout(() => msg.textContent = '', 3000);
+}
+
+async function deleteProfile(id) {
+  if (!confirm('Supprimer ce profil ?')) return;
+  const r = await fetch(`/api/profiles/${id}`, {method:'DELETE'});
+  if (r.ok) loadProfiles();
+  else { const e = await r.json(); alert(e.error); }
+}
+
+async function loadOverview() {
+  const r = await fetch('/api/overview'); const d = await r.json();
+  const pnlClass = d.profit_net_total >= 0 ? 'pos' : 'neg';
+  document.getElementById('overviewCards').innerHTML = `
+    <div class="card"><div class="label">Capital actuel</div><div class="value">$${d.capital_actuel}</div></div>
+    <div class="card"><div class="label">Profit / Perte net</div><div class="value ${pnlClass}">$${d.profit_net_total}</div></div>
+    <div class="card"><div class="label">Drawdown max</div><div class="value neg">$${d.drawdown_max}</div></div>
+    <div class="card"><div class="label">Winrate</div><div class="value">${d.winrate}%</div></div>
+    <div class="card"><div class="label">Signaux totaux</div><div class="value">${d.total_signals}</div></div>
+    <div class="card"><div class="label">Positions ouvertes</div><div class="value">${d.open_positions} / ${d.settings.max_open_positions}</div></div>
+  `;
+  const s = d.settings;
+  document.getElementById('s_capital').value = s.capital;
+  document.getElementById('s_leverage').value = s.leverage;
+  document.getElementById('s_risk_percent').value = s.risk_percent;
+  document.getElementById('s_max_open_positions').value = s.max_open_positions;
+  document.getElementById('s_min_score_to_publish').value = s.min_score_to_publish;
+  document.getElementById('s_martingale_multiplier').value = s.martingale_multiplier;
+  document.getElementById('s_recovery_max_multiplier').value = s.recovery_max_multiplier;
+  document.getElementById('s_martingale_enabled').checked = s.martingale_enabled;
+  document.getElementById('s_recovery_enabled').checked = s.recovery_enabled;
+  document.getElementById('lastUpdate').textContent = 'mis à jour ' + new Date().toLocaleTimeString();
+}
+
+async function saveSettings() {
+  const payload = {
+    capital: parseFloat(document.getElementById('s_capital').value),
+    leverage: parseFloat(document.getElementById('s_leverage').value),
+    risk_percent: parseFloat(document.getElementById('s_risk_percent').value),
+    max_open_positions: parseInt(document.getElementById('s_max_open_positions').value),
+    min_score_to_publish: parseInt(document.getElementById('s_min_score_to_publish').value),
+    martingale_multiplier: parseFloat(document.getElementById('s_martingale_multiplier').value),
+    recovery_max_multiplier: parseFloat(document.getElementById('s_recovery_max_multiplier').value),
+    martingale_enabled: document.getElementById('s_martingale_enabled').checked,
+    recovery_enabled: document.getElementById('s_recovery_enabled').checked,
+  };
+  const r = await fetch('/api/settings', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
+  const msg = document.getElementById('saveMsg');
+  if (r.ok) { msg.style.color = 'var(--green)'; msg.textContent = '✓ Enregistré'; loadOverview(); }
+  else { const e = await r.json(); msg.style.color = 'var(--red)'; msg.textContent = '✗ ' + e.error; }
+  setTimeout(() => msg.textContent = '', 3000);
+}
+
+async function loadByAsset() {
+  const r = await fetch('/api/stats/by-asset'); const d = await r.json();
+  const tbody = document.querySelector('#byAssetTable tbody');
+  tbody.innerHTML = Object.entries(d).map(([sym, s]) => `
+    <tr><td>${s.display_name || sym}</td><td>${s.total}</td><td>${s.wins}</td><td>${s.losses}</td>
+    <td>${s.win_rate}%</td><td class="${s.total_r>=0?'pos':'neg'}">${s.total_r}</td></tr>`).join('');
+}
+
+async function loadMonthly() {
+  const r = await fetch('/api/stats/monthly?months=6'); const d = await r.json();
+  const tbody = document.querySelector('#monthlyTable tbody');
+  tbody.innerHTML = d.map(m => `
+    <tr><td>${m.period_key}</td><td>${m.total_signals}</td><td>${m.wins}</td><td>${m.losses}</td>
+    <td>${m.win_rate}%</td><td class="${m.total_r>=0?'pos':'neg'}">${m.total_r}</td></tr>`).join('');
+}
+
+async function loadHistory() {
+  const symbol = document.getElementById('f_symbol').value;
+  const status = document.getElementById('f_status').value;
+  const params = new URLSearchParams({limit: 150});
+  if (symbol) params.set('symbol', symbol);
+  if (status) params.set('status', status);
+  const r = await fetch('/api/history?' + params.toString()); const d = await r.json();
+  const tbody = document.querySelector('#historyTable tbody');
+  tbody.innerHTML = d.map(t => {
+    const date = new Date(t.created_at * 1000).toLocaleString();
+    const dirBadge = t.direction === 'BUY' ? '<span class="badge b-buy">ACHAT</span>' : '<span class="badge b-sell">VENTE</span>';
+    return `<tr><td>${date}</td><td>${t.symbol}</td><td>${dirBadge}</td><td>${t.entry_type}</td>
+      <td>${t.score}</td><td>${t.entry_price.toFixed(5)}</td><td>${t.stop_loss.toFixed(5)}</td>
+      <td>${t.tp1.toFixed(5)}</td><td><span class="badge b-status">${t.status}</span></td></tr>`;
+  }).join('');
+}
+
+function initFilters() {
+  const sel = document.getElementById('f_symbol');
+  ASSETS.forEach(a => { const o = document.createElement('option'); o.value = a.symbol; o.textContent = a.display_name; sel.appendChild(o); });
+}
+
+initFilters();
+loadOverview();
+loadProfiles();
+loadByAsset();
+loadMonthly();
+loadHistory();
+setInterval(loadOverview, 30000);
+</script>
+</body>
+</html>
+"""
+
+
+@app.route("/")
+def index():
+    assets_json = json.dumps([
+        {"symbol": sym, "display_name": a.display_name} for sym, a in ASSETS.items()
+    ])
+    return render_template_string(DASHBOARD_HTML, assets_json=assets_json)
+
+
+# ============================================================================
+# 11. POINT D'ENTRÉE — lance le dashboard Flask dans un thread + la boucle de
+#     scan dans le thread principal, pour ne déployer qu'UN seul process.
+# ============================================================================
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="SMC Signal Engine v10 — FUSION COMPLÈTE (v8.6 + v9.6 + v4)",
-        formatter_class=argparse.RawTextHelpFormatter,
+    enforce_group_asset_whitelist()
+    init_db()
+
+    port = int(os.environ.get("PORT", 5000))
+    flask_thread = threading.Thread(
+        target=lambda: app.run(host="0.0.0.0", port=port, use_reloader=False),
+        daemon=True,
     )
-    parser.add_argument("--symbol", default=None,
-                        help="Symbole unique (ex: GC=F, BTC-USD, R_75, R_25)")
-    parser.add_argument("--cat",    default="all",
-                        choices=["gold", "priority", "btc", "deriv", "all"])
-    parser.add_argument("--scan",   action="store_true",
-                        help="Scan unique (test local, sans Telegram)")
-    parser.add_argument("--min-rr",  type=float, default=MIN_RR)
-    parser.add_argument("--interval",type=int,   default=300,
-                        help="Intervalle scan secondes (défaut: 300 = 5 min)")
-    args = parser.parse_args()
+    flask_thread.start()
+    log.info(f"Dashboard Flask démarré sur le port {port} (thread daemon).")
 
-    # Flask dashboard
-    flask_port = int(os.environ.get("PORT", 10000))
-    threading.Thread(target=start_flask, args=(flask_port,),
-                     daemon=True, name="flask").start()
-    time.sleep(3)
-    log.info(f"  ✓ Flask dashboard port {flask_port}")
-    start_self_ping(flask_port)
+    report_thread = threading.Thread(target=report_scheduler_loop, daemon=True)
+    report_thread.start()
+    log.info("Thread du planificateur de rapports démarré.")
 
-    # ── Trade Monitor — alertes TP/SL automatiques ───────────
-    _init_trade_db()
-    _settings_init()
-    _monitor_trades_thread()
-    log.info("  ✓ Trade Monitor actif — alertes TP1/TP2/TP3/SL automatiques")
-    _daily_report_thread()    # Rapport Telegram à 21h00 UTC (Gold+BTC + Deriv séparés)
-    _weekly_report_thread()   # Rapport Telegram hebdomadaire — dimanche 21h05 UTC
-    _telegram_command_thread()  # Commande admin /rapport (long-polling)
-    print_stats_summary()     # Résumé stats au démarrage
+    deriv_feed.start()  # connexion WebSocket Deriv persistante (V75 + V25)
 
-    if args.symbol:
-        # Test d'un seul symbole
-        sigs = scan_symbol(args.symbol, args.symbol, min_rr=args.min_rr)
-        if sigs:
-            for s in sigs:
-                print(c(f"\n⚡ {s.setup_type} T{s.tier}  {s.direction}  "
-                        f"score={s.score}  RR=1:{s.rr}", "yellow"))
-                for r in s.reasons:
-                    print(f"   • {r}")
-                tg_notify(s.to_signal(), tier=SETUP_LABELS[s.setup_type], mode=s.setup_type)
-        else:
-            print(c(f"  Aucun setup validé pour {args.symbol}", "white"))
+    watchdog_thread = threading.Thread(target=watchdog_loop, daemon=True)
+    watchdog_thread.start()
+    log.info("Thread watchdog démarré.")
 
-    elif args.scan:
-        symbols = get_symbols(args.cat)
-        all_sigs: list[tuple[str, SetupSignal]] = []
-        print(f"\n  SMC v4 — Scan {len(symbols)} symboles…\n")
-        for sym, mkt in symbols:
-            sigs = scan_symbol(sym, mkt, min_rr=args.min_rr)
-            for s in sigs:
-                all_sigs.append((mkt, s))
-                d = "green" if s.direction == "LONG" else "red"
-                print(f"  {mkt:<16} {c(s.direction, d)}  [{s.setup_type}]"
-                      f"  score={s.score}  RR=1:{s.rr}")
-        if not all_sigs:
-            print(c("  Aucun signal.", "yellow"))
+    # Message "bot en ligne" sur Telegram — en thread séparé (non bloquant),
+    # pour ne jamais retarder le démarrage de la boucle de scan si Telegram
+    # est lent/indisponible au moment du déploiement.
+    startup_notify_thread = threading.Thread(target=send_startup_notification, daemon=True)
+    startup_notify_thread.start()
 
-    else:
-        run_live_v4(cat=args.cat, min_rr=args.min_rr, interval=args.interval)
+    scan_loop()  # boucle infinie dans le thread principal
 
+
+# ============================================================================
+# DÉPLOIEMENT SUR RENDER
+# ============================================================================
+# 1. Type de service : "Web Service" (pas "Background Worker") — car ce fichier
+#    expose aussi le dashboard Flask sur $PORT, ce que Render attend d'un Web
+#    Service pour le healthcheck HTTP. Render redémarre automatiquement tout
+#    process qui se termine (crash, os._exit du watchdog, etc.) : c'est ce
+#    mécanisme qui est utilisé par le watchdog intégré (section 9bis).
+# 2. Start command : python main.py
+# 3. Variables d'environnement à définir dans Render (Settings > Environment) :
+#      Groupe BTC + Gold : TELEGRAM_BOT_TOKEN_BTC_GOLD, TG_CHAT_BTC_GOLD
+#      Groupe Deriv (V25/V75) : TELEGRAM_BOT_TOKEN_DERIV, TG_CHAT_DERIV
+#      DERIV_APP_ID (optionnel, sinon "1089" par défaut — App ID public de démo)
+#      TG_CHAT_REPORTS (optionnel — sinon les rapports partent sur les 2 groupes ci-dessus)
+#      TELEGRAM_BOT_TOKEN_REPORTS (optionnel — sinon le bot "btc_gold" est réutilisé)
+#      TELEGRAM_WEBHOOK_SECRET (optionnel mais recommandé — sécurise /telegram/webhook)
+#      SIGNAL_COOLDOWN_MINUTES (optionnel, défaut 15 — délai mini entre 2 signaux sur le même actif)
+#      DB_PATH (optionnel — chemin du fichier SQLite, ex. un disque persistant Render)
+# 4. Healthcheck path côté Render : /health
+#      -> renvoie 200 si le scan a tourné il y a moins de WATCHDOG_MAX_SILENCE_SECONDS,
+#         503 sinon (Render peut alors, en plus du watchdog interne, redémarrer le service).
+# 5. Dépendances supplémentaires à ajouter dans requirements.txt : websocket-client
+# 6. Boutons Telegram interactifs — à faire UNE FOIS par bot (btc_gold ET deriv),
+#    après le premier déploiement, pour que Telegram pousse les clics de bouton
+#    vers /telegram/webhook au lieu qu'on ait à faire du polling :
+#      curl -X POST "https://api.telegram.org/bot<TOKEN>/setWebhook" \
+#           -d "url=https://<ton-service>.onrender.com/telegram/webhook" \
+#           -d "secret_token=<TELEGRAM_WEBHOOK_SECRET>"
+#    (répéter avec le token de chaque bot : TELEGRAM_BOT_TOKEN_BTC_GOLD et
+#    TELEGRAM_BOT_TOKEN_DERIV — un webhook par bot).
 
