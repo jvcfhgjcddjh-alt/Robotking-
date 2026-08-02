@@ -1,5 +1,6 @@
 
 
+
 """
 ╔══════════════════════════════════════════════════════════════════════════╗
 ║       ALPHABOT — SMC/ICT SIGNAL ENGINE  v13 — STRATÉGIE UNIQUE          ║
@@ -978,7 +979,7 @@ def correlation_guard(symbol: str, direction: str) -> tuple[bool, str]:
 # défini dans l'environnement (.env), Telegram reste désactivé — le moteur
 # ne doit JAMAIS retomber sur un token ou un chat/group ID appartenant à
 # quelqu'un d'autre.
-_TG_TOKEN_ENV = os.environ.get("TG_TOKEN", "8632763755:AAECibBa64ftswCGuDMF3DPFR5cuWKpQ_ZI")
+_TG_TOKEN_ENV = os.environ.get("TG_TOKEN", "")
 _TG_ENABLED   = bool(_TG_TOKEN_ENV) if os.environ.get("TG_ENABLED", "") == "" else \
                 os.environ.get("TG_ENABLED", "false").lower() == "true"
 
@@ -1458,8 +1459,16 @@ def update_trade_field_guarded(trade_id: str, field: str, value) -> int:
 def get_current_price_live(symbol: str) -> Optional[float]:
     """
     [v10] Récupère le prix actuel via yfinance OU requests direct (5m, fallback 1m).
+    Deriv (R_75/R_25) → API WebSocket Deriv dédiée : ces indices synthétiques
+    n'existent PAS sur Yahoo Finance (yfinance renvoie 404 "Quote not found").
     Utilisé uniquement par le trade monitor.
     """
+    if is_deriv_symbol(symbol):
+        df = fetch_deriv(symbol, "1m", count=5)
+        if not df.empty:
+            return float(df["close"].iloc[-1])
+        return None
+
     for interval in ("5m", "1m"):
         try:
             if _HAS_YFINANCE:
@@ -6798,11 +6807,14 @@ def run_live_v4(cat: str = "all", min_rr: float = MIN_RR, interval: int = 300) -
     )
     try:
         if TELEGRAM_LEADER_ID:
-            requests.post(_tg_url("sendMessage"), json={
+            r = requests.post(_tg_url("sendMessage"), json={
                 "chat_id": TELEGRAM_LEADER_ID, "text": startup_msg, "parse_mode": "HTML",
             }, timeout=10)
-    except Exception:
-        pass
+            if r.status_code != 200:
+                log.error(f"  [TG] ✗ Message de démarrage → leader ({TELEGRAM_LEADER_ID}) "
+                          f"— HTTP {r.status_code} : {r.text[:300]}")
+    except Exception as e:
+        log.error(f"  [TG] ✗ Message de démarrage → leader — exception : {e}")
 
     # ── Confirmation de démarrage dans les DEUX groupes ────────────────
     for grp_id, grp_label in (
@@ -6816,8 +6828,12 @@ def run_live_v4(cat: str = "all", min_rr: float = MIN_RR, interval: int = 300) -
                 "chat_id": grp_id, "text": startup_msg, "parse_mode": "HTML",
             }, timeout=10)
             ok = r.status_code == 200
-        except Exception:
+            if not ok:
+                log.error(f"  [TG] ✗ Message de démarrage → groupe {grp_label} ({grp_id}) "
+                          f"— HTTP {r.status_code} : {r.text[:300]}")
+        except Exception as e:
             ok = False
+            log.error(f"  [TG] ✗ Message de démarrage → groupe {grp_label} ({grp_id}) — exception : {e}")
         log.info(f"  [TG] {'✓' if ok else '✗'} Message de démarrage → groupe {grp_label} ({grp_id})")
 
     with _STATUS_LOCK:
@@ -7091,6 +7107,5 @@ if __name__ == "__main__":
 
     else:
         run_live_v4(cat=args.cat, min_rr=args.min_rr, interval=args.interval)
-
 
 
