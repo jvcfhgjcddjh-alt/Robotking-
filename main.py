@@ -1,11 +1,12 @@
+
 """
 ALPHABOT SMC PRO — FUSION (fichier unique, prêt à déployer sur Render)
 ========================================================================
 Fusion des deux cahiers des charges (PDF "SMC PRO" + DOCX "Liquidity Sweep +
 BOS Corps de Bougie"), confirmée avec Pie :
 
-  - Actifs : Gold (XAUUSD), BTC/USD, Deriv Volatility 75, Deriv Volatility 25
-  - Sessions : Gold + BTC -> session US/NY, 13h-22h UTC. Deriv (V75/V25) -> H24.
+  - Actifs : Gold (XAUUSD), BTC/USD
+  - Sessions : Gold + BTC -> session US/NY, 13h-22h UTC.
   - Timeframe : M5 uniquement, sur tous les actifs.
   - Signal : sweep de liquidité (mèche dépasse un niveau) PUIS cassure de
     structure validée UNIQUEMENT par la clôture du CORPS de la bougie au-delà
@@ -19,7 +20,7 @@ BOS Corps de Bougie"), confirmée avec Pie :
     du trade (peut donner RR > 10, pas de plafond — juste un badge d'alerte).
   - Score global 0-100 (étoiles + qualité du RR de TP2) ; seuil de publication
     configurable (MIN_SCORE_TO_PUBLISH).
-  - Diffusion Telegram sur 2 groupes : "BTC + Gold" et "Deriv" (V75/V25).
+  - Diffusion Telegram sur un seul groupe (BTC + Gold), via un seul bot.
   - Dashboard Flask : capital/levier/risque/lot, stats, profils de risque,
     statut des trades (pris/ignoré/clôturé), endpoint /health pour Render.
   - Persistance SQLite : historique complet, anti-doublon, cap quotidien de signaux.
@@ -28,12 +29,9 @@ BOS Corps de Bougie"), confirmée avec Pie :
     côté Render (Background Worker ou Web Service, cf. section DÉPLOIEMENT
     en bas de fichier).
 
-  - Flux Deriv (V75/V25) : branché en direct sur l'API publique Deriv (WebSocket
-    ticks_history, granularity M5). App ID configurable via DERIV_APP_ID
-    (App ID public de démo "1089" utilisé par défaut).
   - Rapports automatiques : journalier (21h UTC), hebdomadaire (dimanche
     21h30 UTC), mensuel (dernier jour du mois, 22h UTC) — envoyés sur
-    Telegram (TG_CHAT_REPORTS si défini, sinon sur les 2 groupes de signaux)
+    Telegram (TG_CHAT_REPORTS si défini, sinon sur le groupe de signaux)
     et consultables via /api/reports/daily, /weekly, /monthly.
 
 ⚠️ POINTS OUVERTS avant la prod réelle (voir aussi les commentaires inline) :
@@ -77,8 +75,8 @@ from matplotlib.patches import Rectangle
 class AssetConfig:
     symbol: str
     display_name: str
-    data_source: str            # "yfinance" | "binance" | "deriv_ws"
-    telegram_group: str         # "btc_gold" | "deriv"
+    data_source: str            # "yfinance" | "binance"
+    telegram_group: str         # "btc_gold"
     session_continuous: bool
     session_start_utc: Optional[int] = None
     session_end_utc: Optional[int] = None
@@ -96,14 +94,6 @@ ASSETS = {
         symbol="BTCUSD", display_name="BTC/USD", data_source="binance",
         telegram_group="btc_gold", session_continuous=False,
         session_start_utc=13, session_end_utc=22, contract_type="crypto",
-    ),
-    "V75": AssetConfig(
-        symbol="V75", display_name="Volatility 75 Index", data_source="deriv_ws",
-        telegram_group="deriv", session_continuous=True, contract_type="synthetic",
-    ),
-    "V25": AssetConfig(
-        symbol="V25", display_name="Volatility 25 Index", data_source="deriv_ws",
-        telegram_group="deriv", session_continuous=True, contract_type="synthetic",
     ),
 }
 
@@ -147,11 +137,9 @@ MAX_SIGNALS_PER_DAY_PER_ASSET = 2
 # variables d'environnement Render au lieu de ce fallback.
 _DEFAULT_TG_CHAT_BTC_GOLD = "-5281258868"
 _DEFAULT_TG_TOKEN_BTC_GOLD = "6950706659:AAEeRW9Ld1zNz0xyDLwlKuIQxZst4S7RU0Q"
-_DEFAULT_TG_CHAT_DERIV = "-1002335466840"
-_DEFAULT_TG_TOKEN_DERIV = "8665812395:AAGdB95bYjQOcGrk5r84V7bosdGboRQJcUQ"
 
 TELEGRAM_GROUPS = {
-    # Groupe 1 : BTC/USD + XAU/USD (Gold) — bot Telegram dédié, indépendant du groupe Deriv.
+    # Groupe unique : BTC/USD + XAU/USD (Gold) — un seul bot Telegram, un seul groupe.
     "btc_gold": {
         "token_env": "TELEGRAM_BOT_TOKEN_BTC_GOLD",
         "chat_id_env": "TG_CHAT_BTC_GOLD",
@@ -159,25 +147,16 @@ TELEGRAM_GROUPS = {
         "token_default": _DEFAULT_TG_TOKEN_BTC_GOLD,
         "chat_id_default": _DEFAULT_TG_CHAT_BTC_GOLD,
     },
-    # Groupe 2 : Volatility 25 + Volatility 75 (Deriv) — bot Telegram dédié.
-    "deriv": {
-        "token_env": "TELEGRAM_BOT_TOKEN_DERIV",
-        "chat_id_env": "TG_CHAT_DERIV",
-        "assets": ["V25", "V75"],
-        "token_default": _DEFAULT_TG_TOKEN_DERIV,
-        "chat_id_default": _DEFAULT_TG_CHAT_DERIV,
-    },
     # Optionnel : si TG_CHAT_REPORTS n'est pas défini, les rapports sont
-    # envoyés sur les deux groupes de signaux ci-dessus à la place (chacun
-    # avec son propre bot token). TELEGRAM_BOT_TOKEN_REPORTS est optionnel ;
-    # à défaut, le token du groupe "btc_gold" est réutilisé pour ce canal.
+    # envoyés sur le groupe de signaux ci-dessus à la place. TELEGRAM_BOT_TOKEN_REPORTS
+    # est optionnel ; à défaut, le token du groupe "btc_gold" est réutilisé pour ce canal.
     "reports": {"token_env": "TELEGRAM_BOT_TOKEN_REPORTS", "chat_id_env": "TG_CHAT_REPORTS", "assets": []},
 }
 
 
 def enforce_group_asset_whitelist():
     """Vérifie au démarrage que chaque actif n'est routé QUE vers le groupe
-    Telegram autorisé pour lui (BTC/XAU -> btc_gold, V25/V75 -> deriv).
+    Telegram autorisé pour lui (BTC/XAU -> btc_gold).
     Lève une erreur explicite si la config a été modifiée de façon incohérente."""
     for symbol, asset in ASSETS.items():
         allowed = TELEGRAM_GROUPS.get(asset.telegram_group, {}).get("assets", [])
@@ -204,13 +183,15 @@ CHARTS_KEEP_LAST = 300  # nettoyage automatique — ne garde que les N dernière
 # configures lors de l'appel à setWebhook, cf. section DÉPLOIEMENT en bas).
 TELEGRAM_WEBHOOK_SECRET = os.environ.get("TELEGRAM_WEBHOOK_SECRET", "")
 
-# --- Deriv WebSocket : flux temps réel -----------------------------------
-DERIV_APP_ID = os.environ.get("DERIV_APP_ID", "1089")
-DERIV_RECONNECT_MIN_SECONDS = 2
-DERIV_RECONNECT_MAX_SECONDS = 60
-DERIV_WS_TIMEOUT_SECONDS = 15          # timeout socket (connexion + recv)
-DERIV_CACHE_STALE_SECONDS = 900        # au-delà, le cache est jugé périmé (fallback one-shot)
-DERIV_PING_INTERVAL_SECONDS = 20       # ping applicatif pour détecter les connexions mortes
+# ID Telegram numérique du SEUL utilisateur autorisé à modifier quoi que ce
+# soit (commandes /capital /risque /levier, activation d'un profil via
+# /profils, et boutons ✅❌🟡🔒🔴 sous chaque signal). Le reste du groupe
+# continue de VOIR les signaux et les boutons, mais un tap/une commande d'un
+# autre utilisateur est rejeté. Récupère ton ID en écrivant à @userinfobot
+# sur Telegram, puis définis TELEGRAM_OWNER_ID dans les variables
+# d'environnement Render. ⚠️ Si laissé vide, l'accès reste ouvert à tout le
+# groupe (comportement historique, aucune restriction).
+TELEGRAM_OWNER_ID = os.environ.get("TELEGRAM_OWNER_ID", "")
 
 # --- Watchdog VPS / Render ------------------------------------------------
 WATCHDOG_CHECK_INTERVAL_SECONDS = 15
@@ -968,7 +949,7 @@ def _try_claim_report(report_type: str, period_key: str) -> bool:
 
 
 def _dispatch_report(message: str):
-    """Envoie sur TG_CHAT_REPORTS si configuré, sinon sur les deux groupes de signaux."""
+    """Envoie sur TG_CHAT_REPORTS si configuré, sinon sur le groupe de signaux."""
     reports_env = TELEGRAM_GROUPS["reports"]["chat_id_env"]
     reports_chat_id = os.environ.get(reports_env)
     if reports_chat_id:
@@ -983,11 +964,10 @@ def _dispatch_report(message: str):
             return
         except Exception:
             log.error(f"Échec d'envoi du rapport sur {reports_env}:\n{traceback.format_exc()}")
-    for group in ("btc_gold", "deriv"):
-        try:
-            send_telegram_signal(group, message)
-        except Exception:
-            log.error(f"Échec d'envoi du rapport sur le groupe '{group}':\n{traceback.format_exc()}")
+    try:
+        send_telegram_signal("btc_gold", message)
+    except Exception:
+        log.error(f"Échec d'envoi du rapport sur le groupe 'btc_gold':\n{traceback.format_exc()}")
 
 
 def _maybe_send_daily_report(now: datetime):
@@ -1182,16 +1162,23 @@ def fetch_candles(symbol: str, limit: int = 200) -> List[Dict]:
         return _fetch_yfinance(symbol, limit)
     elif asset.data_source == "binance":
         return _fetch_binance(symbol, limit)
-    elif asset.data_source == "deriv_ws":
-        return _fetch_deriv(symbol, limit)
     raise ValueError(f"Source de données inconnue pour {symbol}")
 
 
 def _fetch_yfinance(symbol: str, limit: int) -> List[Dict]:
     import yfinance as yf
+    import pandas as pd  # dépendance de yfinance, toujours présente
     ticker_map = {"XAUUSD": "GC=F"}
     ticker = ticker_map.get(symbol, symbol)
-    data = yf.download(ticker, period="2d", interval="5m", progress=False)
+    # Depuis yfinance >= 0.2.31, download() renvoie par défaut des colonnes
+    # MultiIndex (ex. ("Open", "GC=F")) même pour un seul ticker. Sans
+    # multi_level_index=False, row["Open"] renvoie alors une Series (et non
+    # un scalaire) -> `float(row["Open"])` plantait avec
+    # "TypeError: float() argument must be a string or a real number, not 'Series'".
+    data = yf.download(ticker, period="2d", interval="5m", progress=False,
+                        multi_level_index=False)
+    if isinstance(data.columns, pd.MultiIndex):  # filet de sécurité si l'argument ci-dessus est ignoré
+        data.columns = data.columns.get_level_values(0)
     candles = []
     for idx, row in data.tail(limit).iterrows():
         candles.append({
@@ -1211,281 +1198,6 @@ def _fetch_binance(symbol: str, limit: int) -> List[Dict]:
         "time": k[0] / 1000, "open": float(k[1]), "high": float(k[2]),
         "low": float(k[3]), "close": float(k[4]),
     } for k in raw]
-
-
-DERIV_SYMBOL_MAP = {"V75": "R_75", "V25": "R_25"}
-DERIV_WS_URL = "wss://ws.derivws.com/websockets/v3?app_id={app_id}"
-DERIV_GRANULARITY_SECONDS = 300  # M5
-
-
-def _deriv_app_id() -> str:
-    # 1089 = App ID public de démo Deriv, utilisable tel quel pour des requêtes
-    # en lecture seule (ticks_history). Remplace par ton propre App ID gratuit
-    # (https://api.deriv.com -> "Register Application") pour la prod, via la
-    # variable d'environnement DERIV_APP_ID.
-    return DERIV_APP_ID
-
-
-def _fetch_deriv_snapshot(symbol: str, limit: int = 200) -> List[Dict]:
-    """Requête ponctuelle (one-shot) à l'API publique Deriv, ticks_history en
-    style 'candles'. Utilisée comme filet de sécurité si le flux WebSocket
-    persistant (DerivFeed) n'a pas encore de données fraîches en cache."""
-    import websocket  # pip install websocket-client
-
-    deriv_symbol = DERIV_SYMBOL_MAP.get(symbol)
-    if not deriv_symbol:
-        raise ValueError(f"Pas de mapping Deriv pour le symbole '{symbol}'.")
-
-    url = DERIV_WS_URL.format(app_id=_deriv_app_id())
-    payload = {
-        "ticks_history": deriv_symbol,
-        "adjust_start_time": 1,
-        "count": limit,
-        "end": "latest",
-        "start": 1,
-        "style": "candles",
-        "granularity": DERIV_GRANULARITY_SECONDS,
-    }
-
-    ws = None
-    try:
-        ws = websocket.create_connection(url, timeout=DERIV_WS_TIMEOUT_SECONDS)
-        ws.send(json.dumps(payload))
-        raw = ws.recv()
-    finally:
-        if ws is not None:
-            try:
-                ws.close()
-            except Exception:
-                pass
-
-    data = json.loads(raw)
-    if "error" in data:
-        raise RuntimeError(
-            f"Erreur API Deriv pour {symbol}: {data['error'].get('message', data['error'])}"
-        )
-
-    candles_raw = data.get("candles") or []
-    return [{
-        "time": float(c["epoch"]),
-        "open": float(c["open"]),
-        "high": float(c["high"]),
-        "low": float(c["low"]),
-        "close": float(c["close"]),
-    } for c in candles_raw]
-
-
-class DerivFeed:
-    """Client WebSocket persistant pour l'API publique Deriv.
-
-    Maintient une connexion permanente (avec reconnexion automatique, gestion
-    des timeouts et des erreurs réseau) et s'abonne en continu (`subscribe: 1`)
-    aux bougies M5 de Volatility 75 (R_75) et Volatility 25 (R_25). Les
-    dernières bougies reçues sont mises en cache en mémoire (thread-safe) pour
-    que `fetch_candles()` n'ait jamais besoin d'attendre un aller-retour
-    réseau pendant un scan.
-
-    Robustesse :
-      - reconnexion automatique avec backoff exponentiel borné
-        (DERIV_RECONNECT_MIN/MAX_SECONDS) ;
-      - timeout de connexion/réception (DERIV_WS_TIMEOUT_SECONDS) ;
-      - ping applicatif régulier pour détecter une socket morte ;
-      - toute exception réseau est capturée -> log + reconnexion, jamais de
-        crash du thread ;
-      - expose un heartbeat (`last_message_at`) consommé par le watchdog.
-    """
-
-    def __init__(self, symbols: List[str]):
-        self.symbols = symbols
-        self._lock = threading.Lock()
-        self._cache: Dict[str, Dict] = {
-            sym: {"candles": [], "updated_at": 0.0} for sym in symbols
-        }
-        self._ws = None
-        self._connected = False
-        self._last_message_at = 0.0
-        self._stop = False
-        self._thread: Optional[threading.Thread] = None
-
-    # -- API publique --------------------------------------------------
-    def start(self):
-        if self._thread and self._thread.is_alive():
-            return
-        self._stop = False
-        self._thread = threading.Thread(target=self._run_forever, daemon=True,
-                                         name="deriv-ws-feed")
-        self._thread.start()
-        log.info("DerivFeed : thread WebSocket démarré pour %s.", self.symbols)
-
-    def stop(self):
-        self._stop = True
-        try:
-            if self._ws is not None:
-                self._ws.close()
-        except Exception:
-            pass
-
-    def is_connected(self) -> bool:
-        return self._connected
-
-    def seconds_since_last_message(self) -> Optional[float]:
-        if not self._last_message_at:
-            return None
-        return time.time() - self._last_message_at
-
-    def get_candles(self, symbol: str, limit: int = 200) -> Optional[List[Dict]]:
-        """Retourne les bougies en cache si elles sont assez fraîches, sinon None
-        (l'appelant doit alors utiliser le fallback one-shot)."""
-        with self._lock:
-            entry = self._cache.get(symbol)
-        if not entry or not entry["candles"]:
-            return None
-        if time.time() - entry["updated_at"] > DERIV_CACHE_STALE_SECONDS:
-            return None
-        return entry["candles"][-limit:]
-
-    # -- Boucle interne --------------------------------------------------
-    def _run_forever(self):
-        import websocket  # pip install websocket-client
-        backoff = DERIV_RECONNECT_MIN_SECONDS
-        while not self._stop:
-            try:
-                url = DERIV_WS_URL.format(app_id=_deriv_app_id())
-                ws = websocket.create_connection(url, timeout=DERIV_WS_TIMEOUT_SECONDS)
-                self._ws = ws
-                self._connected = True
-                self._last_message_at = time.time()
-                backoff = DERIV_RECONNECT_MIN_SECONDS  # connexion OK -> reset du backoff
-                log.info("DerivFeed : connecté à %s.", url)
-
-                for sym in self.symbols:
-                    deriv_symbol = DERIV_SYMBOL_MAP.get(sym)
-                    if not deriv_symbol:
-                        continue
-                    ws.send(json.dumps({
-                        "ticks_history": deriv_symbol,
-                        "adjust_start_time": 1,
-                        "count": 200,
-                        "end": "latest",
-                        "start": 1,
-                        "style": "candles",
-                        "granularity": DERIV_GRANULARITY_SECONDS,
-                        "subscribe": 1,
-                        "req_id": self.symbols.index(sym) + 1,
-                    }))
-
-                last_ping = time.time()
-                while not self._stop:
-                    if time.time() - last_ping > DERIV_PING_INTERVAL_SECONDS:
-                        try:
-                            ws.ping()
-                        except Exception:
-                            raise ConnectionError("échec du ping Deriv, reconnexion nécessaire.")
-                        last_ping = time.time()
-
-                    try:
-                        raw = ws.recv()
-                    except Exception as exc:
-                        # Timeout, coupure réseau, socket fermée... : on
-                        # considère la socket potentiellement morte -> on la
-                        # recycle proprement pour forcer une reconnexion.
-                        raise ConnectionError(f"timeout/erreur de réception Deriv : {exc}")
-
-                    if not raw:
-                        continue
-                    self._last_message_at = time.time()
-                    self._handle_message(raw)
-
-            except Exception as exc:
-                self._connected = False
-                log.warning(f"DerivFeed : connexion perdue/erreur ({exc}). "
-                            f"Reconnexion dans {backoff:.0f}s.")
-            finally:
-                try:
-                    if self._ws is not None:
-                        self._ws.close()
-                except Exception:
-                    pass
-                self._ws = None
-                self._connected = False
-
-            if self._stop:
-                break
-            time.sleep(backoff)
-            backoff = min(backoff * 2, DERIV_RECONNECT_MAX_SECONDS)
-
-        log.info("DerivFeed : thread arrêté proprement.")
-
-    def _handle_message(self, raw: str):
-        try:
-            data = json.loads(raw)
-        except (json.JSONDecodeError, TypeError):
-            return
-
-        if data.get("msg_type") == "error" or "error" in data:
-            err = data.get("error", {})
-            log.warning(f"DerivFeed : message d'erreur reçu ({err.get('message', err)}).")
-            return
-
-        req_id = data.get("echo_req", {}).get("req_id")
-        deriv_symbol = data.get("echo_req", {}).get("ticks_history")
-        symbol = next((s for s, d in DERIV_SYMBOL_MAP.items() if d == deriv_symbol), None)
-        if symbol is None and req_id:
-            idx = req_id - 1
-            if 0 <= idx < len(self.symbols):
-                symbol = self.symbols[idx]
-        if symbol is None:
-            return
-
-        # Snapshot initial (history) : liste de bougies.
-        candles_raw = data.get("candles")
-        if candles_raw:
-            candles = [{
-                "time": float(c["epoch"]), "open": float(c["open"]),
-                "high": float(c["high"]), "low": float(c["low"]), "close": float(c["close"]),
-            } for c in candles_raw]
-            with self._lock:
-                self._cache[symbol] = {"candles": candles, "updated_at": time.time()}
-            return
-
-        # Mise à jour incrémentale (ohlc) envoyée en continu grâce à subscribe:1.
-        ohlc = data.get("ohlc")
-        if ohlc:
-            try:
-                new_candle = {
-                    "time": float(ohlc["open_time"]),
-                    "open": float(ohlc["open"]), "high": float(ohlc["high"]),
-                    "low": float(ohlc["low"]), "close": float(ohlc["close"]),
-                }
-            except (KeyError, TypeError, ValueError):
-                return
-            with self._lock:
-                entry = self._cache.setdefault(symbol, {"candles": [], "updated_at": 0.0})
-                candles = entry["candles"]
-                if candles and candles[-1]["time"] == new_candle["time"]:
-                    candles[-1] = new_candle
-                else:
-                    candles.append(new_candle)
-                    if len(candles) > 500:
-                        del candles[: len(candles) - 500]
-                entry["updated_at"] = time.time()
-
-
-# Instance unique partagée par tout le process (démarrée dans le bloc __main__).
-deriv_feed = DerivFeed(list(DERIV_SYMBOL_MAP.keys()))
-
-
-def _fetch_deriv(symbol: str, limit: int = 200) -> List[Dict]:
-    """Point d'entrée utilisé par fetch_candles(). Sert en priorité les
-    bougies en cache du flux WebSocket persistant (rapide, pas d'aller-retour
-    réseau bloquant) ; si le cache est absent/périmé (flux pas encore connecté,
-    coupure réseau prolongée...), retombe sur une requête one-shot classique,
-    elle-même protégée par un try/except au niveau de process_asset()."""
-    cached = deriv_feed.get_candles(symbol, limit)
-    if cached:
-        return cached
-    log.info(f"[{symbol}] cache Deriv WS indisponible/périmé -> requête one-shot de secours.")
-    return _fetch_deriv_snapshot(symbol, limit)
 
 
 # ============================================================================
@@ -2053,12 +1765,12 @@ def send_telegram_signal(group: str, text: str, image_path: str = None, signal_i
 
 
 # --- Message de démarrage --------------------------------------------------
-# Envoyé sur les 2 groupes de signaux (btc_gold + deriv) à chaque lancement OU
+# Envoyé sur le groupe de signaux (btc_gold) à chaque lancement OU
 # redémarrage du process, pour que tu saches immédiatement sur Telegram que le
 # bot est bien en ligne (et pas seulement silencieusement en train de tourner
 # côté serveur). Si le redémarrage a été forcé par le watchdog, le message le
 # précise avec la raison, pour distinguer un déploiement normal d'un incident.
-STARTUP_NOTIFY_GROUPS = ("btc_gold", "deriv")
+STARTUP_NOTIFY_GROUPS = ("btc_gold",)
 
 
 def format_startup_message() -> str:
@@ -2077,7 +1789,6 @@ def format_startup_message() -> str:
         ]
     lines += [
         f"📊 *Actifs surveillés* : {', '.join(a.display_name for a in ASSETS.values())} ({TIMEFRAME})",
-        f"🛰️ *Flux Deriv WS* : connexion en cours…",
         f"🕒 {ts}",
     ]
     return "\n".join(lines)
@@ -2116,6 +1827,188 @@ def _telegram_edit_reply_markup(group: str, chat_id, message_id: int, reply_mark
     if not resp.ok:
         log.warning(f"Telegram editMessageReplyMarkup a échoué ({resp.status_code}): {resp.text[:200]}")
     return resp
+
+
+# --- Commandes Telegram natives (/settings, /capital, /profils...) --------
+# Objectif : piloter les réglages directement depuis le bot Telegram, sans
+# passer par le dashboard web Flask. Le bot (btc_gold) a sa propre URL de
+# webhook (/telegram/webhook/<bot_key>, section DÉPLOIEMENT en bas de
+# fichier) : le bot destinataire est donc toujours connu sans ambiguïté, y
+# compris en DM (message privé). En DM — canal 1-à-1 — les commandes en
+# lecture seule (/settings /status /profils /help) sont réservées au
+# propriétaire (TELEGRAM_OWNER_ID) ; dans le groupe elles restent ouvertes à
+# tous comme avant. Les commandes qui modifient un réglage (/capital /risque
+# /levier, activation de profil) restent réservées au propriétaire partout,
+# groupe comme DM.
+BOT_COMMANDS_HELP = (
+    "🤖 *ALPHABOT SMC PRO* — commandes disponibles\n\n"
+    "/settings — voir les réglages actuels\n"
+    "/capital <valeur> — définir le capital ($)\n"
+    "/risque <valeur> — définir le risque par trade (%)\n"
+    "/levier <valeur> — définir le levier (x)\n"
+    "/profils — lister et activer un profil sauvegardé\n"
+    "/status — état du bot (dernier scan...)\n"
+    "/help — afficher ce message"
+)
+
+_SETTINGS_COMMAND_FIELDS = {"/capital": "capital", "/risque": "risk_percent", "/levier": "leverage"}
+
+
+def _is_owner(user_id) -> bool:
+    """Vrai si user_id correspond à TELEGRAM_OWNER_ID (seul autorisé à changer
+    les réglages ou le statut d'un trade). Si TELEGRAM_OWNER_ID n'est pas
+    défini, l'accès reste ouvert à tout le groupe (comportement historique)."""
+    if not TELEGRAM_OWNER_ID:
+        return True
+    return user_id is not None and str(user_id) == str(TELEGRAM_OWNER_ID)
+
+
+_OWNER_ONLY_REPLY = "⛔ Réservé au propriétaire du bot."
+
+
+def format_settings_message(settings: Optional[Dict] = None) -> str:
+    s = settings or get_settings()
+    active = next((p for p in list_profiles() if p["id"] == s.get("active_profile_id")), None)
+    lines = [
+        "⚙️ *Réglages actuels*",
+        f"💰 Capital : {s['capital']:.2f} $",
+        f"📈 Levier : x{s['leverage']:.0f}",
+        f"🎯 Risque par trade : {s['risk_percent']:.2f} %",
+        f"📊 Positions max simultanées : {s['max_open_positions']}",
+        f"🏅 Score minimum publié : {s['min_score_to_publish']}",
+        f"🔁 Martingale : {'ON' if s['martingale_enabled'] else 'OFF'} (x{s['martingale_multiplier']:.1f})",
+        f"🛟 Recovery : {'ON' if s['recovery_enabled'] else 'OFF'} (plafond x{s['recovery_max_multiplier']:.1f})",
+        f"👤 Profil actif : {active['name'] if active else '—'}",
+        "",
+        "Modifier : /capital <valeur> · /risque <valeur> · /levier <valeur> · /profils",
+    ]
+    return "\n".join(lines)
+
+
+def _profiles_inline_keyboard() -> Dict:
+    rows = []
+    for p in list_profiles():
+        label = f"{'✅ ' if p['active'] else '▫️ '}{p['name']} — {p['capital']:.0f}$ x{p['leverage']:.0f} risque {p['risk_percent']:.1f}%"
+        rows.append([{"text": label, "callback_data": f"prof:{p['id']}"}])
+    return {"inline_keyboard": rows}
+
+
+def _send_command_reply(group: str, chat_id, text: str, reply_markup: Optional[Dict] = None):
+    token = _bot_token(group)
+    url = TELEGRAM_API.format(token=token, method="sendMessage")
+    data = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
+    if reply_markup:
+        data["reply_markup"] = json.dumps(reply_markup)
+    resp = requests.post(url, data=data, timeout=10)
+    if not resp.ok:
+        log.warning(f"Telegram sendMessage (commande) a échoué ({resp.status_code}): {resp.text[:200]}")
+    return resp
+
+
+_READ_ONLY_COMMANDS = ("/start", "/help", "/aide", "/settings", "/reglages",
+                       "/parametres", "/status", "/profils")
+
+
+def _handle_telegram_command(message: Dict, group: str):
+    """group est désormais connu à l'avance (déduit de l'URL du webhook, cf.
+    telegram_webhook) — plus besoin de le deviner à partir du chat_id, donc
+    ça fonctionne aussi bien dans les 2 groupes Telegram configurés qu'en
+    message privé (DM) avec l'un des 2 bots."""
+    chat = message.get("chat") or {}
+    chat_id = chat.get("id")
+    is_private = chat.get("type") == "private"
+    text = (message.get("text") or "").strip()
+    if not text.startswith("/") or chat_id is None:
+        return
+
+    if not is_private:
+        # message de groupe : on vérifie qu'il vient bien du chat configuré
+        # pour CE bot (et pas d'un autre groupe où le bot aurait été ajouté
+        # par erreur), comportement historique inchangé.
+        try:
+            if str(_chat_id_for_group(group)) != str(chat_id):
+                return
+        except RuntimeError:
+            return
+
+    parts = text.split()
+    cmd = parts[0].lower().split("@")[0]  # tolère "/settings@NomDuBot"
+    arg = parts[1] if len(parts) > 1 else None
+    sender_id = (message.get("from") or {}).get("id")
+
+    # En DM (canal 1-à-1), même les commandes en lecture seule sont
+    # réservées au propriétaire. Dans les groupes elles restent ouvertes à
+    # tous comme avant.
+    if is_private and cmd in _READ_ONLY_COMMANDS and not _is_owner(sender_id):
+        _send_command_reply(group, chat_id, _OWNER_ONLY_REPLY)
+        return
+
+    if cmd in ("/start", "/help", "/aide"):
+        _send_command_reply(group, chat_id, BOT_COMMANDS_HELP)
+    elif cmd in ("/settings", "/reglages", "/parametres"):
+        _send_command_reply(group, chat_id, format_settings_message())
+    elif cmd == "/status":
+        _send_command_reply(group, chat_id, format_startup_message())
+    elif cmd == "/profils":
+        _send_command_reply(group, chat_id, "👤 *Profils sauvegardés* — tape pour activer :",
+                             reply_markup=_profiles_inline_keyboard())
+    elif cmd in _SETTINGS_COMMAND_FIELDS:
+        if not _is_owner(sender_id):
+            _send_command_reply(group, chat_id, _OWNER_ONLY_REPLY)
+            return
+        if arg is None:
+            _send_command_reply(group, chat_id, f"Usage : {cmd} <valeur>")
+            return
+        field = _SETTINGS_COMMAND_FIELDS[cmd]
+        try:
+            updated = update_settings({field: arg})
+        except ValueError as e:
+            _send_command_reply(group, chat_id, f"❌ {e}")
+            return
+        _send_command_reply(group, chat_id, f"✅ Mis à jour.\n\n{format_settings_message(updated)}")
+    else:
+        _send_command_reply(group, chat_id, "Commande inconnue. Tape /help pour la liste.")
+
+
+def _handle_profile_callback(callback: Dict, group: str):
+    """Gère les taps sur les boutons inline du menu /profils (callback_data
+    'prof:<id>'), séparé du flux 'act:<signal_id>:<action>' des signaux.
+    group est connu à l'avance (déduit de l'URL du webhook) : ça marche
+    aussi bien dans les groupes qu'en DM avec l'un des 2 bots."""
+    data = callback.get("data", "")
+    try:
+        profile_id = int(data.split(":", 1)[1])
+    except (IndexError, ValueError):
+        return
+
+    message = callback.get("message") or {}
+    chat = message.get("chat") or {}
+    chat_id = chat.get("id")
+
+    sender_id = (callback.get("from") or {}).get("id")
+    if not _is_owner(sender_id):
+        try:
+            _telegram_answer_callback(group, callback["id"], text=_OWNER_ONLY_REPLY, show_alert=True)
+        except Exception:
+            log.warning("Échec answerCallbackQuery (profil, accès refusé):\n" + traceback.format_exc())
+        return
+
+    try:
+        activate_profile(profile_id)
+        confirm_text = "✅ Profil activé."
+    except ValueError as e:
+        confirm_text = f"❌ {e}"
+
+    try:
+        _telegram_answer_callback(group, callback["id"], text=confirm_text)
+    except Exception:
+        log.warning("Échec answerCallbackQuery (profil):\n" + traceback.format_exc())
+
+    if chat_id and message.get("message_id"):
+        try:
+            _telegram_edit_reply_markup(group, chat_id, message["message_id"], _profiles_inline_keyboard())
+        except Exception:
+            log.warning("Échec editMessageReplyMarkup (profil):\n" + traceback.format_exc())
 
 
 # ============================================================================
@@ -2313,7 +2206,6 @@ def health():
         "scan_healthy": hb["healthy"],
         "seconds_since_last_scan": hb["seconds_since_scan"],
         "restart_count": hb["restart_count"],
-        "deriv_ws_connected": deriv_feed.is_connected(),
     }), (200 if hb["healthy"] else 503)
 
 
@@ -2322,11 +2214,6 @@ def watchdog_status():
     hb = get_heartbeat_status()
     return jsonify({
         "heartbeat": hb,
-        "deriv_feed": {
-            "connected": deriv_feed.is_connected(),
-            "seconds_since_last_message": deriv_feed.seconds_since_last_message(),
-            "symbols": deriv_feed.symbols,
-        },
     })
 
 
@@ -2507,20 +2394,44 @@ def get_trade_actions_endpoint(signal_id):
     return jsonify([dict(r) for r in rows])
 
 
-@app.route("/telegram/webhook", methods=["POST"])
-def telegram_webhook():
-    """Reçoit les updates Telegram (callback_query des boutons interactifs
-    ✅❌🟡🔒🔴 sous chaque signal). Voir section DÉPLOIEMENT en bas de fichier
-    pour la commande setWebhook à exécuter une fois par bot."""
+_WEBHOOK_BOT_KEYS = ("btc_gold",)  # clé valide pour <bot_key> dans l'URL
+
+
+@app.route("/telegram/webhook/<bot_key>", methods=["POST"])
+def telegram_webhook(bot_key):
+    """Reçoit les updates Telegram : commandes texte (/settings, /capital...),
+    boutons inline des signaux (✅❌🟡🔒🔴) et du menu /profils. bot_key (dans
+    l'URL) identifie le bot — donc le token — qui a reçu le message, y
+    compris en DM. Voir section DÉPLOIEMENT en bas de fichier pour l'URL de
+    webhook (.../telegram/webhook/btc_gold)."""
+    if bot_key not in _WEBHOOK_BOT_KEYS:
+        return jsonify({"error": "bot inconnu"}), 404
+
     if TELEGRAM_WEBHOOK_SECRET:
         header = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
         if header != TELEGRAM_WEBHOOK_SECRET:
             return jsonify({"error": "secret invalide"}), 403
 
     update = request.get_json(force=True, silent=True) or {}
+
+    message = update.get("message")
+    if message and isinstance(message.get("text"), str):
+        try:
+            _handle_telegram_command(message, bot_key)
+        except Exception:
+            log.error("Erreur traitement commande Telegram:\n" + traceback.format_exc())
+        return jsonify({"ok": True})
+
     callback = update.get("callback_query")
     if not callback:
-        return jsonify({"ok": True})  # autre type d'update (message, etc.) -> ignoré
+        return jsonify({"ok": True})  # autre type d'update -> ignoré
+
+    if callback.get("data", "").startswith("prof:"):
+        try:
+            _handle_profile_callback(callback, bot_key)
+        except Exception:
+            log.error("Erreur callback profil Telegram:\n" + traceback.format_exc())
+        return jsonify({"ok": True})
 
     try:
         data = callback.get("data", "")
@@ -2536,12 +2447,20 @@ def telegram_webhook():
         if not action_def or not row:
             return jsonify({"ok": True})
 
+        group = row["telegram_group"]
+        sender_id = (callback.get("from") or {}).get("id")
+        if not _is_owner(sender_id):
+            try:
+                _telegram_answer_callback(group, callback["id"], text=_OWNER_ONLY_REPLY, show_alert=True)
+            except Exception:
+                log.warning("Échec answerCallbackQuery Telegram (accès refusé):\n" + traceback.format_exc())
+            return jsonify({"ok": True})
+
         actor_info = callback.get("from") or {}
         actor = actor_info.get("username") or str(actor_info.get("id", "")) or None
         record_trade_action(signal_id, action=action_key, new_status=action_def["status"],
                              source="telegram", actor=actor)
 
-        group = row["telegram_group"]
         confirm_text = f"{action_def['emoji']} {action_def['label']} enregistré pour le signal #{signal_id}."
         try:
             _telegram_answer_callback(group, callback["id"], text=confirm_text)
@@ -2891,6 +2810,15 @@ if __name__ == "__main__":
     enforce_group_asset_whitelist()
     init_db()
 
+    if not TELEGRAM_OWNER_ID:
+        log.warning(
+            "TELEGRAM_OWNER_ID n'est pas défini : les commandes /capital /risque "
+            "/levier /profils et les boutons sous les signaux restent utilisables "
+            "par tout le monde dans les groupes Telegram. Définis cette variable "
+            "d'environnement (ton ID Telegram numérique, via @userinfobot) pour "
+            "restreindre l'accès à toi seul."
+        )
+
     port = int(os.environ.get("PORT", 5000))
     flask_thread = threading.Thread(
         target=lambda: app.run(host="0.0.0.0", port=port, use_reloader=False),
@@ -2902,8 +2830,6 @@ if __name__ == "__main__":
     report_thread = threading.Thread(target=report_scheduler_loop, daemon=True)
     report_thread.start()
     log.info("Thread du planificateur de rapports démarré.")
-
-    deriv_feed.start()  # connexion WebSocket Deriv persistante (V75 + V25)
 
     watchdog_thread = threading.Thread(target=watchdog_loop, daemon=True)
     watchdog_thread.start()
@@ -2928,24 +2854,45 @@ if __name__ == "__main__":
 #    mécanisme qui est utilisé par le watchdog intégré (section 9bis).
 # 2. Start command : python main.py
 # 3. Variables d'environnement à définir dans Render (Settings > Environment) :
-#      Groupe BTC + Gold : TELEGRAM_BOT_TOKEN_BTC_GOLD, TG_CHAT_BTC_GOLD
-#      Groupe Deriv (V25/V75) : TELEGRAM_BOT_TOKEN_DERIV, TG_CHAT_DERIV
-#      DERIV_APP_ID (optionnel, sinon "1089" par défaut — App ID public de démo)
-#      TG_CHAT_REPORTS (optionnel — sinon les rapports partent sur les 2 groupes ci-dessus)
+#      Groupe BTC + Gold (unique) : TELEGRAM_BOT_TOKEN_BTC_GOLD, TG_CHAT_BTC_GOLD
+#      TG_CHAT_REPORTS (optionnel — sinon les rapports partent sur le groupe ci-dessus)
 #      TELEGRAM_BOT_TOKEN_REPORTS (optionnel — sinon le bot "btc_gold" est réutilisé)
-#      TELEGRAM_WEBHOOK_SECRET (optionnel mais recommandé — sécurise /telegram/webhook)
+#      TELEGRAM_WEBHOOK_SECRET (optionnel mais recommandé — sécurise la route
+#        /telegram/webhook/btc_gold)
+#      TELEGRAM_OWNER_ID (recommandé — ton ID Telegram numérique, récupérable via
+#        @userinfobot ; sans elle, /capital /risque /levier /profils et les boutons
+#        ✅❌🟡🔒🔴 restent modifiables par tout le monde — et depuis que les commandes
+#        marchent aussi en DM, ça inclut n'importe qui DMant le bot, pas
+#        seulement les membres du groupe)
 #      SIGNAL_COOLDOWN_MINUTES (optionnel, défaut 15 — délai mini entre 2 signaux sur le même actif)
 #      DB_PATH (optionnel — chemin du fichier SQLite, ex. un disque persistant Render)
 # 4. Healthcheck path côté Render : /health
 #      -> renvoie 200 si le scan a tourné il y a moins de WATCHDOG_MAX_SILENCE_SECONDS,
 #         503 sinon (Render peut alors, en plus du watchdog interne, redémarrer le service).
-# 5. Dépendances supplémentaires à ajouter dans requirements.txt : websocket-client
-# 6. Boutons Telegram interactifs — à faire UNE FOIS par bot (btc_gold ET deriv),
-#    après le premier déploiement, pour que Telegram pousse les clics de bouton
-#    vers /telegram/webhook au lieu qu'on ait à faire du polling :
-#      curl -X POST "https://api.telegram.org/bot<TOKEN>/setWebhook" \
-#           -d "url=https://<ton-service>.onrender.com/telegram/webhook" \
+# 5. Bouton Telegram interactif + commandes en DM — le bot a sa PROPRE URL de
+#    webhook (le chemin encode quel bot répond, indispensable pour lever
+#    l'ambiguïté en DM). À faire UNE FOIS, après le premier déploiement :
+#      curl -X POST "https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN_BTC_GOLD>/setWebhook" \
+#           -d "url=https://<ton-service>.onrender.com/telegram/webhook/btc_gold" \
 #           -d "secret_token=<TELEGRAM_WEBHOOK_SECRET>"
-#    (répéter avec le token de chaque bot : TELEGRAM_BOT_TOKEN_BTC_GOLD et
-#    TELEGRAM_BOT_TOKEN_DERIV — un webhook par bot).
-
+#    ⚠️ Si le bot avait déjà un webhook pointé vers l'ancienne URL partagée
+#    (/telegram/webhook) avant ce changement, relance cet appel après
+#    déploiement pour basculer vers la nouvelle URL dédiée — sinon Telegram
+#    continue d'appeler l'ancienne route (qui n'existe plus) et les updates
+#    ne partent nulle part.
+# 6. Commandes Telegram natives (/settings, /capital, /risque, /levier,
+#    /profils, /status, /help) — fonctionnent dans le groupe ET en message
+#    privé (DM) avec le bot (cf. commentaire au-dessus de BOT_COMMANDS_HELP).
+#    Pour que le menu "/" apparaisse dans Telegram, exécute UNE FOIS
+#    (optionnel, juste pour l'UI) :
+#      curl -X POST "https://api.telegram.org/bot<TOKEN>/setMyCommands" \
+#           -H "Content-Type: application/json" \
+#           -d '{"commands": [
+#                 {"command": "settings", "description": "Voir les réglages actuels"},
+#                 {"command": "capital", "description": "Définir le capital ($)"},
+#                 {"command": "risque", "description": "Définir le risque par trade (%)"},
+#                 {"command": "levier", "description": "Définir le levier (x)"},
+#                 {"command": "profils", "description": "Lister/activer un profil"},
+#                 {"command": "status", "description": "État du bot"},
+#                 {"command": "help", "description": "Liste des commandes"}
+#               ]}'
