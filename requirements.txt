@@ -13,3 +13,12 @@ matplotlib
 requests
 flask 
 colorama
+requests
+pandas
+numpy
+flask
+yfinance
+python-dotenv
+colorama
+matplotlib
+websocket-client
