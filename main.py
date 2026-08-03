@@ -20,7 +20,11 @@ BOS Corps de Bougie"), confirmée avec Pie :
     du trade (peut donner RR > 10, pas de plafond — juste un badge d'alerte).
   - Score global 0-100 (étoiles + qualité du RR de TP2) ; seuil de publication
     configurable (MIN_SCORE_TO_PUBLISH).
-  - Diffusion Telegram sur un seul groupe (BTC + Gold), via un seul bot.
+  - Diffusion Telegram sur un groupe FREE et, si configuré, un groupe VIP
+    (contenu strictement identique sur les deux), chacun via son propre bot.
+    Diffusion privée (DM) en plus, vers les abonnés activés manuellement par
+    l'admin (/addsub) — commandes /start /stop /mute /unmute /stats /report
+    côté abonné, panneau complet côté admin (/admin, /addsub, /promote...).
   - Dashboard Flask : capital/levier/risque/lot, stats, profils de risque,
     statut des trades (pris/ignoré/clôturé), endpoint /health pour Render.
   - Persistance SQLite : historique complet, anti-doublon, cap quotidien de signaux.
@@ -139,7 +143,7 @@ _DEFAULT_TG_CHAT_BTC_GOLD = "-5281258868"
 _DEFAULT_TG_TOKEN_BTC_GOLD = "6950706659:AAEeRW9Ld1zNz0xyDLwlKuIQxZst4S7RU0Q"
 
 TELEGRAM_GROUPS = {
-    # Groupe unique : BTC/USD + XAU/USD (Gold) — un seul bot Telegram, un seul groupe.
+    # Groupe FREE : BTC/USD + XAU/USD (Gold) — bot dédié, groupe public/gratuit.
     "btc_gold": {
         "token_env": "TELEGRAM_BOT_TOKEN_BTC_GOLD",
         "chat_id_env": "TG_CHAT_BTC_GOLD",
@@ -147,8 +151,22 @@ TELEGRAM_GROUPS = {
         "token_default": _DEFAULT_TG_TOKEN_BTC_GOLD,
         "chat_id_default": _DEFAULT_TG_CHAT_BTC_GOLD,
     },
+    # Groupe VIP : contenu strictement identique au groupe FREE (mêmes
+    # signaux, même contenu, même instant) — la seule différence est l'accès
+    # au groupe Telegram lui-même (privé, membres ajoutés manuellement par
+    # l'admin). Bot dédié obligatoire : nécessaire pour son propre webhook
+    # (boutons ✅❌🟡🔒🔴 utilisables aussi dans ce groupe) et pour pouvoir DM
+    # les abonnés VIP qui auraient fait /start avec CE bot. Pas de valeur par
+    # défaut codée en dur ici (contrairement à btc_gold, legacy) : tant que
+    # TELEGRAM_BOT_TOKEN_VIP_GOLD / TG_CHAT_VIP_GOLD ne sont pas définies, le
+    # groupe VIP est simplement ignoré partout (best-effort), sans erreur bloquante.
+    "vip_gold": {
+        "token_env": "TELEGRAM_BOT_TOKEN_VIP_GOLD",
+        "chat_id_env": "TG_CHAT_VIP_GOLD",
+        "assets": ["XAUUSD", "BTCUSD"],
+    },
     # Optionnel : si TG_CHAT_REPORTS n'est pas défini, les rapports sont
-    # envoyés sur le groupe de signaux ci-dessus à la place. TELEGRAM_BOT_TOKEN_REPORTS
+    # envoyés sur le groupe FREE à la place. TELEGRAM_BOT_TOKEN_REPORTS
     # est optionnel ; à défaut, le token du groupe "btc_gold" est réutilisé pour ce canal.
     "reports": {"token_env": "TELEGRAM_BOT_TOKEN_REPORTS", "chat_id_env": "TG_CHAT_REPORTS", "assets": []},
 }
@@ -170,6 +188,22 @@ REPORT_DAILY_HOUR_UTC = 21
 REPORT_WEEKLY_HOUR_UTC = 21
 REPORT_WEEKLY_MINUTE_UTC = 30   # décalé de la journalière pour ne pas se chevaucher
 REPORT_MONTHLY_HOUR_UTC = 22
+
+# --- Promotion (lien d'affiliation) dans les rapports -----------------------
+# Ajoutée UNIQUEMENT en pied des rapports auto (quotidien/hebdo/mensuel), au
+# maximum une fois par jour civil (UTC) — peu importe combien de rapports
+# tombent le même jour (ex : rapport journalier + mensuel le dernier jour du
+# mois), via _try_claim_report("promo", jour) qui garantit l'unicité.
+PROMO_ENABLED = os.environ.get("PROMO_ENABLED", "true").lower() == "true"
+PROMO_TEXT = os.environ.get(
+    "PROMO_TEXT",
+    "🚀 *Envie de vous entraîner sans risque ?*\n"
+    "Ouvrez un compte démo Exness et recevez 10 000 $ de fonds virtuels "
+    "pour tester vos stratégies sur le Forex, l'or et le Bitcoin.",
+)
+PROMO_LINK = os.environ.get(
+    "PROMO_LINK", "https://one.exnessonelink.com/a/nb3fx0bpnm?source=app&platform=mobile&pid=mobile_share",
+)
 
 DB_PATH = os.environ.get("DB_PATH", "alphabot_smc_fusion.db")
 TELEGRAM_API = "https://api.telegram.org/bot{token}/{method}"
@@ -212,12 +246,51 @@ TP2_TARGET_LABELS = {
 }
 OB_IMPULSE_ATR_MULTIPLIER = 1.3  # une bougie est jugée "impulsive" si son corps > ATR x ce facteur
 
+# --- Export CSV/PDF --------------------------------------------------------
+EXPORT_DIR = os.environ.get("EXPORT_DIR", "exports")
+EXPORT_KEEP_LAST = int(os.environ.get("EXPORT_KEEP_LAST", "50"))  # nettoyage auto par type de fichier
+
+# --- Sauvegarde automatique de la base SQLite -------------------------------
+BACKUP_DIR = os.environ.get("BACKUP_DIR", "backups")
+BACKUP_INTERVAL_HOURS = float(os.environ.get("BACKUP_INTERVAL_HOURS", "6"))
+BACKUP_KEEP_LAST = int(os.environ.get("BACKUP_KEEP_LAST", "20"))
+BACKUP_SEND_TO_TELEGRAM = os.environ.get("BACKUP_SEND_TO_TELEGRAM", "false").lower() == "true"
+
+# --- Journalisation ----------------------------------------------------------
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+LOG_MAX_BYTES = int(os.environ.get("LOG_MAX_BYTES", str(5 * 1024 * 1024)))  # 5 Mo par fichier
+LOG_BACKUP_COUNT = int(os.environ.get("LOG_BACKUP_COUNT", "5"))
+
 os.makedirs("logs", exist_ok=True)
 os.makedirs(CHARTS_DIR, exist_ok=True)
+os.makedirs(EXPORT_DIR, exist_ok=True)
+os.makedirs(BACKUP_DIR, exist_ok=True)
+
+from logging.handlers import RotatingFileHandler
+
+_log_formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+
+_console_handler = logging.StreamHandler()
+_console_handler.setFormatter(_log_formatter)
+
+# Fichier principal (tous niveaux), avec rotation automatique pour ne jamais
+# saturer le disque sur un service tournant en continu (Render).
+_main_file_handler = RotatingFileHandler(
+    "logs/alphabot_smc.log", maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUP_COUNT, encoding="utf-8",
+)
+_main_file_handler.setFormatter(_log_formatter)
+
+# Fichier séparé, ERROR uniquement — pour retrouver rapidement les incidents
+# sans avoir à fouiller dans les milliers de lignes INFO du fichier principal.
+_error_file_handler = RotatingFileHandler(
+    "logs/alphabot_smc_errors.log", maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUP_COUNT, encoding="utf-8",
+)
+_error_file_handler.setFormatter(_log_formatter)
+_error_file_handler.setLevel(logging.ERROR)
+
 logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler(), logging.FileHandler("logs/alphabot_smc.log")],
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    handlers=[_console_handler, _main_file_handler, _error_file_handler],
 )
 log = logging.getLogger("alphabot_smc")
 
@@ -309,6 +382,30 @@ CREATE TABLE IF NOT EXISTS watchdog_heartbeat (
     last_restart_at REAL,
     last_restart_reason TEXT
 );
+
+-- Abonnés à la diffusion privée (DM). Ajout/activation UNIQUEMENT par
+-- l'administrateur (/addsub) — /start ne fait qu'enregistrer le chat_id en
+-- statut 'pending', il ne donne accès à rien tant que l'admin n'a pas validé.
+-- source_bot mémorise quel bot (btc_gold / vip_gold) l'utilisateur a
+-- démarré : Telegram n'autorise un bot à DM un utilisateur QUE si celui-ci a
+-- fait /start avec CE bot précis, donc c'est ce bot-là qui doit être réutilisé
+-- pour toute diffusion privée ultérieure vers cet abonné.
+CREATE TABLE IF NOT EXISTS subscribers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id TEXT NOT NULL UNIQUE,
+    username TEXT,
+    first_name TEXT,
+    source_bot TEXT NOT NULL DEFAULT 'btc_gold',
+    tier TEXT NOT NULL DEFAULT 'pending',      -- 'pending' | 'free' | 'vip'
+    status TEXT NOT NULL DEFAULT 'pending',    -- 'pending' | 'active' | 'stopped' | 'banned'
+    notify_signals INTEGER NOT NULL DEFAULT 1,
+    notify_tp_sl_be INTEGER NOT NULL DEFAULT 1,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    last_seen_at REAL
+);
+
+CREATE INDEX IF NOT EXISTS idx_subscribers_tier_status ON subscribers(tier, status);
 """
 
 
@@ -337,15 +434,29 @@ DEFAULT_SETTINGS = {
     "recovery_max_multiplier": 1.5,          # plafond du multiplicateur de risque en recovery
     "max_open_positions": 3,                 # nombre maximum de positions ouvertes simultanées
     "min_score_to_publish": MIN_SCORE_TO_PUBLISH,  # score minimum pour publier un signal
+    "session_mode": "ny",                    # "ny" (13h-22h UTC) | "24h" (scan en continu)
+    "timeframe": TIMEFRAME,                  # "M1" (scalping) | "M5" (par défaut)
 }
+
+VALID_SESSION_MODES = {"ny", "24h"}
+VALID_TIMEFRAMES = {"M1", "M5"}
+TIMEFRAME_TO_INTERVAL = {"M1": "1m", "M5": "5m"}  # -> paramètre `interval` yfinance/Binance
 
 _SETTINGS_KEY = "config"
 
 
 @contextmanager
 def get_conn():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
+    # Mode WAL : lecteurs et écrivain ne se bloquent plus mutuellement, ce qui
+    # évite les "database is locked" quand le dashboard lit pendant que la
+    # boucle de scan écrit. synchronous=NORMAL est le compromis recommandé
+    # par SQLite pour le mode WAL (sûr en cas de crash process, tout en étant
+    # nettement plus rapide que FULL).
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA foreign_keys=ON")
     try:
         yield conn
         conn.commit()
@@ -353,9 +464,21 @@ def get_conn():
         conn.close()
 
 
+# Index additionnels (au-delà de ceux déjà déclarés dans SCHEMA) posés sur les
+# colonnes les plus filtrées/triées par le dashboard et les rapports, pour
+# éviter les scans complets de la table `signals` à mesure qu'elle grossit.
+_EXTRA_INDEXES = """
+CREATE INDEX IF NOT EXISTS idx_signals_created_at ON signals(created_at);
+CREATE INDEX IF NOT EXISTS idx_signals_symbol ON signals(symbol);
+CREATE INDEX IF NOT EXISTS idx_signals_status ON signals(status);
+CREATE INDEX IF NOT EXISTS idx_signals_closed_at ON signals(closed_at);
+"""
+
+
 def init_db():
     with get_conn() as conn:
         conn.executescript(SCHEMA)
+        conn.executescript(_EXTRA_INDEXES)
     _migrate_schema()
     _seed_default_settings()
     _seed_default_profiles()
@@ -415,6 +538,8 @@ def update_settings(patch: Dict) -> Dict:
         "recovery_max_multiplier": (float, lambda v: v >= 1),
         "max_open_positions": (int, lambda v: v >= 1),
         "min_score_to_publish": (int, lambda v: 0 <= v <= 100),
+        "session_mode": (str, lambda v: v in VALID_SESSION_MODES),
+        "timeframe": (lambda v: str(v).upper(), lambda v: v in VALID_TIMEFRAMES),
     }
 
     for key, raw_value in patch.items():
@@ -617,6 +742,10 @@ def update_status(signal_id: int, status: str):
             "UPDATE signals SET status=?, updated_at=?, closed_at=COALESCE(?, closed_at) WHERE id=?",
             (status, now, closed, signal_id),
         )
+    try:
+        invalidate_dashboard_cache()
+    except NameError:
+        pass  # appelé avant que le cache dashboard soit initialisé (ne devrait pas arriver en pratique)
 
 
 def get_signal(signal_id: int) -> Optional[sqlite3.Row]:
@@ -651,6 +780,150 @@ def get_trade_actions(signal_id: int) -> List[sqlite3.Row]:
             "SELECT * FROM trade_actions WHERE signal_id=? ORDER BY created_at ASC",
             (signal_id,),
         ).fetchall()
+
+
+# ----------------------------------------------------------------------
+# Abonnés (diffusion privée en DM) — /start enregistre en 'pending',
+# SEUL un admin (/addsub) peut faire passer un abonné en 'active'
+# (tier 'free' ou 'vip'). Pas d'auto-inscription possible.
+# ----------------------------------------------------------------------
+
+def get_subscriber(chat_id) -> Optional[sqlite3.Row]:
+    with get_conn() as conn:
+        return conn.execute("SELECT * FROM subscribers WHERE chat_id=?", (str(chat_id),)).fetchone()
+
+
+def upsert_subscriber_start(chat_id, username: Optional[str], first_name: Optional[str],
+                             source_bot: str) -> sqlite3.Row:
+    """Appelé sur /start en DM. Crée l'abonné en statut 'pending' s'il n'existe
+    pas encore ; sinon met seulement à jour username/first_name/last_seen_at,
+    SANS jamais toucher au tier/status déjà attribués par un admin (donc /start
+    répété par un abonné déjà actif ne le rétrograde jamais)."""
+    now = time.time()
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM subscribers WHERE chat_id=?", (str(chat_id),)).fetchone()
+        if row is None:
+            conn.execute(
+                """INSERT INTO subscribers (chat_id, username, first_name, source_bot, tier, status,
+                   created_at, updated_at, last_seen_at, notify_signals, notify_tp_sl_be)
+                   VALUES (?,?,?,?,?,?,?,?,?,1,1)""",
+                (str(chat_id), username, first_name, source_bot, "pending", "pending", now, now, now),
+            )
+        else:
+            conn.execute(
+                "UPDATE subscribers SET username=?, first_name=?, last_seen_at=?, updated_at=? WHERE chat_id=?",
+                (username, first_name, now, now, str(chat_id)),
+            )
+    return get_subscriber(chat_id)
+
+
+def set_subscriber_status(chat_id, status: str) -> bool:
+    with get_conn() as conn:
+        cur = conn.execute("UPDATE subscribers SET status=?, updated_at=? WHERE chat_id=?",
+                            (status, time.time(), str(chat_id)))
+        return cur.rowcount > 0
+
+
+def set_subscriber_notify(chat_id, enabled: bool) -> bool:
+    """Active/coupe les deux types d'alertes privées (signaux + TP/SL/BE)
+    d'un coup — commandes /mute et /unmute, en self-service pour l'abonné
+    lui-même (contrairement au tier FREE/VIP, qui reste admin-only)."""
+    val = 1 if enabled else 0
+    with get_conn() as conn:
+        cur = conn.execute(
+            "UPDATE subscribers SET notify_signals=?, notify_tp_sl_be=?, updated_at=? WHERE chat_id=?",
+            (val, val, time.time(), str(chat_id)),
+        )
+        return cur.rowcount > 0
+
+
+def admin_add_subscriber(chat_id, tier: str) -> sqlite3.Row:
+    """Ajoute/active un abonné manuellement (admin uniquement). Si l'abonné
+    n'a jamais fait /start (donc pas encore de source_bot connu), on suppose
+    le bot FREE par défaut ; l'admin peut corriger via /promote /demote une
+    fois que l'abonné aura fait /start avec le bon bot."""
+    if tier not in ("free", "vip"):
+        raise ValueError("le tier doit être 'free' ou 'vip'")
+    now = time.time()
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM subscribers WHERE chat_id=?", (str(chat_id),)).fetchone()
+        if row is None:
+            conn.execute(
+                """INSERT INTO subscribers (chat_id, source_bot, tier, status, created_at, updated_at,
+                   last_seen_at, notify_signals, notify_tp_sl_be)
+                   VALUES (?,?,?,?,?,?,?,1,1)""",
+                (str(chat_id), "btc_gold", tier, "active", now, now, now),
+            )
+        else:
+            conn.execute(
+                "UPDATE subscribers SET tier=?, status=?, updated_at=? WHERE chat_id=?",
+                (tier, "active", now, str(chat_id)),
+            )
+    return get_subscriber(chat_id)
+
+
+def admin_remove_subscriber(chat_id) -> bool:
+    with get_conn() as conn:
+        cur = conn.execute("DELETE FROM subscribers WHERE chat_id=?", (str(chat_id),))
+        return cur.rowcount > 0
+
+
+def admin_set_tier(chat_id, tier: str) -> bool:
+    if tier not in ("free", "vip"):
+        raise ValueError("le tier doit être 'free' ou 'vip'")
+    with get_conn() as conn:
+        cur = conn.execute(
+            "UPDATE subscribers SET tier=?, updated_at=? WHERE chat_id=? AND status='active'",
+            (tier, time.time(), str(chat_id)),
+        )
+        return cur.rowcount > 0
+
+
+def admin_set_ban(chat_id, banned: bool) -> bool:
+    with get_conn() as conn:
+        cur = conn.execute(
+            "UPDATE subscribers SET status=?, updated_at=? WHERE chat_id=?",
+            ("banned" if banned else "active", time.time(), str(chat_id)),
+        )
+        return cur.rowcount > 0
+
+
+def list_subscribers(tier: Optional[str] = None, status: Optional[str] = None,
+                      limit: int = 200) -> List[sqlite3.Row]:
+    query = "SELECT * FROM subscribers WHERE 1=1"
+    params: List = []
+    if tier:
+        query += " AND tier=?"
+        params.append(tier)
+    if status:
+        query += " AND status=?"
+        params.append(status)
+    query += " ORDER BY created_at DESC LIMIT ?"
+    params.append(limit)
+    with get_conn() as conn:
+        return conn.execute(query, params).fetchall()
+
+
+def list_broadcast_targets(notify_field: str = "notify_signals") -> List[sqlite3.Row]:
+    """Abonnés actifs (free ou vip) ayant le type de notification demandé
+    activé — utilisé pour la diffusion privée des signaux et des alertes TP/SL/BE."""
+    assert notify_field in ("notify_signals", "notify_tp_sl_be")
+    with get_conn() as conn:
+        return conn.execute(
+            f"SELECT * FROM subscribers WHERE status='active' AND tier IN ('free','vip') "
+            f"AND {notify_field}=1"
+        ).fetchall()
+
+
+def count_subscribers_by_tier() -> Dict[str, Dict[str, int]]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT tier, status, COUNT(*) c FROM subscribers GROUP BY tier, status"
+        ).fetchall()
+    out: Dict[str, Dict[str, int]] = {}
+    for r in rows:
+        out.setdefault(r["tier"], {})[r["status"]] = r["c"]
+    return out
 
 
 def get_stats():
@@ -970,13 +1243,26 @@ def _dispatch_report(message: str):
         log.error(f"Échec d'envoi du rapport sur le groupe 'btc_gold':\n{traceback.format_exc()}")
 
 
+def _maybe_append_promo(message: str, now: datetime) -> str:
+    """Ajoute le bloc promo au message si PROMO_ENABLED et qu'aucune promo n'a
+    déjà été jointe à un rapport aujourd'hui (toutes claims confondues,
+    jour civil UTC) — garantit le plafond '1 fois par jour max' même si
+    plusieurs rapports (journalier + hebdo/mensuel) tombent le même jour."""
+    if not PROMO_ENABLED:
+        return message
+    day_key = now.strftime("%Y-%m-%d")
+    if not _try_claim_report("promo", day_key):
+        return message
+    return f"{message}\n\n{PROMO_TEXT}\n👉 {PROMO_LINK}"
+
+
 def _maybe_send_daily_report(now: datetime):
     day_key = now.strftime("%Y-%m-%d")
     if not _try_claim_report("daily", day_key):
         return
     start_ts, end_ts = _day_bounds(now)
     stats = get_period_stats(start_ts, end_ts)
-    _dispatch_report(format_daily_report(stats, day_key))
+    _dispatch_report(_maybe_append_promo(format_daily_report(stats, day_key), now))
     log.info(f"Rapport journalier envoyé ({day_key}).")
 
 
@@ -985,7 +1271,7 @@ def _maybe_send_weekly_report(now: datetime):
     if not _try_claim_report("weekly", period_key):
         return
     stats = get_period_stats(start_ts, end_ts)
-    _dispatch_report(format_weekly_report(stats, period_key))
+    _dispatch_report(_maybe_append_promo(format_weekly_report(stats, period_key), now))
     log.info(f"Rapport hebdomadaire envoyé ({period_key}).")
 
 
@@ -995,7 +1281,7 @@ def _maybe_send_monthly_report(now: datetime):
         return
     start_ts, end_ts = _month_bounds(now)
     stats = get_period_stats(start_ts, end_ts)
-    _dispatch_report(format_monthly_report(stats, period_key))
+    _dispatch_report(_maybe_append_promo(format_monthly_report(stats, period_key), now))
     log.info(f"Rapport mensuel envoyé ({period_key}).")
 
 
@@ -1158,24 +1444,30 @@ def record_watchdog_restart(reason: str):
 
 def fetch_candles(symbol: str, limit: int = 200) -> List[Dict]:
     asset = ASSETS[symbol]
+    timeframe = get_settings().get("timeframe", TIMEFRAME)
+    interval = TIMEFRAME_TO_INTERVAL.get(timeframe, "5m")
     if asset.data_source == "yfinance":
-        return _fetch_yfinance(symbol, limit)
+        return _fetch_yfinance(symbol, limit, interval)
     elif asset.data_source == "binance":
-        return _fetch_binance(symbol, limit)
+        return _fetch_binance(symbol, limit, interval)
     raise ValueError(f"Source de données inconnue pour {symbol}")
 
 
-def _fetch_yfinance(symbol: str, limit: int) -> List[Dict]:
+def _fetch_yfinance(symbol: str, limit: int, interval: str = "5m") -> List[Dict]:
     import yfinance as yf
     import pandas as pd  # dépendance de yfinance, toujours présente
     ticker_map = {"XAUUSD": "GC=F"}
     ticker = ticker_map.get(symbol, symbol)
+    # yfinance limite l'historique disponible en intraday : 1m -> 7 jours max,
+    # 5m -> 60 jours max. "2d" reste largement suffisant pour les deux, et
+    # évite un rejet de l'API sur des périodes trop longues en 1m.
+    period = "1d" if interval == "1m" else "2d"
     # Depuis yfinance >= 0.2.31, download() renvoie par défaut des colonnes
     # MultiIndex (ex. ("Open", "GC=F")) même pour un seul ticker. Sans
     # multi_level_index=False, row["Open"] renvoie alors une Series (et non
     # un scalaire) -> `float(row["Open"])` plantait avec
     # "TypeError: float() argument must be a string or a real number, not 'Series'".
-    data = yf.download(ticker, period="2d", interval="5m", progress=False,
+    data = yf.download(ticker, period=period, interval=interval, progress=False,
                         multi_level_index=False)
     if isinstance(data.columns, pd.MultiIndex):  # filet de sécurité si l'argument ci-dessus est ignoré
         data.columns = data.columns.get_level_values(0)
@@ -1189,9 +1481,9 @@ def _fetch_yfinance(symbol: str, limit: int) -> List[Dict]:
     return candles
 
 
-def _fetch_binance(symbol: str, limit: int) -> List[Dict]:
+def _fetch_binance(symbol: str, limit: int, interval: str = "5m") -> List[Dict]:
     pair = "BTCUSDT"
-    url = f"https://api.binance.com/api/v3/klines?symbol={pair}&interval=5m&limit={limit}"
+    url = f"https://api.binance.com/api/v3/klines?symbol={pair}&interval={interval}&limit={limit}"
     with urllib.request.urlopen(url, timeout=10) as resp:
         raw = json.loads(resp.read().decode())
     return [{
@@ -1594,6 +1886,81 @@ def _chat_id_for_group(group: str) -> str:
     return chat_id
 
 
+# --- Gestion des erreurs Telegram (retry, rate limit, bot bloqué) --------
+class TelegramForbiddenError(Exception):
+    """Le bot a été bloqué, ou l'utilisateur/groupe a supprimé la conversation
+    (Telegram renvoie 403). Ne sert à rien de retenter : c'est à l'appelant
+    de désactiver le destinataire concerné (cf. _send_command_reply)."""
+
+
+TELEGRAM_MAX_RETRIES = 3
+TELEGRAM_RETRY_BACKOFF_SECONDS = 1.5
+
+
+def _tg_error_reason(resp) -> str:
+    try:
+        return resp.json().get("description", resp.text)
+    except ValueError:
+        return resp.text
+
+
+def _tg_retry_after(resp) -> float:
+    try:
+        return float(resp.json().get("parameters", {}).get("retry_after", 3))
+    except (ValueError, TypeError):
+        return 3.0
+
+
+def _tg_call(token: str, method: str, data: Optional[Dict] = None,
+             files: Optional[Dict] = None, timeout: int = 15) -> Dict:
+    """Point de passage UNIQUE pour tous les appels à l'API Telegram
+    (sendMessage, sendPhoto, answerCallbackQuery, editMessageReplyMarkup...).
+    Centralise la gestion des erreurs :
+      - 429 (rate limit) : attend le `retry_after` renvoyé par Telegram puis
+        retente, jusqu'à TELEGRAM_MAX_RETRIES fois.
+      - 403 (bot bloqué/supprimé par le destinataire) : jamais de retry,
+        lève TelegramForbiddenError pour que l'appelant puisse désactiver
+        l'abonné concerné plutôt que de reloguer l'erreur en boucle.
+      - Erreur réseau/timeout : backoff progressif puis abandon.
+      - Autre code d'erreur HTTP : loggé avec le motif Telegram, puis levé
+        (comportement best-effort : ne doit jamais faire planter la boucle
+        de scan chez l'appelant, qui reste responsable de son propre try/except)."""
+    url = TELEGRAM_API.format(token=token, method=method)
+    last_exc: Optional[Exception] = None
+    for attempt in range(1, TELEGRAM_MAX_RETRIES + 1):
+        try:
+            if files:
+                resp = requests.post(url, data=data, files=files, timeout=timeout)
+            else:
+                resp = requests.post(url, data=data, timeout=timeout)
+        except requests.RequestException as e:
+            last_exc = e
+            log.warning(f"Telegram {method}: erreur réseau (tentative {attempt}/{TELEGRAM_MAX_RETRIES}): {e}")
+            time.sleep(TELEGRAM_RETRY_BACKOFF_SECONDS * attempt)
+            continue
+
+        if resp.status_code == 403:
+            raise TelegramForbiddenError(_tg_error_reason(resp))
+
+        if resp.status_code == 429:
+            retry_after = _tg_retry_after(resp)
+            log.warning(f"Telegram {method}: rate limit (429), pause {retry_after:.1f}s "
+                        f"(tentative {attempt}/{TELEGRAM_MAX_RETRIES}).")
+            time.sleep(retry_after)
+            continue
+
+        if not resp.ok:
+            reason = _tg_error_reason(resp)
+            log.warning(f"Telegram {method} a échoué ({resp.status_code}): {reason}")
+            resp.raise_for_status()
+
+        return resp.json()
+
+    if last_exc:
+        raise last_exc
+    raise RuntimeError(f"Telegram {method}: échec après {TELEGRAM_MAX_RETRIES} tentatives.")
+
+
 def format_signal_message(symbol, display_name, direction, entry_type_label, stars, score,
                            entry, sl, tp1, tp2, rr_tp1, rr_tp2, high_rr_warning,
                            tp2_source=None) -> str:
@@ -1601,7 +1968,7 @@ def format_signal_message(symbol, display_name, direction, entry_type_label, sta
     ts = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())
     lines = [
         "⚡ *ALPHABOT SMC PRO* ⚡", "",
-        f"📊 *Actif* : {display_name} ({TIMEFRAME})",
+        f"📊 *Actif* : {display_name} ({get_settings().get('timeframe', TIMEFRAME)})",
         f"🎯 *Setup* : {entry_type_label} {stars}",
         f"{direction_emoji}", "",
         f"🔹 *Entrée* : `{entry:.5f}`",
@@ -1699,7 +2066,7 @@ def generate_signal_chart(symbol: str, display_name: str, direction: str,
         ax.grid(axis="y", color="#262e42", linewidth=0.5, alpha=0.5)
 
         title_emoji = "🟢 BUY" if direction == "BUY" else "🔴 SELL"
-        ax.set_title(f"⚡ ALPHABOT SMC PRO — {display_name} ({TIMEFRAME})  ·  {title_emoji}",
+        ax.set_title(f"⚡ ALPHABOT SMC PRO — {display_name} ({get_settings().get('timeframe', TIMEFRAME)})  ·  {title_emoji}",
                      color="#e8ecf4", fontsize=13, fontweight="bold", loc="left", pad=14)
 
         fname = f"{symbol}_{signal_id or int(time.time())}_{int(time.time())}.png"
@@ -1748,20 +2115,15 @@ def send_telegram_signal(group: str, text: str, image_path: str = None, signal_i
     token = _bot_token(group)
     reply_markup = _signal_inline_keyboard(signal_id) if signal_id is not None else None
     if image_path:
-        url = TELEGRAM_API.format(token=token, method="sendPhoto")
         data = {"chat_id": chat_id, "caption": text, "parse_mode": "Markdown"}
         if reply_markup:
             data["reply_markup"] = json.dumps(reply_markup)
         with open(image_path, "rb") as img:
-            resp = requests.post(url, data=data, files={"photo": img}, timeout=15)
-    else:
-        url = TELEGRAM_API.format(token=token, method="sendMessage")
-        data = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
-        if reply_markup:
-            data["reply_markup"] = json.dumps(reply_markup)
-        resp = requests.post(url, data=data, timeout=15)
-    resp.raise_for_status()
-    return resp.json()
+            return _tg_call(token, "sendPhoto", data=data, files={"photo": img}, timeout=15)
+    data = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
+    if reply_markup:
+        data["reply_markup"] = json.dumps(reply_markup)
+    return _tg_call(token, "sendMessage", data=data, timeout=15)
 
 
 # --- Message de démarrage --------------------------------------------------
@@ -1770,7 +2132,7 @@ def send_telegram_signal(group: str, text: str, image_path: str = None, signal_i
 # bot est bien en ligne (et pas seulement silencieusement en train de tourner
 # côté serveur). Si le redémarrage a été forcé par le watchdog, le message le
 # précise avec la raison, pour distinguer un déploiement normal d'un incident.
-STARTUP_NOTIFY_GROUPS = ("btc_gold",)
+STARTUP_NOTIFY_GROUPS = ("btc_gold", "vip_gold")
 
 
 def format_startup_message() -> str:
@@ -1788,7 +2150,7 @@ def format_startup_message() -> str:
             "",
         ]
     lines += [
-        f"📊 *Actifs surveillés* : {', '.join(a.display_name for a in ASSETS.values())} ({TIMEFRAME})",
+        f"📊 *Actifs surveillés* : {', '.join(a.display_name for a in ASSETS.values())} ({get_settings().get('timeframe', TIMEFRAME)})",
         f"🕒 {ts}",
     ]
     return "\n".join(lines)
@@ -1809,24 +2171,173 @@ def send_startup_notification():
 
 def _telegram_answer_callback(group: str, callback_query_id: str, text: str = "", show_alert: bool = False):
     token = _bot_token(group)
-    url = TELEGRAM_API.format(token=token, method="answerCallbackQuery")
-    resp = requests.post(url, data={
+    return _tg_call(token, "answerCallbackQuery", data={
         "callback_query_id": callback_query_id, "text": text[:200], "show_alert": show_alert,
     }, timeout=10)
-    resp.raise_for_status()
-    return resp.json()
 
 
 def _telegram_edit_reply_markup(group: str, chat_id, message_id: int, reply_markup: Optional[Dict]):
     token = _bot_token(group)
-    url = TELEGRAM_API.format(token=token, method="editMessageReplyMarkup")
-    payload = {"chat_id": chat_id, "message_id": message_id}
-    payload["reply_markup"] = json.dumps(reply_markup or {"inline_keyboard": []})
-    resp = requests.post(url, data=payload, timeout=10)
-    # best-effort : un message déjà édité/supprimé ne doit jamais faire planter le webhook.
-    if not resp.ok:
-        log.warning(f"Telegram editMessageReplyMarkup a échoué ({resp.status_code}): {resp.text[:200]}")
-    return resp
+    payload = {"chat_id": chat_id, "message_id": message_id,
+               "reply_markup": json.dumps(reply_markup or {"inline_keyboard": []})}
+    try:
+        return _tg_call(token, "editMessageReplyMarkup", data=payload, timeout=10)
+    except Exception:
+        # best-effort : un message déjà édité/supprimé ne doit jamais faire planter le webhook.
+        log.warning("Telegram editMessageReplyMarkup a échoué:\n" + traceback.format_exc())
+        return None
+
+
+# ----------------------------------------------------------------------
+# Diffusion — groupes FREE + VIP (contenu strictement identique) puis
+# abonnés privés (DM). Chaque canal est indépendant et best-effort : l'échec
+# d'un groupe ou d'un abonné ne bloque jamais les autres.
+# ----------------------------------------------------------------------
+SIGNAL_BROADCAST_GROUPS = ("btc_gold", "vip_gold")
+PRIVATE_DM_THROTTLE_SECONDS = 0.05  # petite pause entre 2 DM (marge sous les limites Telegram)
+
+
+def _send_private_dm(source_bot: str, chat_id: str, text: str):
+    """Envoie un message privé à un abonné, avec gestion dédiée du cas où le
+    bot a été bloqué : l'abonné est alors automatiquement désactivé (status
+    'stopped'), pour ne plus jamais retenter en pure perte à chaque diffusion."""
+    token = _bot_token(source_bot)
+    try:
+        _tg_call(token, "sendMessage",
+                 data={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}, timeout=10)
+    except TelegramForbiddenError:
+        log.info(f"Telegram: {chat_id} a bloqué/supprimé le bot '{source_bot}' — abonné désactivé.")
+        try:
+            set_subscriber_status(chat_id, "stopped")
+        except Exception:
+            pass
+    except Exception:
+        log.warning(f"Échec d'envoi privé vers {chat_id} (bot '{source_bot}'):\n{traceback.format_exc()}")
+
+
+def _broadcast_private(text: str, notify_field: str = "notify_signals"):
+    for sub in list_broadcast_targets(notify_field):
+        try:
+            _send_private_dm(sub["source_bot"] or "btc_gold", sub["chat_id"], text)
+        except RuntimeError:
+            pass  # bot source non configuré (token manquant) -> ignoré silencieusement
+        time.sleep(PRIVATE_DM_THROTTLE_SECONDS)
+
+
+def broadcast_signal(text: str, image_path: Optional[str] = None, signal_id: Optional[int] = None):
+    """Diffuse un signal sur le groupe FREE, le groupe VIP (contenu
+    identique) puis en message privé à chaque abonné actif ayant les
+    notifications de signaux activées."""
+    for group in SIGNAL_BROADCAST_GROUPS:
+        try:
+            send_telegram_signal(group, text, image_path=image_path, signal_id=signal_id)
+        except RuntimeError:
+            pass  # groupe non configuré (token/chat_id manquant) -> ignoré silencieusement
+        except Exception:
+            log.error(f"Échec de diffusion du signal sur le groupe '{group}':\n{traceback.format_exc()}")
+    _broadcast_private(text, notify_field="notify_signals")
+
+
+# ----------------------------------------------------------------------
+# Notifications TP / SL / Break Even — diffusées sur les mêmes canaux que
+# les signaux (groupes FREE + VIP + abonnés privés), déclenchées par tout
+# changement de statut pertinent d'un trade (bouton Telegram, API dashboard,
+# ou un futur moteur de suivi automatique).
+# ----------------------------------------------------------------------
+TRADE_EVENT_MESSAGES = {
+    "be":          ("🟡", "Break Even", "Stop Loss déplacé au point d'entrée — trade désormais sans risque."),
+    "secured":     ("🔒", "Sécurisation partielle", "Prise de profit partielle recommandée à ce niveau."),
+    "tp1_hit":     ("✅", "TP1 atteint", "Premier objectif touché."),
+    "tp2_hit":     ("🚀", "TP2 atteint", "Objectif final touché — trade clôturé."),
+    "invalidated": ("🛑", "Stop Loss touché", "Le trade est invalidé."),
+    "closed":      ("🔴", "Trade clôturé", "Position fermée."),
+}
+
+
+def format_trade_event_message(row: sqlite3.Row, status: str) -> Optional[str]:
+    info = TRADE_EVENT_MESSAGES.get(status)
+    if not info:
+        return None
+    emoji, title, detail = info
+    ts = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())
+    direction_txt = "🟢 ACHAT" if row["direction"] == "BUY" else "🔴 VENTE"
+    return (
+        f"{emoji} *{title}* — {row['symbol']} #{row['id']} ({direction_txt})\n"
+        f"{detail}\n"
+        f"🕒 {ts}"
+    )
+
+
+# Statuts terminaux : plus aucune action possible sur ce trade -> c'est le
+# bon moment pour envoyer le "rapport après trade" complet en plus de
+# l'alerte courte habituelle.
+TERMINAL_TRADE_STATUSES = {"closed", "invalidated", "tp2_hit"}
+
+
+def format_trade_closed_report(row: sqlite3.Row) -> Optional[str]:
+    """Compte-rendu complet envoyé quand un trade atteint un statut terminal :
+    résultat en R, durée du trade, et cumul du jour (tous actifs confondus),
+    pour donner un vrai suivi de performance à chaud plutôt qu'une simple
+    alerte de statut."""
+    r = _r_result(row)
+    if r is None:
+        return None
+
+    created_at = row["created_at"]
+    closed_at = row["closed_at"] or time.time()
+    duration_s = max(0, closed_at - created_at)
+    hours, rem = divmod(int(duration_s), 3600)
+    minutes = rem // 60
+    duration_txt = f"{hours}h{minutes:02d}" if hours else f"{minutes}min"
+
+    result_emoji = "✅" if r > 0 else ("🟡" if r == 0 else "❌")
+    result_txt = f"+{r:.2f}R" if r > 0 else f"{r:.2f}R"
+
+    now = datetime.now(timezone.utc)
+    start_ts, end_ts = _day_bounds(now)
+    day_stats = get_period_stats(start_ts, end_ts)
+    cumul = day_stats["total_r"]
+    cumul_txt = f"+{cumul:.2f}R" if cumul >= 0 else f"{cumul:.2f}R"
+
+    direction_txt = "🟢 ACHAT" if row["direction"] == "BUY" else "🔴 VENTE"
+    return (
+        f"📊 *Rapport de trade* — {row['symbol']} #{row['id']} ({direction_txt})\n"
+        f"{result_emoji} Résultat : *{result_txt}*\n"
+        f"⏱️ Durée : {duration_txt}\n"
+        f"📈 Cumul du jour (tous actifs) : {cumul_txt} sur {day_stats['total_signals']} signal(aux)"
+    )
+
+
+def notify_trade_event(signal_id: int, status: str):
+    """Diffuse une alerte TP/SL/BE pour le signal donné, best-effort. À
+    appeler à chaque changement de statut pertinent, quelle qu'en soit
+    l'origine (bouton Telegram, API dashboard, futur moteur de suivi auto).
+    Ne fait rien si le statut n'a pas d'alerte dédiée (ex: 'taken', 'ignored').
+    Pour un statut terminal (TP2, SL, clôture), un rapport complet (résultat
+    en R, durée, cumul du jour) est envoyé en complément de l'alerte courte."""
+    row = get_signal(signal_id)
+    if not row:
+        return
+    text = format_trade_event_message(row, status)
+    if not text:
+        return
+
+    if status in TERMINAL_TRADE_STATUSES:
+        try:
+            report_text = format_trade_closed_report(row)
+            if report_text:
+                text = f"{text}\n\n{report_text}"
+        except Exception:
+            log.warning(f"Échec génération rapport de trade #{signal_id}:\n{traceback.format_exc()}")
+
+    for group in SIGNAL_BROADCAST_GROUPS:
+        try:
+            send_telegram_signal(group, text)
+        except RuntimeError:
+            pass
+        except Exception:
+            log.warning(f"Échec notification trade #{signal_id} sur '{group}':\n{traceback.format_exc()}")
+    _broadcast_private(text, notify_field="notify_tp_sl_be")
 
 
 # --- Commandes Telegram natives (/settings, /capital, /profils...) --------
@@ -1841,14 +2352,43 @@ def _telegram_edit_reply_markup(group: str, chat_id, message_id: int, reply_mark
 # /levier, activation de profil) restent réservées au propriétaire partout,
 # groupe comme DM.
 BOT_COMMANDS_HELP = (
-    "🤖 *ALPHABOT SMC PRO* — commandes disponibles\n\n"
+    "🤖 *ALPHABOT SMC PRO* — commandes propriétaire\n\n"
     "/settings — voir les réglages actuels\n"
     "/capital <valeur> — définir le capital ($)\n"
     "/risque <valeur> — définir le risque par trade (%)\n"
     "/levier <valeur> — définir le levier (x)\n"
+    "/session <ny|24h> — session NY fixe ou scan 24h/24 en continu\n"
+    "/timeframe <M1|M5> — changer le timeframe du scan (M1 = scalping)\n"
     "/profils — lister et activer un profil sauvegardé\n"
     "/status — état du bot (dernier scan...)\n"
+    "/stats — statistiques globales\n"
+    "/report [daily|weekly|monthly] — rapport de performance\n"
     "/help — afficher ce message"
+)
+
+# Commandes ouvertes à tout le monde en DM (pas de gestion de réglages —
+# uniquement inscription/désinscription et lecture de stats publiques).
+PUBLIC_COMMANDS_HELP = (
+    "🤖 *ALPHABOT SMC PRO*\n\n"
+    "/start — s'enregistrer (activation ensuite faite par l'admin)\n"
+    "/stop — arrêter les messages privés du bot\n"
+    "/mute — couper temporairement les alertes privées\n"
+    "/unmute — réactiver les alertes privées\n"
+    "/stats — statistiques globales\n"
+    "/report [daily|weekly|monthly] — rapport de performance\n"
+    "/help — afficher ce message"
+)
+
+ADMIN_COMMANDS_HELP = (
+    "\n\n👑 *Administration — abonnés*\n"
+    "/admin — ce panneau\n"
+    "/addsub <chat_id> <free|vip> — ajouter/activer un abonné\n"
+    "/removesub <chat_id> — retirer un abonné\n"
+    "/promote <chat_id> — passer un abonné en VIP\n"
+    "/demote <chat_id> — repasser un abonné en FREE\n"
+    "/ban <chat_id> · /unban <chat_id> — bannir / débannir\n"
+    "/listsubs [free|vip] — lister les abonnés\n"
+    "/broadcast <message> — message privé à tous les abonnés actifs"
 )
 
 _SETTINGS_COMMAND_FIELDS = {"/capital": "capital", "/risque": "risk_percent", "/levier": "leverage"}
@@ -1869,6 +2409,7 @@ _OWNER_ONLY_REPLY = "⛔ Réservé au propriétaire du bot."
 def format_settings_message(settings: Optional[Dict] = None) -> str:
     s = settings or get_settings()
     active = next((p for p in list_profiles() if p["id"] == s.get("active_profile_id")), None)
+    session_label = "24h/24 (continu)" if s.get("session_mode") == "24h" else "NY (13h-22h UTC)"
     lines = [
         "⚙️ *Réglages actuels*",
         f"💰 Capital : {s['capital']:.2f} $",
@@ -1878,10 +2419,72 @@ def format_settings_message(settings: Optional[Dict] = None) -> str:
         f"🏅 Score minimum publié : {s['min_score_to_publish']}",
         f"🔁 Martingale : {'ON' if s['martingale_enabled'] else 'OFF'} (x{s['martingale_multiplier']:.1f})",
         f"🛟 Recovery : {'ON' if s['recovery_enabled'] else 'OFF'} (plafond x{s['recovery_max_multiplier']:.1f})",
+        f"🕐 Session : {session_label}",
+        f"⏱ Timeframe : {s.get('timeframe', TIMEFRAME)}",
         f"👤 Profil actif : {active['name'] if active else '—'}",
         "",
-        "Modifier : /capital <valeur> · /risque <valeur> · /levier <valeur> · /profils",
+        "Modifier : /capital <valeur> · /risque <valeur> · /levier <valeur> · /profils\n"
+        "/session <ny|24h> · /timeframe <M1|M5>",
     ]
+    return "\n".join(lines)
+
+
+def format_public_stats_message() -> str:
+    s = get_all_time_stats()
+    lines = [
+        "📊 *Statistiques globales*", "",
+        f"Signaux comptabilisés : {s['total_signals']}",
+        f"Gagnants : {s['wins']} · Perdants : {s['losses']} · BE : {s['be']}",
+        f"Winrate : {s['win_rate']:.1f}%",
+        f"Résultat cumulé : {s['total_r']:+.2f} R",
+        f"Drawdown max : {s['max_drawdown_r']:.2f} R",
+    ]
+    return "\n".join(lines)
+
+
+def format_report_message(period: Optional[str]) -> str:
+    now = datetime.now(timezone.utc)
+    period = (period or "daily").lower()
+    if period == "weekly":
+        start_ts, end_ts, period_key = _week_bounds(now)
+        label = f"Semaine {period_key}"
+    elif period == "monthly":
+        start_ts, end_ts = _month_bounds(now)
+        label = now.strftime("Mois %Y-%m")
+    else:
+        period = "daily"
+        start_ts, end_ts = _day_bounds(now)
+        label = now.strftime("Jour %Y-%m-%d")
+
+    s = get_period_stats(start_ts, end_ts)
+    lines = [
+        f"🗓️ *Rapport — {label}*", "",
+        f"Signaux : {s['total_signals']}",
+        f"Gagnants : {s['wins']} · Perdants : {s['losses']} · BE : {s['be']}",
+        f"Winrate : {s['win_rate']:.1f}%",
+        f"Résultat : {s['total_r']:+.2f} R",
+    ]
+    if s["best"]:
+        lines.append(f"🏆 Meilleur trade : {s['best']['symbol']} {s['best']['r']:+.2f} R")
+    if s["worst"]:
+        lines.append(f"📉 Pire trade : {s['worst']['symbol']} {s['worst']['r']:+.2f} R")
+    return "\n".join(lines)
+
+
+def format_subscribers_list_message(tier: Optional[str] = None) -> str:
+    subs = list_subscribers(tier=tier, limit=50)
+    counts = count_subscribers_by_tier()
+    header = f"👥 *Abonnés*" + (f" — filtre : {tier}" if tier else "")
+    summary_lines = []
+    for t, by_status in counts.items():
+        parts_txt = " · ".join(f"{st}: {n}" for st, n in by_status.items())
+        summary_lines.append(f"  {t} → {parts_txt}")
+    if not subs:
+        return header + "\n\n" + "\n".join(summary_lines) + "\n\nAucun abonné à afficher pour ce filtre."
+    lines = [header, ""] + summary_lines + ["", "Derniers 50 :"]
+    for s in subs:
+        uname = f"@{s['username']}" if s["username"] else (s["first_name"] or "—")
+        lines.append(f"`{s['chat_id']}` · {s['tier']} · {s['status']} · {uname}")
     return "\n".join(lines)
 
 
@@ -1895,25 +2498,40 @@ def _profiles_inline_keyboard() -> Dict:
 
 def _send_command_reply(group: str, chat_id, text: str, reply_markup: Optional[Dict] = None):
     token = _bot_token(group)
-    url = TELEGRAM_API.format(token=token, method="sendMessage")
     data = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
     if reply_markup:
         data["reply_markup"] = json.dumps(reply_markup)
-    resp = requests.post(url, data=data, timeout=10)
-    if not resp.ok:
-        log.warning(f"Telegram sendMessage (commande) a échoué ({resp.status_code}): {resp.text[:200]}")
-    return resp
+    try:
+        return _tg_call(token, "sendMessage", data=data, timeout=10)
+    except TelegramForbiddenError:
+        log.info(f"Telegram: {chat_id} a bloqué/supprimé le bot '{group}' — abonné désactivé si présent.")
+        try:
+            set_subscriber_status(chat_id, "stopped")
+        except Exception:
+            pass
+        return None
+    except Exception:
+        log.warning("Telegram sendMessage (commande) a échoué:\n" + traceback.format_exc())
+        return None
 
 
-_READ_ONLY_COMMANDS = ("/start", "/help", "/aide", "/settings", "/reglages",
-                       "/parametres", "/status", "/profils")
+# Commandes de réglages trading : réservées au propriétaire en DM comme en groupe.
+_READ_ONLY_COMMANDS = ("/settings", "/reglages", "/parametres", "/status", "/profils")
+
+# Commandes ouvertes à tout le monde en DM (inscription, stats publiques).
+_PUBLIC_DM_COMMANDS = ("/start", "/help", "/aide", "/stop", "/mute", "/unmute", "/stats", "/report")
+
+# Commandes d'administration des abonnés : réservées au propriétaire, partout
+# (DM comme groupe), quel que soit TELEGRAM_OWNER_ID.
+_ADMIN_ONLY_COMMANDS = ("/admin", "/addsub", "/removesub", "/promote", "/demote",
+                        "/ban", "/unban", "/listsubs", "/broadcast")
 
 
 def _handle_telegram_command(message: Dict, group: str):
     """group est désormais connu à l'avance (déduit de l'URL du webhook, cf.
     telegram_webhook) — plus besoin de le deviner à partir du chat_id, donc
-    ça fonctionne aussi bien dans les 2 groupes Telegram configurés qu'en
-    message privé (DM) avec l'un des 2 bots."""
+    ça fonctionne aussi bien dans les groupes Telegram configurés qu'en
+    message privé (DM) avec l'un des bots."""
     chat = message.get("chat") or {}
     chat_id = chat.get("id")
     is_private = chat.get("type") == "private"
@@ -1934,17 +2552,72 @@ def _handle_telegram_command(message: Dict, group: str):
     parts = text.split()
     cmd = parts[0].lower().split("@")[0]  # tolère "/settings@NomDuBot"
     arg = parts[1] if len(parts) > 1 else None
-    sender_id = (message.get("from") or {}).get("id")
+    arg2 = parts[2] if len(parts) > 2 else None
+    rest_text = text.split(maxsplit=1)[1] if len(parts) > 1 else None
+    sender = message.get("from") or {}
+    sender_id = sender.get("id")
 
-    # En DM (canal 1-à-1), même les commandes en lecture seule sont
-    # réservées au propriétaire. Dans les groupes elles restent ouvertes à
-    # tous comme avant.
+    # Admin-only, partout (DM ou groupe).
+    if cmd in _ADMIN_ONLY_COMMANDS and not _is_owner(sender_id):
+        _send_command_reply(group, chat_id, _OWNER_ONLY_REPLY)
+        return
+
+    # En DM (canal 1-à-1), les commandes de réglages trading restent
+    # réservées au propriétaire. Les commandes "publiques" (/start /stop
+    # /mute /stats /report /help) restent ouvertes à tout le monde en DM.
     if is_private and cmd in _READ_ONLY_COMMANDS and not _is_owner(sender_id):
         _send_command_reply(group, chat_id, _OWNER_ONLY_REPLY)
         return
 
-    if cmd in ("/start", "/help", "/aide"):
-        _send_command_reply(group, chat_id, BOT_COMMANDS_HELP)
+    # --- Commandes publiques (abonné / DM) ---------------------------------
+    if cmd == "/start":
+        if is_private:
+            upsert_subscriber_start(chat_id, sender.get("username"), sender.get("first_name"), group)
+            _send_command_reply(
+                group, chat_id,
+                "👋 Bienvenue sur *ALPHABOT SMC PRO*.\n\n"
+                "Ton inscription est enregistrée — un administrateur doit encore "
+                "l'activer (accès FREE ou VIP) avant que tu reçoives les alertes "
+                "en message privé. En attendant, /stats et /report restent disponibles.\n\n"
+                + PUBLIC_COMMANDS_HELP,
+            )
+        else:
+            _send_command_reply(group, chat_id, PUBLIC_COMMANDS_HELP)
+    elif cmd in ("/help", "/aide"):
+        text_out = BOT_COMMANDS_HELP if _is_owner(sender_id) else PUBLIC_COMMANDS_HELP
+        if _is_owner(sender_id):
+            text_out += ADMIN_COMMANDS_HELP
+        _send_command_reply(group, chat_id, text_out)
+    elif cmd == "/stop":
+        if is_private:
+            changed = set_subscriber_status(chat_id, "stopped")
+            _send_command_reply(group, chat_id,
+                                 "🛑 Messages privés arrêtés." if changed else
+                                 "Tu n'étais pas inscrit — rien à arrêter.")
+        else:
+            _send_command_reply(group, chat_id, "Envoie /stop en message privé au bot pour arrêter tes DM.")
+    elif cmd == "/mute":
+        if is_private:
+            changed = set_subscriber_notify(chat_id, False)
+            _send_command_reply(group, chat_id,
+                                 "🔕 Alertes privées coupées (tape /unmute pour les réactiver)." if changed
+                                 else "Aucun abonnement actif trouvé pour ce chat.")
+        else:
+            _send_command_reply(group, chat_id, "Envoie /mute en message privé au bot.")
+    elif cmd == "/unmute":
+        if is_private:
+            changed = set_subscriber_notify(chat_id, True)
+            _send_command_reply(group, chat_id,
+                                 "🔔 Alertes privées réactivées." if changed
+                                 else "Aucun abonnement actif trouvé pour ce chat.")
+        else:
+            _send_command_reply(group, chat_id, "Envoie /unmute en message privé au bot.")
+    elif cmd == "/stats":
+        _send_command_reply(group, chat_id, format_public_stats_message())
+    elif cmd == "/report":
+        _send_command_reply(group, chat_id, format_report_message(arg))
+
+    # --- Commandes propriétaire (réglages trading) --------------------------
     elif cmd in ("/settings", "/reglages", "/parametres"):
         _send_command_reply(group, chat_id, format_settings_message())
     elif cmd == "/status":
@@ -1953,9 +2626,6 @@ def _handle_telegram_command(message: Dict, group: str):
         _send_command_reply(group, chat_id, "👤 *Profils sauvegardés* — tape pour activer :",
                              reply_markup=_profiles_inline_keyboard())
     elif cmd in _SETTINGS_COMMAND_FIELDS:
-        if not _is_owner(sender_id):
-            _send_command_reply(group, chat_id, _OWNER_ONLY_REPLY)
-            return
         if arg is None:
             _send_command_reply(group, chat_id, f"Usage : {cmd} <valeur>")
             return
@@ -1966,6 +2636,72 @@ def _handle_telegram_command(message: Dict, group: str):
             _send_command_reply(group, chat_id, f"❌ {e}")
             return
         _send_command_reply(group, chat_id, f"✅ Mis à jour.\n\n{format_settings_message(updated)}")
+    elif cmd == "/session":
+        if not arg or arg.lower() not in VALID_SESSION_MODES:
+            _send_command_reply(group, chat_id, "Usage : /session <ny|24h>")
+            return
+        updated = update_settings({"session_mode": arg.lower()})
+        label = "24h/24 (continu)" if updated["session_mode"] == "24h" else "NY (13h-22h UTC)"
+        _send_command_reply(group, chat_id, f"✅ Session mise à jour : *{label}*.\n\n{format_settings_message(updated)}")
+    elif cmd == "/timeframe":
+        if not arg or arg.upper() not in VALID_TIMEFRAMES:
+            _send_command_reply(group, chat_id, "Usage : /timeframe <M1|M5>")
+            return
+        updated = update_settings({"timeframe": arg.upper()})
+        _send_command_reply(
+            group, chat_id,
+            f"✅ Timeframe mis à jour : *{updated['timeframe']}*.\n\n{format_settings_message(updated)}",
+        )
+
+    # --- Administration des abonnés (propriétaire uniquement) ---------------
+    elif cmd == "/admin":
+        _send_command_reply(group, chat_id, "👑 *Panneau admin*" + ADMIN_COMMANDS_HELP)
+    elif cmd == "/addsub":
+        if not arg or arg2 not in ("free", "vip"):
+            _send_command_reply(group, chat_id, "Usage : /addsub <chat_id> <free|vip>")
+            return
+        sub = admin_add_subscriber(arg, arg2)
+        _send_command_reply(group, chat_id, f"✅ Abonné `{sub['chat_id']}` activé en *{sub['tier'].upper()}*.")
+    elif cmd == "/removesub":
+        if not arg:
+            _send_command_reply(group, chat_id, "Usage : /removesub <chat_id>")
+            return
+        ok = admin_remove_subscriber(arg)
+        _send_command_reply(group, chat_id, "✅ Abonné retiré." if ok else "❌ Abonné introuvable.")
+    elif cmd == "/promote":
+        if not arg:
+            _send_command_reply(group, chat_id, "Usage : /promote <chat_id>")
+            return
+        ok = admin_set_tier(arg, "vip")
+        _send_command_reply(group, chat_id, "✅ Passé en VIP." if ok else "❌ Abonné actif introuvable.")
+    elif cmd == "/demote":
+        if not arg:
+            _send_command_reply(group, chat_id, "Usage : /demote <chat_id>")
+            return
+        ok = admin_set_tier(arg, "free")
+        _send_command_reply(group, chat_id, "✅ Repassé en FREE." if ok else "❌ Abonné actif introuvable.")
+    elif cmd == "/ban":
+        if not arg:
+            _send_command_reply(group, chat_id, "Usage : /ban <chat_id>")
+            return
+        ok = admin_set_ban(arg, True)
+        _send_command_reply(group, chat_id, "🚫 Abonné banni." if ok else "❌ Abonné introuvable.")
+    elif cmd == "/unban":
+        if not arg:
+            _send_command_reply(group, chat_id, "Usage : /unban <chat_id>")
+            return
+        ok = admin_set_ban(arg, False)
+        _send_command_reply(group, chat_id, "✅ Abonné débanni (réactivé)." if ok else "❌ Abonné introuvable.")
+    elif cmd == "/listsubs":
+        tier_filter = arg if arg in ("free", "vip") else None
+        _send_command_reply(group, chat_id, format_subscribers_list_message(tier_filter))
+    elif cmd == "/broadcast":
+        if not rest_text:
+            _send_command_reply(group, chat_id, "Usage : /broadcast <message>")
+            return
+        targets = list_broadcast_targets("notify_signals")
+        _send_command_reply(group, chat_id, f"📣 Diffusion en cours vers {len(targets)} abonné(s)...")
+        _broadcast_private(f"📣 *Message de l'équipe*\n\n{rest_text}", notify_field="notify_signals")
     else:
         _send_command_reply(group, chat_id, "Commande inconnue. Tape /help pour la liste.")
 
@@ -2016,6 +2752,9 @@ def _handle_profile_callback(callback: Dict, group: str):
 # ============================================================================
 
 def is_session_open(asset_symbol: str) -> bool:
+    settings = get_settings()
+    if settings.get("session_mode") == "24h":
+        return True
     asset = ASSETS[asset_symbol]
     if asset.session_continuous:
         return True
@@ -2095,7 +2834,7 @@ def process_asset(symbol: str):
         signal_id=signal_id,
     )
     try:
-        send_telegram_signal(asset.telegram_group, message, image_path=image_path, signal_id=signal_id)
+        broadcast_signal(message, image_path=image_path, signal_id=signal_id)
         log.info(f"[{symbol}] signal #{signal_id} publié ({direction}, {entry_type}, score={score})")
     except Exception:
         log.error(f"[{symbol}] échec d'envoi Telegram pour le signal #{signal_id}:\n{traceback.format_exc()}")
@@ -2191,6 +2930,227 @@ def watchdog_loop():
 
 
 # ============================================================================
+# 9ter. EXPORT (CSV/PDF) ET SAUVEGARDE AUTOMATIQUE
+# ============================================================================
+
+import csv
+import io
+import shutil
+import glob
+
+
+def _cleanup_old_files(directory: str, pattern: str, keep_last: int):
+    """Ne garde que les `keep_last` fichiers les plus récents correspondant à
+    `pattern` dans `directory` (nettoyage best-effort, jamais bloquant)."""
+    try:
+        files = sorted(glob.glob(os.path.join(directory, pattern)), key=os.path.getmtime, reverse=True)
+        for old_file in files[keep_last:]:
+            try:
+                os.remove(old_file)
+            except OSError:
+                pass
+    except Exception:
+        log.warning(f"Nettoyage de '{directory}' échoué (best-effort):\n{traceback.format_exc()}")
+
+
+def export_trades_csv(symbol: Optional[str] = None, limit: int = 1000) -> str:
+    """Exporte l'historique des trades (le plus récent en premier) au format
+    CSV. Retourne le chemin du fichier généré dans EXPORT_DIR."""
+    rows = get_trade_history(limit=limit, symbol=symbol)
+    ts = time.strftime("%Y%m%d_%H%M%S", time.gmtime())
+    suffix = f"_{symbol}" if symbol else ""
+    filename = f"trades{suffix}_{ts}.csv"
+    path = os.path.join(EXPORT_DIR, filename)
+
+    fieldnames = [
+        "id", "symbol", "direction", "entry_type", "stars", "score", "entry_price",
+        "stop_loss", "tp1", "tp2", "rr_tp1", "rr_tp2", "status", "result_r",
+        "created_at_utc", "closed_at_utc",
+    ]
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({
+                "id": row["id"], "symbol": row["symbol"], "direction": row["direction"],
+                "entry_type": row["entry_type"], "stars": row["stars"], "score": row["score"],
+                "entry_price": row["entry_price"], "stop_loss": row["stop_loss"],
+                "tp1": row["tp1"], "tp2": row["tp2"], "rr_tp1": row["rr_tp1"], "rr_tp2": row["rr_tp2"],
+                "status": row["status"], "result_r": _r_result(row),
+                "created_at_utc": time.strftime("%Y-%m-%d %H:%M", time.gmtime(row["created_at"])),
+                "closed_at_utc": (
+                    time.strftime("%Y-%m-%d %H:%M", time.gmtime(row["closed_at"])) if row["closed_at"] else ""
+                ),
+            })
+
+    _cleanup_old_files(EXPORT_DIR, "trades*.csv", EXPORT_KEEP_LAST)
+    log.info(f"Export CSV généré : {path} ({len(rows)} trades)")
+    return path
+
+
+def export_trades_pdf(symbol: Optional[str] = None, limit: int = 1000) -> str:
+    """Génère un rapport PDF (via matplotlib, sans dépendance supplémentaire) :
+    résumé de performance + tableau des derniers trades. Retourne le chemin
+    du fichier PDF généré dans EXPORT_DIR."""
+    from matplotlib.backends.backend_pdf import PdfPages
+
+    rows = get_trade_history(limit=limit, symbol=symbol)
+    stats = get_all_time_stats() if not symbol else get_period_stats(0, time.time() + 1)
+    ts = time.strftime("%Y%m%d_%H%M%S", time.gmtime())
+    suffix = f"_{symbol}" if symbol else ""
+    filename = f"rapport{suffix}_{ts}.pdf"
+    path = os.path.join(EXPORT_DIR, filename)
+
+    with PdfPages(path) as pdf:
+        # Page 1 : résumé de performance
+        fig, ax = plt.subplots(figsize=(8.27, 11.69))  # A4 portrait
+        ax.axis("off")
+        title = f"AlphaBot SMC PRO — Rapport de performance{(' ' + symbol) if symbol else ''}"
+        ax.text(0.5, 0.97, title, ha="center", va="top", fontsize=16, fontweight="bold")
+        ax.text(0.5, 0.93, f"Généré le {time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime())}",
+                ha="center", va="top", fontsize=9, color="gray")
+
+        summary_lines = [
+            f"Total signaux : {stats['total_signals']}",
+            f"Gagnants : {stats['wins']}   Perdants : {stats['losses']}   BE : {stats['be']}",
+            f"Winrate : {stats['win_rate']:.1f}%",
+            f"Résultat cumulé : {stats['total_r']:+.2f}R",
+            f"Drawdown max : {stats['max_drawdown_r']:.2f}R",
+        ]
+        y = 0.85
+        for line in summary_lines:
+            ax.text(0.08, y, line, fontsize=12, va="top")
+            y -= 0.05
+        pdf.savefig(fig)
+        plt.close(fig)
+
+        # Page(s) suivantes : tableau des trades (par lots de 35 lignes/page)
+        table_cols = ["ID", "Symbole", "Dir.", "Score", "Statut", "R", "Ouvert (UTC)"]
+        page_rows = []
+        for row in rows:
+            r = _r_result(row)
+            page_rows.append([
+                str(row["id"]), row["symbol"], row["direction"], f"{row['score']}", row["status"],
+                f"{r:+.2f}" if r is not None else "-",
+                time.strftime("%Y-%m-%d %H:%M", time.gmtime(row["created_at"])),
+            ])
+
+        chunk_size = 35
+        for i in range(0, len(page_rows), chunk_size) or [0]:
+            chunk = page_rows[i:i + chunk_size]
+            fig, ax = plt.subplots(figsize=(8.27, 11.69))
+            ax.axis("off")
+            if chunk:
+                table = ax.table(cellText=chunk, colLabels=table_cols, loc="upper center", cellLoc="center")
+                table.auto_set_font_size(False)
+                table.set_fontsize(7)
+                table.scale(1, 1.3)
+            else:
+                ax.text(0.5, 0.5, "Aucun trade sur la période.", ha="center", va="center")
+            pdf.savefig(fig)
+            plt.close(fig)
+
+    _cleanup_old_files(EXPORT_DIR, "rapport*.pdf", EXPORT_KEEP_LAST)
+    log.info(f"Export PDF généré : {path} ({len(rows)} trades)")
+    return path
+
+
+def backup_database() -> Optional[str]:
+    """Sauvegarde la base SQLite via l'API native de backup (cohérente même
+    si une écriture concurrente est en cours, contrairement à une simple
+    copie de fichier), avec rotation locale et copie optionnelle sur
+    Telegram. Best-effort : ne lève jamais d'exception vers l'appelant."""
+    ts = time.strftime("%Y%m%d_%H%M%S", time.gmtime())
+    filename = f"backup_{ts}.db"
+    path = os.path.join(BACKUP_DIR, filename)
+    try:
+        src = sqlite3.connect(DB_PATH)
+        dst = sqlite3.connect(path)
+        with dst:
+            src.backup(dst)
+        src.close()
+        dst.close()
+    except Exception:
+        log.error(f"Échec de la sauvegarde de la base:\n{traceback.format_exc()}")
+        return None
+
+    _cleanup_old_files(BACKUP_DIR, "backup_*.db", BACKUP_KEEP_LAST)
+    log.info(f"Sauvegarde de la base créée : {path}")
+
+    if BACKUP_SEND_TO_TELEGRAM:
+        try:
+            group = "reports" if os.environ.get("TG_CHAT_REPORTS") else "btc_gold"
+            token = _bot_token(group)
+            chat_id = _chat_id_for_group(group)
+            with open(path, "rb") as f:
+                requests.post(
+                    TELEGRAM_API.format(token=token, method="sendDocument"),
+                    data={"chat_id": chat_id, "caption": f"💾 Sauvegarde DB — {ts}"},
+                    files={"document": (filename, f)},
+                    timeout=30,
+                )
+        except RuntimeError:
+            pass  # groupe non configuré -> ignoré silencieusement (best-effort)
+        except Exception:
+            log.warning(f"Échec d'envoi de la sauvegarde sur Telegram (best-effort):\n{traceback.format_exc()}")
+
+    return path
+
+
+def backup_scheduler_loop():
+    """Thread dédié : sauvegarde la base toutes les BACKUP_INTERVAL_HOURS
+    heures. Une première sauvegarde est prise peu après le démarrage."""
+    time.sleep(60)  # laisse le temps au reste du service de démarrer proprement
+    while True:
+        try:
+            backup_database()
+        except Exception:
+            log.error(f"Erreur inattendue dans backup_scheduler_loop (continue):\n{traceback.format_exc()}")
+        time.sleep(max(60, BACKUP_INTERVAL_HOURS * 3600))
+
+
+# --- Cache TTL (endpoints de lecture les plus sollicités du dashboard) ------
+# Le dashboard interroge /api/overview, /api/stats* etc. toutes les 30s
+# (setInterval côté JS) alors que ces requêtes recalculent des agrégats sur
+# toute la table `signals`. Un petit cache en mémoire, à durée de vie courte,
+# évite de refaire ce travail à chaque appel sans jamais renvoyer une donnée
+# vieille de plus de quelques secondes. Verrou car app.run/Waitress sert
+# plusieurs requêtes en parallèle sur des threads différents.
+_dashboard_cache: Dict[str, tuple] = {}  # clé -> (expire_at, valeur)
+_dashboard_cache_lock = threading.Lock()
+DASHBOARD_CACHE_TTL_SECONDS = float(os.environ.get("DASHBOARD_CACHE_TTL_SECONDS", "10"))
+
+
+def _ttl_cached(key_prefix: str):
+    """Décorateur : met en cache le résultat JSON-sérialisable de la fonction
+    décorée pendant DASHBOARD_CACHE_TTL_SECONDS, par clé = key_prefix + args."""
+    def decorator(fn):
+        def wrapper(*args, **kwargs):
+            cache_key = key_prefix + str(args) + str(sorted(kwargs.items()))
+            now = time.time()
+            with _dashboard_cache_lock:
+                cached = _dashboard_cache.get(cache_key)
+                if cached and cached[0] > now:
+                    return cached[1]
+            value = fn(*args, **kwargs)
+            with _dashboard_cache_lock:
+                _dashboard_cache[cache_key] = (now + DASHBOARD_CACHE_TTL_SECONDS, value)
+            return value
+        wrapper.__name__ = fn.__name__
+        return wrapper
+    return decorator
+
+
+def invalidate_dashboard_cache():
+    """À appeler après toute écriture qui change les stats (nouveau signal,
+    changement de statut) pour ne jamais servir une valeur cachée obsolète
+    plus de quelques secondes de toute façon, mais utile pour une invalidation
+    immédiate après une action explicite de l'utilisateur (dashboard/Telegram)."""
+    with _dashboard_cache_lock:
+        _dashboard_cache.clear()
+
+
+# ============================================================================
 # 10. DASHBOARD FLASK
 # ============================================================================
 
@@ -2215,6 +3175,40 @@ def watchdog_status():
     return jsonify({
         "heartbeat": hb,
     })
+
+
+@app.route("/api/export/csv")
+def export_csv_endpoint():
+    from flask import send_file
+    symbol = request.args.get("symbol") or None
+    limit = int(request.args.get("limit", 1000))
+    try:
+        path = export_trades_csv(symbol=symbol, limit=limit)
+        return send_file(path, as_attachment=True, download_name=os.path.basename(path))
+    except Exception:
+        log.error(f"Échec export CSV via API:\n{traceback.format_exc()}")
+        return jsonify({"error": "export_failed"}), 500
+
+
+@app.route("/api/export/pdf")
+def export_pdf_endpoint():
+    from flask import send_file
+    symbol = request.args.get("symbol") or None
+    limit = int(request.args.get("limit", 1000))
+    try:
+        path = export_trades_pdf(symbol=symbol, limit=limit)
+        return send_file(path, as_attachment=True, download_name=os.path.basename(path))
+    except Exception:
+        log.error(f"Échec export PDF via API:\n{traceback.format_exc()}")
+        return jsonify({"error": "export_failed"}), 500
+
+
+@app.route("/api/backup", methods=["POST"])
+def backup_endpoint():
+    path = backup_database()
+    if not path:
+        return jsonify({"ok": False, "error": "backup_failed"}), 500
+    return jsonify({"ok": True, "file": os.path.basename(path)})
 
 
 @app.route("/api/lot-size", methods=["POST"])
@@ -2315,25 +3309,31 @@ def settings_endpoint():
     return jsonify(get_settings())
 
 
+_cached_get_stats = _ttl_cached("stats")(get_stats)
+_cached_get_dashboard_overview = _ttl_cached("overview")(get_dashboard_overview)
+_cached_get_stats_by_asset = _ttl_cached("by_asset")(get_stats_by_asset)
+_cached_get_monthly_performance = _ttl_cached("monthly")(get_monthly_performance)
+
+
 @app.route("/api/stats")
 def stats():
-    return jsonify(get_stats())
+    return jsonify(_cached_get_stats())
 
 
 @app.route("/api/overview")
 def overview():
-    return jsonify(get_dashboard_overview())
+    return jsonify(_cached_get_dashboard_overview())
 
 
 @app.route("/api/stats/by-asset")
 def stats_by_asset():
-    return jsonify(get_stats_by_asset())
+    return jsonify(_cached_get_stats_by_asset())
 
 
 @app.route("/api/stats/monthly")
 def stats_monthly():
     n = request.args.get("months", default=6, type=int)
-    return jsonify(get_monthly_performance(n))
+    return jsonify(_cached_get_monthly_performance(n))
 
 
 @app.route("/api/history")
@@ -2377,6 +3377,10 @@ def set_trade_status(signal_id):
     if status not in valid:
         return jsonify({"error": f"status invalide, attendu un de {valid}"}), 400
     record_trade_action(signal_id, action=status, new_status=status, source="dashboard")
+    try:
+        notify_trade_event(signal_id, status)
+    except Exception:
+        log.warning(f"Échec notification Telegram pour le signal #{signal_id}:\n{traceback.format_exc()}")
     return jsonify({"ok": True, "signal_id": signal_id, "status": status})
 
 
@@ -2394,7 +3398,7 @@ def get_trade_actions_endpoint(signal_id):
     return jsonify([dict(r) for r in rows])
 
 
-_WEBHOOK_BOT_KEYS = ("btc_gold",)  # clé valide pour <bot_key> dans l'URL
+_WEBHOOK_BOT_KEYS = ("btc_gold", "vip_gold")  # clés valides pour <bot_key> dans l'URL
 
 
 @app.route("/telegram/webhook/<bot_key>", methods=["POST"])
@@ -2447,7 +3451,11 @@ def telegram_webhook(bot_key):
         if not action_def or not row:
             return jsonify({"ok": True})
 
-        group = row["telegram_group"]
+        # bot_key = le bot qui a RÉELLEMENT reçu ce clic (FREE ou VIP — le
+        # signal est désormais posté avec les mêmes boutons sur les deux
+        # groupes, donc row['telegram_group'] ne suffit plus pour savoir
+        # quel bot répondre à un clic donné).
+        group = bot_key
         sender_id = (callback.get("from") or {}).get("id")
         if not _is_owner(sender_id):
             try:
@@ -2460,6 +3468,10 @@ def telegram_webhook(bot_key):
         actor = actor_info.get("username") or str(actor_info.get("id", "")) or None
         record_trade_action(signal_id, action=action_key, new_status=action_def["status"],
                              source="telegram", actor=actor)
+        try:
+            notify_trade_event(signal_id, action_def["status"])
+        except Exception:
+            log.warning(f"Échec notification TP/SL/BE pour le signal #{signal_id}:\n{traceback.format_exc()}")
 
         confirm_text = f"{action_def['emoji']} {action_def['label']} enregistré pour le signal #{signal_id}."
         try:
@@ -2575,6 +3587,18 @@ DASHBOARD_HTML = """
       <div><label>Score minimum pour publier</label><input type="number" step="1" min="0" max="100" id="s_min_score_to_publish"></div>
       <div><label>Multiplicateur martingale</label><input type="number" step="0.1" id="s_martingale_multiplier"></div>
       <div><label>Multiplicateur max recovery</label><input type="number" step="0.1" id="s_recovery_max_multiplier"></div>
+      <div><label>Session de trading</label>
+        <select id="s_session_mode">
+          <option value="ny">NY fixe (13h-22h UTC)</option>
+          <option value="24h">24h/24 (continu)</option>
+        </select>
+      </div>
+      <div><label>Timeframe du scan</label>
+        <select id="s_timeframe">
+          <option value="M5">M5</option>
+          <option value="M1">M1 (scalping)</option>
+        </select>
+      </div>
     </div>
     <div class="grid-form" style="margin-top:14px;">
       <div class="toggle-row"><span>Martingale</span>
@@ -2619,6 +3643,9 @@ DASHBOARD_HTML = """
         <option value="ignored">ignored</option>
       </select>
       <button onclick="loadHistory()">Filtrer</button>
+      <button onclick="exportHistory('csv')">⬇️ Export CSV</button>
+      <button onclick="exportHistory('pdf')">⬇️ Export PDF</button>
+      <button onclick="triggerBackup()">💾 Sauvegarder maintenant</button>
     </div>
     <table id="historyTable">
       <thead><tr><th>Date</th><th>Actif</th><th>Sens</th><th>Type</th><th>Score</th><th>Entrée</th><th>SL</th><th>TP1</th><th>Statut</th></tr></thead>
@@ -2720,6 +3747,8 @@ async function loadOverview() {
   document.getElementById('s_recovery_max_multiplier').value = s.recovery_max_multiplier;
   document.getElementById('s_martingale_enabled').checked = s.martingale_enabled;
   document.getElementById('s_recovery_enabled').checked = s.recovery_enabled;
+  document.getElementById('s_session_mode').value = s.session_mode || 'ny';
+  document.getElementById('s_timeframe').value = s.timeframe || 'M5';
   document.getElementById('lastUpdate').textContent = 'mis à jour ' + new Date().toLocaleTimeString();
 }
 
@@ -2734,6 +3763,8 @@ async function saveSettings() {
     recovery_max_multiplier: parseFloat(document.getElementById('s_recovery_max_multiplier').value),
     martingale_enabled: document.getElementById('s_martingale_enabled').checked,
     recovery_enabled: document.getElementById('s_recovery_enabled').checked,
+    session_mode: document.getElementById('s_session_mode').value,
+    timeframe: document.getElementById('s_timeframe').value,
   };
   const r = await fetch('/api/settings', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
   const msg = document.getElementById('saveMsg');
@@ -2773,6 +3804,19 @@ async function loadHistory() {
       <td>${t.score}</td><td>${t.entry_price.toFixed(5)}</td><td>${t.stop_loss.toFixed(5)}</td>
       <td>${t.tp1.toFixed(5)}</td><td><span class="badge b-status">${t.status}</span></td></tr>`;
   }).join('');
+}
+
+function exportHistory(fmt) {
+  const symbol = document.getElementById('f_symbol').value;
+  const params = new URLSearchParams({limit: 1000});
+  if (symbol) params.set('symbol', symbol);
+  window.open(`/api/export/${fmt}?` + params.toString(), '_blank');
+}
+
+async function triggerBackup() {
+  const r = await fetch('/api/backup', {method: 'POST'});
+  const d = await r.json();
+  alert(d.ok ? `Sauvegarde créée : ${d.file}` : 'Échec de la sauvegarde.');
 }
 
 function initFilters() {
@@ -2820,12 +3864,22 @@ if __name__ == "__main__":
         )
 
     port = int(os.environ.get("PORT", 5000))
-    flask_thread = threading.Thread(
-        target=lambda: app.run(host="0.0.0.0", port=port, use_reloader=False),
-        daemon=True,
-    )
+
+    def _run_wsgi_server():
+        # Waitress est un serveur WSGI de production (multi-thread, pas de
+        # limitation de débogage) — on évite le serveur de développement de
+        # Flask, non recommandé en production même derrière un thread daemon.
+        try:
+            from waitress import serve
+            serve(app, host="0.0.0.0", port=port, threads=8)
+        except ImportError:
+            log.warning("waitress n'est pas installé — retombe sur le serveur de dev Flask "
+                        "(ajoute 'waitress' à requirements.txt pour la production).")
+            app.run(host="0.0.0.0", port=port, use_reloader=False)
+
+    flask_thread = threading.Thread(target=_run_wsgi_server, daemon=True)
     flask_thread.start()
-    log.info(f"Dashboard Flask démarré sur le port {port} (thread daemon).")
+    log.info(f"Dashboard Flask (Waitress) démarré sur le port {port} (thread daemon).")
 
     report_thread = threading.Thread(target=report_scheduler_loop, daemon=True)
     report_thread.start()
@@ -2834,6 +3888,10 @@ if __name__ == "__main__":
     watchdog_thread = threading.Thread(target=watchdog_loop, daemon=True)
     watchdog_thread.start()
     log.info("Thread watchdog démarré.")
+
+    backup_thread = threading.Thread(target=backup_scheduler_loop, daemon=True)
+    backup_thread.start()
+    log.info(f"Thread de sauvegarde automatique démarré (toutes les {BACKUP_INTERVAL_HOURS}h).")
 
     # Message "bot en ligne" sur Telegram — en thread séparé (non bloquant),
     # pour ne jamais retarder le démarrage de la boucle de scan si Telegram
@@ -2854,40 +3912,82 @@ if __name__ == "__main__":
 #    mécanisme qui est utilisé par le watchdog intégré (section 9bis).
 # 2. Start command : python main.py
 # 3. Variables d'environnement à définir dans Render (Settings > Environment) :
-#      Groupe BTC + Gold (unique) : TELEGRAM_BOT_TOKEN_BTC_GOLD, TG_CHAT_BTC_GOLD
-#      TG_CHAT_REPORTS (optionnel — sinon les rapports partent sur le groupe ci-dessus)
+#      Groupe FREE : TELEGRAM_BOT_TOKEN_BTC_GOLD, TG_CHAT_BTC_GOLD
+#      Groupe VIP (optionnel — sans ces 2 variables, le groupe VIP est
+#        simplement ignoré partout, best-effort, sans erreur bloquante) :
+#        TELEGRAM_BOT_TOKEN_VIP_GOLD, TG_CHAT_VIP_GOLD
+#      TG_CHAT_REPORTS (optionnel — sinon les rapports partent sur le groupe FREE)
 #      TELEGRAM_BOT_TOKEN_REPORTS (optionnel — sinon le bot "btc_gold" est réutilisé)
-#      TELEGRAM_WEBHOOK_SECRET (optionnel mais recommandé — sécurise la route
-#        /telegram/webhook/btc_gold)
-#      TELEGRAM_OWNER_ID (recommandé — ton ID Telegram numérique, récupérable via
-#        @userinfobot ; sans elle, /capital /risque /levier /profils et les boutons
-#        ✅❌🟡🔒🔴 restent modifiables par tout le monde — et depuis que les commandes
-#        marchent aussi en DM, ça inclut n'importe qui DMant le bot, pas
-#        seulement les membres du groupe)
+#      TELEGRAM_WEBHOOK_SECRET (optionnel mais recommandé — sécurise les routes
+#        /telegram/webhook/btc_gold et /telegram/webhook/vip_gold)
+#      TELEGRAM_OWNER_ID (fortement recommandé — ton ID Telegram numérique,
+#        récupérable via @userinfobot ; sans elle, /capital /risque /levier
+#        /profils, les boutons ✅❌🟡🔒🔴 ET tout le panneau admin abonnés
+#        (/addsub /removesub /promote /demote /ban /listsubs /broadcast)
+#        restent ouverts à tout le monde — y compris en DM, donc à n'importe
+#        qui DMant l'un des 2 bots. À définir avant toute mise en prod réelle.)
 #      SIGNAL_COOLDOWN_MINUTES (optionnel, défaut 15 — délai mini entre 2 signaux sur le même actif)
 #      DB_PATH (optionnel — chemin du fichier SQLite, ex. un disque persistant Render)
+#      EXPORT_DIR (optionnel, défaut "exports" — dossier des CSV/PDF générés)
+#      EXPORT_KEEP_LAST (optionnel, défaut 50 — nombre de fichiers conservés par type)
+#      BACKUP_DIR (optionnel, défaut "backups" — dossier des sauvegardes .db)
+#      BACKUP_INTERVAL_HOURS (optionnel, défaut 6 — fréquence de la sauvegarde automatique)
+#      BACKUP_KEEP_LAST (optionnel, défaut 20 — nombre de sauvegardes conservées)
+#      BACKUP_SEND_TO_TELEGRAM (optionnel, défaut "false" — "true" pour recevoir chaque
+#        sauvegarde en document Telegram sur le canal "reports", sinon "btc_gold")
+#      LOG_LEVEL (optionnel, défaut "INFO" — DEBUG/INFO/WARNING/ERROR)
+#      LOG_MAX_BYTES (optionnel, défaut 5242880 — taille max avant rotation d'un fichier de log)
+#      LOG_BACKUP_COUNT (optionnel, défaut 5 — nombre de fichiers de log archivés conservés)
+#      DASHBOARD_CACHE_TTL_SECONDS (optionnel, défaut 10 — durée de cache des endpoints
+#        /api/stats, /api/overview, /api/stats/by-asset, /api/stats/monthly)
+#      PROMO_ENABLED (optionnel, défaut "true" — "false" pour désactiver la promo)
+#      PROMO_TEXT / PROMO_LINK (optionnels — personnalise le texte/lien affilié ajouté
+#        en pied des rapports journalier/hebdo/mensuel, au maximum 1x par jour civil UTC
+#        même si plusieurs rapports partent le même jour)
+#    ⚠️ Sur Render, EXPORT_DIR/BACKUP_DIR/DB_PATH/CHARTS_DIR gagnent à pointer vers un
+#    disque persistant (Settings > Disks) : sans disque, leur contenu est perdu à
+#    chaque redéploiement/redémarrage du service.
 # 4. Healthcheck path côté Render : /health
 #      -> renvoie 200 si le scan a tourné il y a moins de WATCHDOG_MAX_SILENCE_SECONDS,
 #         503 sinon (Render peut alors, en plus du watchdog interne, redémarrer le service).
-# 5. Bouton Telegram interactif + commandes en DM — le bot a sa PROPRE URL de
-#    webhook (le chemin encode quel bot répond, indispensable pour lever
-#    l'ambiguïté en DM). À faire UNE FOIS, après le premier déploiement :
+# 5. Boutons Telegram interactifs + commandes en DM — chaque bot (FREE et,
+#    si configuré, VIP) a sa PROPRE URL de webhook (le chemin encode quel bot
+#    répond, indispensable pour lever l'ambiguïté en DM et pour que les
+#    boutons ✅❌🟡🔒🔴 fonctionnent aussi bien sous le post FREE que sous le
+#    post VIP du même signal). À faire UNE FOIS par bot, après le déploiement :
 #      curl -X POST "https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN_BTC_GOLD>/setWebhook" \
 #           -d "url=https://<ton-service>.onrender.com/telegram/webhook/btc_gold" \
 #           -d "secret_token=<TELEGRAM_WEBHOOK_SECRET>"
-#    ⚠️ Si le bot avait déjà un webhook pointé vers l'ancienne URL partagée
-#    (/telegram/webhook) avant ce changement, relance cet appel après
-#    déploiement pour basculer vers la nouvelle URL dédiée — sinon Telegram
-#    continue d'appeler l'ancienne route (qui n'existe plus) et les updates
-#    ne partent nulle part.
-# 6. Commandes Telegram natives (/settings, /capital, /risque, /levier,
-#    /profils, /status, /help) — fonctionnent dans le groupe ET en message
-#    privé (DM) avec le bot (cf. commentaire au-dessus de BOT_COMMANDS_HELP).
-#    Pour que le menu "/" apparaisse dans Telegram, exécute UNE FOIS
+#      # si le groupe VIP est activé :
+#      curl -X POST "https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN_VIP_GOLD>/setWebhook" \
+#           -d "url=https://<ton-service>.onrender.com/telegram/webhook/vip_gold" \
+#           -d "secret_token=<TELEGRAM_WEBHOOK_SECRET>"
+#    ⚠️ Si un bot avait déjà un webhook pointé vers une ancienne URL avant ce
+#    changement, relance l'appel correspondant après déploiement pour
+#    basculer vers la nouvelle URL dédiée — sinon Telegram continue d'appeler
+#    l'ancienne route (qui n'existe plus) et les updates ne partent nulle part.
+# 6. Commandes Telegram natives :
+#      Publiques (DM, tout le monde) : /start /stop /mute /unmute /stats
+#        /report [daily|weekly|monthly] /help
+#      Propriétaire (réglages trading, groupe + DM) : /settings /capital
+#        /risque /levier /profils /status
+#      Propriétaire (administration des abonnés, groupe + DM) : /admin
+#        /addsub <chat_id> <free|vip> /removesub <chat_id> /promote <chat_id>
+#        /demote <chat_id> /ban <chat_id> /unban <chat_id> /listsubs [free|vip]
+#        /broadcast <message>
+#    Rappel : /addsub est le SEUL moyen d'activer un abonné pour la diffusion
+#    privée — /start ne fait qu'enregistrer le chat_id en statut 'pending'.
+#    Pour connaître le chat_id d'un abonné qui a fait /start, consulte
+#    /listsubs (ou la table `subscribers` en base).
+#    Pour que le menu "/" apparaisse dans Telegram, exécute UNE FOIS par bot
 #    (optionnel, juste pour l'UI) :
 #      curl -X POST "https://api.telegram.org/bot<TOKEN>/setMyCommands" \
 #           -H "Content-Type: application/json" \
 #           -d '{"commands": [
+#                 {"command": "start", "description": "S'"'"'enregistrer"},
+#                 {"command": "stop", "description": "Arrêter les messages privés"},
+#                 {"command": "stats", "description": "Statistiques globales"},
+#                 {"command": "report", "description": "Rapport de performance"},
 #                 {"command": "settings", "description": "Voir les réglages actuels"},
 #                 {"command": "capital", "description": "Définir le capital ($)"},
 #                 {"command": "risque", "description": "Définir le risque par trade (%)"},
