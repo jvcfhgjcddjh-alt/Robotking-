@@ -1,4 +1,5 @@
 
+
 """
 ALPHABOT SMC PRO — FUSION (fichier unique, prêt à déployer sur Render)
 ========================================================================
@@ -2364,6 +2365,7 @@ def notify_trade_event(signal_id: int, status: str):
 # groupe comme DM.
 BOT_COMMANDS_HELP = (
     "🤖 *ALPHABOT SMC PRO* — commandes propriétaire\n\n"
+    "/menu — menu à boutons pour tous les réglages ci-dessous\n"
     "/settings — voir les réglages actuels\n"
     "/capital <valeur> — définir le capital ($)\n"
     "/risque <valeur> — définir le risque par trade (%)\n"
@@ -2521,6 +2523,47 @@ def _profiles_inline_keyboard() -> Dict:
     return {"inline_keyboard": rows}
 
 
+# Valeurs prédéfinies proposées par bouton pour chaque réglage, + rappel de
+# la commande texte pour une valeur libre (les deux méthodes cohabitent).
+_MENU_PRESETS = {
+    "capital": [500, 1000, 2000, 5000],
+    "risque": [0.5, 1, 2, 3],
+    "levier": [50, 100, 200, 500],
+    "timeframe": ["M1", "M5"],
+    "session": ["ny", "24h"],
+}
+
+
+def _main_menu_keyboard() -> Dict:
+    return {"inline_keyboard": [
+        [{"text": "💰 Capital", "callback_data": "menu:capital"},
+         {"text": "🎯 Risque", "callback_data": "menu:risque"}],
+        [{"text": "📈 Levier", "callback_data": "menu:levier"},
+         {"text": "⏱ Timeframe", "callback_data": "menu:timeframe"}],
+        [{"text": "🕐 Session", "callback_data": "menu:session"},
+         {"text": "👤 Profils", "callback_data": "menu:profils"}],
+    ]}
+
+
+def _preset_submenu_keyboard(field: str) -> Dict:
+    values = _MENU_PRESETS[field]
+    row = [{"text": (f"{v}" if field in ("timeframe", "session") else f"{v}"), "callback_data": f"set:{field}:{v}"}
+           for v in values]
+    # Telegram limite la largeur lisible d'une ligne -> 2 boutons par ligne pour les valeurs numériques.
+    rows = [row[i:i + 2] for i in range(0, len(row), 2)]
+    rows.append([{"text": "⬅️ Retour", "callback_data": "menu:home"}])
+    return {"inline_keyboard": rows}
+
+
+_MENU_FIELD_LABELS = {
+    "capital": ("💰 Capital", "capital", "/capital <valeur>"),
+    "risque": ("🎯 Risque par trade (%)", "risk_percent", "/risque <valeur>"),
+    "levier": ("📈 Levier", "leverage", "/levier <valeur>"),
+    "timeframe": ("⏱ Timeframe", "timeframe", "/timeframe <M1|M5>"),
+    "session": ("🕐 Session", "session_mode", "/session <ny|24h>"),
+}
+
+
 def _send_command_reply(group: str, chat_id, text: str, reply_markup: Optional[Dict] = None):
     token = _bot_token(group)
     data = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
@@ -2541,7 +2584,7 @@ def _send_command_reply(group: str, chat_id, text: str, reply_markup: Optional[D
 
 
 # Commandes de réglages trading : réservées au propriétaire en DM comme en groupe.
-_READ_ONLY_COMMANDS = ("/settings", "/reglages", "/parametres", "/status", "/profils")
+_READ_ONLY_COMMANDS = ("/settings", "/reglages", "/parametres", "/status", "/profils", "/menu")
 
 # Commandes ouvertes à tout le monde en DM (inscription, stats publiques).
 _PUBLIC_DM_COMMANDS = ("/start", "/help", "/aide", "/stop", "/mute", "/unmute", "/stats", "/report")
@@ -2650,6 +2693,9 @@ def _handle_telegram_command(message: Dict, group: str):
     elif cmd == "/profils":
         _send_command_reply(group, chat_id, "👤 *Profils sauvegardés* — tape pour activer :",
                              reply_markup=_profiles_inline_keyboard())
+    elif cmd == "/menu":
+        _send_command_reply(group, chat_id, "⚙️ *Réglages* — choisis ce que tu veux modifier :",
+                             reply_markup=_main_menu_keyboard())
     elif cmd in _SETTINGS_COMMAND_FIELDS:
         if arg is None:
             _send_command_reply(group, chat_id, f"Usage : {cmd} <valeur>")
@@ -2770,6 +2816,85 @@ def _handle_profile_callback(callback: Dict, group: str):
             _telegram_edit_reply_markup(group, chat_id, message["message_id"], _profiles_inline_keyboard())
         except Exception:
             log.warning("Échec editMessageReplyMarkup (profil):\n" + traceback.format_exc())
+
+
+def _handle_menu_callback(callback: Dict, group: str):
+    """Gère les taps du menu /menu : navigation ('menu:<champ>' ou 'menu:home')
+    et application d'une valeur prédéfinie ('set:<champ>:<valeur>'). Les
+    valeurs libres restent possibles via la commande texte correspondante
+    (rappelée dans chaque sous-menu) — les deux méthodes cohabitent."""
+    data = callback.get("data", "")
+    message = callback.get("message") or {}
+    chat = message.get("chat") or {}
+    chat_id = chat.get("id")
+
+    sender_id = (callback.get("from") or {}).get("id")
+    if not _is_owner(sender_id):
+        try:
+            _telegram_answer_callback(group, callback["id"], text=_OWNER_ONLY_REPLY, show_alert=True)
+        except Exception:
+            log.warning("Échec answerCallbackQuery (menu, accès refusé):\n" + traceback.format_exc())
+        return
+
+    if not chat_id:
+        return
+
+    if data == "menu:home":
+        try:
+            _telegram_answer_callback(group, callback["id"])
+        except Exception:
+            pass
+        _send_command_reply(group, chat_id, "⚙️ *Réglages* — choisis ce que tu veux modifier :",
+                             reply_markup=_main_menu_keyboard())
+        return
+
+    if data == "menu:profils":
+        try:
+            _telegram_answer_callback(group, callback["id"])
+        except Exception:
+            pass
+        _send_command_reply(group, chat_id, "👤 *Profils sauvegardés* — tape pour activer :",
+                             reply_markup=_profiles_inline_keyboard())
+        return
+
+    if data.startswith("menu:"):
+        field = data.split(":", 1)[1]
+        if field not in _MENU_FIELD_LABELS:
+            return
+        label, _settings_key, usage = _MENU_FIELD_LABELS[field]
+        try:
+            _telegram_answer_callback(group, callback["id"])
+        except Exception:
+            pass
+        _send_command_reply(
+            group, chat_id,
+            f"{label} — choisis une valeur, ou tape `{usage}` pour une valeur libre :",
+            reply_markup=_preset_submenu_keyboard(field),
+        )
+        return
+
+    if data.startswith("set:"):
+        try:
+            _, field, raw_value = data.split(":", 2)
+        except ValueError:
+            return
+        if field not in _MENU_FIELD_LABELS:
+            return
+        _, settings_key, _usage = _MENU_FIELD_LABELS[field]
+        try:
+            updated = update_settings({settings_key: raw_value})
+            confirm_text = "✅ Mis à jour."
+        except ValueError as e:
+            confirm_text = f"❌ {e}"
+            updated = None
+        try:
+            _telegram_answer_callback(group, callback["id"], text=confirm_text)
+        except Exception:
+            log.warning("Échec answerCallbackQuery (menu, set):\n" + traceback.format_exc())
+        if updated is not None:
+            _send_command_reply(group, chat_id, f"{confirm_text}\n\n{format_settings_message(updated)}",
+                                 reply_markup=_main_menu_keyboard())
+        return
 
 
 # ============================================================================
@@ -3460,6 +3585,13 @@ def telegram_webhook(bot_key):
             _handle_profile_callback(callback, bot_key)
         except Exception:
             log.error("Erreur callback profil Telegram:\n" + traceback.format_exc())
+        return jsonify({"ok": True})
+
+    if callback.get("data", "").startswith(("menu:", "set:")):
+        try:
+            _handle_menu_callback(callback, bot_key)
+        except Exception:
+            log.error("Erreur callback menu Telegram:\n" + traceback.format_exc())
         return jsonify({"ok": True})
 
     try:
