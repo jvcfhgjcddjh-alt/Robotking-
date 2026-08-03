@@ -99,6 +99,11 @@ ASSETS = {
         telegram_group="btc_gold", session_continuous=False,
         session_start_utc=13, session_end_utc=22, contract_type="crypto",
     ),
+    "XAGUSD": AssetConfig(
+        symbol="XAGUSD", display_name="Silver (XAGUSD)", data_source="yfinance",
+        telegram_group="btc_gold", session_continuous=False,
+        session_start_utc=13, session_end_utc=22, contract_type="classic",
+    ),
 }
 
 TIMEFRAME = "M5"
@@ -147,7 +152,7 @@ TELEGRAM_GROUPS = {
     "btc_gold": {
         "token_env": "TELEGRAM_BOT_TOKEN_BTC_GOLD",
         "chat_id_env": "TG_CHAT_BTC_GOLD",
-        "assets": ["XAUUSD", "BTCUSD"],
+        "assets": ["XAUUSD", "BTCUSD", "XAGUSD"],
         "token_default": _DEFAULT_TG_TOKEN_BTC_GOLD,
         "chat_id_default": _DEFAULT_TG_CHAT_BTC_GOLD,
     },
@@ -163,7 +168,7 @@ TELEGRAM_GROUPS = {
     "vip_gold": {
         "token_env": "TELEGRAM_BOT_TOKEN_VIP_GOLD",
         "chat_id_env": "TG_CHAT_VIP_GOLD",
-        "assets": ["XAUUSD", "BTCUSD"],
+        "assets": ["XAUUSD", "BTCUSD", "XAGUSD"],
     },
     # Optionnel : si TG_CHAT_REPORTS n'est pas défini, les rapports sont
     # envoyés sur le groupe FREE à la place. TELEGRAM_BOT_TOKEN_REPORTS
@@ -1456,7 +1461,7 @@ def fetch_candles(symbol: str, limit: int = 200) -> List[Dict]:
 def _fetch_yfinance(symbol: str, limit: int, interval: str = "5m") -> List[Dict]:
     import yfinance as yf
     import pandas as pd  # dépendance de yfinance, toujours présente
-    ticker_map = {"XAUUSD": "GC=F"}
+    ticker_map = {"XAUUSD": "GC=F", "XAGUSD": "SI=F"}
     ticker = ticker_map.get(symbol, symbol)
     # yfinance limite l'historique disponible en intraday : 1m -> 7 jours max,
     # 5m -> 60 jours max. "2d" reste largement suffisant pour les deux, et
@@ -1467,8 +1472,7 @@ def _fetch_yfinance(symbol: str, limit: int, interval: str = "5m") -> List[Dict]
     # multi_level_index=False, row["Open"] renvoie alors une Series (et non
     # un scalaire) -> `float(row["Open"])` plantait avec
     # "TypeError: float() argument must be a string or a real number, not 'Series'".
-    data = yf.download(ticker, period=period, interval=interval, progress=False,
-                        multi_level_index=False)
+    data = yf.download(ticker, period=period, interval=interval, progress=False)
     if isinstance(data.columns, pd.MultiIndex):  # filet de sécurité si l'argument ci-dessus est ignoré
         data.columns = data.columns.get_level_values(0)
     candles = []
@@ -1545,9 +1549,16 @@ def detect_liquidity_sweep(
             key=lambda p: -p.index,
         )
         for point in candidates:
+            # Sweep classique : la mèche dépasse le niveau, le corps reste de l'autre côté.
             if point.kind == "high" and candle["high"] > point.price and body_high <= point.price:
                 return LiquiditySweep(point, idx, candle["high"], "bearish")
             if point.kind == "low" and candle["low"] < point.price and body_low >= point.price:
+                return LiquiditySweep(point, idx, candle["low"], "bullish")
+            # Sweep par bougie institutionnelle : le corps lui-même casse déjà le
+            # niveau (marubozu / englobante) — pas de mèche de rejet nécessaire.
+            if point.kind == "high" and body_high > point.price:
+                return LiquiditySweep(point, idx, candle["high"], "bearish")
+            if point.kind == "low" and body_low < point.price:
                 return LiquiditySweep(point, idx, candle["low"], "bullish")
     return None
 
@@ -2457,8 +2468,22 @@ def format_report_message(period: Optional[str]) -> str:
         label = now.strftime("Jour %Y-%m-%d")
 
     s = get_period_stats(start_ts, end_ts)
-    lines = [
-        f"🗓️ *Rapport — {label}*", "",
+    lines = [f"🗓️ *Rapport — {label}*", ""]
+
+    # Détail par marché, avant le résumé global.
+    if s["by_symbol"]:
+        lines.append("*Par marché :*")
+        for sym, sym_stats in sorted(s["by_symbol"].items()):
+            decided = sym_stats["wins"] + sym_stats["losses"]
+            sym_wr = (sym_stats["wins"] / decided * 100) if decided else 0.0
+            lines.append(
+                f"  • {sym} — {sym_stats['total']} signaux · "
+                f"{sym_stats['wins']}G/{sym_stats['losses']}P · {sym_wr:.1f}%"
+            )
+        lines.append("")
+
+    lines += [
+        "*Global (tous marchés) :*",
         f"Signaux : {s['total_signals']}",
         f"Gagnants : {s['wins']} · Perdants : {s['losses']} · BE : {s['be']}",
         f"Winrate : {s['win_rate']:.1f}%",
@@ -2797,9 +2822,9 @@ def process_asset(symbol: str):
 
     levels = compute_levels(entry_price, direction, sweep.sweep_wick_price, candles, swing_points)
 
+    # Score conservé uniquement à titre informatif dans le message envoyé —
+    # il ne filtre plus rien : tout setup avec BOS confirmé est publié.
     score = compute_score(entry_type, levels.rr_tp2)
-    if not passes_threshold(score, settings):
-        return
 
     setup_key = f"{symbol}:{direction}:{round(sweep.swept_point.price, 5)}"
     if has_active_setup(setup_key):
@@ -3996,4 +4021,3 @@ if __name__ == "__main__":
 #                 {"command": "status", "description": "État du bot"},
 #                 {"command": "help", "description": "Liste des commandes"}
 #               ]}'
-
