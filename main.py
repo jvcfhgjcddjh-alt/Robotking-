@@ -1462,18 +1462,29 @@ def fetch_candles(symbol: str, limit: int = 200) -> List[Dict]:
 def _fetch_yfinance(symbol: str, limit: int, interval: str = "5m") -> List[Dict]:
     import yfinance as yf
     import pandas as pd  # dépendance de yfinance, toujours présente
+    import requests
     ticker_map = {"XAUUSD": "GC=F", "XAGUSD": "SI=F"}
     ticker = ticker_map.get(symbol, symbol)
     # yfinance limite l'historique disponible en intraday : 1m -> 7 jours max,
     # 5m -> 60 jours max. "2d" reste largement suffisant pour les deux, et
     # évite un rejet de l'API sur des périodes trop longues en 1m.
     period = "1d" if interval == "1m" else "2d"
+    # Yahoo Finance bloque de plus en plus les requêtes sans en-tête
+    # "navigateur" (fréquent sur IP de serveurs cloud comme Render) -> réponse
+    # vide qui casse le parsing JSON de yfinance. Un User-Agent classique
+    # suffit parfois à passer ce filtre (pas garanti à 100%, Yahoo change
+    # régulièrement ses règles anti-bot).
+    session = requests.Session()
+    session.headers["User-Agent"] = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    )
     # Depuis yfinance >= 0.2.31, download() renvoie par défaut des colonnes
     # MultiIndex (ex. ("Open", "GC=F")) même pour un seul ticker. Sans
     # multi_level_index=False, row["Open"] renvoie alors une Series (et non
     # un scalaire) -> `float(row["Open"])` plantait avec
     # "TypeError: float() argument must be a string or a real number, not 'Series'".
-    data = yf.download(ticker, period=period, interval=interval, progress=False)
+    data = yf.download(ticker, period=period, interval=interval, progress=False, session=session)
     if isinstance(data.columns, pd.MultiIndex):  # filet de sécurité si l'argument ci-dessus est ignoré
         data.columns = data.columns.get_level_values(0)
     candles = []
