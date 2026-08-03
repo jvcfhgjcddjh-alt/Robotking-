@@ -139,14 +139,14 @@ MAX_SIGNALS_PER_DAY_PER_ASSET = 2
 # code. Recommandé : régénère ces tokens via @BotFather dès que possible
 # puisqu'ils ont transité en clair dans un chat, puis passe par les
 # variables d'environnement Render au lieu de ce fallback.
-_DEFAULT_TG_CHAT_BTC_GOLD = "1002335466840"
+_DEFAULT_TG_CHAT_BTC_GOLD = "-1002335466840"
 _DEFAULT_TG_TOKEN_BTC_GOLD = "6950706659:AAFxJFP2DhAlTbFF6Ve5uylypPkMGKRecIE"
 
 TELEGRAM_GROUPS = {
     # Groupe FREE : BTC/USD + XAU/USD (Gold) — bot dédié, groupe public/gratuit.
     "btc_gold": {
         "token_env": "TELEGRAM_BOT_TOKEN_BTC_GOLD",
-        "chat_id_env": "1002335466840",
+        "chat_id_env": "TG_CHAT_BTC_GOLD",
         "assets": ["XAUUSD", "BTCUSD"],
         "token_default": _DEFAULT_TG_TOKEN_BTC_GOLD,
         "chat_id_default": _DEFAULT_TG_CHAT_BTC_GOLD,
@@ -3996,3 +3996,4 @@ if __name__ == "__main__":
 #                 {"command": "status", "description": "État du bot"},
 #                 {"command": "help", "description": "Liste des commandes"}
 #               ]}'
+
