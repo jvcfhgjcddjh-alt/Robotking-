@@ -2534,6 +2534,16 @@ _MENU_PRESETS = {
 }
 
 
+def _persistent_owner_keyboard() -> Dict:
+    """Clavier persistant (barre du bas), distinct du clavier inline de /menu.
+    Remplace tout clavier persistant précédent (ex: ancien clavier resté
+    affiché depuis une version antérieure du bot)."""
+    return {
+        "keyboard": [["/menu", "/status"], ["/report", "/help"]],
+        "resize_keyboard": True,
+    }
+
+
 def _main_menu_keyboard() -> Dict:
     return {"inline_keyboard": [
         [{"text": "💰 Capital", "callback_data": "menu:capital"},
@@ -2648,6 +2658,7 @@ def _handle_telegram_command(message: Dict, group: str):
                 "l'activer (accès FREE ou VIP) avant que tu reçoives les alertes "
                 "en message privé. En attendant, /stats et /report restent disponibles.\n\n"
                 + PUBLIC_COMMANDS_HELP,
+                reply_markup=(_persistent_owner_keyboard() if _is_owner(sender_id) else None),
             )
         else:
             _send_command_reply(group, chat_id, PUBLIC_COMMANDS_HELP)
@@ -2655,7 +2666,8 @@ def _handle_telegram_command(message: Dict, group: str):
         text_out = BOT_COMMANDS_HELP if _is_owner(sender_id) else PUBLIC_COMMANDS_HELP
         if _is_owner(sender_id):
             text_out += ADMIN_COMMANDS_HELP
-        _send_command_reply(group, chat_id, text_out)
+        _send_command_reply(group, chat_id, text_out,
+                             reply_markup=(_persistent_owner_keyboard() if _is_owner(sender_id) else None))
     elif cmd == "/stop":
         if is_private:
             changed = set_subscriber_status(chat_id, "stopped")
