@@ -2169,7 +2169,9 @@ def format_startup_message() -> str:
 
 
 def send_startup_notification():
-    """Diffuse le message de démarrage sur les groupes Telegram configurés.
+    """Diffuse le message de démarrage sur les groupes Telegram configurés,
+    et en DM au propriétaire (TELEGRAM_OWNER_ID) s'il a déjà démarré une
+    conversation avec le bot (obligatoire côté Telegram pour recevoir un DM).
     Best-effort : une erreur (token manquant, réseau...) est loggée mais ne
     doit jamais empêcher le bot de démarrer/scanner."""
     message = format_startup_message()
@@ -2179,6 +2181,13 @@ def send_startup_notification():
             log.info(f"Message de démarrage envoyé sur le groupe Telegram '{group}'.")
         except Exception:
             log.warning(f"Échec d'envoi du message de démarrage sur '{group}':\n{traceback.format_exc()}")
+
+    if TELEGRAM_OWNER_ID:
+        try:
+            _send_command_reply("btc_gold", int(TELEGRAM_OWNER_ID), message)
+            log.info("Message de démarrage envoyé en DM au propriétaire.")
+        except Exception:
+            log.warning("Échec d'envoi du message de démarrage en DM au propriétaire:\n" + traceback.format_exc())
 
 
 def _telegram_answer_callback(group: str, callback_query_id: str, text: str = "", show_alert: bool = False):
