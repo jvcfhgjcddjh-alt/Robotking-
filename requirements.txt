@@ -1,3 +1,8 @@
+Flask==3.0.3
+requests==2.32.3
+matplotlib==3.9.2
+waitress==3.0.0
+yfinance==0.2.43
 websocket-client
 matplotlib
 yfinance
