@@ -1462,29 +1462,35 @@ def fetch_candles(symbol: str, limit: int = 200) -> List[Dict]:
 def _fetch_yfinance(symbol: str, limit: int, interval: str = "5m") -> List[Dict]:
     import yfinance as yf
     import pandas as pd  # dépendance de yfinance, toujours présente
-    import requests
     ticker_map = {"XAUUSD": "GC=F", "XAGUSD": "SI=F"}
     ticker = ticker_map.get(symbol, symbol)
     # yfinance limite l'historique disponible en intraday : 1m -> 7 jours max,
     # 5m -> 60 jours max. "2d" reste largement suffisant pour les deux, et
     # évite un rejet de l'API sur des périodes trop longues en 1m.
     period = "1d" if interval == "1m" else "2d"
-    # Yahoo Finance bloque de plus en plus les requêtes sans en-tête
-    # "navigateur" (fréquent sur IP de serveurs cloud comme Render) -> réponse
-    # vide qui casse le parsing JSON de yfinance. Un User-Agent classique
-    # suffit parfois à passer ce filtre (pas garanti à 100%, Yahoo change
-    # régulièrement ses règles anti-bot).
-    session = requests.Session()
-    session.headers["User-Agent"] = (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-    )
+    # Yahoo Finance bloque de plus en plus les requêtes dont l'empreinte
+    # technique (TLS/HTTP) ne ressemble pas à un vrai navigateur -> réponse
+    # vide qui casse le parsing JSON de yfinance (fréquent sur IP de serveurs
+    # cloud comme Render). Un simple en-tête User-Agent ne suffit pas : il
+    # faut imiter l'empreinte TLS de Chrome, ce que fait `curl_cffi`
+    # (gratuit, sans limite de quota, contrairement à une API tierce
+    # payante/à quota). Nécessite `curl_cffi` dans requirements.txt.
+    try:
+        from curl_cffi import requests as curl_requests
+        session = curl_requests.Session(impersonate="chrome")
+    except ImportError:
+        log.warning("curl_cffi non installé (ajoute-le à requirements.txt) — "
+                     "repli sur une session standard, plus susceptible d'être bloquée par Yahoo.")
+        session = None
     # Depuis yfinance >= 0.2.31, download() renvoie par défaut des colonnes
     # MultiIndex (ex. ("Open", "GC=F")) même pour un seul ticker. Sans
     # multi_level_index=False, row["Open"] renvoie alors une Series (et non
     # un scalaire) -> `float(row["Open"])` plantait avec
     # "TypeError: float() argument must be a string or a real number, not 'Series'".
-    data = yf.download(ticker, period=period, interval=interval, progress=False, session=session)
+    kwargs = {"period": period, "interval": interval, "progress": False}
+    if session is not None:
+        kwargs["session"] = session
+    data = yf.download(ticker, **kwargs)
     if isinstance(data.columns, pd.MultiIndex):  # filet de sécurité si l'argument ci-dessus est ignoré
         data.columns = data.columns.get_level_values(0)
     candles = []
@@ -2961,15 +2967,22 @@ def process_asset(symbol: str):
     if len(candles) < 30:
         log.warning(f"[{symbol}] pas assez de données ({len(candles)} bougies)")
         return
+    last_close = candles[-1]["close"]
+    log.info(f"[{symbol}] scan OK — {len(candles)} bougies, dernier prix = {last_close}")
 
     swing_points = find_swing_points(candles)
     sweep = detect_liquidity_sweep(candles, swing_points)
     if not sweep:
+        log.info(f"[{symbol}] pas de sweep de liquidité détecté sur cette bougie.")
         return
+    log.info(f"[{symbol}] sweep détecté : {sweep.direction} @ {sweep.sweep_wick_price} "
+             f"(niveau balayé : {sweep.swept_point.price}).")
 
     bos = confirm_bos(candles, sweep, swing_points)
     if not bos or not bos.confirmed:
+        log.info(f"[{symbol}] sweep présent mais BOS non confirmé — en attente de cassure de structure.")
         return
+    log.info(f"[{symbol}] BOS confirmé : {bos.direction} @ niveau {bos.break_level}.")
 
     direction = "BUY" if bos.direction == "bullish" else "SELL"
     entry_price = candles[bos.break_index]["close"]
