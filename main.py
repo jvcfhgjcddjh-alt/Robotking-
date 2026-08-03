@@ -1259,7 +1259,7 @@ def _maybe_append_promo(message: str, now: datetime) -> str:
     day_key = now.strftime("%Y-%m-%d")
     if not _try_claim_report("promo", day_key):
         return message
-    return f"{message}\n\n{PROMO_TEXT}\n👉 {PROMO_LINK}"
+    return f"{message}\n\n{PROMO_TEXT}\n[👉 Ouvrir un compte démo]({PROMO_LINK})"
 
 
 def _maybe_send_daily_report(now: datetime):
