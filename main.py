@@ -1471,26 +1471,16 @@ def _fetch_yfinance(symbol: str, limit: int, interval: str = "5m") -> List[Dict]
     # Yahoo Finance bloque de plus en plus les requêtes dont l'empreinte
     # technique (TLS/HTTP) ne ressemble pas à un vrai navigateur -> réponse
     # vide qui casse le parsing JSON de yfinance (fréquent sur IP de serveurs
-    # cloud comme Render). Un simple en-tête User-Agent ne suffit pas : il
-    # faut imiter l'empreinte TLS de Chrome, ce que fait `curl_cffi`
-    # (gratuit, sans limite de quota, contrairement à une API tierce
-    # payante/à quota). Nécessite `curl_cffi` dans requirements.txt.
-    try:
-        from curl_cffi import requests as curl_requests
-        session = curl_requests.Session(impersonate="chrome")
-    except ImportError:
-        log.warning("curl_cffi non installé (ajoute-le à requirements.txt) — "
-                     "repli sur une session standard, plus susceptible d'être bloquée par Yahoo.")
-        session = None
+    # cloud comme Render). yfinance >= 0.2.4x gère `curl_cffi` en interne dès
+    # qu'il est installé (cf. requirements.txt) — NE PAS lui passer de
+    # session curl_cffi manuelle : ça casse sa gestion interne du cookie
+    # Yahoo et provoque l'erreur "'str' object has no attribute 'name'".
     # Depuis yfinance >= 0.2.31, download() renvoie par défaut des colonnes
     # MultiIndex (ex. ("Open", "GC=F")) même pour un seul ticker. Sans
     # multi_level_index=False, row["Open"] renvoie alors une Series (et non
     # un scalaire) -> `float(row["Open"])` plantait avec
     # "TypeError: float() argument must be a string or a real number, not 'Series'".
-    kwargs = {"period": period, "interval": interval, "progress": False}
-    if session is not None:
-        kwargs["session"] = session
-    data = yf.download(ticker, **kwargs)
+    data = yf.download(ticker, period=period, interval=interval, progress=False)
     if isinstance(data.columns, pd.MultiIndex):  # filet de sécurité si l'argument ci-dessus est ignoré
         data.columns = data.columns.get_level_values(0)
     candles = []
@@ -2008,8 +1998,7 @@ def format_signal_message(symbol, display_name, direction, entry_type_label, sta
         rr2_txt = f"RR{rr_tp2:.1f}" + (" 🔥" if high_rr_warning else "")
         source_txt = f" — {tp2_source}" if tp2_source else ""
         lines.append(f"🚀 *TP2 ({rr2_txt}){source_txt}* : `{tp2:.5f}`")
-    lines += ["", f"⭐ *Score* : {score}/100",
-              "🔁 BE proposé à RR1 · Sécurisation proposée à RR2", "", f"🕒 {ts}"]
+    lines += ["", "🔁 BE proposé à RR1 · Sécurisation proposée à RR2", "", f"🕒 {ts}"]
     return "\n".join(lines)
 
 
