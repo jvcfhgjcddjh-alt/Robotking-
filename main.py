@@ -122,6 +122,10 @@ ATR_PERIOD = 14
 ATR_SL_MULTIPLIER = 0.6
 INCLUDE_SPREAD_COMMISSION_BUFFER = True
 
+# Nb max de bougies pour la reprise (reclaim) après le sweep — aligné sur
+# le réglage Pine actuel (passé de 3 à 8, win rate amélioré côté indicateur).
+SWEEP_RECLAIM_BARS = 8
+
 TP1_RR = 3.0
 BE_TRIGGER_RR = 1.0
 SECURE_TRIGGER_RR = 2.0
@@ -1259,7 +1263,7 @@ def _maybe_append_promo(message: str, now: datetime) -> str:
     day_key = now.strftime("%Y-%m-%d")
     if not _try_claim_report("promo", day_key):
         return message
-    return f"{message}\n\n{PROMO_TEXT}\n[👉 Ouvrir un compte démo]({PROMO_LINK})"
+    return f"{message}\n\n{PROMO_TEXT}\n👉 {PROMO_LINK}"
 
 
 def _maybe_send_daily_report(now: datetime):
@@ -1315,18 +1319,10 @@ def _today_key() -> str:
 
 
 def can_publish_today(symbol: str) -> bool:
-    day = _today_key()
-    with get_conn() as conn:
-        global_count = conn.execute(
-            "SELECT COALESCE(SUM(count),0) c FROM daily_counters WHERE day=?", (day,)
-        ).fetchone()["c"]
-        if global_count >= MAX_SIGNALS_PER_DAY_GLOBAL:
-            return False
-        row = conn.execute(
-            "SELECT count FROM daily_counters WHERE day=? AND symbol=?", (day, symbol)
-        ).fetchone()
-        symbol_count = row["count"] if row else 0
-        return symbol_count < MAX_SIGNALS_PER_DAY_PER_ASSET
+    # Plafond quotidien désactivé à la demande : le bot publie tout signal
+    # détecté (Sweep+BOS confirmé), sans limite de nombre. La décision de
+    # prendre ou non la position revient entièrement à l'utilisateur.
+    return True
 
 
 OPEN_STATUSES = ("pending", "taken", "be", "secured", "tp1_hit")
@@ -1537,6 +1533,24 @@ def find_swing_points(candles: List[Dict], lookback: int = 3) -> List[SwingPoint
     return points
 
 
+def _reclaimed_within(
+    candles: List[Dict], sweep_index: int, level: float, kind: str, reclaim_bars: int = SWEEP_RECLAIM_BARS
+) -> bool:
+    """Vérifie que le prix reclaim la zone (clôture revenue du bon côté du
+    niveau balayé) dans les `reclaim_bars` bougies suivant le sweep. Sert de
+    garde-fou pour le sweep par bougie institutionnelle (corps déjà cassé au
+    moment du sweep, donc pas de rejet immédiat par la mèche seule)."""
+    n = len(candles)
+    end = min(n, sweep_index + 1 + reclaim_bars)
+    for i in range(sweep_index, end):
+        c = candles[i]
+        if kind == "high" and c["close"] <= level:
+            return True
+        if kind == "low" and c["close"] >= level:
+            return True
+    return False
+
+
 def detect_liquidity_sweep(
     candles: List[Dict], swing_points: List[SwingPoint], search_window: int = 8
 ) -> Optional[LiquiditySweep]:
@@ -1558,16 +1572,23 @@ def detect_liquidity_sweep(
         )
         for point in candidates:
             # Sweep classique : la mèche dépasse le niveau, le corps reste de l'autre côté.
+            # Reclaim déjà satisfait sur la même bougie (comportement identique à avant).
             if point.kind == "high" and candle["high"] > point.price and body_high <= point.price:
                 return LiquiditySweep(point, idx, candle["high"], "bearish")
             if point.kind == "low" and candle["low"] < point.price and body_low >= point.price:
                 return LiquiditySweep(point, idx, candle["low"], "bullish")
-            # Sweep par bougie institutionnelle : le corps lui-même casse déjà le
-            # niveau (marubozu / englobante) — pas de mèche de rejet nécessaire.
+            # Sweep par bougie institutionnelle : le corps casse déjà le niveau —
+            # on exige un reclaim (clôture revenue du bon côté) dans les
+            # SWEEP_RECLAIM_BARS bougies suivantes, sinon ce n'est pas un vrai
+            # piège de liquidité mais une cassure franche.
             if point.kind == "high" and body_high > point.price:
-                return LiquiditySweep(point, idx, candle["high"], "bearish")
+                if _reclaimed_within(candles, idx, point.price, "high"):
+                    return LiquiditySweep(point, idx, candle["high"], "bearish")
+                continue
             if point.kind == "low" and body_low < point.price:
-                return LiquiditySweep(point, idx, candle["low"], "bullish")
+                if _reclaimed_within(candles, idx, point.price, "low"):
+                    return LiquiditySweep(point, idx, candle["low"], "bullish")
+                continue
     return None
 
 
@@ -1603,7 +1624,7 @@ def _find_structure_level(swing_points: List[SwingPoint], sweep: LiquiditySweep)
 
 
 def confirm_bos(
-    candles: List[Dict], sweep: LiquiditySweep, swing_points: List[SwingPoint], max_lookahead: int = 6
+    candles: List[Dict], sweep: LiquiditySweep, swing_points: List[SwingPoint], max_lookahead: int = 15
 ) -> Optional[BOSConfirmation]:
     """RÈGLE STRICTE : validée uniquement par clôture du CORPS au-delà du niveau.
     Une mèche seule ne valide jamais -> signal ignoré."""
