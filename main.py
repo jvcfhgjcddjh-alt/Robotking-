@@ -57,6 +57,7 @@ import logging
 import threading
 import traceback
 import urllib.request
+import urllib.parse
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
@@ -239,6 +240,11 @@ TELEGRAM_WEBHOOK_SECRET = os.environ.get("TELEGRAM_WEBHOOK_SECRET", "")
 # d'environnement Render. ⚠️ Si laissé vide, l'accès reste ouvert à tout le
 # groupe (comportement historique, aucune restriction).
 TELEGRAM_OWNER_ID = os.environ.get("TELEGRAM_OWNER_ID", "")
+# Flux spot réel pour XAUUSD/XAGUSD (remplace le proxy futures yfinance
+# GC=F/SI=F, décalé de plusieurs dizaines de dollars par rapport au spot).
+# Compte gratuit sur https://twelvedata.com/ (tier free largement suffisant
+# pour 2 actifs scannés en continu).
+TWELVEDATA_API_KEY = os.environ.get("TWELVEDATA_API_KEY", "")
 
 # --- Watchdog VPS / Render ------------------------------------------------
 WATCHDOG_CHECK_INTERVAL_SECONDS = 15
@@ -1451,11 +1457,50 @@ def fetch_candles(symbol: str, limit: int = 200) -> List[Dict]:
     asset = ASSETS[symbol]
     timeframe = get_settings().get("timeframe", TIMEFRAME)
     interval = TIMEFRAME_TO_INTERVAL.get(timeframe, "5m")
-    if asset.data_source == "yfinance":
+    if asset.data_source == "twelvedata":
+        return _fetch_twelvedata(symbol, limit, interval)
+    elif asset.data_source == "yfinance":
         return _fetch_yfinance(symbol, limit, interval)
     elif asset.data_source == "binance":
         return _fetch_binance(symbol, limit, interval)
     raise ValueError(f"Source de données inconnue pour {symbol}")
+
+
+_TWELVEDATA_INTERVAL_MAP = {"1m": "1min", "5m": "5min"}
+_TWELVEDATA_SYMBOL_MAP = {"XAUUSD": "XAU/USD", "XAGUSD": "XAG/USD"}
+
+
+def _fetch_twelvedata(symbol: str, limit: int, interval: str = "5m") -> List[Dict]:
+    """Flux spot réel (XAU/USD, XAG/USD) via TwelveData — remplace le proxy
+    futures yfinance (GC=F/SI=F), décalé de plusieurs dizaines de dollars par
+    rapport au prix affiché sur MT5."""
+    if not TWELVEDATA_API_KEY:
+        raise RuntimeError(
+            "TWELVEDATA_API_KEY manquante — créer un compte gratuit sur "
+            "twelvedata.com et ajouter la clé dans les variables d'environnement Render."
+        )
+    td_symbol = _TWELVEDATA_SYMBOL_MAP.get(symbol, symbol)
+    td_interval = _TWELVEDATA_INTERVAL_MAP.get(interval, "5min")
+    url = (
+        "https://api.twelvedata.com/time_series"
+        f"?symbol={urllib.parse.quote(td_symbol)}&interval={td_interval}"
+        f"&outputsize={limit}&apikey={TWELVEDATA_API_KEY}"
+    )
+    with urllib.request.urlopen(url, timeout=10) as resp:
+        raw = json.loads(resp.read().decode())
+    if raw.get("status") == "error" or "values" not in raw:
+        raise RuntimeError(f"TwelveData erreur pour {symbol}: {raw.get('message', raw)}")
+    values = list(reversed(raw["values"]))  # TwelveData renvoie du plus récent au plus ancien
+    candles = []
+    for v in values:
+        candles.append({
+            "time": datetime.strptime(v["datetime"], "%Y-%m-%d %H:%M:%S").timestamp()
+            if len(v["datetime"]) > 10 else
+            datetime.strptime(v["datetime"], "%Y-%m-%d").timestamp(),
+            "open": float(v["open"]), "high": float(v["high"]),
+            "low": float(v["low"]), "close": float(v["close"]),
+        })
+    return candles
 
 
 def _fetch_yfinance(symbol: str, limit: int, interval: str = "5m") -> List[Dict]:
