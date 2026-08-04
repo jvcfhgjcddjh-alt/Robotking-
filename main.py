@@ -1,5 +1,4 @@
 
-
 """
 ALPHABOT SMC PRO — FUSION (fichier unique, prêt à déployer sur Render)
 ========================================================================
@@ -127,6 +126,10 @@ INCLUDE_SPREAD_COMMISSION_BUFFER = True
 SWEEP_RECLAIM_BARS = 8
 
 TP1_RR = 3.0
+# TP2 stratégique : une cible plus proche que ce seuil est ignorée (trop
+# redondante avec TP1) — le bot cherche alors la cible suivante dans le pool
+# (Order Block > FVG > liquidité). Si aucune cible ne l'atteint, pas de TP2.
+MIN_TP2_RR = 6.0
 BE_TRIGGER_RR = 1.0
 SECURE_TRIGGER_RR = 2.0
 TP2_MIN_RR_WARNING = 10.0
@@ -1738,7 +1741,7 @@ class TP2Target:
 
 def select_smart_tp2(candles: List[Dict], swing_points: List["SwingPoint"],
                       entry_price: float, direction: str,
-                      tp1_price: float) -> "TP2Target":
+                      tp1_price: float, risk: float = 0.0) -> "TP2Target":
     """Choisit le TP2 parmi les cibles SMC/ICT réellement disponibles sur le
     graphique au lieu d'un simple multiple de RR fixe :
       - Order Block non mitigé
@@ -1749,7 +1752,8 @@ def select_smart_tp2(candles: List[Dict], swing_points: List["SwingPoint"],
     d'écart), l'empreinte la plus fiable gagne (Order Block > FVG > liquidité
     pool), conformément à la hiérarchie SMC/ICT usuelle. Si rien n'existe
     au-delà de TP1, on retombe sur la cible non mitigée la plus proche
-    au-delà de l'entrée."""
+    au-delà de l'entrée. Toute cible sous MIN_TP2_RR (trop proche de TP1
+    pour être un vrai second objectif) est écartée."""
     candidates = []  # (price, kind, priority)
 
     for ob in find_order_blocks(candles):
@@ -1780,6 +1784,10 @@ def select_smart_tp2(candles: List[Dict], swing_points: List["SwingPoint"],
     else:
         for price in unswept_lows:
             candidates.append((price, "liquidity_sell", TP2_TARGET_PRIORITY["liquidity"]))
+
+    if risk > 0:
+        min_distance = MIN_TP2_RR * risk
+        candidates = [c for c in candidates if abs(c[0] - entry_price) >= min_distance]
 
     if not candidates:
         return TP2Target(None, None)
@@ -1849,7 +1857,7 @@ def compute_levels(entry, direction, invalidation_price, candles, swing_points=N
 
     tp2, tp2_source = None, None
     if swing_points is not None:
-        target = select_smart_tp2(candles, swing_points, entry, direction, tp1)
+        target = select_smart_tp2(candles, swing_points, entry, direction, tp1, risk=risk)
         valid = target.price and (target.price > tp1 if direction == "BUY" else target.price < tp1)
         if valid:
             tp2, tp2_source = target.price, target.label
@@ -2216,6 +2224,12 @@ def send_startup_notification():
         except Exception:
             log.warning("Échec d'envoi du message de démarrage en DM au propriétaire:\n" + traceback.format_exc())
 
+    try:
+        _broadcast_private(message, notify_field="notify_signals")
+        log.info("Message de démarrage envoyé en DM aux abonnés.")
+    except Exception:
+        log.warning("Échec d'envoi du message de démarrage en DM aux abonnés:\n" + traceback.format_exc())
+
 
 def _telegram_answer_callback(group: str, callback_query_id: str, text: str = "", show_alert: bool = False):
     token = _bot_token(group)
@@ -2245,14 +2259,21 @@ SIGNAL_BROADCAST_GROUPS = ("btc_gold", "vip_gold")
 PRIVATE_DM_THROTTLE_SECONDS = 0.05  # petite pause entre 2 DM (marge sous les limites Telegram)
 
 
-def _send_private_dm(source_bot: str, chat_id: str, text: str):
-    """Envoie un message privé à un abonné, avec gestion dédiée du cas où le
-    bot a été bloqué : l'abonné est alors automatiquement désactivé (status
-    'stopped'), pour ne plus jamais retenter en pure perte à chaque diffusion."""
+def _send_private_dm(source_bot: str, chat_id: str, text: str, image_path: Optional[str] = None):
+    """Envoie un message privé à un abonné (avec photo si fournie), avec
+    gestion dédiée du cas où le bot a été bloqué : l'abonné est alors
+    automatiquement désactivé (status 'stopped'), pour ne plus jamais
+    retenter en pure perte à chaque diffusion."""
     token = _bot_token(source_bot)
     try:
-        _tg_call(token, "sendMessage",
-                 data={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}, timeout=10)
+        if image_path:
+            with open(image_path, "rb") as img:
+                _tg_call(token, "sendPhoto",
+                         data={"chat_id": chat_id, "caption": text, "parse_mode": "Markdown"},
+                         files={"photo": img}, timeout=15)
+        else:
+            _tg_call(token, "sendMessage",
+                     data={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}, timeout=10)
     except TelegramForbiddenError:
         log.info(f"Telegram: {chat_id} a bloqué/supprimé le bot '{source_bot}' — abonné désactivé.")
         try:
@@ -2263,19 +2284,24 @@ def _send_private_dm(source_bot: str, chat_id: str, text: str):
         log.warning(f"Échec d'envoi privé vers {chat_id} (bot '{source_bot}'):\n{traceback.format_exc()}")
 
 
-def _broadcast_private(text: str, notify_field: str = "notify_signals"):
+def _broadcast_private(text: str, notify_field: str = "notify_signals", image_path: Optional[str] = None):
     for sub in list_broadcast_targets(notify_field):
         try:
-            _send_private_dm(sub["source_bot"] or "btc_gold", sub["chat_id"], text)
+            _send_private_dm(sub["source_bot"] or "btc_gold", sub["chat_id"], text, image_path=image_path)
         except RuntimeError:
             pass  # bot source non configuré (token manquant) -> ignoré silencieusement
         time.sleep(PRIVATE_DM_THROTTLE_SECONDS)
 
 
-def broadcast_signal(text: str, image_path: Optional[str] = None, signal_id: Optional[int] = None):
+def broadcast_signal(text: str, image_path: Optional[str] = None, signal_id: Optional[int] = None,
+                      symbol: Optional[str] = None, entry_price: Optional[float] = None,
+                      stop_loss: Optional[float] = None):
     """Diffuse un signal sur le groupe FREE, le groupe VIP (contenu
     identique) puis en message privé à chaque abonné actif ayant les
-    notifications de signaux activées."""
+    notifications de signaux activées. En DM uniquement, le lot suggéré
+    (basé sur le capital et le risque % réglés dans /parametres) est ajouté
+    en complément — pas affiché en groupe pour ne pas exposer le capital
+    de chacun publiquement."""
     for group in SIGNAL_BROADCAST_GROUPS:
         try:
             send_telegram_signal(group, text, image_path=image_path, signal_id=signal_id)
@@ -2283,7 +2309,25 @@ def broadcast_signal(text: str, image_path: Optional[str] = None, signal_id: Opt
             pass  # groupe non configuré (token/chat_id manquant) -> ignoré silencieusement
         except Exception:
             log.error(f"Échec de diffusion du signal sur le groupe '{group}':\n{traceback.format_exc()}")
-    _broadcast_private(text, notify_field="notify_signals")
+
+    dm_text = text
+    if symbol and entry_price is not None and stop_loss is not None:
+        try:
+            settings = get_settings()
+            risk_percent = get_effective_risk_percent(symbol, settings)
+            lot = compute_lot_size(
+                capital=settings["capital"], risk_percent=risk_percent,
+                entry=entry_price, stop_loss=stop_loss,
+            )
+            dm_text = (
+                f"{text}\n\n"
+                f"💰 *Lot suggéré* : {lot} "
+                f"(capital {settings['capital']:.0f}$, risque {risk_percent:.2f}%)"
+            )
+        except Exception:
+            log.warning(f"Échec calcul du lot size pour le DM ({symbol}):\n{traceback.format_exc()}")
+
+    _broadcast_private(dm_text, notify_field="notify_signals", image_path=image_path)
 
 
 # ----------------------------------------------------------------------
@@ -2962,6 +3006,86 @@ def is_session_open(asset_symbol: str) -> bool:
     return hour_utc >= asset.session_start_utc or hour_utc < asset.session_end_utc
 
 
+def _fire_auto_trade_event(signal_id: int, status: str):
+    """Enregistre et notifie un changement de statut détecté automatiquement
+    par le moteur de suivi (par opposition aux boutons Telegram, source
+    'telegram'). Best-effort : une erreur ici ne doit jamais interrompre le
+    scan des autres actifs."""
+    try:
+        record_trade_action(signal_id, action=status, new_status=status, source="auto")
+        notify_trade_event(signal_id, status)
+    except Exception:
+        log.error(f"Échec notification auto trade #{signal_id} ({status}):\n{traceback.format_exc()}")
+
+
+_AUTO_STATUS_RANK = {"pending": 0, "taken": 0, "be": 1, "secured": 2, "tp1_hit": 3, "tp2_hit": 4}
+_AUTO_STATUS_TERMINAL = {"closed", "invalidated", "tp2_hit", "ignored"}
+
+
+def _check_signal_progress(row: sqlite3.Row, high: float, low: float):
+    status = row["status"]
+    if status in _AUTO_STATUS_TERMINAL:
+        return
+    direction = row["direction"]
+    entry, sl = row["entry_price"], row["stop_loss"]
+    tp1, tp2 = row["tp1"], row["tp2"]
+    risk = abs(entry - sl)
+    if risk <= 0:
+        return
+    signal_id = row["id"]
+
+    def level(rr: float) -> float:
+        return entry + rr * risk if direction == "BUY" else entry - rr * risk
+
+    def reached(price_level: float) -> bool:
+        return (direction == "BUY" and high >= price_level) or (direction == "SELL" and low <= price_level)
+
+    def sl_reached() -> bool:
+        return (direction == "BUY" and low <= sl) or (direction == "SELL" and high >= sl)
+
+    # SL en priorité (pire cas d'abord), sauf si TP1 est déjà sécurisé — une
+    # fois TP1 atteint le SL initial n'a plus de sens (BE/trailing pris en
+    # charge par l'utilisateur ensuite).
+    if status not in ("tp1_hit",) and sl_reached():
+        _fire_auto_trade_event(signal_id, "invalidated")
+        return
+
+    current_rank = _AUTO_STATUS_RANK.get(status, 0)
+    progression = [("be", level(BE_TRIGGER_RR)), ("secured", level(SECURE_TRIGGER_RR)), ("tp1_hit", tp1)]
+    if tp2:
+        progression.append(("tp2_hit", tp2))
+
+    for name, price_level in progression:
+        if _AUTO_STATUS_RANK[name] <= current_rank or price_level is None:
+            continue
+        if reached(price_level):
+            _fire_auto_trade_event(signal_id, name)
+            current_rank = _AUTO_STATUS_RANK[name]
+
+
+def monitor_open_signals(symbol: str, candles: List[Dict]):
+    """Moteur de suivi automatique : à chaque scan, compare la dernière
+    bougie de `symbol` aux niveaux de tous ses signaux encore ouverts et
+    déclenche BE / Sécurisation / TP1 / TP2 / SL dès qu'ils sont atteints —
+    avec notification Telegram (groupes + DM), sans action manuelle requise.
+    Résolution = fréquence du scan (~30s) : un mouvement extrême intrabar
+    peut être détecté un peu après coup mais n'est jamais raté."""
+    if not candles:
+        return
+    last = candles[-1]
+    high, low = last["high"], last["low"]
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM signals WHERE symbol=? AND status NOT IN ('closed','invalidated','tp2_hit','ignored')",
+            (symbol,),
+        ).fetchall()
+    for row in rows:
+        try:
+            _check_signal_progress(row, high, low)
+        except Exception:
+            log.error(f"Échec suivi auto du signal #{row['id']} ({symbol}):\n{traceback.format_exc()}")
+
+
 def process_asset(symbol: str):
     asset = ASSETS[symbol]
     if not is_session_open(symbol):
@@ -2979,6 +3103,8 @@ def process_asset(symbol: str):
         return
     last_close = candles[-1]["close"]
     log.info(f"[{symbol}] scan OK — {len(candles)} bougies, dernier prix = {last_close}")
+
+    monitor_open_signals(symbol, candles)
 
     swing_points = find_swing_points(candles)
     sweep = detect_liquidity_sweep(candles, swing_points)
@@ -3039,7 +3165,8 @@ def process_asset(symbol: str):
         signal_id=signal_id,
     )
     try:
-        broadcast_signal(message, image_path=image_path, signal_id=signal_id)
+        broadcast_signal(message, image_path=image_path, signal_id=signal_id,
+                          symbol=symbol, entry_price=entry_price, stop_loss=levels.stop_loss)
         log.info(f"[{symbol}] signal #{signal_id} publié ({direction}, {entry_type}, score={score})")
     except Exception:
         log.error(f"[{symbol}] échec d'envoi Telegram pour le signal #{signal_id}:\n{traceback.format_exc()}")
@@ -4208,3 +4335,4 @@ if __name__ == "__main__":
 #                 {"command": "status", "description": "État du bot"},
 #                 {"command": "help", "description": "Liste des commandes"}
 #               ]}'
+
