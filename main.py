@@ -1,4 +1,5 @@
 
+
 """
 ALPHABOT SMC PRO — FUSION (fichier unique, prêt à déployer sur Render)
 ========================================================================
@@ -16,10 +17,12 @@ BOS Corps de Bougie"), confirmée avec Pie :
     retour dans l'imbalance (★★★) si un FVG est détecté (plus haute confiance).
   - SL : ATR(14) x 0,6 au-delà de l'extrémité du sweep, marge spread/commission incluse.
   - TP1 : RR3, avec BE proposé à RR1 et sécurisation partielle proposée à RR2.
-  - TP2 : cible stratégique = prochain pool de liquidité non mitigé dans le sens
-    du trade (peut donner RR > 10, pas de plafond — juste un badge d'alerte).
-  - Score global 0-100 (étoiles + qualité du RR de TP2) ; seuil de publication
-    configurable (MIN_SCORE_TO_PUBLISH).
+  - TP2 : RR6 fixe (plus de cible "intelligente" OB/FVG/liquidité).
+  - Pas de score 0-100 : tout setup Sweep + CHoCH confirmé par clôture du
+    corps de bougie est publié tel quel, sans filtre de qualité.
+  - Lot recalculé à chaque signal à partir du risque choisi (mode $ fixe,
+    ex. 3$/10$, ou % du capital), de l'entrée et du Stop Loss — affiché
+    directement dans le message Telegram.
   - Diffusion Telegram sur un groupe FREE et, si configuré, un groupe VIP
     (contenu strictement identique sur les deux), chacun via son propre bot.
     Diffusion privée (DM) en plus, vers les abonnés activés manuellement par
@@ -80,35 +83,50 @@ from matplotlib.patches import Rectangle
 class AssetConfig:
     symbol: str
     display_name: str
-    data_source: str            # "yfinance" | "binance"
+    data_source: str            # "mt5_bridge" | "twelvedata" | "yfinance" | "binance"
     telegram_group: str         # "btc_gold"
     session_continuous: bool
     session_start_utc: Optional[int] = None
     session_end_utc: Optional[int] = None
     pip_size: float = 0.01
     contract_type: str = "classic"
+    # Source utilisée si data_source échoue ou renvoie une erreur (ex. pont
+    # MT5 pas encore connecté, ou en panne) — jamais de scan bloqué en silence.
+    fallback_data_source: Optional[str] = None
+    # $ de P&L par lot standard pour 1$ de mouvement de prix — sert au calcul
+    # du lot à partir du risque $ (voir compute_lot_size_v2). À AJUSTER si la
+    # taille de contrat de ton broker diffère (vérifie les spécifications du
+    # symbole côté MT5 : "Taille du contrat").
+    #   XAUUSD : lot standard = 100 oz -> 1$ de mouvement = 100$/lot
+    #   XAGUSD : lot standard = 5000 oz -> 1$ de mouvement = 5000$/lot
+    #   BTCUSD : lot standard = 1 BTC (courant chez la plupart des brokers CFD)
+    #            -> 1$ de mouvement = 1$/lot
+    lot_value_per_point: float = 100.0
 
 
 ASSETS = {
     "XAUUSD": AssetConfig(
-        symbol="XAUUSD", display_name="Gold (XAUUSD)", data_source="yfinance",
+        symbol="XAUUSD", display_name="Gold (XAUUSD)", data_source="mt5_bridge",
         telegram_group="btc_gold", session_continuous=False,
         session_start_utc=13, session_end_utc=22, contract_type="classic",
+        fallback_data_source="yfinance", lot_value_per_point=100.0,
     ),
     "BTCUSD": AssetConfig(
         symbol="BTCUSD", display_name="BTC/USD", data_source="binance",
         telegram_group="btc_gold", session_continuous=False,
         session_start_utc=13, session_end_utc=22, contract_type="crypto",
+        lot_value_per_point=1.0,
     ),
     "XAGUSD": AssetConfig(
         symbol="XAGUSD", display_name="Silver (XAGUSD)", data_source="yfinance",
         telegram_group="btc_gold", session_continuous=False,
         session_start_utc=13, session_end_utc=22, contract_type="classic",
+        lot_value_per_point=5000.0,
     ),
 }
 
 TIMEFRAME = "M5"
-SCAN_INTERVAL_SECONDS = 30
+SCAN_INTERVAL_SECONDS = 20  # suivi des trades ouverts toutes les 20s (fourchette demandée : 10-30s)
 
 # Anti-doublon "temps" : délai minimum entre deux signaux sur le MÊME actif,
 # quel que soit leur statut (même après clôture). Vient en plus de la
@@ -126,20 +144,18 @@ INCLUDE_SPREAD_COMMISSION_BUFFER = True
 # le réglage Pine actuel (passé de 3 à 8, win rate amélioré côté indicateur).
 SWEEP_RECLAIM_BARS = 8
 
-TP1_RR = 3.0
-# TP2 stratégique : une cible plus proche que ce seuil est ignorée (trop
-# redondante avec TP1) — le bot cherche alors la cible suivante dans le pool
-# (Order Block > FVG > liquidité). Si aucune cible ne l'atteint, pas de TP2.
-MIN_TP2_RR = 6.0
+# Grille RR fixe demandée : BE à RR1, sécurisation partielle à RR2, TP1
+# (laisser courir le reste) à RR3, objectif final TP2 à RR6. Plus de cible
+# "intelligente" dynamique (OB/FVG/liquidité) : TP2 = RR6 fixe, toujours.
 BE_TRIGGER_RR = 1.0
 SECURE_TRIGGER_RR = 2.0
-TP2_MIN_RR_WARNING = 10.0
+TP1_RR = 3.0
+TP2_RR = 6.0
 
 ENTRY_TYPES = {
-    "direct": {"stars": "★★", "label": "Entrée directe", "score_weight": 60},
-    "fvg_return": {"stars": "★★★", "label": "Retour Imbalance (FVG)", "score_weight": 85},
+    "direct": {"stars": "★★", "label": "Entrée directe"},
+    "fvg_return": {"stars": "★★★", "label": "Retour Imbalance (FVG)"},
 }
-MIN_SCORE_TO_PUBLISH = 70
 
 MAX_SIGNALS_PER_DAY_GLOBAL = 3
 MAX_SIGNALS_PER_DAY_PER_ASSET = 2
@@ -242,9 +258,42 @@ TELEGRAM_WEBHOOK_SECRET = os.environ.get("TELEGRAM_WEBHOOK_SECRET", "")
 TELEGRAM_OWNER_ID = os.environ.get("TELEGRAM_OWNER_ID", "")
 # Flux spot réel pour XAUUSD/XAGUSD (remplace le proxy futures yfinance
 # GC=F/SI=F, décalé de plusieurs dizaines de dollars par rapport au spot).
-# Compte gratuit sur https://twelvedata.com/ (tier free largement suffisant
-# pour 2 actifs scannés en continu).
+# Compte gratuit sur https://twelvedata.com/ — ⚠️ le tier gratuit (800
+# crédits/jour) est TROP JUSTE pour scanner 2 actifs en continu à 20-30s
+# d'intervalle ; non utilisé par défaut ici (voir ASSETS plus haut), à
+# activer uniquement si tu passes sur un plan payant TwelveData, ou en
+# complément du pont MT5 ci-dessous (fallback secondaire).
 TWELVEDATA_API_KEY = os.environ.get("TWELVEDATA_API_KEY", "")
+
+# --- Pont de prix MT5 (optionnel) -----------------------------------------
+# MetaTrader5 (le package Python) exige un terminal MT5 Windows ouvert en
+# continu -> IMPOSSIBLE à faire tourner directement sur Render (Linux,
+# headless). Solution : un petit script (mt5_price_bridge.py, fourni à côté)
+# tourne sur TON PC/VPS Windows avec MT5 ouvert, et POST les bougies M5
+# XAUUSD (prix EXACT de ton broker) vers ce bot toutes les 20-30s via
+# /api/mt5/push. Tant qu'aucune donnée fraîche n'est reçue (ou si
+# MT5_BRIDGE_SECRET n'est pas défini), l'actif retombe automatiquement sur
+# sa source de secours (fallback_data_source dans AssetConfig).
+MT5_BRIDGE_SECRET = os.environ.get("MT5_BRIDGE_SECRET", "")
+MT5_BRIDGE_STALE_AFTER_SECONDS = 90  # au-delà, on considère le flux MT5 mort -> fallback
+_mt5_bridge_lock = threading.Lock()
+_MT5_BRIDGE_CACHE: Dict[str, Dict] = {}  # {symbol: {"candles": [...], "updated_at": float}}
+
+
+def _mt5_bridge_push(symbol: str, candles: List[Dict]):
+    with _mt5_bridge_lock:
+        _MT5_BRIDGE_CACHE[symbol] = {"candles": candles, "updated_at": time.time()}
+
+
+def _fetch_mt5_bridge(symbol: str, limit: int) -> List[Dict]:
+    with _mt5_bridge_lock:
+        entry = _MT5_BRIDGE_CACHE.get(symbol)
+    if not entry:
+        raise RuntimeError(f"Pont MT5 : aucune donnée reçue pour {symbol} pour le moment.")
+    age = time.time() - entry["updated_at"]
+    if age > MT5_BRIDGE_STALE_AFTER_SECONDS:
+        raise RuntimeError(f"Pont MT5 : dernière donnée pour {symbol} vieille de {age:.0f}s (source considérée morte).")
+    return entry["candles"][-limit:]
 
 # --- Watchdog VPS / Render ------------------------------------------------
 WATCHDOG_CHECK_INTERVAL_SECONDS = 15
@@ -337,7 +386,8 @@ CREATE TABLE IF NOT EXISTS signals (
     telegram_group TEXT NOT NULL,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL,
-    closed_at REAL
+    closed_at REAL,
+    risk_amount REAL
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_active_setup
@@ -435,6 +485,8 @@ def _migrate_schema():
         cols = {row["name"] for row in conn.execute("PRAGMA table_info(signals)")}
         if "tp2_source" not in cols:
             conn.execute("ALTER TABLE signals ADD COLUMN tp2_source TEXT")
+        if "risk_amount" not in cols:
+            conn.execute("ALTER TABLE signals ADD COLUMN risk_amount REAL")
 
 # ----------------------------------------------------------------------
 # Paramètres modifiables depuis le dashboard (sans toucher au code).
@@ -444,7 +496,9 @@ def _migrate_schema():
 DEFAULT_SETTINGS = {
     "capital": 1000.0,                      # capital du compte ($)
     "leverage": 100,                        # levier (x)
-    "risk_percent": 1.0,                    # risque par trade (%)
+    "risk_unit": "dollar",                  # "dollar" (risk_dollar_amount) | "percent" (risk_percent x capital)
+    "risk_dollar_amount": 10.0,             # risque par trade en $ (ex. 3$, 10$...) — utilisé si risk_unit="dollar"
+    "risk_percent": 1.0,                    # risque par trade (%) — utilisé si risk_unit="percent"
     "risk_mode": "standard",                # conservé pour compatibilité (voir table `profiles`)
     "active_profile_id": None,              # id du profil actuellement sélectionné (table `profiles`)
     "martingale_enabled": False,             # martingale ON/OFF
@@ -452,10 +506,11 @@ DEFAULT_SETTINGS = {
     "recovery_enabled": False,               # mode recovery ON/OFF
     "recovery_max_multiplier": 1.5,          # plafond du multiplicateur de risque en recovery
     "max_open_positions": 3,                 # nombre maximum de positions ouvertes simultanées
-    "min_score_to_publish": MIN_SCORE_TO_PUBLISH,  # score minimum pour publier un signal
     "session_mode": "ny",                    # "ny" (13h-22h UTC) | "24h" (scan en continu)
     "timeframe": TIMEFRAME,                  # "M1" (scalping) | "M5" (par défaut)
 }
+
+VALID_RISK_UNITS = {"dollar", "percent"}
 
 VALID_SESSION_MODES = {"ny", "24h"}
 VALID_TIMEFRAMES = {"M1", "M5"}
@@ -550,13 +605,14 @@ def update_settings(patch: Dict) -> Dict:
         "capital": (float, lambda v: v > 0),
         "leverage": (float, lambda v: v > 0),
         "risk_percent": (float, lambda v: 0 < v <= 100),
+        "risk_unit": (str, lambda v: v in VALID_RISK_UNITS),
+        "risk_dollar_amount": (float, lambda v: v > 0),
         "risk_mode": (str, lambda v: True),  # champ hérité, remplacé par le système de profils (table `profiles`)
         "martingale_enabled": (bool, lambda v: True),
         "martingale_multiplier": (float, lambda v: v >= 1),
         "recovery_enabled": (bool, lambda v: True),
         "recovery_max_multiplier": (float, lambda v: v >= 1),
         "max_open_positions": (int, lambda v: v >= 1),
-        "min_score_to_publish": (int, lambda v: 0 <= v <= 100),
         "session_mode": (str, lambda v: v in VALID_SESSION_MODES),
         "timeframe": (lambda v: str(v).upper(), lambda v: v in VALID_TIMEFRAMES),
     }
@@ -572,6 +628,16 @@ def update_settings(patch: Dict) -> Dict:
         if not check(value):
             raise ValueError(f"Valeur hors limites pour '{key}': {raw_value!r}")
         current[key] = value
+
+    # Bascule automatique de l'unité de risque : si on touche risk_percent
+    # sans préciser risk_unit, on suppose que l'intention est le mode "%"
+    # (et inversement pour risk_dollar_amount) — évite le piège où le lot
+    # continue d'être calculé sur l'ancienne unité restée active en silence.
+    if "risk_unit" not in patch:
+        if "risk_percent" in patch and "risk_dollar_amount" not in patch:
+            current["risk_unit"] = "percent"
+        elif "risk_dollar_amount" in patch and "risk_percent" not in patch:
+            current["risk_unit"] = "dollar"
 
     with get_conn() as conn:
         conn.execute(
@@ -706,6 +772,7 @@ def activate_profile(profile_id: int) -> Dict:
         "capital": p["capital"],
         "leverage": p["leverage"],
         "risk_percent": p["risk_percent"],
+        "risk_unit": "percent",  # les profils sont toujours en % du capital
         "max_open_positions": p["max_open_positions"],
     })
     _set_active_profile_id(profile_id)
@@ -738,17 +805,18 @@ def seconds_since_last_signal(symbol: str) -> Optional[float]:
 
 def insert_signal(symbol, setup_key, direction, entry_type, stars, score,
                    entry_price, stop_loss, tp1, tp2, rr_tp1, rr_tp2, telegram_group,
-                   tp2_source=None) -> int:
+                   tp2_source=None, risk_amount=None) -> int:
     now = time.time()
     with get_conn() as conn:
         cur = conn.execute(
             """INSERT INTO signals
                (symbol, setup_key, direction, entry_type, stars, score,
                 entry_price, stop_loss, tp1, tp2, rr_tp1, rr_tp2, status,
-                telegram_group, created_at, updated_at, tp2_source)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?, 'pending', ?, ?, ?, ?)""",
+                telegram_group, created_at, updated_at, tp2_source, risk_amount)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?, 'pending', ?, ?, ?, ?, ?)""",
             (symbol, setup_key, direction, entry_type, stars, score,
-             entry_price, stop_loss, tp1, tp2, rr_tp1, rr_tp2, telegram_group, now, now, tp2_source),
+             entry_price, stop_loss, tp1, tp2, rr_tp1, rr_tp2, telegram_group, now, now,
+             tp2_source, risk_amount),
         )
         return cur.lastrowid
 
@@ -1391,6 +1459,33 @@ def get_effective_risk_percent(symbol: Optional[str] = None, settings: Optional[
     return base_risk
 
 
+def get_effective_risk_amount(symbol: Optional[str] = None, settings: Optional[Dict] = None) -> float:
+    """Calcule le risque $ réellement appliqué au prochain signal, en tenant
+    compte du mode choisi (dollar fixe ou % du capital) et de la martingale /
+    recovery (même logique que get_effective_risk_percent, appliquée au montant $)."""
+    s = settings or get_settings()
+    if s.get("risk_unit") == "dollar":
+        base_amount = s.get("risk_dollar_amount", 10.0)
+    else:
+        base_amount = s["capital"] * (get_effective_risk_percent(symbol, s) / 100.0)
+        return round(base_amount, 2)  # martingale/recovery déjà appliqués dans get_effective_risk_percent
+
+    if s.get("martingale_enabled"):
+        r = last_closed_result(symbol)
+        if r is not None and r < 0:
+            return round(base_amount * s.get("martingale_multiplier", 2.0), 2)
+
+    if s.get("recovery_enabled"):
+        now = datetime.now(timezone.utc)
+        start_ts, end_ts = _month_bounds(now)
+        month_stats = get_period_stats(start_ts, end_ts)
+        if month_stats["total_r"] < 0:
+            factor = min(1 + abs(month_stats["total_r"]) / 10.0, s.get("recovery_max_multiplier", 1.5))
+            return round(base_amount * factor, 2)
+
+    return round(base_amount, 2)
+
+
 def increment_daily_counter(symbol: str):
     day = _today_key()
     with get_conn() as conn:
@@ -1457,13 +1552,26 @@ def fetch_candles(symbol: str, limit: int = 200) -> List[Dict]:
     asset = ASSETS[symbol]
     timeframe = get_settings().get("timeframe", TIMEFRAME)
     interval = TIMEFRAME_TO_INTERVAL.get(timeframe, "5m")
-    if asset.data_source == "twelvedata":
+    try:
+        return _fetch_by_source(asset.data_source, symbol, limit, interval)
+    except Exception as e:
+        if not asset.fallback_data_source:
+            raise
+        log.warning(f"[{symbol}] source '{asset.data_source}' indisponible ({e}) "
+                    f"-> repli sur '{asset.fallback_data_source}'.")
+        return _fetch_by_source(asset.fallback_data_source, symbol, limit, interval)
+
+
+def _fetch_by_source(data_source: str, symbol: str, limit: int, interval: str) -> List[Dict]:
+    if data_source == "mt5_bridge":
+        return _fetch_mt5_bridge(symbol, limit)
+    elif data_source == "twelvedata":
         return _fetch_twelvedata(symbol, limit, interval)
-    elif asset.data_source == "yfinance":
+    elif data_source == "yfinance":
         return _fetch_yfinance(symbol, limit, interval)
-    elif asset.data_source == "binance":
+    elif data_source == "binance":
         return _fetch_binance(symbol, limit, interval)
-    raise ValueError(f"Source de données inconnue pour {symbol}")
+    raise ValueError(f"Source de données inconnue : {data_source}")
 
 
 _TWELVEDATA_INTERVAL_MAP = {"1m": "1min", "5m": "5min"}
@@ -1883,9 +1991,10 @@ def compute_atr(candles: List[Dict], period: int = ATR_PERIOD) -> float:
 
 def compute_levels(entry, direction, invalidation_price, candles, swing_points=None,
                     spread_commission_buffer=0.0) -> TradeLevels:
-    """TP2 n'est plus un simple multiple de RR fixe : il est choisi
-    dynamiquement parmi les cibles SMC/ICT non mitigées disponibles
-    (Order Block / FVG / Liquidité) via select_smart_tp2()."""
+    """Grille RR fixe : TP1 = RR3 (sécurisation/laisser courir géré côté
+    suivi via BE à RR1 et sécurisation partielle à RR2), TP2 = RR6, toujours.
+    Le choix de cible "intelligente" (OB/FVG/liquidité) a été retiré : trop
+    variable et difficile à anticiper pour le trader -> RR6 fixe, prévisible."""
     atr = compute_atr(candles)
     sl_distance = max(atr * ATR_SL_MULTIPLIER, 1e-9)
     if INCLUDE_SPREAD_COMMISSION_BUFFER:
@@ -1895,28 +2004,20 @@ def compute_levels(entry, direction, invalidation_price, candles, swing_points=N
         stop_loss = min(invalidation_price, entry) - sl_distance
         risk = entry - stop_loss
         tp1 = entry + risk * TP1_RR
+        tp2 = entry + risk * TP2_RR
     else:
         stop_loss = max(invalidation_price, entry) + sl_distance
         risk = stop_loss - entry
         tp1 = entry - risk * TP1_RR
+        tp2 = entry - risk * TP2_RR
 
-    tp2, tp2_source = None, None
-    if swing_points is not None:
-        target = select_smart_tp2(candles, swing_points, entry, direction, tp1, risk=risk)
-        valid = target.price and (target.price > tp1 if direction == "BUY" else target.price < tp1)
-        if valid:
-            tp2, tp2_source = target.price, target.label
-
-    rr_tp2, high_rr_warning = None, False
-    if tp2 is not None and risk > 0:
-        rr_tp2 = abs(tp2 - entry) / risk
-        high_rr_warning = rr_tp2 >= TP2_MIN_RR_WARNING
-
-    return TradeLevels(entry, stop_loss, tp1, tp2, TP1_RR, rr_tp2, high_rr_warning, tp2_source)
+    return TradeLevels(entry, stop_loss, tp1, tp2, TP1_RR, TP2_RR, False, None)
 
 
 def compute_lot_size(capital, risk_percent, entry, stop_loss,
                       pip_value_per_lot=10.0, pip_size=0.01) -> float:
+    """Conservée pour le calculateur manuel du dashboard (/api/lot) — inchangée,
+    ne concerne pas le calcul automatique du lot par signal (voir compute_lot_size_v2)."""
     risk_amount = capital * (risk_percent / 100)
     sl_pips = abs(entry - stop_loss) / pip_size
     if sl_pips <= 0:
@@ -1924,29 +2025,23 @@ def compute_lot_size(capital, risk_percent, entry, stop_loss,
     return round(risk_amount / (sl_pips * pip_value_per_lot), 2)
 
 
-# ============================================================================
-# 7. SCORING
-# ============================================================================
-
-def compute_score(entry_type: str, rr_tp2: Optional[float], sweep_clean: bool = True) -> int:
-    base = ENTRY_TYPES[entry_type]["score_weight"]
-    bonus = 0
-    if rr_tp2 and rr_tp2 >= 5:
-        bonus += 15
-    elif rr_tp2 and rr_tp2 >= 3:
-        bonus += 8
-    if sweep_clean:
-        bonus += 5
-    return min(100, base + bonus)
+def compute_lot_size_v2(risk_amount: float, entry: float, stop_loss: float,
+                         value_per_point: float, lot_step: float = 0.01,
+                         min_lot: float = 0.01) -> float:
+    """Calcul du lot utilisé automatiquement à chaque signal : à partir du
+    risque en $ choisi (risk_amount), de l'entrée, du Stop Loss et de la
+    valeur $ par point de l'actif (AssetConfig.lot_value_per_point).
+    Arrondi au pas de lot du broker (0.01 par défaut)."""
+    price_diff = abs(entry - stop_loss)
+    if price_diff <= 0 or value_per_point <= 0 or risk_amount <= 0:
+        return 0.0
+    raw_lot = risk_amount / (price_diff * value_per_point)
+    lot = max(min_lot, round(raw_lot / lot_step) * lot_step)
+    return round(lot, 2)
 
 
 def get_stars(entry_type: str) -> str:
     return ENTRY_TYPES[entry_type]["stars"]
-
-
-def passes_threshold(score: int, settings: Optional[Dict] = None) -> bool:
-    min_score = (settings or get_settings())["min_score_to_publish"]
-    return score >= min_score
 
 
 # ============================================================================
@@ -2054,9 +2149,12 @@ def _tg_call(token: str, method: str, data: Optional[Dict] = None,
     raise RuntimeError(f"Telegram {method}: échec après {TELEGRAM_MAX_RETRIES} tentatives.")
 
 
-def format_signal_message(symbol, display_name, direction, entry_type_label, stars, score,
-                           entry, sl, tp1, tp2, rr_tp1, rr_tp2, high_rr_warning,
-                           tp2_source=None) -> str:
+def format_signal_message(symbol, display_name, direction, entry_type_label, stars,
+                           entry, sl, tp1, tp2, rr_tp1, rr_tp2,
+                           lot: Optional[float] = None, risk_amount: Optional[float] = None) -> str:
+    """Pas de score 0-100 : tout signal Sweep + CHoCH confirmé par la clôture
+    du corps de bougie est publié tel quel. `stars` reste un simple repère de
+    type d'entrée (directe vs retour FVG), pas un filtre de qualité."""
     direction_emoji = "🟢 ACHAT" if direction == "BUY" else "🔴 VENTE"
     ts = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())
     lines = [
@@ -2069,10 +2167,12 @@ def format_signal_message(symbol, display_name, direction, entry_type_label, sta
         f"✅ *TP1 (RR{rr_tp1:g})* : `{tp1:.5f}`",
     ]
     if tp2:
-        rr2_txt = f"RR{rr_tp2:.1f}" + (" 🔥" if high_rr_warning else "")
-        source_txt = f" — {tp2_source}" if tp2_source else ""
-        lines.append(f"🚀 *TP2 ({rr2_txt}){source_txt}* : `{tp2:.5f}`")
-    lines += ["", "🔁 BE proposé à RR1 · Sécurisation proposée à RR2", "", f"🕒 {ts}"]
+        lines.append(f"🚀 *TP2 (RR{rr_tp2:g})* : `{tp2:.5f}`")
+    if lot is not None:
+        risk_txt = f" — risque {risk_amount:.2f}$" if risk_amount is not None else ""
+        lines.append(f"💰 *Lot suggéré* : `{lot}`{risk_txt}")
+    lines += ["", "🟡 BE à RR1 · 🔒 Sécurisation partielle à RR2 · 🟢 TP1 (laisser courir) à RR3 · 🚀 TP2 à RR6",
+              "", f"🕒 {ts}"]
     return "\n".join(lines)
 
 
@@ -2224,7 +2324,7 @@ def send_telegram_signal(group: str, text: str, image_path: str = None, signal_i
 # bot est bien en ligne (et pas seulement silencieusement en train de tourner
 # côté serveur). Si le redémarrage a été forcé par le watchdog, le message le
 # précise avec la raison, pour distinguer un déploiement normal d'un incident.
-STARTUP_NOTIFY_GROUPS = ("btc_gold", "vip_gold")
+STARTUP_NOTIFY_GROUPS = ()  # plus aucun message de démarrage/redémarrage dans les groupes Telegram — DM propriétaire uniquement (voir send_startup_notification)
 
 
 def format_startup_message() -> str:
@@ -2249,31 +2349,20 @@ def format_startup_message() -> str:
 
 
 def send_startup_notification():
-    """Diffuse le message de démarrage sur les groupes Telegram configurés,
-    et en DM au propriétaire (TELEGRAM_OWNER_ID) s'il a déjà démarré une
-    conversation avec le bot (obligatoire côté Telegram pour recevoir un DM).
-    Best-effort : une erreur (token manquant, réseau...) est loggée mais ne
-    doit jamais empêcher le bot de démarrer/scanner."""
+    """Notifie UNIQUEMENT le propriétaire (TELEGRAM_OWNER_ID) en DM que le bot
+    est démarré/redémarré — plus aucune diffusion dans les groupes ni aux
+    abonnés (bruit inutile pour eux). Best-effort : une erreur (token
+    manquant, réseau...) est loggée mais ne doit jamais empêcher le bot de
+    démarrer/scanner."""
     message = format_startup_message()
-    for group in STARTUP_NOTIFY_GROUPS:
-        try:
-            send_telegram_signal(group, message)
-            log.info(f"Message de démarrage envoyé sur le groupe Telegram '{group}'.")
-        except Exception:
-            log.warning(f"Échec d'envoi du message de démarrage sur '{group}':\n{traceback.format_exc()}")
-
     if TELEGRAM_OWNER_ID:
         try:
             _send_command_reply("btc_gold", int(TELEGRAM_OWNER_ID), message)
             log.info("Message de démarrage envoyé en DM au propriétaire.")
         except Exception:
             log.warning("Échec d'envoi du message de démarrage en DM au propriétaire:\n" + traceback.format_exc())
-
-    try:
-        _broadcast_private(message, notify_field="notify_signals")
-        log.info("Message de démarrage envoyé en DM aux abonnés.")
-    except Exception:
-        log.warning("Échec d'envoi du message de démarrage en DM aux abonnés:\n" + traceback.format_exc())
+    else:
+        log.info("TELEGRAM_OWNER_ID non défini — message de démarrage non envoyé (aucun canal privé configuré).")
 
 
 def _telegram_answer_callback(group: str, callback_query_id: str, text: str = "", show_alert: bool = False):
@@ -2343,10 +2432,9 @@ def broadcast_signal(text: str, image_path: Optional[str] = None, signal_id: Opt
                       stop_loss: Optional[float] = None):
     """Diffuse un signal sur le groupe FREE, le groupe VIP (contenu
     identique) puis en message privé à chaque abonné actif ayant les
-    notifications de signaux activées. En DM uniquement, le lot suggéré
-    (basé sur le capital et le risque % réglés dans /parametres) est ajouté
-    en complément — pas affiché en groupe pour ne pas exposer le capital
-    de chacun publiquement."""
+    notifications de signaux activées. Le lot suggéré est déjà inclus dans
+    `text` (calculé une fois pour toutes dans process_asset à partir du
+    risque $ réglé dans /parametres) — identique sur tous les canaux."""
     for group in SIGNAL_BROADCAST_GROUPS:
         try:
             send_telegram_signal(group, text, image_path=image_path, signal_id=signal_id)
@@ -2355,24 +2443,7 @@ def broadcast_signal(text: str, image_path: Optional[str] = None, signal_id: Opt
         except Exception:
             log.error(f"Échec de diffusion du signal sur le groupe '{group}':\n{traceback.format_exc()}")
 
-    dm_text = text
-    if symbol and entry_price is not None and stop_loss is not None:
-        try:
-            settings = get_settings()
-            risk_percent = get_effective_risk_percent(symbol, settings)
-            lot = compute_lot_size(
-                capital=settings["capital"], risk_percent=risk_percent,
-                entry=entry_price, stop_loss=stop_loss,
-            )
-            dm_text = (
-                f"{text}\n\n"
-                f"💰 *Lot suggéré* : {lot} "
-                f"(capital {settings['capital']:.0f}$, risque {risk_percent:.2f}%)"
-            )
-        except Exception:
-            log.warning(f"Échec calcul du lot size pour le DM ({symbol}):\n{traceback.format_exc()}")
-
-    _broadcast_private(dm_text, notify_field="notify_signals", image_path=image_path)
+    _broadcast_private(text, notify_field="notify_signals", image_path=image_path)
 
 
 # ----------------------------------------------------------------------
@@ -2430,6 +2501,16 @@ def format_trade_closed_report(row: sqlite3.Row) -> Optional[str]:
     result_emoji = "✅" if r > 0 else ("🟡" if r == 0 else "❌")
     result_txt = f"+{r:.2f}R" if r > 0 else f"{r:.2f}R"
 
+    # Gain réel en $ = résultat en R x risque $ engagé sur CE signal précis
+    # (figé au moment de l'ouverture — indépendant d'un changement de
+    # réglages depuis). Absent pour les signaux ouverts avant cette mise à
+    # jour (risk_amount NULL en base) -> ligne $ simplement omise.
+    risk_amount = row["risk_amount"] if "risk_amount" in row.keys() else None
+    gain_txt = None
+    if risk_amount:
+        gain = r * float(risk_amount)
+        gain_txt = f"+{gain:.2f}$" if gain >= 0 else f"{gain:.2f}$"
+
     now = datetime.now(timezone.utc)
     start_ts, end_ts = _day_bounds(now)
     day_stats = get_period_stats(start_ts, end_ts)
@@ -2437,12 +2518,13 @@ def format_trade_closed_report(row: sqlite3.Row) -> Optional[str]:
     cumul_txt = f"+{cumul:.2f}R" if cumul >= 0 else f"{cumul:.2f}R"
 
     direction_txt = "🟢 ACHAT" if row["direction"] == "BUY" else "🔴 VENTE"
-    return (
-        f"📊 *Rapport de trade* — {row['symbol']} #{row['id']} ({direction_txt})\n"
-        f"{result_emoji} Résultat : *{result_txt}*\n"
-        f"⏱️ Durée : {duration_txt}\n"
-        f"📈 Cumul du jour (tous actifs) : {cumul_txt} sur {day_stats['total_signals']} signal(aux)"
-    )
+    lines = [
+        f"📊 *Rapport de trade* — {row['symbol']} #{row['id']} ({direction_txt})",
+        f"{result_emoji} Résultat : *{result_txt}*" + (f" · Gain : *{gain_txt}*" if gain_txt else ""),
+        f"⏱️ Durée : {duration_txt}",
+        f"📈 Cumul du jour (tous actifs) : {cumul_txt} sur {day_stats['total_signals']} signal(aux)",
+    ]
+    return "\n".join(lines)
 
 
 def notify_trade_event(signal_id: int, status: str):
@@ -2529,7 +2611,10 @@ ADMIN_COMMANDS_HELP = (
     "/broadcast <message> — message privé à tous les abonnés actifs"
 )
 
-_SETTINGS_COMMAND_FIELDS = {"/capital": "capital", "/risque": "risk_percent", "/levier": "leverage"}
+_SETTINGS_COMMAND_FIELDS = {
+    "/capital": "capital", "/risque": "risk_percent", "/levier": "leverage",
+    "/risquedollar": "risk_dollar_amount",
+}
 
 
 def _is_owner(user_id) -> bool:
@@ -2552,9 +2637,10 @@ def format_settings_message(settings: Optional[Dict] = None) -> str:
         "⚙️ *Réglages actuels*",
         f"💰 Capital : {s['capital']:.2f} $",
         f"📈 Levier : x{s['leverage']:.0f}",
-        f"🎯 Risque par trade : {s['risk_percent']:.2f} %",
+        "Mode risque actuel : $" if s.get("risk_unit") == "dollar" else "Mode risque actuel : %",
+        f"🎯 Risque par trade : {s['risk_dollar_amount']:.2f} $" if s.get("risk_unit") == "dollar"
+        else f"🎯 Risque par trade : {s['risk_percent']:.2f} %",
         f"📊 Positions max simultanées : {s['max_open_positions']}",
-        f"🏅 Score minimum publié : {s['min_score_to_publish']}",
         f"🔁 Martingale : {'ON' if s['martingale_enabled'] else 'OFF'} (x{s['martingale_multiplier']:.1f})",
         f"🛟 Recovery : {'ON' if s['recovery_enabled'] else 'OFF'} (plafond x{s['recovery_max_multiplier']:.1f})",
         f"🕐 Session : {session_label}",
@@ -2653,6 +2739,7 @@ def _profiles_inline_keyboard() -> Dict:
 _MENU_PRESETS = {
     "capital": [500, 1000, 2000, 5000],
     "risque": [0.5, 1, 2, 3],
+    "risquedollar": [3, 5, 10, 25],
     "levier": [50, 100, 200, 500],
     "timeframe": ["M1", "M5"],
     "session": ["ny", "24h"],
@@ -2671,12 +2758,13 @@ def _persistent_owner_keyboard() -> Dict:
 
 def _main_menu_keyboard() -> Dict:
     return {"inline_keyboard": [
-        [{"text": "💰 Capital", "callback_data": "menu:capital"},
-         {"text": "🎯 Risque", "callback_data": "menu:risque"}],
-        [{"text": "📈 Levier", "callback_data": "menu:levier"},
-         {"text": "⏱ Timeframe", "callback_data": "menu:timeframe"}],
-        [{"text": "🕐 Session", "callback_data": "menu:session"},
-         {"text": "👤 Profils", "callback_data": "menu:profils"}],
+        [{"text": "💰 Solde du compte", "callback_data": "menu:capital"},
+         {"text": "📈 Levier", "callback_data": "menu:levier"}],
+        [{"text": "🎯 Risque ($ fixe)", "callback_data": "menu:risquedollar"},
+         {"text": "🎯 Risque (%)", "callback_data": "menu:risque"}],
+        [{"text": "⏱ Timeframe", "callback_data": "menu:timeframe"},
+         {"text": "🕐 Session", "callback_data": "menu:session"}],
+        [{"text": "👤 Profils", "callback_data": "menu:profils"}],
     ]}
 
 
@@ -2691,8 +2779,9 @@ def _preset_submenu_keyboard(field: str) -> Dict:
 
 
 _MENU_FIELD_LABELS = {
-    "capital": ("💰 Capital", "capital", "/capital <valeur>"),
+    "capital": ("💰 Solde du compte", "capital", "/capital <valeur>"),
     "risque": ("🎯 Risque par trade (%)", "risk_percent", "/risque <valeur>"),
+    "risquedollar": ("🎯 Risque par trade ($ fixe)", "risk_dollar_amount", "/risquedollar <valeur>"),
     "levier": ("📈 Levier", "leverage", "/levier <valeur>"),
     "timeframe": ("⏱ Timeframe", "timeframe", "/timeframe <M1|M5>"),
     "session": ("🕐 Session", "session_mode", "/session <ny|24h>"),
@@ -2844,6 +2933,12 @@ def _handle_telegram_command(message: Dict, group: str):
             _send_command_reply(group, chat_id, f"❌ {e}")
             return
         _send_command_reply(group, chat_id, f"✅ Mis à jour.\n\n{format_settings_message(updated)}")
+    elif cmd == "/risqueunite":
+        if not arg or arg.lower() not in VALID_RISK_UNITS:
+            _send_command_reply(group, chat_id, "Usage : /risqueunite <dollar|percent>")
+            return
+        updated = update_settings({"risk_unit": arg.lower()})
+        _send_command_reply(group, chat_id, f"✅ Unité de risque mise à jour.\n\n{format_settings_message(updated)}")
     elif cmd == "/session":
         if not arg or arg.lower() not in VALID_SESSION_MODES:
             _send_command_reply(group, chat_id, "Usage : /session <ny|24h>")
@@ -3173,10 +3268,6 @@ def process_asset(symbol: str):
 
     levels = compute_levels(entry_price, direction, sweep.sweep_wick_price, candles, swing_points)
 
-    # Score conservé uniquement à titre informatif dans le message envoyé —
-    # il ne filtre plus rien : tout setup avec BOS confirmé est publié.
-    score = compute_score(entry_type, levels.rr_tp2)
-
     setup_key = f"{symbol}:{direction}:{round(sweep.swept_point.price, 5)}"
     if has_active_setup(setup_key):
         return
@@ -3191,18 +3282,25 @@ def process_asset(symbol: str):
                  f"(cooldown = {SIGNAL_COOLDOWN_SECONDS:.0f}s).")
         return
 
+    # Lot recalculé à CHAQUE signal à partir du risque choisi (mode $ ou %),
+    # de l'entrée et du Stop Loss de CE signal précis.
+    risk_amount = get_effective_risk_amount(symbol, settings)
+    lot = compute_lot_size_v2(risk_amount, entry_price, levels.stop_loss, asset.lot_value_per_point)
+
+    # Plus de score 0-100 : tout setup Sweep + CHoCH confirmé par la clôture
+    # du corps de bougie est publié tel quel (score=0 conservé en base pour
+    # compatibilité de schéma uniquement, non affiché, non utilisé pour filtrer).
     signal_id = insert_signal(
-        symbol, setup_key, direction, entry_type, get_stars(entry_type), score,
+        symbol, setup_key, direction, entry_type, get_stars(entry_type), 0,
         entry_price, levels.stop_loss, levels.tp1, levels.tp2, levels.rr_tp1, levels.rr_tp2,
-        asset.telegram_group, levels.tp2_source,
+        asset.telegram_group, levels.tp2_source, risk_amount,
     )
     increment_daily_counter(symbol)
 
     message = format_signal_message(
         symbol, asset.display_name, direction, ENTRY_TYPES[entry_type]["label"],
-        get_stars(entry_type), score, entry_price, levels.stop_loss, levels.tp1,
-        levels.tp2, levels.rr_tp1, levels.rr_tp2 or 0, levels.high_rr_warning,
-        levels.tp2_source,
+        get_stars(entry_type), entry_price, levels.stop_loss, levels.tp1,
+        levels.tp2, levels.rr_tp1, levels.rr_tp2 or 0, lot=lot, risk_amount=risk_amount,
     )
     image_path = generate_signal_chart(
         symbol, asset.display_name, direction, candles, sweep, bos,
@@ -3212,7 +3310,7 @@ def process_asset(symbol: str):
     try:
         broadcast_signal(message, image_path=image_path, signal_id=signal_id,
                           symbol=symbol, entry_price=entry_price, stop_loss=levels.stop_loss)
-        log.info(f"[{symbol}] signal #{signal_id} publié ({direction}, {entry_type}, score={score})")
+        log.info(f"[{symbol}] signal #{signal_id} publié ({direction}, {entry_type}, lot={lot})")
     except Exception:
         log.error(f"[{symbol}] échec d'envoi Telegram pour le signal #{signal_id}:\n{traceback.format_exc()}")
 
@@ -3586,6 +3684,33 @@ def backup_endpoint():
     if not path:
         return jsonify({"ok": False, "error": "backup_failed"}), 500
     return jsonify({"ok": True, "file": os.path.basename(path)})
+
+
+@app.route("/api/mt5/push", methods=["POST"])
+def mt5_bridge_push_endpoint():
+    """Reçoit les bougies M5 poussées par mt5_price_bridge.py (tourne sur un
+    PC/VPS Windows avec MT5 ouvert). Body attendu :
+    {"secret": "...", "symbol": "XAUUSD", "candles": [{"time","open","high","low","close"}, ...]}
+    Sans MT5_BRIDGE_SECRET défini côté serveur, la route est désactivée
+    (retourne 503) pour ne jamais accepter de prix non authentifiés."""
+    if not MT5_BRIDGE_SECRET:
+        return jsonify({"ok": False, "error": "mt5_bridge_disabled_no_secret_configured"}), 503
+    data = request.get_json(silent=True) or {}
+    if data.get("secret") != MT5_BRIDGE_SECRET:
+        return jsonify({"ok": False, "error": "invalid_secret"}), 403
+    symbol = data.get("symbol")
+    candles = data.get("candles")
+    if symbol not in ASSETS or not isinstance(candles, list) or not candles:
+        return jsonify({"ok": False, "error": "invalid_payload"}), 400
+    try:
+        cleaned = [{
+            "time": float(c["time"]), "open": float(c["open"]), "high": float(c["high"]),
+            "low": float(c["low"]), "close": float(c["close"]),
+        } for c in candles]
+    except (KeyError, TypeError, ValueError):
+        return jsonify({"ok": False, "error": "invalid_candle_format"}), 400
+    _mt5_bridge_push(symbol, cleaned)
+    return jsonify({"ok": True, "symbol": symbol, "candles_received": len(cleaned)})
 
 
 @app.route("/api/lot-size", methods=["POST"])
@@ -3968,7 +4093,10 @@ DASHBOARD_HTML = """
       <div><label>Levier (x)</label><input type="number" step="1" id="s_leverage"></div>
       <div><label>Risque par trade (%)</label><input type="number" step="0.1" id="s_risk_percent"></div>
       <div><label>Positions ouvertes max</label><input type="number" step="1" id="s_max_open_positions"></div>
-      <div><label>Score minimum pour publier</label><input type="number" step="1" min="0" max="100" id="s_min_score_to_publish"></div>
+      <div><label>Risque par trade ($)</label><input type="number" step="0.5" min="0" id="s_risk_dollar_amount"></div>
+      <div><label>Unité de risque</label>
+        <select id="s_risk_unit"><option value="dollar">$ fixe</option><option value="percent">% du capital</option></select>
+      </div>
       <div><label>Multiplicateur martingale</label><input type="number" step="0.1" id="s_martingale_multiplier"></div>
       <div><label>Multiplicateur max recovery</label><input type="number" step="0.1" id="s_recovery_max_multiplier"></div>
       <div><label>Session de trading</label>
@@ -4126,7 +4254,8 @@ async function loadOverview() {
   document.getElementById('s_leverage').value = s.leverage;
   document.getElementById('s_risk_percent').value = s.risk_percent;
   document.getElementById('s_max_open_positions').value = s.max_open_positions;
-  document.getElementById('s_min_score_to_publish').value = s.min_score_to_publish;
+  document.getElementById('s_risk_dollar_amount').value = s.risk_dollar_amount;
+  document.getElementById('s_risk_unit').value = s.risk_unit;
   document.getElementById('s_martingale_multiplier').value = s.martingale_multiplier;
   document.getElementById('s_recovery_max_multiplier').value = s.recovery_max_multiplier;
   document.getElementById('s_martingale_enabled').checked = s.martingale_enabled;
@@ -4142,7 +4271,8 @@ async function saveSettings() {
     leverage: parseFloat(document.getElementById('s_leverage').value),
     risk_percent: parseFloat(document.getElementById('s_risk_percent').value),
     max_open_positions: parseInt(document.getElementById('s_max_open_positions').value),
-    min_score_to_publish: parseInt(document.getElementById('s_min_score_to_publish').value),
+    risk_dollar_amount: parseFloat(document.getElementById('s_risk_dollar_amount').value),
+    risk_unit: document.getElementById('s_risk_unit').value,
     martingale_multiplier: parseFloat(document.getElementById('s_martingale_multiplier').value),
     recovery_max_multiplier: parseFloat(document.getElementById('s_recovery_max_multiplier').value),
     martingale_enabled: document.getElementById('s_martingale_enabled').checked,
@@ -4380,4 +4510,3 @@ if __name__ == "__main__":
 #                 {"command": "status", "description": "État du bot"},
 #                 {"command": "help", "description": "Liste des commandes"}
 #               ]}'
-
