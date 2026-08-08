@@ -1,5 +1,6 @@
 
 
+
 """
 ALPHABOT SMC PRO — FUSION (fichier unique, prêt à déployer sur Render)
 ========================================================================
@@ -21,12 +22,15 @@ BOS Corps de Bougie"), confirmée avec Pie :
   - Pas de score 0-100 : tout setup Sweep + CHoCH confirmé par clôture du
     corps de bougie est publié tel quel, sans filtre de qualité.
   - Lot recalculé à chaque signal à partir du risque choisi (mode $ fixe,
-    ex. 3$/10$, ou % du capital), de l'entrée et du Stop Loss — visible
-    UNIQUEMENT dans le DM privé du leader (jamais dans le groupe public).
+    ex. 3$/10$, ou % du capital), de l'entrée et du Stop Loss — publié dans
+    le groupe avec le signal (à titre indicatif, calculé sur le capital du
+    LEADER — chaque abonné est invité à l'adapter au sien), et repris avec
+    le détail du risque $ dans le DM privé du leader.
   - Diffusion Telegram sur DEUX canaux seulement :
-      1. le GROUPE DE SIGNAUX (public) : signal (ENTRY/SL/TP1/TP2/RR) puis
-         suivi automatique (🥇 TP1 touché / 🥈 TP2 touché / ❌ SL touché) —
-         jamais de lot, de risque $, de solde ou de levier personnel.
+      1. le GROUPE DE SIGNAUX (public) : signal (ENTRY/SL/TP1/TP2/RR/Lot),
+         message de lancement au démarrage/redémarrage du bot, puis suivi
+         automatique (🥇 TP1 touché / 🥈 TP2 touché / ❌ SL touché) — jamais
+         de risque $, de solde ou de levier personnel.
       2. le DM PRIVÉ DU LEADER (TELEGRAM_OWNER_ID, seul destinataire) :
          solde, risque/trade, levier, lot calculé, paramètres, état
          ACTIF/DÉSACTIVÉ, détail complet de chaque signal, et son suivi.
@@ -2096,11 +2100,14 @@ def _tg_call(token: str, method: str, data: Optional[Dict] = None,
 
 
 def format_signal_message(symbol, display_name, direction, entry_type_label, stars,
-                           entry, sl, tp1, tp2, rr_tp1, rr_tp2) -> str:
-    """Message PUBLIC du groupe de signaux — strictement le signal :
-    ENTRY / SL / TP1 / TP2 / RR. AUCUNE donnée personnelle (pas de lot, pas
-    de risque $, pas de solde, pas de levier) : ces infos restent dans le
-    DM du leader (voir format_leader_signal_dm)."""
+                           entry, sl, tp1, tp2, rr_tp1, rr_tp2, lot: float) -> str:
+    """Message PUBLIC du groupe de signaux — le signal (ENTRY / SL / TP1 /
+    TP2 / RR) PLUS le lot suggéré. Le lot est calculé sur le risque et le
+    capital PERSONNELS du leader (voir compute_lot_size_v2) : il est donc
+    accompagné d'un avertissement invitant chacun à l'adapter à son propre
+    capital plutôt que de le copier tel quel. Le risque $, le solde et le
+    levier du leader, eux, restent strictement dans son DM privé (voir
+    format_leader_signal_dm)."""
     direction_emoji = "🟢 ACHAT" if direction == "BUY" else "🔴 VENTE"
     ts = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())
     lines = [
@@ -2115,6 +2122,7 @@ def format_signal_message(symbol, display_name, direction, entry_type_label, sta
     if tp2:
         lines.append(f"🚀 *TP2 (RR{rr_tp2:g})* : `{tp2:.5f}`")
     lines.append(f"📐 *RR* : {rr_tp1:g}" + (f" / {rr_tp2:g}" if tp2 else ""))
+    lines.append(f"📦 *Lot* : `{lot}` _(calculé sur le capital du leader — à adapter au vôtre)_")
     lines += ["", "🟡 BE à RR1 · 🔒 Sécurisation partielle à RR2 · 🟢 TP1 (laisser courir) à RR3 · 🚀 TP2 à RR6",
               "", f"🕒 {ts}"]
     return "\n".join(lines)
@@ -2320,7 +2328,7 @@ def send_telegram_signal(group: str, text: str, image_path: str = None, signal_i
 # bot est bien en ligne (et pas seulement silencieusement en train de tourner
 # côté serveur). Si le redémarrage a été forcé par le watchdog, le message le
 # précise avec la raison, pour distinguer un déploiement normal d'un incident.
-STARTUP_NOTIFY_GROUPS = ()  # plus aucun message de démarrage/redémarrage dans les groupes Telegram — DM propriétaire uniquement (voir send_startup_notification)
+STARTUP_NOTIFY_GROUPS = ("signal_group",)  # groupe(s) Telegram avertis à chaque lancement/redémarrage du process, en plus du DM leader (voir send_startup_notification)
 
 
 def format_startup_message() -> str:
@@ -2345,11 +2353,23 @@ def format_startup_message() -> str:
 
 
 def send_startup_notification():
-    """Notifie UNIQUEMENT le leader (TELEGRAM_OWNER_ID) en DM que le bot est
-    démarré/redémarré — c'est le même DM privé que celui utilisé pour les
-    signaux et le suivi. Best-effort : une erreur (token manquant,
-    réseau...) est loggée mais ne doit jamais empêcher le bot de démarrer/scanner."""
-    send_leader_dm(format_startup_message())
+    """Notifie que le bot est démarré/redémarré : en DM au leader
+    (TELEGRAM_OWNER_ID) ET dans le(s) groupe(s) listés dans
+    STARTUP_NOTIFY_GROUPS, pour que tu le saches immédiatement sur Telegram,
+    toi comme le groupe. Le message ne contient aucune donnée personnelle
+    (pas de lot, de risque $, de solde ou de levier) : il peut donc être
+    publié tel quel dans le groupe public. Chaque canal est indépendant et
+    best-effort : une erreur (token manquant, réseau...) est loggée mais ne
+    doit jamais empêcher le bot de démarrer/scanner, ni bloquer les autres canaux."""
+    text = format_startup_message()
+    send_leader_dm(text)
+    for group in STARTUP_NOTIFY_GROUPS:
+        try:
+            send_telegram_signal(group, text)
+        except RuntimeError:
+            pass  # groupe non configuré (token/chat_id manquant) -> ignoré silencieusement
+        except Exception:
+            log.error(f"Échec d'envoi du message de lancement sur le groupe '{group}':\n{traceback.format_exc()}")
 
 
 def _telegram_answer_callback(group: str, callback_query_id: str, text: str = "", show_alert: bool = False):
@@ -2374,11 +2394,11 @@ def _telegram_edit_reply_markup(group: str, chat_id, message_id: int, reply_mark
 # ----------------------------------------------------------------------
 # Diffusion — il n'existe que DEUX destinataires dans tout le projet :
 #   1. le groupe de signaux (SIGNAL_BROADCAST_GROUPS) : contenu public
-#      uniquement (signal, TP1, TP2, SL). JAMAIS de lot, de risque $, de
-#      solde ou de levier personnel.
+#      (signal, TP1, TP2, SL, lot indicatif) + message de lancement du bot.
+#      JAMAIS de risque $, de solde ou de levier personnel.
 #   2. le DM privé du leader (send_leader_dm, TELEGRAM_OWNER_ID) : seul
-#      canal recevant les données personnelles (solde, risque, levier, lot,
-#      paramètres, suivi détaillé). Chaque canal est indépendant et
+#      canal recevant les données strictement personnelles (solde, risque $,
+#      levier, paramètres, suivi détaillé). Chaque canal est indépendant et
 #      best-effort : l'échec de l'un ne bloque jamais l'autre.
 # ----------------------------------------------------------------------
 SIGNAL_BROADCAST_GROUPS = ("signal_group",)
@@ -2417,10 +2437,11 @@ def broadcast_signal(public_text: str, leader_text: Optional[str] = None,
                       image_path: Optional[str] = None, signal_id: Optional[int] = None,
                       symbol: Optional[str] = None, entry_price: Optional[float] = None,
                       stop_loss: Optional[float] = None):
-    """Publie `public_text` (signal SANS lot/risque/solde/levier) sur le
-    groupe de signaux, puis — si fourni — envoie `leader_text` (détail
-    complet : lot, risque, solde, levier, paramètres) exclusivement en DM
-    au leader. Les deux canaux sont indépendants (best-effort)."""
+    """Publie `public_text` (signal + lot indicatif, SANS risque $/solde/
+    levier) sur le groupe de signaux, puis — si fourni — envoie
+    `leader_text` (détail complet : lot, risque, solde, levier, paramètres)
+    exclusivement en DM au leader. Les deux canaux sont indépendants
+    (best-effort)."""
     for group in SIGNAL_BROADCAST_GROUPS:
         try:
             send_telegram_signal(group, public_text, image_path=image_path, signal_id=signal_id)
@@ -3020,11 +3041,38 @@ def _handle_menu_callback(callback: Dict, group: str):
 # 9. SIGNAL PIPELINE
 # ============================================================================
 
+def _classic_market_weekend_closed(asset: AssetConfig) -> bool:
+    """Marchés futures 'classiques' (Gold/Silver — contract_type='classic') :
+    fermés du vendredi ~21h UTC (clôture US) au dimanche ~21h UTC
+    (réouverture Asie/Sydney). Ne s'applique jamais aux actifs crypto
+    (contract_type='crypto', ouverts 24/7). Approximation volontairement
+    simple (pas de calcul DST minute-précis) : le filet de sécurité contre
+    une donnée figée reste validate_price_data (MAX_CANDLE_AGE_SECONDS) —
+    l'imprécision ici ne peut donc jamais causer un signal sur donnée
+    périmée, elle évite seulement des tentatives de scan inutiles (et le
+    bruit de logs associé) pendant que le marché est fermé. S'applique
+    QUELLE QUE SOIT la valeur de settings['session_mode'] : un marché
+    réellement fermé le reste, que le mode soit 'ny' ou '24h'."""
+    if asset.contract_type != "classic":
+        return False
+    now = datetime.now(timezone.utc)
+    weekday = now.weekday()  # lundi=0 ... dimanche=6
+    if weekday == 5:  # samedi : fermé toute la journée
+        return True
+    if weekday == 6 and now.hour < 21:  # dimanche avant ~21h UTC : pas encore rouvert
+        return True
+    if weekday == 4 and now.hour >= 21:  # vendredi après ~21h UTC : déjà fermé
+        return True
+    return False
+
+
 def is_session_open(asset_symbol: str) -> bool:
+    asset = ASSETS[asset_symbol]
+    if _classic_market_weekend_closed(asset):
+        return False
     settings = get_settings()
     if settings.get("session_mode") == "24h":
         return True
-    asset = ASSETS[asset_symbol]
     if asset.session_continuous:
         return True
     hour_utc = datetime.now(timezone.utc).hour
@@ -3232,7 +3280,7 @@ def process_asset(symbol: str):
     message = format_signal_message(
         symbol, asset.display_name, direction, ENTRY_TYPES[entry_type]["label"],
         get_stars(entry_type), entry_price, levels.stop_loss, levels.tp1,
-        levels.tp2, levels.rr_tp1, levels.rr_tp2 or 0,
+        levels.tp2, levels.rr_tp1, levels.rr_tp2 or 0, lot=lot,
     )
     leader_message = format_leader_signal_dm(
         symbol, asset.display_name, direction, ENTRY_TYPES[entry_type]["label"],
@@ -3248,8 +3296,8 @@ def process_asset(symbol: str):
     try:
         broadcast_signal(message, leader_text=leader_message, image_path=image_path, signal_id=signal_id,
                           symbol=symbol, entry_price=entry_price, stop_loss=levels.stop_loss)
-        log.info(f"[{symbol}] signal #{signal_id} publié ({direction}, {entry_type}) — "
-                 f"détail (lot={lot}, risque={risk_amount:.2f}$) envoyé uniquement en DM leader.")
+        log.info(f"[{symbol}] signal #{signal_id} publié ({direction}, {entry_type}, lot={lot}) — "
+                 f"détail (risque={risk_amount:.2f}$) envoyé uniquement en DM leader.")
     except Exception:
         log.error(f"[{symbol}] échec d'envoi Telegram pour le signal #{signal_id}:\n{traceback.format_exc()}")
 
@@ -4307,11 +4355,11 @@ if __name__ == "__main__":
 
     if not TELEGRAM_OWNER_ID:
         log.warning(
-            "TELEGRAM_OWNER_ID n'est pas défini : les commandes /capital /risque "
-            "/levier /profils et les boutons sous les signaux restent utilisables "
-            "par tout le monde dans les groupes Telegram. Définis cette variable "
-            "d'environnement (ton ID Telegram numérique, via @userinfobot) pour "
-            "restreindre l'accès à toi seul."
+            "TELEGRAM_OWNER_ID n'est pas défini : TOUTES les commandes réservées au "
+            "leader (/capital /risque /levier /profils /signaux, boutons sous les "
+            "signaux) et le DM privé (send_leader_dm) seront REFUSÉS/NON ENVOYÉS "
+            "tant que cette variable n'est pas définie (comportement fail-closed). "
+            "Définis-la (ton ID Telegram numérique, via @userinfobot) avant la prod."
         )
 
     port = int(os.environ.get("PORT", 5000))
@@ -4374,8 +4422,14 @@ if __name__ == "__main__":
 #        C'est le SEUL destinataire du DM privé (solde, risque, levier, lot,
 #        paramètres, suivi détaillé) et le seul autorisé à changer les
 #        réglages (/capital /risque /levier /profils /signaux, boutons
-#        ✅❌🟡🔒🔴). Sans elle, ces commandes restent ouvertes à tout le
-#        monde — y compris à n'importe qui DMant le bot.)
+#        ✅❌🟡🔒🔴). Sans elle : fail-closed -> TOUTES ces commandes sont
+#        REFUSÉES à tout le monde (personne, pas même toi, ne peut les
+#        utiliser) et le DM privé n'est envoyé à personne.
+#        ⚠️ Même une fois définie, Telegram exige que TU envoies d'abord UN
+#        message (ex. /help) en privé à ton bot AVANT qu'il puisse te DM en
+#        retour — un bot ne peut jamais initier une conversation privée.
+#        Sans ce premier message de ta part, send_leader_dm() échoue
+#        silencieusement (loggé "Échec d'envoi du DM leader", 403 Forbidden).
 #      SIGNAL_COOLDOWN_MINUTES (optionnel, défaut 15 — délai mini entre 2 signaux sur le même actif)
 #      MAX_CANDLE_AGE_SECONDS (optionnel, défaut 900 — âge max toléré de la dernière bougie
 #        avant de considérer la donnée de prix périmée -> NO SIGNAL)
@@ -4437,4 +4491,3 @@ if __name__ == "__main__":
 #                 {"command": "status", "description": "État du bot"},
 #                 {"command": "help", "description": "Liste des commandes"}
 #               ]}'
-
