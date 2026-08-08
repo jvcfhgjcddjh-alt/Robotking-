@@ -2113,7 +2113,7 @@ def format_signal_message(symbol, display_name, direction, entry_type_label, sta
     lines = [
         "📢 *ALPHABOT SMC PRO*", "",
         f"📊 *Actif* : {display_name} ({get_settings().get('timeframe', TIMEFRAME)})",
-        f"🎯 *Setup* : {entry_type_label} {stars}",
+        f"🎯 *Setup* : Sweep + CHoCH — {entry_type_label} {stars}",
         f"{direction_emoji}", "",
         f"🔹 *ENTRY* : `{entry:.5f}`",
         f"🛑 *SL* : `{sl:.5f}`",
@@ -2229,9 +2229,10 @@ def generate_signal_chart(symbol: str, display_name: str, direction: str,
                         color="#38bdf8", fontsize=10, fontweight="bold",
                         va="bottom" if direction == "SELL" else "top", ha="left")
 
-        # --- BOS confirmé 📈 ---
+        # --- CHoCH confirmé 📈 (structure cassée dans le sens INVERSE du
+        # sweep -> c'est un Change of Character, pas un BOS de continuation) ---
         ax.axhline(bos.break_level, color="#f59e0b", linestyle="--", linewidth=1.2, zorder=1)
-        ax.text(len(view) - 1, bos.break_level, "  📈 BOS confirmé", color="#f59e0b",
+        ax.text(len(view) - 1, bos.break_level, "  📈 CHoCH confirmé", color="#f59e0b",
                 fontsize=10, fontweight="bold", va="bottom", ha="left")
 
         # --- Zone d'entrée / SL / TP1 / TP2 ---
@@ -2429,8 +2430,9 @@ def send_leader_dm(text: str, image_path: Optional[str] = None):
         else:
             _tg_call(token, "sendMessage",
                      data={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}, timeout=10)
+        log.info(f"DM leader envoyé avec succès (chat_id={chat_id}).")
     except Exception:
-        log.warning(f"Échec d'envoi du DM leader:\n{traceback.format_exc()}")
+        log.warning(f"Échec d'envoi du DM leader (chat_id={chat_id}):\n{traceback.format_exc()}")
 
 
 def broadcast_signal(public_text: str, leader_text: Optional[str] = None,
@@ -3229,7 +3231,8 @@ def process_asset(symbol: str):
         else:
             log.info(f"[{symbol}] WAITING FOR BODY CLOSE SHIFT")
         return
-    log.info(f"[{symbol}] STRUCTURE SHIFT CONFIRMED BY BODY CLOSE — {bos.direction} @ niveau {bos.break_level}.")
+    log.info(f"[{symbol}] CHoCH CONFIRMED BY BODY CLOSE (Sweep + CHoCH, pas un simple BOS) — "
+             f"{bos.direction} @ niveau {bos.break_level}.")
 
     direction = "BUY" if bos.direction == "bullish" else "SELL"
     entry_price = candles[bos.break_index]["close"]
@@ -4472,13 +4475,12 @@ if __name__ == "__main__":
 #    changement, relance l'appel ci-dessus après déploiement pour basculer
 #    vers la nouvelle URL — sinon Telegram continue d'appeler l'ancienne
 #    route (qui n'existe plus) et les updates ne partent nulle part.
-# 6. Commandes Telegram natives — il n'y a que DEUX contextes : le groupe de
-#    signaux (public, lecture seule) et le DM du leader (privé, tout le reste) :
-#      Publiques (dans le groupe, tout le monde) : /stats
-#        /report [daily|weekly|monthly] /help
-#      Leader uniquement (réglages trading + profil privé, groupe ou DM) :
-#        /settings /profil /capital /risque /levier /session /timeframe
-#        /signaux <on|off> /profils /status /menu
+# 6. Commandes Telegram natives — il n'y a plus qu'UN SEUL contexte : le DM
+#    privé du leader (TELEGRAM_OWNER_ID). Il n'y a plus de groupe Telegram
+#    dans ce projet ; tout message reçu hors DM est ignoré :
+#      /stats /report [daily|weekly|monthly] /help
+#      /settings /profil /capital /risque /levier /session /timeframe
+#      /signaux <on|off> /profils /status /menu
 #    Pour que le menu "/" apparaisse dans Telegram, exécute UNE FOIS
 #    (optionnel, juste pour l'UI) :
 #      curl -X POST "https://api.telegram.org/bot<TOKEN>/setMyCommands" \
