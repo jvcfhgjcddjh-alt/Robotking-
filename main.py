@@ -1,5 +1,6 @@
 
 
+
 """
 ALPHABOT SMC PRO — FUSION (fichier unique, prêt à déployer sur Render)
 ========================================================================
@@ -114,6 +115,13 @@ class AssetConfig:
     #   BTCUSD : lot standard = 1 BTC (courant chez la plupart des brokers CFD)
     #            -> 1$ de mouvement = 1$/lot
     lot_value_per_point: float = 100.0
+    # Spread broker typique (en unités de PRIX, ex. 0.30 = 0.30$ pour XAUUSD,
+    # 8.0 = 8$ pour BTCUSD) — ajouté à la distance SL (ATR x 0.6) pour éviter
+    # qu'un SL basé sur l'ATR seul soit stoppé par le spread lui-même plutôt
+    # que par un vrai mouvement de marché. Ne remplace PAS ni ne modifie le
+    # calcul ATR x 0.6 (stratégie inchangée) : c'est un buffer ADDITIONNEL.
+    # Surchargeable par variable d'environnement (voir _default_spread ci-dessous).
+    typical_spread: float = 0.0
 
 
 ASSETS = {
@@ -122,18 +130,21 @@ ASSETS = {
         telegram_group="signal_group", session_continuous=False,
         session_start_utc=13, session_end_utc=22, contract_type="classic",
         fallback_data_source="yfinance", lot_value_per_point=100.0,
+        typical_spread=float(os.environ.get("SPREAD_XAUUSD", "0.30")),
     ),
     "BTCUSD": AssetConfig(
         symbol="BTCUSD", display_name="BTC/USD", data_source="binance",
         telegram_group="signal_group", session_continuous=False,
         session_start_utc=13, session_end_utc=22, contract_type="crypto",
         lot_value_per_point=1.0,
+        typical_spread=float(os.environ.get("SPREAD_BTCUSD", "8.0")),
     ),
     "XAGUSD": AssetConfig(
         symbol="XAGUSD", display_name="Silver (XAGUSD)", data_source="mt5_bridge",
         telegram_group="signal_group", session_continuous=False,
         session_start_utc=13, session_end_utc=22, contract_type="classic",
         fallback_data_source="yfinance", lot_value_per_point=5000.0,
+        typical_spread=float(os.environ.get("SPREAD_XAGUSD", "0.02")),
     ),
 }
 
@@ -149,7 +160,13 @@ SIGNAL_COOLDOWN_MINUTES = float(os.environ.get("SIGNAL_COOLDOWN_MINUTES", "15"))
 SIGNAL_COOLDOWN_SECONDS = SIGNAL_COOLDOWN_MINUTES * 60
 
 ATR_PERIOD = 14
-ATR_SL_MULTIPLIER = 0.6
+ATR_SL_MULTIPLIER = 0.6  # base du SL INCHANGÉE (stratégie ATR x 0.6 pure)
+# Buffer de spread AJOUTÉ par-dessus ATR x 0.6 (ne le remplace ni ne le
+# modifie) — évite qu'un SL basé sur l'ATR seul soit stoppé par le spread
+# lui-même. Valeur réelle = asset.typical_spread (par actif, voir ASSETS
+# plus haut, surchargeable via SPREAD_XAUUSD/SPREAD_BTCUSD/SPREAD_XAGUSD).
+# NB : ce buffer était défini mais jamais transmis à compute_levels() avant
+# ce correctif -> il valait 0.0 partout malgré ce flag à True.
 INCLUDE_SPREAD_COMMISSION_BUFFER = True
 
 # Nb max de bougies pour la reprise (reclaim) après le sweep — aligné sur
@@ -3258,7 +3275,8 @@ def process_asset(symbol: str):
         log.info(f"[{symbol}] FVG DETECTED — zone {fvg.bottom}-{fvg.top} ({fvg.direction}).")
     entry_type = "fvg_return" if fvg else "direct"
 
-    levels = compute_levels(entry_price, direction, sweep.sweep_wick_price, candles, swing_points)
+    levels = compute_levels(entry_price, direction, sweep.sweep_wick_price, candles, swing_points,
+                             spread_commission_buffer=asset.typical_spread)
 
     setup_key = f"{symbol}:{direction}:{round(sweep.swept_point.price, 5)}"
     if has_active_setup(setup_key):
@@ -4514,4 +4532,3 @@ if __name__ == "__main__":
 #                 {"command": "status", "description": "État du bot"},
 #                 {"command": "help", "description": "Liste des commandes"}
 #               ]}'
-
