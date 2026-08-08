@@ -22,18 +22,17 @@ BOS Corps de Bougie"), confirmée avec Pie :
   - Pas de score 0-100 : tout setup Sweep + CHoCH confirmé par clôture du
     corps de bougie est publié tel quel, sans filtre de qualité.
   - Lot recalculé à chaque signal à partir du risque choisi (mode $ fixe,
-    ex. 3$/10$, ou % du capital), de l'entrée et du Stop Loss — publié dans
-    le groupe avec le signal (à titre indicatif, calculé sur le capital du
-    LEADER — chaque abonné est invité à l'adapter au sien), et repris avec
-    le détail du risque $ dans le DM privé du leader.
-  - Diffusion Telegram sur DEUX canaux seulement :
-      1. le GROUPE DE SIGNAUX (public) : signal (ENTRY/SL/TP1/TP2/RR/Lot),
-         message de lancement au démarrage/redémarrage du bot, puis suivi
-         automatique (🥇 TP1 touché / 🥈 TP2 touché / ❌ SL touché) — jamais
-         de risque $, de solde ou de levier personnel.
-      2. le DM PRIVÉ DU LEADER (TELEGRAM_OWNER_ID, seul destinataire) :
-         solde, risque/trade, levier, lot calculé, paramètres, état
-         ACTIF/DÉSACTIVÉ, détail complet de chaque signal, et son suivi.
+    ex. 3$/10$, ou % du capital), de l'entrée et du Stop Loss.
+  - Diffusion Telegram 100% DM PRIVÉ DU LEADER (TELEGRAM_OWNER_ID, seul
+    destinataire) : signal complet (ENTRY/SL/TP1/TP2/RR/Lot), message de
+    lancement au démarrage/redémarrage, suivi automatique de chaque trade
+    (🥇 TP1 / 🥈 TP2 / ❌ SL / BE / sécurisation), rapport $ à la clôture,
+    solde, risque/trade, levier, paramètres, état ACTIF/DÉSACTIVÉ.
+    SIGNAL_BROADCAST_GROUPS et STARTUP_NOTIFY_GROUPS (plus bas dans ce
+    fichier) restent dans le code mais sont VIDES par défaut -> rien n'est
+    publié dans un groupe Telegram. Pour republier aussi dans un groupe
+    plus tard, il suffit d'y remettre "signal_group" ; tout le formatage
+    public (y compris le lot, avec son avertissement) est déjà prêt.
     Aucun système d'abonnés/tiers : pas de "groupe VIP", pas de diffusion à
     une liste d'utilisateurs — seulement ces deux canaux.
   - Suivi 100% automatique : dès qu'un signal est publié, le prix est
@@ -1167,7 +1166,8 @@ def _try_claim_report(report_type: str, period_key: str) -> bool:
 
 
 def _dispatch_report(message: str):
-    """Envoie sur TG_CHAT_REPORTS si configuré, sinon sur le groupe de signaux."""
+    """Envoie sur TG_CHAT_REPORTS si configuré, sinon en DM au leader (plus
+    aucun groupe Telegram dans ce projet)."""
     reports_env = TELEGRAM_GROUPS["reports"]["chat_id_env"]
     reports_chat_id = os.environ.get(reports_env)
     if reports_chat_id:
@@ -1183,9 +1183,9 @@ def _dispatch_report(message: str):
         except Exception:
             log.error(f"Échec d'envoi du rapport sur {reports_env}:\n{traceback.format_exc()}")
     try:
-        send_telegram_signal("signal_group", message)
+        send_leader_dm(message)
     except Exception:
-        log.error(f"Échec d'envoi du rapport sur le groupe 'signal_group':\n{traceback.format_exc()}")
+        log.error(f"Échec d'envoi du rapport en DM leader:\n{traceback.format_exc()}")
 
 
 def _maybe_append_promo(message: str, now: datetime) -> str:
@@ -2328,7 +2328,7 @@ def send_telegram_signal(group: str, text: str, image_path: str = None, signal_i
 # bot est bien en ligne (et pas seulement silencieusement en train de tourner
 # côté serveur). Si le redémarrage a été forcé par le watchdog, le message le
 # précise avec la raison, pour distinguer un déploiement normal d'un incident.
-STARTUP_NOTIFY_GROUPS = ("signal_group",)  # groupe(s) Telegram avertis à chaque lancement/redémarrage du process, en plus du DM leader (voir send_startup_notification)
+STARTUP_NOTIFY_GROUPS = ()  # vide -> DM leader UNIQUEMENT (voir send_startup_notification) ; remettre "signal_group" ici pour avertir aussi un groupe au lancement/redémarrage
 
 
 def format_startup_message() -> str:
@@ -2353,14 +2353,14 @@ def format_startup_message() -> str:
 
 
 def send_startup_notification():
-    """Notifie que le bot est démarré/redémarré : en DM au leader
-    (TELEGRAM_OWNER_ID) ET dans le(s) groupe(s) listés dans
-    STARTUP_NOTIFY_GROUPS, pour que tu le saches immédiatement sur Telegram,
-    toi comme le groupe. Le message ne contient aucune donnée personnelle
-    (pas de lot, de risque $, de solde ou de levier) : il peut donc être
-    publié tel quel dans le groupe public. Chaque canal est indépendant et
-    best-effort : une erreur (token manquant, réseau...) est loggée mais ne
-    doit jamais empêcher le bot de démarrer/scanner, ni bloquer les autres canaux."""
+    """Notifie en DM le leader (TELEGRAM_OWNER_ID) que le bot est
+    démarré/redémarré. STARTUP_NOTIFY_GROUPS est vide par défaut : aucun
+    groupe n'est averti. Pour avertir aussi un groupe, y remettre
+    "signal_group" — le message ne contient aucune donnée personnelle (pas
+    de lot, de risque $, de solde ou de levier), il peut donc être publié
+    tel quel. Chaque canal est indépendant et best-effort : une erreur
+    (token manquant, réseau...) est loggée mais ne doit jamais empêcher le
+    bot de démarrer/scanner, ni bloquer les autres canaux."""
     text = format_startup_message()
     send_leader_dm(text)
     for group in STARTUP_NOTIFY_GROUPS:
@@ -2392,16 +2392,16 @@ def _telegram_edit_reply_markup(group: str, chat_id, message_id: int, reply_mark
 
 
 # ----------------------------------------------------------------------
-# Diffusion — il n'existe que DEUX destinataires dans tout le projet :
-#   1. le groupe de signaux (SIGNAL_BROADCAST_GROUPS) : contenu public
-#      (signal, TP1, TP2, SL, lot indicatif) + message de lancement du bot.
-#      JAMAIS de risque $, de solde ou de levier personnel.
-#   2. le DM privé du leader (send_leader_dm, TELEGRAM_OWNER_ID) : seul
-#      canal recevant les données strictement personnelles (solde, risque $,
-#      levier, paramètres, suivi détaillé). Chaque canal est indépendant et
-#      best-effort : l'échec de l'un ne bloque jamais l'autre.
+# Diffusion — DM PRIVÉ DU LEADER UNIQUEMENT (send_leader_dm, TELEGRAM_OWNER_ID).
+# SIGNAL_BROADCAST_GROUPS est VIDE : plus aucun signal ni suivi de trade
+# n'est publié dans un groupe Telegram, tout part exclusivement en DM au
+# leader (solde, risque $, levier, lot, paramètres, suivi détaillé). Pour
+# republier aussi dans un groupe : remettre "signal_group" dans le tuple
+# ci-dessous — le texte public (SANS risque $/solde/levier, avec lot
+# indicatif) est déjà généré par format_signal_message, rien d'autre à
+# modifier.
 # ----------------------------------------------------------------------
-SIGNAL_BROADCAST_GROUPS = ("signal_group",)
+SIGNAL_BROADCAST_GROUPS = ()
 
 
 def send_leader_dm(text: str, image_path: Optional[str] = None):
@@ -2437,11 +2437,11 @@ def broadcast_signal(public_text: str, leader_text: Optional[str] = None,
                       image_path: Optional[str] = None, signal_id: Optional[int] = None,
                       symbol: Optional[str] = None, entry_price: Optional[float] = None,
                       stop_loss: Optional[float] = None):
-    """Publie `public_text` (signal + lot indicatif, SANS risque $/solde/
-    levier) sur le groupe de signaux, puis — si fourni — envoie
-    `leader_text` (détail complet : lot, risque, solde, levier, paramètres)
-    exclusivement en DM au leader. Les deux canaux sont indépendants
-    (best-effort)."""
+    """Publie `public_text` sur le(s) groupe(s) listés dans
+    SIGNAL_BROADCAST_GROUPS (vide par défaut -> rien n'est publié dans un
+    groupe), puis — si fourni — envoie `leader_text` (détail complet : lot,
+    risque, solde, levier, paramètres) exclusivement en DM au leader. Les
+    deux canaux sont indépendants (best-effort)."""
     for group in SIGNAL_BROADCAST_GROUPS:
         try:
             send_telegram_signal(group, public_text, image_path=image_path, signal_id=signal_id)
@@ -2543,8 +2543,10 @@ def format_trade_closed_report(row: sqlite3.Row) -> Optional[str]:
 def notify_trade_event(signal_id: int, status: str):
     """Suivi 100% automatique (déclenché par monitor_open_signals à chaque
     scan de prix — aucun clic 'j'ai pris le trade' n'est nécessaire) :
-      - alerte COURTE et publique sur le groupe de signaux (statut uniquement) ;
-      - rapport COMPLET (résultat $, cumul du jour) exclusivement en DM leader.
+      - alerte courte publiée sur SIGNAL_BROADCAST_GROUPS si non vide
+        (vide par défaut -> aucun groupe averti) ;
+      - le leader, lui, reçoit TOUJOURS en DM l'alerte, plus le rapport
+        complet (résultat $, cumul du jour) pour les statuts terminaux.
     Ne fait rien si le statut n'a pas d'alerte dédiée (ex: 'taken', 'ignored')."""
     row = get_signal(signal_id)
     if not row:
@@ -2805,10 +2807,10 @@ _LEADER_ONLY_COMMANDS = (
 
 
 def _handle_telegram_command(message: Dict, group: str):
-    """Il n'y a que deux contextes possibles ici : un message dans le groupe
-    de signaux (ouvert à tous en lecture : /stats /report /help), ou un DM
-    avec le bot — et en DM, seul le leader (TELEGRAM_OWNER_ID) est reconnu ;
-    il n'existe pas d'autre abonné privé dans ce projet."""
+    """Plus de groupe Telegram dans ce projet : tout se passe exclusivement
+    en DM privé avec le bot, et en DM seul le leader (TELEGRAM_OWNER_ID) est
+    reconnu ; il n'existe pas d'autre abonné privé. Tout message reçu hors
+    DM (groupe, canal...) est ignoré silencieusement."""
     chat = message.get("chat") or {}
     chat_id = chat.get("id")
     is_private = chat.get("type") == "private"
@@ -2817,14 +2819,8 @@ def _handle_telegram_command(message: Dict, group: str):
         return
 
     if not is_private:
-        # message de groupe : on vérifie qu'il vient bien du chat configuré
-        # pour ce bot (et pas d'un autre groupe où le bot aurait été ajouté
-        # par erreur).
-        try:
-            if str(_chat_id_for_group(group)) != str(chat_id):
-                return
-        except RuntimeError:
-            return
+        # Plus de groupe : un message reçu hors DM est simplement ignoré.
+        return
 
     parts = text.split()
     cmd = parts[0].lower().split("@")[0]  # tolère "/settings@NomDuBot"
@@ -3296,8 +3292,8 @@ def process_asset(symbol: str):
     try:
         broadcast_signal(message, leader_text=leader_message, image_path=image_path, signal_id=signal_id,
                           symbol=symbol, entry_price=entry_price, stop_loss=levels.stop_loss)
-        log.info(f"[{symbol}] signal #{signal_id} publié ({direction}, {entry_type}, lot={lot}) — "
-                 f"détail (risque={risk_amount:.2f}$) envoyé uniquement en DM leader.")
+        log.info(f"[{symbol}] signal #{signal_id} (direction={direction}, {entry_type}, lot={lot}, "
+                 f"risque={risk_amount:.2f}$) envoyé en DM leader (SIGNAL_BROADCAST_GROUPS vide -> aucun groupe averti).")
     except Exception:
         log.error(f"[{symbol}] échec d'envoi Telegram pour le signal #{signal_id}:\n{traceback.format_exc()}")
 
@@ -3540,19 +3536,28 @@ def backup_database() -> Optional[str]:
     log.info(f"Sauvegarde de la base créée : {path}")
 
     if BACKUP_SEND_TO_TELEGRAM:
+        # Plus de groupe Telegram : la sauvegarde part sur TG_CHAT_REPORTS si
+        # configuré, sinon en DM au leader (TELEGRAM_OWNER_ID).
         try:
-            group = "reports" if os.environ.get("TG_CHAT_REPORTS") else "signal_group"
-            token = _bot_token(group)
-            chat_id = _chat_id_for_group(group)
-            with open(path, "rb") as f:
-                requests.post(
-                    TELEGRAM_API.format(token=token, method="sendDocument"),
-                    data={"chat_id": chat_id, "caption": f"💾 Sauvegarde DB — {ts}"},
-                    files={"document": (filename, f)},
-                    timeout=30,
-                )
+            reports_chat_id = os.environ.get("TG_CHAT_REPORTS")
+            if reports_chat_id:
+                token = _bot_token("reports")
+                chat_id = reports_chat_id
+            elif TELEGRAM_OWNER_ID:
+                token = _bot_token("signal_group")
+                chat_id = str(TELEGRAM_OWNER_ID)
+            else:
+                token = chat_id = None
+            if token and chat_id:
+                with open(path, "rb") as f:
+                    requests.post(
+                        TELEGRAM_API.format(token=token, method="sendDocument"),
+                        data={"chat_id": chat_id, "caption": f"💾 Sauvegarde DB — {ts}"},
+                        files={"document": (filename, f)},
+                        timeout=30,
+                    )
         except RuntimeError:
-            pass  # groupe non configuré -> ignoré silencieusement (best-effort)
+            pass  # bot non configuré -> ignoré silencieusement (best-effort)
         except Exception:
             log.warning(f"Échec d'envoi de la sauvegarde sur Telegram (best-effort):\n{traceback.format_exc()}")
 
