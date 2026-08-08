@@ -1,6 +1,5 @@
 
 
-
 """
 ALPHABOT SMC PRO — FUSION (fichier unique, prêt à déployer sur Render)
 ========================================================================
@@ -65,6 +64,7 @@ BOS Corps de Bougie"), confirmée avec Pie :
 """
 
 import os
+import sys
 import time
 import json
 import sqlite3
@@ -2150,7 +2150,7 @@ def format_leader_signal_dm(symbol, display_name, direction, entry_type_label, s
         f"💰 Risque : {risk_amount:.2f}$",
         f"📦 Lot : {lot}",
         f"⚡ Levier : {s.get('leverage', 0):.0f}x",
-        f"🎯 Setup : {entry_type_label} {stars}",
+        f"🎯 Setup : Sweep + CHoCH — {entry_type_label} {stars}",
         "", f"🕒 {ts}",
     ]
     return "\n".join(lines)
@@ -2219,39 +2219,43 @@ def generate_signal_chart(symbol: str, display_name: str, direction: str,
             ax.add_patch(Rectangle((i - 0.3, body_bottom), 0.6, body_height,
                                     facecolor=color, edgecolor=color, zorder=3))
 
-        # --- Sweep de liquidité 💧 ---
+        # --- Sweep de liquidité --------------------------------------------
+        # NB : pas d'emoji dans le texte matplotlib (title/text/annotate) —
+        # le rendu d'emoji couleur via fallback de polices a provoqué un
+        # RecursionError (copy.deepcopy sur des Path très imbriqués côté
+        # matplotlib/Python 3.14) qui a fait planter la génération d'image.
         sweep_i = sweep.sweep_index - offset
         if 0 <= sweep_i < len(view):
             ax.scatter([sweep_i], [sweep.sweep_wick_price], color="#38bdf8", s=90,
                        marker="D", zorder=5, edgecolors="white", linewidths=0.8)
-            ax.annotate("💧 Liquidity Sweep", xy=(sweep_i, sweep.sweep_wick_price),
+            ax.annotate("SWEEP", xy=(sweep_i, sweep.sweep_wick_price),
                         xytext=(sweep_i, sweep.sweep_wick_price), textcoords="data",
                         color="#38bdf8", fontsize=10, fontweight="bold",
                         va="bottom" if direction == "SELL" else "top", ha="left")
 
-        # --- CHoCH confirmé 📈 (structure cassée dans le sens INVERSE du
-        # sweep -> c'est un Change of Character, pas un BOS de continuation) ---
+        # --- CHoCH confirmé (structure cassée dans le sens INVERSE du sweep
+        # -> c'est un Change of Character, pas un BOS de continuation) ------
         ax.axhline(bos.break_level, color="#f59e0b", linestyle="--", linewidth=1.2, zorder=1)
-        ax.text(len(view) - 1, bos.break_level, "  📈 CHoCH confirmé", color="#f59e0b",
+        ax.text(len(view) - 1, bos.break_level, "  CHoCH confirme", color="#f59e0b",
                 fontsize=10, fontweight="bold", va="bottom", ha="left")
 
         # --- Zone d'entrée / SL / TP1 / TP2 ---
-        entry_emoji = "🟢 BUY" if direction == "BUY" else "🔴 SELL"
+        entry_emoji = "BUY" if direction == "BUY" else "SELL"
         ax.axhline(entry, color="#3b82f6", linewidth=1.4, zorder=1)
-        ax.text(len(view) - 1, entry, f"  {entry_emoji}  Entrée {entry:.5f}", color="#3b82f6",
+        ax.text(len(view) - 1, entry, f"  {entry_emoji}  Entree {entry:.5f}", color="#3b82f6",
                 fontsize=10, fontweight="bold", va="center", ha="left")
 
         ax.axhline(sl, color="#ef4444", linewidth=1.4, zorder=1)
-        ax.text(len(view) - 1, sl, f"  🛑 SL {sl:.5f}", color="#ef4444",
+        ax.text(len(view) - 1, sl, f"  SL {sl:.5f}", color="#ef4444",
                 fontsize=10, fontweight="bold", va="center", ha="left")
 
         ax.axhline(tp1, color="#22c55e", linewidth=1.4, zorder=1)
-        ax.text(len(view) - 1, tp1, f"  🎯 TP1 {tp1:.5f}", color="#22c55e",
+        ax.text(len(view) - 1, tp1, f"  TP1 {tp1:.5f}", color="#22c55e",
                 fontsize=10, fontweight="bold", va="center", ha="left")
 
         if tp2:
             ax.axhline(tp2, color="#a855f7", linewidth=1.4, linestyle=":", zorder=1)
-            label = f"  🚀 TP2 {tp2:.5f}" + (f" ({tp2_source})" if tp2_source else "")
+            label = f"  TP2 {tp2:.5f}" + (f" ({tp2_source})" if tp2_source else "")
             ax.text(len(view) - 1, tp2, label, color="#a855f7",
                     fontsize=10, fontweight="bold", va="center", ha="left")
 
@@ -2262,8 +2266,8 @@ def generate_signal_chart(symbol: str, display_name: str, direction: str,
         ax.set_xticks([])
         ax.grid(axis="y", color="#262e42", linewidth=0.5, alpha=0.5)
 
-        title_emoji = "🟢 BUY" if direction == "BUY" else "🔴 SELL"
-        ax.set_title(f"⚡ ALPHABOT SMC PRO — {display_name} ({get_settings().get('timeframe', TIMEFRAME)})  ·  {title_emoji}",
+        title_emoji = "BUY" if direction == "BUY" else "SELL"
+        ax.set_title(f"ALPHABOT SMC PRO — {display_name} ({get_settings().get('timeframe', TIMEFRAME)})  ·  {title_emoji}",
                      color="#e8ecf4", fontsize=13, fontweight="bold", loc="left", pad=14)
 
         fname = f"{symbol}_{signal_id or int(time.time())}_{int(time.time())}.png"
@@ -2273,6 +2277,18 @@ def generate_signal_chart(symbol: str, display_name: str, direction: str,
         plt.close(fig)
         _cleanup_old_charts()
         return path
+    except RecursionError:
+        # Garde-fou : évite que traceback.format_exc() (lui-même récursif)
+        # ne replante en cascade si la limite de récursion vient d'être
+        # atteinte pendant le rendu matplotlib (ex. emoji + fallback de
+        # polices sur certains environnements) — log court, pas de trace.
+        log.error(f"[{symbol}] échec de génération de l'image du signal : RecursionError "
+                  "(rendu matplotlib) — signal envoyé en texte seul.")
+        try:
+            plt.close("all")
+        except Exception:
+            pass
+        return None
     except Exception:
         log.error(f"[{symbol}] échec de génération de l'image du signal:\n{traceback.format_exc()}")
         try:
@@ -4498,3 +4514,4 @@ if __name__ == "__main__":
 #                 {"command": "status", "description": "État du bot"},
 #                 {"command": "help", "description": "Liste des commandes"}
 #               ]}'
+
