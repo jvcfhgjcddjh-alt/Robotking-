@@ -21,13 +21,22 @@ BOS Corps de Bougie"), confirmée avec Pie :
   - Pas de score 0-100 : tout setup Sweep + CHoCH confirmé par clôture du
     corps de bougie est publié tel quel, sans filtre de qualité.
   - Lot recalculé à chaque signal à partir du risque choisi (mode $ fixe,
-    ex. 3$/10$, ou % du capital), de l'entrée et du Stop Loss — affiché
-    directement dans le message Telegram.
-  - Diffusion Telegram sur un groupe FREE et, si configuré, un groupe VIP
-    (contenu strictement identique sur les deux), chacun via son propre bot.
-    Diffusion privée (DM) en plus, vers les abonnés activés manuellement par
-    l'admin (/addsub) — commandes /start /stop /mute /unmute /stats /report
-    côté abonné, panneau complet côté admin (/admin, /addsub, /promote...).
+    ex. 3$/10$, ou % du capital), de l'entrée et du Stop Loss — visible
+    UNIQUEMENT dans le DM privé du leader (jamais dans le groupe public).
+  - Diffusion Telegram sur DEUX canaux seulement :
+      1. le GROUPE DE SIGNAUX (public) : signal (ENTRY/SL/TP1/TP2/RR) puis
+         suivi automatique (🥇 TP1 touché / 🥈 TP2 touché / ❌ SL touché) —
+         jamais de lot, de risque $, de solde ou de levier personnel.
+      2. le DM PRIVÉ DU LEADER (TELEGRAM_OWNER_ID, seul destinataire) :
+         solde, risque/trade, levier, lot calculé, paramètres, état
+         ACTIF/DÉSACTIVÉ, détail complet de chaque signal, et son suivi.
+    Aucun système d'abonnés/tiers : pas de "groupe VIP", pas de diffusion à
+    une liste d'utilisateurs — seulement ces deux canaux.
+  - Suivi 100% automatique : dès qu'un signal est publié, le prix est
+    surveillé en continu (monitor_open_signals) pour détecter TP1/TP2/SL —
+    aucun clic "j'ai pris le trade" n'est nécessaire pour que le suivi
+    fonctionne (les boutons Telegram restent disponibles en plus, pour un
+    reporting manuel optionnel de ce qui a été réellement fait du trade).
   - Dashboard Flask : capital/levier/risque/lot, stats, profils de risque,
     statut des trades (pris/ignoré/clôturé), endpoint /health pour Render.
   - Persistance SQLite : historique complet, anti-doublon, cap quotidien de signaux.
@@ -84,7 +93,7 @@ class AssetConfig:
     symbol: str
     display_name: str
     data_source: str            # "mt5_bridge" | "twelvedata" | "yfinance" | "binance"
-    telegram_group: str         # "btc_gold"
+    telegram_group: str         # "signal_group"
     session_continuous: bool
     session_start_utc: Optional[int] = None
     session_end_utc: Optional[int] = None
@@ -107,21 +116,21 @@ class AssetConfig:
 ASSETS = {
     "XAUUSD": AssetConfig(
         symbol="XAUUSD", display_name="Gold (XAUUSD)", data_source="mt5_bridge",
-        telegram_group="btc_gold", session_continuous=False,
+        telegram_group="signal_group", session_continuous=False,
         session_start_utc=13, session_end_utc=22, contract_type="classic",
         fallback_data_source="yfinance", lot_value_per_point=100.0,
     ),
     "BTCUSD": AssetConfig(
         symbol="BTCUSD", display_name="BTC/USD", data_source="binance",
-        telegram_group="btc_gold", session_continuous=False,
+        telegram_group="signal_group", session_continuous=False,
         session_start_utc=13, session_end_utc=22, contract_type="crypto",
         lot_value_per_point=1.0,
     ),
     "XAGUSD": AssetConfig(
-        symbol="XAGUSD", display_name="Silver (XAGUSD)", data_source="yfinance",
-        telegram_group="btc_gold", session_continuous=False,
+        symbol="XAGUSD", display_name="Silver (XAGUSD)", data_source="mt5_bridge",
+        telegram_group="signal_group", session_continuous=False,
         session_start_utc=13, session_end_utc=22, contract_type="classic",
-        lot_value_per_point=5000.0,
+        fallback_data_source="yfinance", lot_value_per_point=5000.0,
     ),
 }
 
@@ -152,6 +161,19 @@ SECURE_TRIGGER_RR = 2.0
 TP1_RR = 3.0
 TP2_RR = 6.0
 
+# Statuts TERMINAUX d'un signal : plus aucun suivi de prix ni action
+# possible. Source unique de vérité réutilisée PARTOUT (index SQL partiel,
+# has_active_setup, update_status, monitor_open_signals, rapports) pour
+# qu'un nouveau statut terminal ajouté un jour ne puisse pas être oublié
+# dans un seul de ces endroits.
+#   - "closed"        : clôture manuelle (bouton/dashboard) sans résultat R calculable.
+#   - "invalidated"    : SL touché (perte totale, -1R).
+#   - "tp2_hit"        : objectif final atteint (+RR2, trade terminé).
+#   - "tp1_sl_hit"     : SL initial retouché APRÈS que TP1 a déjà été sécurisé
+#                        -> resultat = +RR_TP1 (pas une perte totale, TP1 est déjà en poche).
+#   - "ignored"        : le leader a explicitement ignoré ce trade (bouton "Trade ignoré").
+TERMINAL_STATUSES = ("closed", "invalidated", "tp2_hit", "tp1_sl_hit", "ignored")
+
 ENTRY_TYPES = {
     "direct": {"stars": "★★", "label": "Entrée directe"},
     "fvg_return": {"stars": "★★★", "label": "Retour Imbalance (FVG)"},
@@ -160,51 +182,45 @@ ENTRY_TYPES = {
 MAX_SIGNALS_PER_DAY_GLOBAL = 3
 MAX_SIGNALS_PER_DAY_PER_ASSET = 2
 
-# ⚠️ SÉCURITÉ — valeurs par défaut codées en dur à la demande explicite du
-# porteur du projet (tokens/chat IDs communiqués en clair dans la conversation
-# de configuration). Ces valeurs sont utilisées UNIQUEMENT si la variable
-# d'environnement correspondante n'est pas définie sur Render — donc si tu
-# régénères un token plus tard, définis simplement la variable d'env
-# correspondante et elle prendra le dessus automatiquement, sans toucher au
-# code. Recommandé : régénère ces tokens via @BotFather dès que possible
-# puisqu'ils ont transité en clair dans un chat, puis passe par les
-# variables d'environnement Render au lieu de ce fallback.
-_DEFAULT_TG_CHAT_BTC_GOLD = "-1002335466840"
-_DEFAULT_TG_TOKEN_BTC_GOLD = "6950706659:AAFxJFP2DhAlTbFF6Ve5uylypPkMGKRecIE"
+# ⚠️ SÉCURITÉ — valeur par défaut codée en dur à la demande explicite du
+# porteur du projet (token/chat ID communiqués en clair dans la conversation
+# de configuration). Utilisée UNIQUEMENT si la variable d'environnement
+# correspondante n'est pas définie sur Render — définis TELEGRAM_BOT_TOKEN_SIGNAL
+# / TG_CHAT_SIGNAL sur Render pour prendre le dessus sans toucher au code.
+# Recommandé : régénère ce token via @BotFather dès que possible puisqu'il a
+# transité en clair dans un chat, puis passe par les variables d'environnement.
+_DEFAULT_TG_CHAT_SIGNAL = "-1002335466840"
+_DEFAULT_TG_TOKEN_SIGNAL = "6950706659:AAFxJFP2DhAlTbFF6Ve5uylypPkMGKRecIE"
 
+# --- Canaux Telegram : il n'y en a que DEUX dans ce projet -----------------
+#   1. "signal_group"  : le groupe public de diffusion des signaux (XAUUSD,
+#      XAGUSD, BTCUSD). Contenu STRICTEMENT public : signal + TP1/TP2/SL.
+#      Aucune donnée personnelle (lot, risque $, solde, levier) n'y est
+#      jamais publiée.
+#   2. "reports"       : canal optionnel pour les rapports auto (journalier/
+#      hebdo/mensuel) ; si TG_CHAT_REPORTS n'est pas défini, les rapports
+#      sont envoyés sur "signal_group" à la place.
+# Le DM privé du leader (paramètres, lot, risque, solde, levier, suivi
+# détaillé) n'est PAS un "groupe" : c'est un message privé envoyé au seul
+# TELEGRAM_OWNER_ID via le bot du groupe de signaux (voir send_leader_dm()).
 TELEGRAM_GROUPS = {
-    # Groupe FREE : BTC/USD + XAU/USD (Gold) — bot dédié, groupe public/gratuit.
-    "btc_gold": {
-        "token_env": "TELEGRAM_BOT_TOKEN_BTC_GOLD",
-        "chat_id_env": "TG_CHAT_BTC_GOLD",
+    "signal_group": {
+        "token_env": "TELEGRAM_BOT_TOKEN_SIGNAL",
+        "chat_id_env": "TG_CHAT_SIGNAL",
         "assets": ["XAUUSD", "BTCUSD", "XAGUSD"],
-        "token_default": _DEFAULT_TG_TOKEN_BTC_GOLD,
-        "chat_id_default": _DEFAULT_TG_CHAT_BTC_GOLD,
-    },
-    # Groupe VIP : contenu strictement identique au groupe FREE (mêmes
-    # signaux, même contenu, même instant) — la seule différence est l'accès
-    # au groupe Telegram lui-même (privé, membres ajoutés manuellement par
-    # l'admin). Bot dédié obligatoire : nécessaire pour son propre webhook
-    # (boutons ✅❌🟡🔒🔴 utilisables aussi dans ce groupe) et pour pouvoir DM
-    # les abonnés VIP qui auraient fait /start avec CE bot. Pas de valeur par
-    # défaut codée en dur ici (contrairement à btc_gold, legacy) : tant que
-    # TELEGRAM_BOT_TOKEN_VIP_GOLD / TG_CHAT_VIP_GOLD ne sont pas définies, le
-    # groupe VIP est simplement ignoré partout (best-effort), sans erreur bloquante.
-    "vip_gold": {
-        "token_env": "TELEGRAM_BOT_TOKEN_VIP_GOLD",
-        "chat_id_env": "TG_CHAT_VIP_GOLD",
-        "assets": ["XAUUSD", "BTCUSD", "XAGUSD"],
+        "token_default": _DEFAULT_TG_TOKEN_SIGNAL,
+        "chat_id_default": _DEFAULT_TG_CHAT_SIGNAL,
     },
     # Optionnel : si TG_CHAT_REPORTS n'est pas défini, les rapports sont
-    # envoyés sur le groupe FREE à la place. TELEGRAM_BOT_TOKEN_REPORTS
-    # est optionnel ; à défaut, le token du groupe "btc_gold" est réutilisé pour ce canal.
+    # envoyés sur "signal_group" à la place. TELEGRAM_BOT_TOKEN_REPORTS est
+    # optionnel ; à défaut, le token de "signal_group" est réutilisé.
     "reports": {"token_env": "TELEGRAM_BOT_TOKEN_REPORTS", "chat_id_env": "TG_CHAT_REPORTS", "assets": []},
 }
 
 
 def enforce_group_asset_whitelist():
     """Vérifie au démarrage que chaque actif n'est routé QUE vers le groupe
-    Telegram autorisé pour lui (BTC/XAU -> btc_gold).
+    Telegram autorisé pour lui (XAUUSD/XAGUSD/BTCUSD -> signal_group).
     Lève une erreur explicite si la config a été modifiée de façon incohérente."""
     for symbol, asset in ASSETS.items():
         allowed = TELEGRAM_GROUPS.get(asset.telegram_group, {}).get("assets", [])
@@ -392,7 +408,7 @@ CREATE TABLE IF NOT EXISTS signals (
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_active_setup
     ON signals(setup_key)
-    WHERE status NOT IN ('closed', 'invalidated', 'tp2_hit');
+    WHERE status NOT IN ('closed', 'invalidated', 'tp2_hit', 'tp1_sl_hit', 'ignored');
 
 CREATE TABLE IF NOT EXISTS daily_counters (
     day TEXT NOT NULL,
@@ -452,29 +468,9 @@ CREATE TABLE IF NOT EXISTS watchdog_heartbeat (
     last_restart_reason TEXT
 );
 
--- Abonnés à la diffusion privée (DM). Ajout/activation UNIQUEMENT par
--- l'administrateur (/addsub) — /start ne fait qu'enregistrer le chat_id en
--- statut 'pending', il ne donne accès à rien tant que l'admin n'a pas validé.
--- source_bot mémorise quel bot (btc_gold / vip_gold) l'utilisateur a
--- démarré : Telegram n'autorise un bot à DM un utilisateur QUE si celui-ci a
--- fait /start avec CE bot précis, donc c'est ce bot-là qui doit être réutilisé
--- pour toute diffusion privée ultérieure vers cet abonné.
-CREATE TABLE IF NOT EXISTS subscribers (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    chat_id TEXT NOT NULL UNIQUE,
-    username TEXT,
-    first_name TEXT,
-    source_bot TEXT NOT NULL DEFAULT 'btc_gold',
-    tier TEXT NOT NULL DEFAULT 'pending',      -- 'pending' | 'free' | 'vip'
-    status TEXT NOT NULL DEFAULT 'pending',    -- 'pending' | 'active' | 'stopped' | 'banned'
-    notify_signals INTEGER NOT NULL DEFAULT 1,
-    notify_tp_sl_be INTEGER NOT NULL DEFAULT 1,
-    created_at REAL NOT NULL,
-    updated_at REAL NOT NULL,
-    last_seen_at REAL
-);
-
-CREATE INDEX IF NOT EXISTS idx_subscribers_tier_status ON subscribers(tier, status);
+-- (Le projet n'a que DEUX canaux : le groupe de signaux public, et le DM
+-- privé du seul propriétaire du bot — TELEGRAM_OWNER_ID. Il n'existe pas de
+-- système d'abonnés multiples/tiers : aucune table n'est nécessaire pour ça.)
 """
 
 
@@ -508,6 +504,7 @@ DEFAULT_SETTINGS = {
     "max_open_positions": 3,                 # nombre maximum de positions ouvertes simultanées
     "session_mode": "ny",                    # "ny" (13h-22h UTC) | "24h" (scan en continu)
     "timeframe": TIMEFRAME,                  # "M1" (scalping) | "M5" (par défaut)
+    "signals_enabled": True,                 # état ACTIF/DÉSACTIVÉ affiché dans le profil du leader (/signaux)
 }
 
 VALID_RISK_UNITS = {"dollar", "percent"}
@@ -615,6 +612,7 @@ def update_settings(patch: Dict) -> Dict:
         "max_open_positions": (int, lambda v: v >= 1),
         "session_mode": (str, lambda v: v in VALID_SESSION_MODES),
         "timeframe": (lambda v: str(v).upper(), lambda v: v in VALID_TIMEFRAMES),
+        "signals_enabled": (bool, lambda v: True),
     }
 
     for key, raw_value in patch.items():
@@ -782,9 +780,9 @@ def activate_profile(profile_id: int) -> Dict:
 def has_active_setup(setup_key: str) -> bool:
     with get_conn() as conn:
         row = conn.execute(
-            "SELECT 1 FROM signals WHERE setup_key = ? "
-            "AND status NOT IN ('closed', 'invalidated', 'tp2_hit') LIMIT 1",
-            (setup_key,),
+            f"SELECT 1 FROM signals WHERE setup_key = ? "
+            f"AND status NOT IN ({','.join('?' for _ in TERMINAL_STATUSES)}) LIMIT 1",
+            (setup_key, *TERMINAL_STATUSES),
         ).fetchone()
         return row is not None
 
@@ -823,7 +821,7 @@ def insert_signal(symbol, setup_key, direction, entry_type, stars, score,
 
 def update_status(signal_id: int, status: str):
     now = time.time()
-    closed = now if status in ("closed", "invalidated", "tp2_hit") else None
+    closed = now if status in TERMINAL_STATUSES else None
     with get_conn() as conn:
         conn.execute(
             "UPDATE signals SET status=?, updated_at=?, closed_at=COALESCE(?, closed_at) WHERE id=?",
@@ -869,150 +867,6 @@ def get_trade_actions(signal_id: int) -> List[sqlite3.Row]:
         ).fetchall()
 
 
-# ----------------------------------------------------------------------
-# Abonnés (diffusion privée en DM) — /start enregistre en 'pending',
-# SEUL un admin (/addsub) peut faire passer un abonné en 'active'
-# (tier 'free' ou 'vip'). Pas d'auto-inscription possible.
-# ----------------------------------------------------------------------
-
-def get_subscriber(chat_id) -> Optional[sqlite3.Row]:
-    with get_conn() as conn:
-        return conn.execute("SELECT * FROM subscribers WHERE chat_id=?", (str(chat_id),)).fetchone()
-
-
-def upsert_subscriber_start(chat_id, username: Optional[str], first_name: Optional[str],
-                             source_bot: str) -> sqlite3.Row:
-    """Appelé sur /start en DM. Crée l'abonné en statut 'pending' s'il n'existe
-    pas encore ; sinon met seulement à jour username/first_name/last_seen_at,
-    SANS jamais toucher au tier/status déjà attribués par un admin (donc /start
-    répété par un abonné déjà actif ne le rétrograde jamais)."""
-    now = time.time()
-    with get_conn() as conn:
-        row = conn.execute("SELECT * FROM subscribers WHERE chat_id=?", (str(chat_id),)).fetchone()
-        if row is None:
-            conn.execute(
-                """INSERT INTO subscribers (chat_id, username, first_name, source_bot, tier, status,
-                   created_at, updated_at, last_seen_at, notify_signals, notify_tp_sl_be)
-                   VALUES (?,?,?,?,?,?,?,?,?,1,1)""",
-                (str(chat_id), username, first_name, source_bot, "pending", "pending", now, now, now),
-            )
-        else:
-            conn.execute(
-                "UPDATE subscribers SET username=?, first_name=?, last_seen_at=?, updated_at=? WHERE chat_id=?",
-                (username, first_name, now, now, str(chat_id)),
-            )
-    return get_subscriber(chat_id)
-
-
-def set_subscriber_status(chat_id, status: str) -> bool:
-    with get_conn() as conn:
-        cur = conn.execute("UPDATE subscribers SET status=?, updated_at=? WHERE chat_id=?",
-                            (status, time.time(), str(chat_id)))
-        return cur.rowcount > 0
-
-
-def set_subscriber_notify(chat_id, enabled: bool) -> bool:
-    """Active/coupe les deux types d'alertes privées (signaux + TP/SL/BE)
-    d'un coup — commandes /mute et /unmute, en self-service pour l'abonné
-    lui-même (contrairement au tier FREE/VIP, qui reste admin-only)."""
-    val = 1 if enabled else 0
-    with get_conn() as conn:
-        cur = conn.execute(
-            "UPDATE subscribers SET notify_signals=?, notify_tp_sl_be=?, updated_at=? WHERE chat_id=?",
-            (val, val, time.time(), str(chat_id)),
-        )
-        return cur.rowcount > 0
-
-
-def admin_add_subscriber(chat_id, tier: str) -> sqlite3.Row:
-    """Ajoute/active un abonné manuellement (admin uniquement). Si l'abonné
-    n'a jamais fait /start (donc pas encore de source_bot connu), on suppose
-    le bot FREE par défaut ; l'admin peut corriger via /promote /demote une
-    fois que l'abonné aura fait /start avec le bon bot."""
-    if tier not in ("free", "vip"):
-        raise ValueError("le tier doit être 'free' ou 'vip'")
-    now = time.time()
-    with get_conn() as conn:
-        row = conn.execute("SELECT * FROM subscribers WHERE chat_id=?", (str(chat_id),)).fetchone()
-        if row is None:
-            conn.execute(
-                """INSERT INTO subscribers (chat_id, source_bot, tier, status, created_at, updated_at,
-                   last_seen_at, notify_signals, notify_tp_sl_be)
-                   VALUES (?,?,?,?,?,?,?,1,1)""",
-                (str(chat_id), "btc_gold", tier, "active", now, now, now),
-            )
-        else:
-            conn.execute(
-                "UPDATE subscribers SET tier=?, status=?, updated_at=? WHERE chat_id=?",
-                (tier, "active", now, str(chat_id)),
-            )
-    return get_subscriber(chat_id)
-
-
-def admin_remove_subscriber(chat_id) -> bool:
-    with get_conn() as conn:
-        cur = conn.execute("DELETE FROM subscribers WHERE chat_id=?", (str(chat_id),))
-        return cur.rowcount > 0
-
-
-def admin_set_tier(chat_id, tier: str) -> bool:
-    if tier not in ("free", "vip"):
-        raise ValueError("le tier doit être 'free' ou 'vip'")
-    with get_conn() as conn:
-        cur = conn.execute(
-            "UPDATE subscribers SET tier=?, updated_at=? WHERE chat_id=? AND status='active'",
-            (tier, time.time(), str(chat_id)),
-        )
-        return cur.rowcount > 0
-
-
-def admin_set_ban(chat_id, banned: bool) -> bool:
-    with get_conn() as conn:
-        cur = conn.execute(
-            "UPDATE subscribers SET status=?, updated_at=? WHERE chat_id=?",
-            ("banned" if banned else "active", time.time(), str(chat_id)),
-        )
-        return cur.rowcount > 0
-
-
-def list_subscribers(tier: Optional[str] = None, status: Optional[str] = None,
-                      limit: int = 200) -> List[sqlite3.Row]:
-    query = "SELECT * FROM subscribers WHERE 1=1"
-    params: List = []
-    if tier:
-        query += " AND tier=?"
-        params.append(tier)
-    if status:
-        query += " AND status=?"
-        params.append(status)
-    query += " ORDER BY created_at DESC LIMIT ?"
-    params.append(limit)
-    with get_conn() as conn:
-        return conn.execute(query, params).fetchall()
-
-
-def list_broadcast_targets(notify_field: str = "notify_signals") -> List[sqlite3.Row]:
-    """Abonnés actifs (free ou vip) ayant le type de notification demandé
-    activé — utilisé pour la diffusion privée des signaux et des alertes TP/SL/BE."""
-    assert notify_field in ("notify_signals", "notify_tp_sl_be")
-    with get_conn() as conn:
-        return conn.execute(
-            f"SELECT * FROM subscribers WHERE status='active' AND tier IN ('free','vip') "
-            f"AND {notify_field}=1"
-        ).fetchall()
-
-
-def count_subscribers_by_tier() -> Dict[str, Dict[str, int]]:
-    with get_conn() as conn:
-        rows = conn.execute(
-            "SELECT tier, status, COUNT(*) c FROM subscribers GROUP BY tier, status"
-        ).fetchall()
-    out: Dict[str, Dict[str, int]] = {}
-    for r in rows:
-        out.setdefault(r["tier"], {})[r["status"]] = r["c"]
-    return out
-
-
 def get_stats():
     with get_conn() as conn:
         total = conn.execute("SELECT COUNT(*) c FROM signals").fetchone()["c"]
@@ -1041,7 +895,7 @@ def _r_result(row: sqlite3.Row) -> Optional[float]:
     status = row["status"]
     if status == "tp2_hit" and row["rr_tp2"]:
         return float(row["rr_tp2"])
-    if status in ("tp1_hit", "secured"):
+    if status in ("tp1_hit", "secured", "tp1_sl_hit"):
         return float(row["rr_tp1"])
     if status in BE_STATUSES:
         return 0.0
@@ -1325,9 +1179,9 @@ def _dispatch_report(message: str):
         except Exception:
             log.error(f"Échec d'envoi du rapport sur {reports_env}:\n{traceback.format_exc()}")
     try:
-        send_telegram_signal("btc_gold", message)
+        send_telegram_signal("signal_group", message)
     except Exception:
-        log.error(f"Échec d'envoi du rapport sur le groupe 'btc_gold':\n{traceback.format_exc()}")
+        log.error(f"Échec d'envoi du rapport sur le groupe 'signal_group':\n{traceback.format_exc()}")
 
 
 def _maybe_append_promo(message: str, now: datetime) -> str:
@@ -1421,7 +1275,7 @@ def count_open_positions() -> int:
 def last_closed_result(symbol: Optional[str] = None) -> Optional[float]:
     """Résultat en R du dernier trade clôturé (tous actifs, ou un actif
     précis si `symbol` est fourni). Utilisé pour le calcul martingale/recovery."""
-    query = "SELECT * FROM signals WHERE status IN ('tp1_hit','tp2_hit','secured','invalidated','be')"
+    query = "SELECT * FROM signals WHERE status IN ('tp1_hit','tp2_hit','secured','invalidated','be','tp1_sl_hit')"
     params: List = []
     if symbol:
         query += " AND symbol = ?"
@@ -1548,18 +1402,76 @@ def record_watchdog_restart(reason: str):
 # 3. SOURCES DE DONNÉES
 # ============================================================================
 
-def fetch_candles(symbol: str, limit: int = 200) -> List[Dict]:
+# --- PRICE SAFETY : ordre obligatoire MT5 -> Yahoo futures (fallback) -> ---
+# aucune donnée = PAS DE SIGNAL. Ne jamais utiliser une donnée périmée/vide.
+MAX_CANDLE_AGE_SECONDS = int(os.environ.get("MAX_CANDLE_AGE_SECONDS", "900"))
+MIN_CANDLES_REQUIRED = 30
+
+# Étiquette affichée dans les logs / messages pour identifier la source EXACTE
+# du prix utilisé pour un signal donné (MT5 = prix broker réel, YAHOO_GC_F /
+# YAHOO_SI_F = futures Yahoo Finance, fallback uniquement — jamais présenté
+# comme le prix exact du broker).
+_YFINANCE_LABELS = {"XAUUSD": "YAHOO_GC_F", "XAGUSD": "YAHOO_SI_F"}
+
+
+def _price_source_label(symbol: str, source: str) -> str:
+    if source == "mt5_bridge":
+        return "MT5"
+    if source == "yfinance":
+        return _YFINANCE_LABELS.get(symbol, "YAHOO")
+    if source == "twelvedata":
+        return "TWELVEDATA"
+    if source == "binance":
+        return "BINANCE"
+    return source.upper()
+
+
+def fetch_candles(symbol: str, limit: int = 200):
+    """Retourne (candles, source_utilisee). Ordre STRICT : source principale
+    de l'actif (MT5 pour XAUUSD/XAGUSD) -> fallback (Yahoo futures GC=F/SI=F)
+    -> si tout échoue, l'exception remonte et l'appelant doit émettre NO SIGNAL.
+    Ne remplace JAMAIS silencieusement par une source approximative non prévue
+    dans AssetConfig (ex. PAXG-USD)."""
     asset = ASSETS[symbol]
     timeframe = get_settings().get("timeframe", TIMEFRAME)
     interval = TIMEFRAME_TO_INTERVAL.get(timeframe, "5m")
     try:
-        return _fetch_by_source(asset.data_source, symbol, limit, interval)
+        candles = _fetch_by_source(asset.data_source, symbol, limit, interval)
+        return candles, asset.data_source
     except Exception as e:
         if not asset.fallback_data_source:
             raise
         log.warning(f"[{symbol}] source '{asset.data_source}' indisponible ({e}) "
                     f"-> repli sur '{asset.fallback_data_source}'.")
-        return _fetch_by_source(asset.fallback_data_source, symbol, limit, interval)
+        candles = _fetch_by_source(asset.fallback_data_source, symbol, limit, interval)
+        return candles, asset.fallback_data_source
+
+
+def validate_price_data(symbol: str, candles: List[Dict]) -> Optional[str]:
+    """Retourne None si les données sont exploitables pour générer un signal,
+    sinon une raison de rejet (-> NO SIGNAL). Vérifie : présence, nombre
+    minimum de bougies, OHLC complets et valides, et âge de la dernière bougie
+    (donnée périmée = rejetée, jamais utilisée pour un signal)."""
+    if not candles:
+        return "aucune donnée reçue"
+    if len(candles) < MIN_CANDLES_REQUIRED:
+        return f"seulement {len(candles)} bougies reçues (minimum {MIN_CANDLES_REQUIRED})"
+    last = candles[-1]
+    for key in ("time", "open", "high", "low", "close"):
+        if last.get(key) is None:
+            return f"champ '{key}' manquant sur la dernière bougie (OHLC incomplet)"
+    o, h, l, c = last["open"], last["high"], last["low"], last["close"]
+    try:
+        if min(o, h, l, c) <= 0:
+            return "prix invalide (<= 0) sur la dernière bougie"
+    except TypeError:
+        return "prix non numérique sur la dernière bougie"
+    if h < l or h < o or h < c or l > o or l > c:
+        return "OHLC incohérent sur la dernière bougie (high/low invalides)"
+    age = time.time() - last["time"]
+    if age > MAX_CANDLE_AGE_SECONDS:
+        return f"donnée périmée (dernière bougie vieille de {age:.0f}s, max toléré {MAX_CANDLE_AGE_SECONDS}s)"
+    return None
 
 
 def _fetch_by_source(data_source: str, symbol: str, limit: int, interval: str) -> List[Dict]:
@@ -1798,6 +1710,36 @@ def confirm_bos(
     return None
 
 
+def wick_only_break_pending(candles: List[Dict], sweep: LiquiditySweep,
+                             swing_points: List[SwingPoint], max_lookahead: int = 15) -> bool:
+    """Distingue, quand le BOS n'est PAS encore confirmé, deux cas pour le
+    logging : une mèche a déjà dépassé le niveau de structure interne opposé
+    SANS qu'aucune clôture de corps ne le valide (WICK BREAK REJECTED), vs.
+    aucune bougie n'a encore approché ce niveau (WAITING FOR BODY CLOSE
+    SHIFT, cas normal d'attente). N'affecte jamais la décision de signal :
+    seule confirm_bos() (clôture du corps) valide un setup."""
+    level = _find_structure_level(swing_points, sweep)
+    if level is None:
+        return False
+    start = sweep.sweep_index + 1
+    end = min(len(candles), start + max_lookahead)
+    for i in range(start, end):
+        c = candles[i]
+        body_confirmed = (
+            (sweep.direction == "bullish" and c["close"] > level and c["close"] > c["open"]) or
+            (sweep.direction == "bearish" and c["close"] < level and c["close"] < c["open"])
+        )
+        if body_confirmed:
+            return False  # déjà validé par le corps -> pas un cas de rejet
+        wick_crossed = (
+            (sweep.direction == "bullish" and c["high"] > level) or
+            (sweep.direction == "bearish" and c["low"] < level)
+        )
+        if wick_crossed:
+            return True
+    return False
+
+
 def detect_fvg(candles: List[Dict], around_index: int, direction: str) -> Optional[FVGZone]:
     """FVG sur la séquence à 3 bougies de la cassure (méthode ICT)."""
     i = around_index
@@ -2025,18 +1967,22 @@ def compute_lot_size(capital, risk_percent, entry, stop_loss,
     return round(risk_amount / (sl_pips * pip_value_per_lot), 2)
 
 
+MAX_LOT_DEFAULT = float(os.environ.get("MAX_LOT_DEFAULT", "50.0"))
+
+
 def compute_lot_size_v2(risk_amount: float, entry: float, stop_loss: float,
                          value_per_point: float, lot_step: float = 0.01,
-                         min_lot: float = 0.01) -> float:
-    """Calcul du lot utilisé automatiquement à chaque signal : à partir du
-    risque en $ choisi (risk_amount), de l'entrée, du Stop Loss et de la
-    valeur $ par point de l'actif (AssetConfig.lot_value_per_point).
-    Arrondi au pas de lot du broker (0.01 par défaut)."""
+                         min_lot: float = 0.01, max_lot: float = MAX_LOT_DEFAULT) -> float:
+    """Lot ENTIÈREMENT dynamique, recalculé à chaque signal — jamais de lot
+    fixe codé en dur. raw_lot = risk_usd / (abs(entry - SL) * value_per_point),
+    puis application du min lot, du max lot (garde-fou anti fat-finger), du
+    pas de lot (lot_step) et arrondi conforme au broker."""
     price_diff = abs(entry - stop_loss)
     if price_diff <= 0 or value_per_point <= 0 or risk_amount <= 0:
         return 0.0
     raw_lot = risk_amount / (price_diff * value_per_point)
-    lot = max(min_lot, round(raw_lot / lot_step) * lot_step)
+    lot = round(raw_lot / lot_step) * lot_step
+    lot = max(min_lot, min(lot, max_lot))
     return round(lot, 2)
 
 
@@ -2048,9 +1994,9 @@ def get_stars(entry_type: str) -> str:
 # 8. TELEGRAM
 # ============================================================================
 
-def _bot_token(group: str = "btc_gold") -> str:
+def _bot_token(group: str = "signal_group") -> str:
     """Chaque groupe Telegram a son propre bot (donc son propre token).
-    'reports' retombe sur le token du groupe 'btc_gold' si
+    'reports' retombe sur le token du groupe 'signal_group' si
     TELEGRAM_BOT_TOKEN_REPORTS n'est pas défini. Si la variable d'env n'est
     pas définie du tout, on retombe sur token_default (cf. avertissement de
     sécurité au niveau de TELEGRAM_GROUPS)."""
@@ -2058,7 +2004,7 @@ def _bot_token(group: str = "btc_gold") -> str:
     env_key = group_cfg["token_env"]
     token = os.environ.get(env_key) or group_cfg.get("token_default")
     if not token and group == "reports":
-        bg = TELEGRAM_GROUPS["btc_gold"]
+        bg = TELEGRAM_GROUPS["signal_group"]
         token = os.environ.get(bg["token_env"]) or bg.get("token_default")
     if not token:
         raise RuntimeError(f"Variable d'environnement {env_key} manquante pour le groupe '{group}'.")
@@ -2150,30 +2096,80 @@ def _tg_call(token: str, method: str, data: Optional[Dict] = None,
 
 
 def format_signal_message(symbol, display_name, direction, entry_type_label, stars,
-                           entry, sl, tp1, tp2, rr_tp1, rr_tp2,
-                           lot: Optional[float] = None, risk_amount: Optional[float] = None) -> str:
-    """Pas de score 0-100 : tout signal Sweep + CHoCH confirmé par la clôture
-    du corps de bougie est publié tel quel. `stars` reste un simple repère de
-    type d'entrée (directe vs retour FVG), pas un filtre de qualité."""
+                           entry, sl, tp1, tp2, rr_tp1, rr_tp2) -> str:
+    """Message PUBLIC du groupe de signaux — strictement le signal :
+    ENTRY / SL / TP1 / TP2 / RR. AUCUNE donnée personnelle (pas de lot, pas
+    de risque $, pas de solde, pas de levier) : ces infos restent dans le
+    DM du leader (voir format_leader_signal_dm)."""
     direction_emoji = "🟢 ACHAT" if direction == "BUY" else "🔴 VENTE"
     ts = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())
     lines = [
-        "⚡ *ALPHABOT SMC PRO* ⚡", "",
+        "📢 *ALPHABOT SMC PRO*", "",
         f"📊 *Actif* : {display_name} ({get_settings().get('timeframe', TIMEFRAME)})",
         f"🎯 *Setup* : {entry_type_label} {stars}",
         f"{direction_emoji}", "",
-        f"🔹 *Entrée* : `{entry:.5f}`",
-        f"🛑 *Stop Loss* : `{sl:.5f}`",
+        f"🔹 *ENTRY* : `{entry:.5f}`",
+        f"🛑 *SL* : `{sl:.5f}`",
         f"✅ *TP1 (RR{rr_tp1:g})* : `{tp1:.5f}`",
     ]
     if tp2:
         lines.append(f"🚀 *TP2 (RR{rr_tp2:g})* : `{tp2:.5f}`")
-    if lot is not None:
-        risk_txt = f" — risque {risk_amount:.2f}$" if risk_amount is not None else ""
-        lines.append(f"💰 *Lot suggéré* : `{lot}`{risk_txt}")
+    lines.append(f"📐 *RR* : {rr_tp1:g}" + (f" / {rr_tp2:g}" if tp2 else ""))
     lines += ["", "🟡 BE à RR1 · 🔒 Sécurisation partielle à RR2 · 🟢 TP1 (laisser courir) à RR3 · 🚀 TP2 à RR6",
               "", f"🕒 {ts}"]
     return "\n".join(lines)
+
+
+def format_leader_signal_dm(symbol, display_name, direction, entry_type_label, stars,
+                             entry, sl, tp1, tp2, rr_tp1, rr_tp2,
+                             lot: float, risk_amount: float, settings: Optional[Dict] = None) -> str:
+    """DM PRIVÉ du leader UNIQUEMENT — détail complet du signal : direction,
+    niveaux, ET les infos personnelles (risque $, lot, levier) qui ne
+    doivent jamais apparaître dans le groupe public."""
+    s = settings or get_settings()
+    ts = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())
+    lines = [
+        f"📡 *SIGNAL {symbol}* (privé — leader uniquement)", "",
+        f"Direction : {direction}",
+        f"Entry : `{entry:.5f}`",
+        f"SL : `{sl:.5f}`",
+        f"TP1 (RR{rr_tp1:g}) : `{tp1:.5f}`",
+    ]
+    if tp2:
+        lines.append(f"TP2 (RR{rr_tp2:g}) : `{tp2:.5f}`")
+    lines += [
+        "",
+        f"💰 Risque : {risk_amount:.2f}$",
+        f"📦 Lot : {lot}",
+        f"⚡ Levier : {s.get('leverage', 0):.0f}x",
+        f"🎯 Setup : {entry_type_label} {stars}",
+        "", f"🕒 {ts}",
+    ]
+    return "\n".join(lines)
+
+
+def format_leader_profile_message(settings: Optional[Dict] = None) -> str:
+    """Profil complet du leader — solde, risque, levier, lot type, état
+    ACTIF/DÉSACTIVÉ. Envoyé UNIQUEMENT en DM au leader (ex: /profil,
+    au démarrage du bot, ou sur demande)."""
+    s = settings or get_settings()
+    risk_txt = f"{s['risk_dollar_amount']:.2f}$" if s.get("risk_unit") == "dollar" \
+        else f"{s['risk_percent']:.2f}%"
+    active = s.get("signals_enabled", True)
+    lines = [
+        "📊 *PROFIL LEADER*", "",
+        f"💰 Solde : {s['capital']:.0f}$",
+        f"🎯 Risque/trade : {risk_txt}",
+        f"⚡ Levier : {s['leverage']:.0f}x",
+        f"📊 Positions max simultanées : {s['max_open_positions']}",
+        f"🕐 Session : {'24h/24' if s.get('session_mode') == '24h' else 'NY (13h-22h UTC)'}",
+        f"⏱ Timeframe : {s.get('timeframe', TIMEFRAME)}",
+        f"{'🟢 Signaux : ACTIVÉS' if active else '🔴 Signaux : DÉSACTIVÉS'}",
+    ]
+    return "\n".join(lines)
+
+
+
 
 
 def _cleanup_old_charts():
@@ -2319,7 +2315,7 @@ def send_telegram_signal(group: str, text: str, image_path: str = None, signal_i
 
 
 # --- Message de démarrage --------------------------------------------------
-# Envoyé sur le groupe de signaux (btc_gold) à chaque lancement OU
+# Envoyé sur le groupe de signaux (signal_group) à chaque lancement OU
 # redémarrage du process, pour que tu saches immédiatement sur Telegram que le
 # bot est bien en ligne (et pas seulement silencieusement en train de tourner
 # côté serveur). Si le redémarrage a été forcé par le watchdog, le message le
@@ -2349,20 +2345,11 @@ def format_startup_message() -> str:
 
 
 def send_startup_notification():
-    """Notifie UNIQUEMENT le propriétaire (TELEGRAM_OWNER_ID) en DM que le bot
-    est démarré/redémarré — plus aucune diffusion dans les groupes ni aux
-    abonnés (bruit inutile pour eux). Best-effort : une erreur (token
-    manquant, réseau...) est loggée mais ne doit jamais empêcher le bot de
-    démarrer/scanner."""
-    message = format_startup_message()
-    if TELEGRAM_OWNER_ID:
-        try:
-            _send_command_reply("btc_gold", int(TELEGRAM_OWNER_ID), message)
-            log.info("Message de démarrage envoyé en DM au propriétaire.")
-        except Exception:
-            log.warning("Échec d'envoi du message de démarrage en DM au propriétaire:\n" + traceback.format_exc())
-    else:
-        log.info("TELEGRAM_OWNER_ID non défini — message de démarrage non envoyé (aucun canal privé configuré).")
+    """Notifie UNIQUEMENT le leader (TELEGRAM_OWNER_ID) en DM que le bot est
+    démarré/redémarré — c'est le même DM privé que celui utilisé pour les
+    signaux et le suivi. Best-effort : une erreur (token manquant,
+    réseau...) est loggée mais ne doit jamais empêcher le bot de démarrer/scanner."""
+    send_leader_dm(format_startup_message())
 
 
 def _telegram_answer_callback(group: str, callback_query_id: str, text: str = "", show_alert: bool = False):
@@ -2385,20 +2372,34 @@ def _telegram_edit_reply_markup(group: str, chat_id, message_id: int, reply_mark
 
 
 # ----------------------------------------------------------------------
-# Diffusion — groupes FREE + VIP (contenu strictement identique) puis
-# abonnés privés (DM). Chaque canal est indépendant et best-effort : l'échec
-# d'un groupe ou d'un abonné ne bloque jamais les autres.
+# Diffusion — il n'existe que DEUX destinataires dans tout le projet :
+#   1. le groupe de signaux (SIGNAL_BROADCAST_GROUPS) : contenu public
+#      uniquement (signal, TP1, TP2, SL). JAMAIS de lot, de risque $, de
+#      solde ou de levier personnel.
+#   2. le DM privé du leader (send_leader_dm, TELEGRAM_OWNER_ID) : seul
+#      canal recevant les données personnelles (solde, risque, levier, lot,
+#      paramètres, suivi détaillé). Chaque canal est indépendant et
+#      best-effort : l'échec de l'un ne bloque jamais l'autre.
 # ----------------------------------------------------------------------
-SIGNAL_BROADCAST_GROUPS = ("btc_gold", "vip_gold")
-PRIVATE_DM_THROTTLE_SECONDS = 0.05  # petite pause entre 2 DM (marge sous les limites Telegram)
+SIGNAL_BROADCAST_GROUPS = ("signal_group",)
 
 
-def _send_private_dm(source_bot: str, chat_id: str, text: str, image_path: Optional[str] = None):
-    """Envoie un message privé à un abonné (avec photo si fournie), avec
-    gestion dédiée du cas où le bot a été bloqué : l'abonné est alors
-    automatiquement désactivé (status 'stopped'), pour ne plus jamais
-    retenter en pure perte à chaque diffusion."""
-    token = _bot_token(source_bot)
+def send_leader_dm(text: str, image_path: Optional[str] = None):
+    """Envoie un message privé UNIQUEMENT au leader (TELEGRAM_OWNER_ID) — le
+    seul DM privé de tout le projet. C'est ici, et ici seulement, que
+    transitent les infos personnelles (solde, risque, levier, lot,
+    paramètres, suivi détaillé du signal). Si TELEGRAM_OWNER_ID n'est pas
+    défini, le message est simplement journalisé comme non envoyé (aucun
+    canal privé configuré) — jamais publié ailleurs en remplacement."""
+    if not TELEGRAM_OWNER_ID:
+        log.info("TELEGRAM_OWNER_ID non défini — DM leader non envoyé (aucun canal privé configuré).")
+        return
+    try:
+        token = _bot_token("signal_group")
+    except RuntimeError:
+        log.warning("Bot 'signal_group' non configuré (token manquant) — DM leader non envoyé.")
+        return
+    chat_id = str(TELEGRAM_OWNER_ID)
     try:
         if image_path:
             with open(image_path, "rb") as img:
@@ -2408,61 +2409,51 @@ def _send_private_dm(source_bot: str, chat_id: str, text: str, image_path: Optio
         else:
             _tg_call(token, "sendMessage",
                      data={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}, timeout=10)
-    except TelegramForbiddenError:
-        log.info(f"Telegram: {chat_id} a bloqué/supprimé le bot '{source_bot}' — abonné désactivé.")
-        try:
-            set_subscriber_status(chat_id, "stopped")
-        except Exception:
-            pass
     except Exception:
-        log.warning(f"Échec d'envoi privé vers {chat_id} (bot '{source_bot}'):\n{traceback.format_exc()}")
+        log.warning(f"Échec d'envoi du DM leader:\n{traceback.format_exc()}")
 
 
-def _broadcast_private(text: str, notify_field: str = "notify_signals", image_path: Optional[str] = None):
-    for sub in list_broadcast_targets(notify_field):
-        try:
-            _send_private_dm(sub["source_bot"] or "btc_gold", sub["chat_id"], text, image_path=image_path)
-        except RuntimeError:
-            pass  # bot source non configuré (token manquant) -> ignoré silencieusement
-        time.sleep(PRIVATE_DM_THROTTLE_SECONDS)
-
-
-def broadcast_signal(text: str, image_path: Optional[str] = None, signal_id: Optional[int] = None,
+def broadcast_signal(public_text: str, leader_text: Optional[str] = None,
+                      image_path: Optional[str] = None, signal_id: Optional[int] = None,
                       symbol: Optional[str] = None, entry_price: Optional[float] = None,
                       stop_loss: Optional[float] = None):
-    """Diffuse un signal sur le groupe FREE, le groupe VIP (contenu
-    identique) puis en message privé à chaque abonné actif ayant les
-    notifications de signaux activées. Le lot suggéré est déjà inclus dans
-    `text` (calculé une fois pour toutes dans process_asset à partir du
-    risque $ réglé dans /parametres) — identique sur tous les canaux."""
+    """Publie `public_text` (signal SANS lot/risque/solde/levier) sur le
+    groupe de signaux, puis — si fourni — envoie `leader_text` (détail
+    complet : lot, risque, solde, levier, paramètres) exclusivement en DM
+    au leader. Les deux canaux sont indépendants (best-effort)."""
     for group in SIGNAL_BROADCAST_GROUPS:
         try:
-            send_telegram_signal(group, text, image_path=image_path, signal_id=signal_id)
+            send_telegram_signal(group, public_text, image_path=image_path, signal_id=signal_id)
         except RuntimeError:
             pass  # groupe non configuré (token/chat_id manquant) -> ignoré silencieusement
         except Exception:
             log.error(f"Échec de diffusion du signal sur le groupe '{group}':\n{traceback.format_exc()}")
 
-    _broadcast_private(text, notify_field="notify_signals", image_path=image_path)
+    if leader_text:
+        send_leader_dm(leader_text, image_path=image_path)
 
 
 # ----------------------------------------------------------------------
-# Notifications TP / SL / Break Even — diffusées sur les mêmes canaux que
-# les signaux (groupes FREE + VIP + abonnés privés), déclenchées par tout
-# changement de statut pertinent d'un trade (bouton Telegram, API dashboard,
-# ou un futur moteur de suivi automatique).
+# Notifications TP / SL / Break Even — l'alerte courte (statut uniquement,
+# aucune donnée personnelle) part sur le groupe de signaux ; le rapport
+# complet (résultat en $, cumul du jour) part UNIQUEMENT en DM au leader.
+# Déclenché par tout changement de statut pertinent d'un trade (bouton
+# Telegram, API dashboard, ou le moteur de suivi automatique des prix).
 # ----------------------------------------------------------------------
 TRADE_EVENT_MESSAGES = {
     "be":          ("🟡", "Break Even", "Stop Loss déplacé au point d'entrée — trade désormais sans risque."),
     "secured":     ("🔒", "Sécurisation partielle", "Prise de profit partielle recommandée à ce niveau."),
-    "tp1_hit":     ("✅", "TP1 atteint", "Premier objectif touché."),
-    "tp2_hit":     ("🚀", "TP2 atteint", "Objectif final touché — trade clôturé."),
-    "invalidated": ("🛑", "Stop Loss touché", "Le trade est invalidé."),
+    "tp1_hit":     ("🥇", "TP1 atteint", "Premier objectif touché."),
+    "tp2_hit":     ("🥈", "TP2 atteint", "Objectif final touché — trade clôturé."),
+    "invalidated": ("❌", "SL touché", "Le trade est invalidé."),
+    "tp1_sl_hit":  ("❌", "SL touché (après TP1)", "Stop Loss initial retouché — TP1 était déjà sécurisé."),
     "closed":      ("🔴", "Trade clôturé", "Position fermée."),
 }
 
 
 def format_trade_event_message(row: sqlite3.Row, status: str) -> Optional[str]:
+    """Message COURT et 100% public : statut du trade uniquement, aucune
+    donnée personnelle (pas de lot, pas de $ de risque/gain)."""
     info = TRADE_EVENT_MESSAGES.get(status)
     if not info:
         return None
@@ -2477,16 +2468,17 @@ def format_trade_event_message(row: sqlite3.Row, status: str) -> Optional[str]:
 
 
 # Statuts terminaux : plus aucune action possible sur ce trade -> c'est le
-# bon moment pour envoyer le "rapport après trade" complet en plus de
-# l'alerte courte habituelle.
-TERMINAL_TRADE_STATUSES = {"closed", "invalidated", "tp2_hit"}
+# bon moment pour envoyer le "rapport après trade" complet au leader, en plus
+# de l'alerte courte publique habituelle. Alias de TERMINAL_STATUTES (source
+# unique de vérité, définie en haut du fichier) pour rester synchronisé.
+TERMINAL_TRADE_STATUSES = set(TERMINAL_STATUSES)
 
 
 def format_trade_closed_report(row: sqlite3.Row) -> Optional[str]:
-    """Compte-rendu complet envoyé quand un trade atteint un statut terminal :
-    résultat en R, durée du trade, et cumul du jour (tous actifs confondus),
-    pour donner un vrai suivi de performance à chaud plutôt qu'une simple
-    alerte de statut."""
+    """Compte-rendu complet — résultat en R **et en $** (dérivé du risque
+    personnel du leader), durée du trade, cumul du jour. Contient des
+    données personnelles (gain $) : réservé STRICTEMENT au DM du leader,
+    ne doit jamais être publié dans le groupe de signaux."""
     r = _r_result(row)
     if r is None:
         return None
@@ -2519,7 +2511,7 @@ def format_trade_closed_report(row: sqlite3.Row) -> Optional[str]:
 
     direction_txt = "🟢 ACHAT" if row["direction"] == "BUY" else "🔴 VENTE"
     lines = [
-        f"📊 *Rapport de trade* — {row['symbol']} #{row['id']} ({direction_txt})",
+        f"📊 *Rapport de trade (privé)* — {row['symbol']} #{row['id']} ({direction_txt})",
         f"{result_emoji} Résultat : *{result_txt}*" + (f" · Gain : *{gain_txt}*" if gain_txt else ""),
         f"⏱️ Durée : {duration_txt}",
         f"📈 Cumul du jour (tous actifs) : {cumul_txt} sur {day_stats['total_signals']} signal(aux)",
@@ -2528,26 +2520,17 @@ def format_trade_closed_report(row: sqlite3.Row) -> Optional[str]:
 
 
 def notify_trade_event(signal_id: int, status: str):
-    """Diffuse une alerte TP/SL/BE pour le signal donné, best-effort. À
-    appeler à chaque changement de statut pertinent, quelle qu'en soit
-    l'origine (bouton Telegram, API dashboard, futur moteur de suivi auto).
-    Ne fait rien si le statut n'a pas d'alerte dédiée (ex: 'taken', 'ignored').
-    Pour un statut terminal (TP2, SL, clôture), un rapport complet (résultat
-    en R, durée, cumul du jour) est envoyé en complément de l'alerte courte."""
+    """Suivi 100% automatique (déclenché par monitor_open_signals à chaque
+    scan de prix — aucun clic 'j'ai pris le trade' n'est nécessaire) :
+      - alerte COURTE et publique sur le groupe de signaux (statut uniquement) ;
+      - rapport COMPLET (résultat $, cumul du jour) exclusivement en DM leader.
+    Ne fait rien si le statut n'a pas d'alerte dédiée (ex: 'taken', 'ignored')."""
     row = get_signal(signal_id)
     if not row:
         return
     text = format_trade_event_message(row, status)
     if not text:
         return
-
-    if status in TERMINAL_TRADE_STATUSES:
-        try:
-            report_text = format_trade_closed_report(row)
-            if report_text:
-                text = f"{text}\n\n{report_text}"
-        except Exception:
-            log.warning(f"Échec génération rapport de trade #{signal_id}:\n{traceback.format_exc()}")
 
     for group in SIGNAL_BROADCAST_GROUPS:
         try:
@@ -2556,12 +2539,21 @@ def notify_trade_event(signal_id: int, status: str):
             pass
         except Exception:
             log.warning(f"Échec notification trade #{signal_id} sur '{group}':\n{traceback.format_exc()}")
-    _broadcast_private(text, notify_field="notify_tp_sl_be")
+
+    leader_text = text
+    if status in TERMINAL_TRADE_STATUSES:
+        try:
+            report_text = format_trade_closed_report(row)
+            if report_text:
+                leader_text = f"{text}\n\n{report_text}"
+        except Exception:
+            log.warning(f"Échec génération rapport de trade #{signal_id}:\n{traceback.format_exc()}")
+    send_leader_dm(leader_text)
 
 
 # --- Commandes Telegram natives (/settings, /capital, /profils...) --------
 # Objectif : piloter les réglages directement depuis le bot Telegram, sans
-# passer par le dashboard web Flask. Le bot (btc_gold) a sa propre URL de
+# passer par le dashboard web Flask. Le bot (signal_group) a sa propre URL de
 # webhook (/telegram/webhook/<bot_key>, section DÉPLOIEMENT en bas de
 # fichier) : le bot destinataire est donc toujours connu sans ambiguïté, y
 # compris en DM (message privé). En DM — canal 1-à-1 — les commandes en
@@ -2571,14 +2563,16 @@ def notify_trade_event(signal_id: int, status: str):
 # /levier, activation de profil) restent réservées au propriétaire partout,
 # groupe comme DM.
 BOT_COMMANDS_HELP = (
-    "🤖 *ALPHABOT SMC PRO* — commandes propriétaire\n\n"
+    "🤖 *ALPHABOT SMC PRO* — commandes leader\n\n"
     "/menu — menu à boutons pour tous les réglages ci-dessous\n"
     "/settings — voir les réglages actuels\n"
+    "/profil — profil complet (solde, risque, levier, lot, état ACTIF/DÉSACTIVÉ)\n"
     "/capital <valeur> — définir le capital ($)\n"
     "/risque <valeur> — définir le risque par trade (%)\n"
     "/levier <valeur> — définir le levier (x)\n"
     "/session <ny|24h> — session NY fixe ou scan 24h/24 en continu\n"
     "/timeframe <M1|M5> — changer le timeframe du scan (M1 = scalping)\n"
+    "/signaux <on|off> — activer/désactiver la publication des signaux\n"
     "/profils — lister et activer un profil sauvegardé\n"
     "/status — état du bot (dernier scan...)\n"
     "/stats — statistiques globales\n"
@@ -2586,29 +2580,14 @@ BOT_COMMANDS_HELP = (
     "/help — afficher ce message"
 )
 
-# Commandes ouvertes à tout le monde en DM (pas de gestion de réglages —
-# uniquement inscription/désinscription et lecture de stats publiques).
+# Commandes en lecture seule ouvertes à tout le monde DANS LE GROUPE de
+# signaux (stats/rapports publics). En DM, seul le leader (TELEGRAM_OWNER_ID)
+# a accès au bot — il n'existe pas d'autre canal privé dans ce projet.
 PUBLIC_COMMANDS_HELP = (
     "🤖 *ALPHABOT SMC PRO*\n\n"
-    "/start — s'enregistrer (activation ensuite faite par l'admin)\n"
-    "/stop — arrêter les messages privés du bot\n"
-    "/mute — couper temporairement les alertes privées\n"
-    "/unmute — réactiver les alertes privées\n"
     "/stats — statistiques globales\n"
     "/report [daily|weekly|monthly] — rapport de performance\n"
     "/help — afficher ce message"
-)
-
-ADMIN_COMMANDS_HELP = (
-    "\n\n👑 *Administration — abonnés*\n"
-    "/admin — ce panneau\n"
-    "/addsub <chat_id> <free|vip> — ajouter/activer un abonné\n"
-    "/removesub <chat_id> — retirer un abonné\n"
-    "/promote <chat_id> — passer un abonné en VIP\n"
-    "/demote <chat_id> — repasser un abonné en FREE\n"
-    "/ban <chat_id> · /unban <chat_id> — bannir / débannir\n"
-    "/listsubs [free|vip] — lister les abonnés\n"
-    "/broadcast <message> — message privé à tous les abonnés actifs"
 )
 
 _SETTINGS_COMMAND_FIELDS = {
@@ -2618,12 +2597,18 @@ _SETTINGS_COMMAND_FIELDS = {
 
 
 def _is_owner(user_id) -> bool:
-    """Vrai si user_id correspond à TELEGRAM_OWNER_ID (seul autorisé à changer
-    les réglages ou le statut d'un trade). Si TELEGRAM_OWNER_ID n'est pas
-    défini, l'accès reste ouvert à tout le groupe (comportement historique)."""
+    """Vrai UNIQUEMENT si TELEGRAM_OWNER_ID est défini, se parse comme un
+    entier Telegram valide, ET correspond à user_id. Si la variable d'env
+    est absente, vide, ou invalide (non numérique), l'accès est REFUSÉ par
+    défaut — jamais ouvert à tout le monde. C'est le seul comportement sûr
+    pour un bot qui transite du solde/risque/lot en DM."""
     if not TELEGRAM_OWNER_ID:
-        return True
-    return user_id is not None and str(user_id) == str(TELEGRAM_OWNER_ID)
+        return False
+    try:
+        owner_id_int = int(TELEGRAM_OWNER_ID)
+        return user_id is not None and int(user_id) == owner_id_int
+    except (TypeError, ValueError):
+        return False
 
 
 _OWNER_ONLY_REPLY = "⛔ Réservé au propriétaire du bot."
@@ -2709,22 +2694,6 @@ def format_report_message(period: Optional[str]) -> str:
     return "\n".join(lines)
 
 
-def format_subscribers_list_message(tier: Optional[str] = None) -> str:
-    subs = list_subscribers(tier=tier, limit=50)
-    counts = count_subscribers_by_tier()
-    header = f"👥 *Abonnés*" + (f" — filtre : {tier}" if tier else "")
-    summary_lines = []
-    for t, by_status in counts.items():
-        parts_txt = " · ".join(f"{st}: {n}" for st, n in by_status.items())
-        summary_lines.append(f"  {t} → {parts_txt}")
-    if not subs:
-        return header + "\n\n" + "\n".join(summary_lines) + "\n\nAucun abonné à afficher pour ce filtre."
-    lines = [header, ""] + summary_lines + ["", "Derniers 50 :"]
-    for s in subs:
-        uname = f"@{s['username']}" if s["username"] else (s["first_name"] or "—")
-        lines.append(f"`{s['chat_id']}` · {s['tier']} · {s['status']} · {uname}")
-    return "\n".join(lines)
-
 
 def _profiles_inline_keyboard() -> Dict:
     rows = []
@@ -2796,34 +2765,29 @@ def _send_command_reply(group: str, chat_id, text: str, reply_markup: Optional[D
     try:
         return _tg_call(token, "sendMessage", data=data, timeout=10)
     except TelegramForbiddenError:
-        log.info(f"Telegram: {chat_id} a bloqué/supprimé le bot '{group}' — abonné désactivé si présent.")
-        try:
-            set_subscriber_status(chat_id, "stopped")
-        except Exception:
-            pass
+        log.info(f"Telegram: {chat_id} a bloqué/supprimé le bot '{group}'.")
         return None
     except Exception:
         log.warning("Telegram sendMessage (commande) a échoué:\n" + traceback.format_exc())
         return None
 
 
-# Commandes de réglages trading : réservées au propriétaire en DM comme en groupe.
-_READ_ONLY_COMMANDS = ("/settings", "/reglages", "/parametres", "/status", "/profils", "/menu")
-
-# Commandes ouvertes à tout le monde en DM (inscription, stats publiques).
-_PUBLIC_DM_COMMANDS = ("/start", "/help", "/aide", "/stop", "/mute", "/unmute", "/stats", "/report")
-
-# Commandes d'administration des abonnés : réservées au propriétaire, partout
-# (DM comme groupe), quel que soit TELEGRAM_OWNER_ID.
-_ADMIN_ONLY_COMMANDS = ("/admin", "/addsub", "/removesub", "/promote", "/demote",
-                        "/ban", "/unban", "/listsubs", "/broadcast")
+# Toutes les commandes qui touchent aux réglages trading ou aux données
+# personnelles du leader (lecture ET écriture) — réservées au leader
+# (TELEGRAM_OWNER_ID), QUEL QUE SOIT le contexte (groupe ou DM). Inclut les
+# clés dynamiques de _SETTINGS_COMMAND_FIELDS (/capital /risque /levier
+# /risquedollar) en plus des commandes nommées explicitement.
+_LEADER_ONLY_COMMANDS = (
+    "/settings", "/reglages", "/parametres", "/profil", "/status", "/profils", "/menu",
+    "/risqueunite", "/session", "/timeframe", "/signaux",
+) + tuple(_SETTINGS_COMMAND_FIELDS.keys())
 
 
 def _handle_telegram_command(message: Dict, group: str):
-    """group est désormais connu à l'avance (déduit de l'URL du webhook, cf.
-    telegram_webhook) — plus besoin de le deviner à partir du chat_id, donc
-    ça fonctionne aussi bien dans les groupes Telegram configurés qu'en
-    message privé (DM) avec l'un des bots."""
+    """Il n'y a que deux contextes possibles ici : un message dans le groupe
+    de signaux (ouvert à tous en lecture : /stats /report /help), ou un DM
+    avec le bot — et en DM, seul le leader (TELEGRAM_OWNER_ID) est reconnu ;
+    il n'existe pas d'autre abonné privé dans ce projet."""
     chat = message.get("chat") or {}
     chat_id = chat.get("id")
     is_private = chat.get("type") == "private"
@@ -2833,8 +2797,8 @@ def _handle_telegram_command(message: Dict, group: str):
 
     if not is_private:
         # message de groupe : on vérifie qu'il vient bien du chat configuré
-        # pour CE bot (et pas d'un autre groupe où le bot aurait été ajouté
-        # par erreur), comportement historique inchangé.
+        # pour ce bot (et pas d'un autre groupe où le bot aurait été ajouté
+        # par erreur).
         try:
             if str(_chat_id_for_group(group)) != str(chat_id):
                 return
@@ -2844,76 +2808,42 @@ def _handle_telegram_command(message: Dict, group: str):
     parts = text.split()
     cmd = parts[0].lower().split("@")[0]  # tolère "/settings@NomDuBot"
     arg = parts[1] if len(parts) > 1 else None
-    arg2 = parts[2] if len(parts) > 2 else None
-    rest_text = text.split(maxsplit=1)[1] if len(parts) > 1 else None
     sender = message.get("from") or {}
     sender_id = sender.get("id")
 
-    # Admin-only, partout (DM ou groupe).
-    if cmd in _ADMIN_ONLY_COMMANDS and not _is_owner(sender_id):
+    # En DM (canal 1-à-1), seul le leader peut utiliser le bot : ce DM est
+    # strictement privé (solde/risque/levier/lot y transitent).
+    if is_private and not _is_owner(sender_id):
         _send_command_reply(group, chat_id, _OWNER_ONLY_REPLY)
         return
 
-    # En DM (canal 1-à-1), les commandes de réglages trading restent
-    # réservées au propriétaire. Les commandes "publiques" (/start /stop
-    # /mute /stats /report /help) restent ouvertes à tout le monde en DM.
-    if is_private and cmd in _READ_ONLY_COMMANDS and not _is_owner(sender_id):
+    # Toute commande touchant aux réglages trading ou aux données
+    # personnelles du leader (/capital /risque /levier /session /timeframe
+    # /signaux /settings /profil /status /profils /menu ...) est réservée au
+    # leader, DANS LE GROUPE COMME EN DM. (Le check is_private ci-dessus
+    # couvre déjà tout le DM, mais on revérifie explicitement ici pour ne
+    # JAMAIS dépendre uniquement du contexte : un utilisateur quelconque du
+    # groupe ne doit pas pouvoir toucher aux réglages ni activer/désactiver
+    # les signaux.)
+    if cmd in _LEADER_ONLY_COMMANDS and not _is_owner(sender_id):
         _send_command_reply(group, chat_id, _OWNER_ONLY_REPLY)
         return
 
-    # --- Commandes publiques (abonné / DM) ---------------------------------
-    if cmd == "/start":
-        if is_private:
-            upsert_subscriber_start(chat_id, sender.get("username"), sender.get("first_name"), group)
-            _send_command_reply(
-                group, chat_id,
-                "👋 Bienvenue sur *ALPHABOT SMC PRO*.\n\n"
-                "Ton inscription est enregistrée — un administrateur doit encore "
-                "l'activer (accès FREE ou VIP) avant que tu reçoives les alertes "
-                "en message privé. En attendant, /stats et /report restent disponibles.\n\n"
-                + PUBLIC_COMMANDS_HELP,
-                reply_markup=(_persistent_owner_keyboard() if _is_owner(sender_id) else None),
-            )
-        else:
-            _send_command_reply(group, chat_id, PUBLIC_COMMANDS_HELP)
-    elif cmd in ("/help", "/aide"):
+    # --- Commandes publiques (groupe de signaux) ----------------------------
+    if cmd in ("/help", "/aide"):
         text_out = BOT_COMMANDS_HELP if _is_owner(sender_id) else PUBLIC_COMMANDS_HELP
-        if _is_owner(sender_id):
-            text_out += ADMIN_COMMANDS_HELP
         _send_command_reply(group, chat_id, text_out,
                              reply_markup=(_persistent_owner_keyboard() if _is_owner(sender_id) else None))
-    elif cmd == "/stop":
-        if is_private:
-            changed = set_subscriber_status(chat_id, "stopped")
-            _send_command_reply(group, chat_id,
-                                 "🛑 Messages privés arrêtés." if changed else
-                                 "Tu n'étais pas inscrit — rien à arrêter.")
-        else:
-            _send_command_reply(group, chat_id, "Envoie /stop en message privé au bot pour arrêter tes DM.")
-    elif cmd == "/mute":
-        if is_private:
-            changed = set_subscriber_notify(chat_id, False)
-            _send_command_reply(group, chat_id,
-                                 "🔕 Alertes privées coupées (tape /unmute pour les réactiver)." if changed
-                                 else "Aucun abonnement actif trouvé pour ce chat.")
-        else:
-            _send_command_reply(group, chat_id, "Envoie /mute en message privé au bot.")
-    elif cmd == "/unmute":
-        if is_private:
-            changed = set_subscriber_notify(chat_id, True)
-            _send_command_reply(group, chat_id,
-                                 "🔔 Alertes privées réactivées." if changed
-                                 else "Aucun abonnement actif trouvé pour ce chat.")
-        else:
-            _send_command_reply(group, chat_id, "Envoie /unmute en message privé au bot.")
     elif cmd == "/stats":
         _send_command_reply(group, chat_id, format_public_stats_message())
     elif cmd == "/report":
         _send_command_reply(group, chat_id, format_report_message(arg))
 
-    # --- Commandes propriétaire (réglages trading) --------------------------
+    # --- Commandes leader (réglages trading + profil privé) -----------------
     elif cmd in ("/settings", "/reglages", "/parametres"):
         _send_command_reply(group, chat_id, format_settings_message())
+    elif cmd == "/profil":
+        _send_command_reply(group, chat_id, format_leader_profile_message())
     elif cmd == "/status":
         _send_command_reply(group, chat_id, format_startup_message())
     elif cmd == "/profils":
@@ -2955,56 +2885,13 @@ def _handle_telegram_command(message: Dict, group: str):
             group, chat_id,
             f"✅ Timeframe mis à jour : *{updated['timeframe']}*.\n\n{format_settings_message(updated)}",
         )
-
-    # --- Administration des abonnés (propriétaire uniquement) ---------------
-    elif cmd == "/admin":
-        _send_command_reply(group, chat_id, "👑 *Panneau admin*" + ADMIN_COMMANDS_HELP)
-    elif cmd == "/addsub":
-        if not arg or arg2 not in ("free", "vip"):
-            _send_command_reply(group, chat_id, "Usage : /addsub <chat_id> <free|vip>")
+    elif cmd == "/signaux":
+        if not arg or arg.lower() not in ("on", "off"):
+            _send_command_reply(group, chat_id, "Usage : /signaux <on|off>")
             return
-        sub = admin_add_subscriber(arg, arg2)
-        _send_command_reply(group, chat_id, f"✅ Abonné `{sub['chat_id']}` activé en *{sub['tier'].upper()}*.")
-    elif cmd == "/removesub":
-        if not arg:
-            _send_command_reply(group, chat_id, "Usage : /removesub <chat_id>")
-            return
-        ok = admin_remove_subscriber(arg)
-        _send_command_reply(group, chat_id, "✅ Abonné retiré." if ok else "❌ Abonné introuvable.")
-    elif cmd == "/promote":
-        if not arg:
-            _send_command_reply(group, chat_id, "Usage : /promote <chat_id>")
-            return
-        ok = admin_set_tier(arg, "vip")
-        _send_command_reply(group, chat_id, "✅ Passé en VIP." if ok else "❌ Abonné actif introuvable.")
-    elif cmd == "/demote":
-        if not arg:
-            _send_command_reply(group, chat_id, "Usage : /demote <chat_id>")
-            return
-        ok = admin_set_tier(arg, "free")
-        _send_command_reply(group, chat_id, "✅ Repassé en FREE." if ok else "❌ Abonné actif introuvable.")
-    elif cmd == "/ban":
-        if not arg:
-            _send_command_reply(group, chat_id, "Usage : /ban <chat_id>")
-            return
-        ok = admin_set_ban(arg, True)
-        _send_command_reply(group, chat_id, "🚫 Abonné banni." if ok else "❌ Abonné introuvable.")
-    elif cmd == "/unban":
-        if not arg:
-            _send_command_reply(group, chat_id, "Usage : /unban <chat_id>")
-            return
-        ok = admin_set_ban(arg, False)
-        _send_command_reply(group, chat_id, "✅ Abonné débanni (réactivé)." if ok else "❌ Abonné introuvable.")
-    elif cmd == "/listsubs":
-        tier_filter = arg if arg in ("free", "vip") else None
-        _send_command_reply(group, chat_id, format_subscribers_list_message(tier_filter))
-    elif cmd == "/broadcast":
-        if not rest_text:
-            _send_command_reply(group, chat_id, "Usage : /broadcast <message>")
-            return
-        targets = list_broadcast_targets("notify_signals")
-        _send_command_reply(group, chat_id, f"📣 Diffusion en cours vers {len(targets)} abonné(s)...")
-        _broadcast_private(f"📣 *Message de l'équipe*\n\n{rest_text}", notify_field="notify_signals")
+        updated = update_settings({"signals_enabled": arg.lower() == "on"})
+        state = "🟢 ACTIVÉS" if updated["signals_enabled"] else "🔴 DÉSACTIVÉS"
+        _send_command_reply(group, chat_id, f"Signaux : {state}\n\n{format_leader_profile_message(updated)}")
     else:
         _send_command_reply(group, chat_id, "Commande inconnue. Tape /help pour la liste.")
 
@@ -3159,7 +3046,8 @@ def _fire_auto_trade_event(signal_id: int, status: str):
 
 
 _AUTO_STATUS_RANK = {"pending": 0, "taken": 0, "be": 1, "secured": 2, "tp1_hit": 3, "tp2_hit": 4}
-_AUTO_STATUS_TERMINAL = {"closed", "invalidated", "tp2_hit", "ignored"}
+# Alias de TERMINAL_STATUSES (source unique de vérité) pour rester synchronisé.
+_AUTO_STATUS_TERMINAL = set(TERMINAL_STATUSES)
 
 
 def _check_signal_progress(row: sqlite3.Row, high: float, low: float):
@@ -3173,6 +3061,7 @@ def _check_signal_progress(row: sqlite3.Row, high: float, low: float):
     if risk <= 0:
         return
     signal_id = row["id"]
+    symbol = row["symbol"]
 
     def level(rr: float) -> float:
         return entry + rr * risk if direction == "BUY" else entry - rr * risk
@@ -3183,11 +3072,28 @@ def _check_signal_progress(row: sqlite3.Row, high: float, low: float):
     def sl_reached() -> bool:
         return (direction == "BUY" and low <= sl) or (direction == "SELL" and high >= sl)
 
-    # SL en priorité (pire cas d'abord), sauf si TP1 est déjà sécurisé — une
-    # fois TP1 atteint le SL initial n'a plus de sens (BE/trailing pris en
-    # charge par l'utilisateur ensuite).
-    if status not in ("tp1_hit",) and sl_reached():
-        _fire_auto_trade_event(signal_id, "invalidated")
+    # --- Ambiguïté intrabar : avec des données OHLC (pas de tick-by-tick),
+    # on ne peut PAS savoir avec certitude si le SL ou un TP a été touché en
+    # premier quand les deux se trouvent dans le range [low, high] de la même
+    # bougie. On le journalise explicitement plutôt que de prétendre le savoir.
+    sl_hit_now = sl_reached()
+    any_tp_in_same_bar = (tp1 is not None and reached(tp1)) or (tp2 is not None and reached(tp2))
+    if sl_hit_now and any_tp_in_same_bar:
+        log.warning(
+            f"[{symbol}] AMBIGUOUS INTRABAR ORDER — signal #{signal_id} : SL ET au moins un TP sont "
+            f"dans le range de la même bougie (high={high}, low={low}, SL={sl}, TP1={tp1}, TP2={tp2}). "
+            f"Impossible de déterminer l'ordre réel intrabar avec des données OHLC seules -> "
+            f"règle déterministe appliquée : SL prioritaire (pire cas)."
+        )
+
+    # SL prioritaire (pire cas d'abord) — règle déterministe et documentée
+    # pour toute bougie ambiguë (voir log ci-dessus). Une fois TP1 déjà
+    # touché, le signal reste néanmoins sous surveillance (PAS fermé par
+    # TP1) : si le SL initial est retouché ensuite, ce n'est plus une perte
+    # totale (TP1 a déjà sécurisé une partie du gain) -> statut dédié
+    # 'tp1_sl_hit' (résultat = +RR_TP1) plutôt que 'invalidated' (-1R).
+    if sl_hit_now:
+        _fire_auto_trade_event(signal_id, "tp1_sl_hit" if status == "tp1_hit" else "invalidated")
         return
 
     current_rank = _AUTO_STATUS_RANK.get(status, 0)
@@ -3216,8 +3122,9 @@ def monitor_open_signals(symbol: str, candles: List[Dict]):
     high, low = last["high"], last["low"]
     with get_conn() as conn:
         rows = conn.execute(
-            "SELECT * FROM signals WHERE symbol=? AND status NOT IN ('closed','invalidated','tp2_hit','ignored')",
-            (symbol,),
+            f"SELECT * FROM signals WHERE symbol=? AND status NOT IN "
+            f"({','.join('?' for _ in TERMINAL_STATUSES)})",
+            (symbol, *TERMINAL_STATUSES),
         ).fetchall()
     for row in rows:
         try:
@@ -3234,15 +3141,32 @@ def process_asset(symbol: str):
         return
 
     settings = get_settings()
+    if not settings.get("signals_enabled", True):
+        return  # signaux désactivés par le leader (état DÉSACTIVÉ) -> aucun scan de publication
     if count_open_positions() >= settings["max_open_positions"]:
         return
 
-    candles = fetch_candles(symbol, limit=200)
-    if len(candles) < 30:
-        log.warning(f"[{symbol}] pas assez de données ({len(candles)} bougies)")
+    # --- SOURCE DE PRIX : MT5 (broker réel) -> Yahoo futures GC=F/SI=F ------
+    # (fallback) -> aucune donnée / donnée périmée = NO SIGNAL. Jamais de
+    # remplacement silencieux par une source approximative (ex. PAXG-USD).
+    try:
+        candles, price_source = fetch_candles(symbol, limit=200)
+    except Exception as e:
+        log.warning(f"[{symbol}] NO SIGNAL — aucune source de prix disponible (MT5 et fallback en échec) : {e}")
         return
+
+    reject_reason = validate_price_data(symbol, candles)
+    if reject_reason:
+        log.warning(f"[{symbol}] NO SIGNAL — donnée de prix rejetée : {reject_reason}")
+        return
+
+    source_label = _price_source_label(symbol, price_source)
     last_close = candles[-1]["close"]
-    log.info(f"[{symbol}] scan OK — {len(candles)} bougies, dernier prix = {last_close}")
+    log.info(f"[{symbol}] scan OK — {len(candles)} bougies, dernier prix = {last_close} "
+             f"— PRICE_SOURCE={source_label}")
+    if price_source == asset.fallback_data_source:
+        log.warning(f"[{symbol}] WARNING: FALLBACK FUTURES PRICE (PRICE_SOURCE={source_label}) "
+                    f"— MT5 indisponible, ce n'est PAS le prix exact du broker.")
 
     monitor_open_signals(symbol, candles)
 
@@ -3251,19 +3175,24 @@ def process_asset(symbol: str):
     if not sweep:
         log.info(f"[{symbol}] pas de sweep de liquidité détecté sur cette bougie.")
         return
-    log.info(f"[{symbol}] sweep détecté : {sweep.direction} @ {sweep.sweep_wick_price} "
+    log.info(f"[{symbol}] LIQUIDITY SWEEP DETECTED — {sweep.direction} @ {sweep.sweep_wick_price} "
              f"(niveau balayé : {sweep.swept_point.price}).")
 
     bos = confirm_bos(candles, sweep, swing_points)
     if not bos or not bos.confirmed:
-        log.info(f"[{symbol}] sweep présent mais BOS non confirmé — en attente de cassure de structure.")
+        if wick_only_break_pending(candles, sweep, swing_points):
+            log.info(f"[{symbol}] WICK BREAK REJECTED - NO STRUCTURE SHIFT")
+        else:
+            log.info(f"[{symbol}] WAITING FOR BODY CLOSE SHIFT")
         return
-    log.info(f"[{symbol}] BOS confirmé : {bos.direction} @ niveau {bos.break_level}.")
+    log.info(f"[{symbol}] STRUCTURE SHIFT CONFIRMED BY BODY CLOSE — {bos.direction} @ niveau {bos.break_level}.")
 
     direction = "BUY" if bos.direction == "bullish" else "SELL"
     entry_price = candles[bos.break_index]["close"]
 
     fvg = detect_fvg(candles, bos.break_index, bos.direction)
+    if fvg:
+        log.info(f"[{symbol}] FVG DETECTED — zone {fvg.bottom}-{fvg.top} ({fvg.direction}).")
     entry_type = "fvg_return" if fvg else "direct"
 
     levels = compute_levels(entry_price, direction, sweep.sweep_wick_price, candles, swing_points)
@@ -3287,6 +3216,9 @@ def process_asset(symbol: str):
     risk_amount = get_effective_risk_amount(symbol, settings)
     lot = compute_lot_size_v2(risk_amount, entry_price, levels.stop_loss, asset.lot_value_per_point)
 
+    log.info(f"[{symbol}] SIGNAL VALIDATED — {direction} {entry_type} "
+             f"entry={entry_price} SL={levels.stop_loss} lot={lot} PRICE_SOURCE={source_label}")
+
     # Plus de score 0-100 : tout setup Sweep + CHoCH confirmé par la clôture
     # du corps de bougie est publié tel quel (score=0 conservé en base pour
     # compatibilité de schéma uniquement, non affiché, non utilisé pour filtrer).
@@ -3300,7 +3232,13 @@ def process_asset(symbol: str):
     message = format_signal_message(
         symbol, asset.display_name, direction, ENTRY_TYPES[entry_type]["label"],
         get_stars(entry_type), entry_price, levels.stop_loss, levels.tp1,
-        levels.tp2, levels.rr_tp1, levels.rr_tp2 or 0, lot=lot, risk_amount=risk_amount,
+        levels.tp2, levels.rr_tp1, levels.rr_tp2 or 0,
+    )
+    leader_message = format_leader_signal_dm(
+        symbol, asset.display_name, direction, ENTRY_TYPES[entry_type]["label"],
+        get_stars(entry_type), entry_price, levels.stop_loss, levels.tp1,
+        levels.tp2, levels.rr_tp1, levels.rr_tp2 or 0,
+        lot=lot, risk_amount=risk_amount, settings=settings,
     )
     image_path = generate_signal_chart(
         symbol, asset.display_name, direction, candles, sweep, bos,
@@ -3308,9 +3246,10 @@ def process_asset(symbol: str):
         signal_id=signal_id,
     )
     try:
-        broadcast_signal(message, image_path=image_path, signal_id=signal_id,
+        broadcast_signal(message, leader_text=leader_message, image_path=image_path, signal_id=signal_id,
                           symbol=symbol, entry_price=entry_price, stop_loss=levels.stop_loss)
-        log.info(f"[{symbol}] signal #{signal_id} publié ({direction}, {entry_type}, lot={lot})")
+        log.info(f"[{symbol}] signal #{signal_id} publié ({direction}, {entry_type}) — "
+                 f"détail (lot={lot}, risque={risk_amount:.2f}$) envoyé uniquement en DM leader.")
     except Exception:
         log.error(f"[{symbol}] échec d'envoi Telegram pour le signal #{signal_id}:\n{traceback.format_exc()}")
 
@@ -3554,7 +3493,7 @@ def backup_database() -> Optional[str]:
 
     if BACKUP_SEND_TO_TELEGRAM:
         try:
-            group = "reports" if os.environ.get("TG_CHAT_REPORTS") else "btc_gold"
+            group = "reports" if os.environ.get("TG_CHAT_REPORTS") else "signal_group"
             token = _bot_token(group)
             chat_id = _chat_id_for_group(group)
             with open(path, "rb") as f:
@@ -3900,7 +3839,7 @@ def get_trade_actions_endpoint(signal_id):
     return jsonify([dict(r) for r in rows])
 
 
-_WEBHOOK_BOT_KEYS = ("btc_gold", "vip_gold")  # clés valides pour <bot_key> dans l'URL
+_WEBHOOK_BOT_KEYS = ("signal_group",)  # une seule clé valide pour <bot_key> dans l'URL
 
 
 @app.route("/telegram/webhook/<bot_key>", methods=["POST"])
@@ -3909,7 +3848,7 @@ def telegram_webhook(bot_key):
     boutons inline des signaux (✅❌🟡🔒🔴) et du menu /profils. bot_key (dans
     l'URL) identifie le bot — donc le token — qui a reçu le message, y
     compris en DM. Voir section DÉPLOIEMENT en bas de fichier pour l'URL de
-    webhook (.../telegram/webhook/btc_gold)."""
+    webhook (.../telegram/webhook/signal_group)."""
     if bot_key not in _WEBHOOK_BOT_KEYS:
         return jsonify({"error": "bot inconnu"}), 404
 
@@ -3960,10 +3899,8 @@ def telegram_webhook(bot_key):
         if not action_def or not row:
             return jsonify({"ok": True})
 
-        # bot_key = le bot qui a RÉELLEMENT reçu ce clic (FREE ou VIP — le
-        # signal est désormais posté avec les mêmes boutons sur les deux
-        # groupes, donc row['telegram_group'] ne suffit plus pour savoir
-        # quel bot répondre à un clic donné).
+        # bot_key = le bot qui a reçu ce clic (il n'y en a qu'un seul,
+        # "signal_group" — plus de multi-bot FREE/VIP).
         group = bot_key
         sender_id = (callback.get("from") or {}).get("id")
         if not _is_owner(sender_id):
@@ -4426,21 +4363,23 @@ if __name__ == "__main__":
 #    mécanisme qui est utilisé par le watchdog intégré (section 9bis).
 # 2. Start command : python main.py
 # 3. Variables d'environnement à définir dans Render (Settings > Environment) :
-#      Groupe FREE : TELEGRAM_BOT_TOKEN_BTC_GOLD, TG_CHAT_BTC_GOLD
-#      Groupe VIP (optionnel — sans ces 2 variables, le groupe VIP est
-#        simplement ignoré partout, best-effort, sans erreur bloquante) :
-#        TELEGRAM_BOT_TOKEN_VIP_GOLD, TG_CHAT_VIP_GOLD
-#      TG_CHAT_REPORTS (optionnel — sinon les rapports partent sur le groupe FREE)
-#      TELEGRAM_BOT_TOKEN_REPORTS (optionnel — sinon le bot "btc_gold" est réutilisé)
-#      TELEGRAM_WEBHOOK_SECRET (optionnel mais recommandé — sécurise les routes
-#        /telegram/webhook/btc_gold et /telegram/webhook/vip_gold)
-#      TELEGRAM_OWNER_ID (fortement recommandé — ton ID Telegram numérique,
-#        récupérable via @userinfobot ; sans elle, /capital /risque /levier
-#        /profils, les boutons ✅❌🟡🔒🔴 ET tout le panneau admin abonnés
-#        (/addsub /removesub /promote /demote /ban /listsubs /broadcast)
-#        restent ouverts à tout le monde — y compris en DM, donc à n'importe
-#        qui DMant l'un des 2 bots. À définir avant toute mise en prod réelle.)
+#      Groupe de signaux (public) : TELEGRAM_BOT_TOKEN_SIGNAL, TG_CHAT_SIGNAL
+#      TG_CHAT_REPORTS (optionnel — sinon les rapports partent sur le groupe de signaux)
+#      TELEGRAM_BOT_TOKEN_REPORTS (optionnel — sinon le bot "signal_group" est réutilisé)
+#      TELEGRAM_WEBHOOK_SECRET (optionnel mais recommandé — sécurise la route
+#        /telegram/webhook/signal_group)
+#      TELEGRAM_OWNER_ID (OBLIGATOIRE avant toute mise en prod réelle — ton ID
+#        Telegram numérique, récupérable via @userinfobot ou affiché par ton
+#        propre bot au démarrage d'une conversation, ex. "Votre ID : ...".
+#        C'est le SEUL destinataire du DM privé (solde, risque, levier, lot,
+#        paramètres, suivi détaillé) et le seul autorisé à changer les
+#        réglages (/capital /risque /levier /profils /signaux, boutons
+#        ✅❌🟡🔒🔴). Sans elle, ces commandes restent ouvertes à tout le
+#        monde — y compris à n'importe qui DMant le bot.)
 #      SIGNAL_COOLDOWN_MINUTES (optionnel, défaut 15 — délai mini entre 2 signaux sur le même actif)
+#      MAX_CANDLE_AGE_SECONDS (optionnel, défaut 900 — âge max toléré de la dernière bougie
+#        avant de considérer la donnée de prix périmée -> NO SIGNAL)
+#      MAX_LOT_DEFAULT (optionnel, défaut 50 — plafond du lot dynamique calculé automatiquement)
 #      DB_PATH (optionnel — chemin du fichier SQLite, ex. un disque persistant Render)
 #      EXPORT_DIR (optionnel, défaut "exports" — dossier des CSV/PDF générés)
 #      EXPORT_KEEP_LAST (optionnel, défaut 50 — nombre de fichiers conservés par type)
@@ -4448,7 +4387,7 @@ if __name__ == "__main__":
 #      BACKUP_INTERVAL_HOURS (optionnel, défaut 6 — fréquence de la sauvegarde automatique)
 #      BACKUP_KEEP_LAST (optionnel, défaut 20 — nombre de sauvegardes conservées)
 #      BACKUP_SEND_TO_TELEGRAM (optionnel, défaut "false" — "true" pour recevoir chaque
-#        sauvegarde en document Telegram sur le canal "reports", sinon "btc_gold")
+#        sauvegarde en document Telegram sur le canal "reports", sinon "signal_group")
 #      LOG_LEVEL (optionnel, défaut "INFO" — DEBUG/INFO/WARNING/ERROR)
 #      LOG_MAX_BYTES (optionnel, défaut 5242880 — taille max avant rotation d'un fichier de log)
 #      LOG_BACKUP_COUNT (optionnel, défaut 5 — nombre de fichiers de log archivés conservés)
@@ -4464,49 +4403,38 @@ if __name__ == "__main__":
 # 4. Healthcheck path côté Render : /health
 #      -> renvoie 200 si le scan a tourné il y a moins de WATCHDOG_MAX_SILENCE_SECONDS,
 #         503 sinon (Render peut alors, en plus du watchdog interne, redémarrer le service).
-# 5. Boutons Telegram interactifs + commandes en DM — chaque bot (FREE et,
-#    si configuré, VIP) a sa PROPRE URL de webhook (le chemin encode quel bot
-#    répond, indispensable pour lever l'ambiguïté en DM et pour que les
-#    boutons ✅❌🟡🔒🔴 fonctionnent aussi bien sous le post FREE que sous le
-#    post VIP du même signal). À faire UNE FOIS par bot, après le déploiement :
-#      curl -X POST "https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN_BTC_GOLD>/setWebhook" \
-#           -d "url=https://<ton-service>.onrender.com/telegram/webhook/btc_gold" \
+# 5. Boutons Telegram interactifs + commandes en DM — UN SEUL bot dans tout le
+#    projet (celui du groupe de signaux), donc une seule URL de webhook. À
+#    faire UNE FOIS, après le déploiement :
+#      curl -X POST "https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN_SIGNAL>/setWebhook" \
+#           -d "url=https://<ton-service>.onrender.com/telegram/webhook/signal_group" \
 #           -d "secret_token=<TELEGRAM_WEBHOOK_SECRET>"
-#      # si le groupe VIP est activé :
-#      curl -X POST "https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN_VIP_GOLD>/setWebhook" \
-#           -d "url=https://<ton-service>.onrender.com/telegram/webhook/vip_gold" \
-#           -d "secret_token=<TELEGRAM_WEBHOOK_SECRET>"
-#    ⚠️ Si un bot avait déjà un webhook pointé vers une ancienne URL avant ce
-#    changement, relance l'appel correspondant après déploiement pour
-#    basculer vers la nouvelle URL dédiée — sinon Telegram continue d'appeler
-#    l'ancienne route (qui n'existe plus) et les updates ne partent nulle part.
-# 6. Commandes Telegram natives :
-#      Publiques (DM, tout le monde) : /start /stop /mute /unmute /stats
+#    ⚠️ Si le bot avait déjà un webhook pointé vers une ancienne URL avant ce
+#    changement, relance l'appel ci-dessus après déploiement pour basculer
+#    vers la nouvelle URL — sinon Telegram continue d'appeler l'ancienne
+#    route (qui n'existe plus) et les updates ne partent nulle part.
+# 6. Commandes Telegram natives — il n'y a que DEUX contextes : le groupe de
+#    signaux (public, lecture seule) et le DM du leader (privé, tout le reste) :
+#      Publiques (dans le groupe, tout le monde) : /stats
 #        /report [daily|weekly|monthly] /help
-#      Propriétaire (réglages trading, groupe + DM) : /settings /capital
-#        /risque /levier /profils /status
-#      Propriétaire (administration des abonnés, groupe + DM) : /admin
-#        /addsub <chat_id> <free|vip> /removesub <chat_id> /promote <chat_id>
-#        /demote <chat_id> /ban <chat_id> /unban <chat_id> /listsubs [free|vip]
-#        /broadcast <message>
-#    Rappel : /addsub est le SEUL moyen d'activer un abonné pour la diffusion
-#    privée — /start ne fait qu'enregistrer le chat_id en statut 'pending'.
-#    Pour connaître le chat_id d'un abonné qui a fait /start, consulte
-#    /listsubs (ou la table `subscribers` en base).
-#    Pour que le menu "/" apparaisse dans Telegram, exécute UNE FOIS par bot
+#      Leader uniquement (réglages trading + profil privé, groupe ou DM) :
+#        /settings /profil /capital /risque /levier /session /timeframe
+#        /signaux <on|off> /profils /status /menu
+#    Pour que le menu "/" apparaisse dans Telegram, exécute UNE FOIS
 #    (optionnel, juste pour l'UI) :
 #      curl -X POST "https://api.telegram.org/bot<TOKEN>/setMyCommands" \
 #           -H "Content-Type: application/json" \
 #           -d '{"commands": [
-#                 {"command": "start", "description": "S'"'"'enregistrer"},
-#                 {"command": "stop", "description": "Arrêter les messages privés"},
+#                 {"command": "profil", "description": "Profil leader (solde/risque/levier/lot)"},
 #                 {"command": "stats", "description": "Statistiques globales"},
 #                 {"command": "report", "description": "Rapport de performance"},
 #                 {"command": "settings", "description": "Voir les réglages actuels"},
 #                 {"command": "capital", "description": "Définir le capital ($)"},
 #                 {"command": "risque", "description": "Définir le risque par trade (%)"},
 #                 {"command": "levier", "description": "Définir le levier (x)"},
+#                 {"command": "signaux", "description": "Activer/désactiver les signaux"},
 #                 {"command": "profils", "description": "Lister/activer un profil"},
 #                 {"command": "status", "description": "État du bot"},
 #                 {"command": "help", "description": "Liste des commandes"}
 #               ]}'
+
