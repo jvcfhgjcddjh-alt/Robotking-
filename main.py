@@ -17,16 +17,19 @@ BOS Corps de Bougie"), confirmée avec Pie :
   - Entrée : directe (★★) si pas de FVG laissé par la bougie de cassure,
     retour dans l'imbalance (★★★) si un FVG est détecté (plus haute confiance).
   - SL : ATR(14) x 0,6 au-delà de l'extrémité du sweep, marge spread/commission incluse.
-  - TP1 : RR3, avec BE proposé à RR1 et sécurisation partielle proposée à RR2.
-  - TP2 : RR6 fixe (plus de cible "intelligente" OB/FVG/liquidité).
+  - TP unique : RR4 par défaut, avec passage en Break Even proposé au même
+    niveau RR2 par défaut (plus d'étape de sécurisation partielle
+    intermédiaire, ni de second TP). Ces deux multiples de RR, ainsi que le
+    mode BE, sont configurables et persistés (voir get_settings()["tp_rr"] /
+    ["be_rr"] / ["be_mode"], MODIFICATION 4/5) — /tprr, /berr, /bemode.
   - Pas de score 0-100 : tout setup Sweep + CHoCH confirmé par clôture du
     corps de bougie est publié tel quel, sans filtre de qualité.
   - Lot recalculé à chaque signal à partir du risque choisi (mode $ fixe,
     ex. 3$/10$, ou % du capital), de l'entrée et du Stop Loss.
   - Diffusion Telegram 100% DM PRIVÉ DU LEADER (TELEGRAM_OWNER_ID, seul
-    destinataire) : signal complet (ENTRY/SL/TP1/TP2/RR/Lot), message de
+    destinataire) : signal complet (ENTRY/SL/TP unique RR4/RR/Lot), message de
     lancement au démarrage/redémarrage, suivi automatique de chaque trade
-    (🥇 TP1 / 🥈 TP2 / ❌ SL / BE / sécurisation), rapport $ à la clôture,
+    (🥇 TP / ❌ SL / BE), rapport $ à la clôture,
     solde, risque/trade, levier, paramètres, état ACTIF/DÉSACTIVÉ.
     SIGNAL_BROADCAST_GROUPS et STARTUP_NOTIFY_GROUPS (plus bas dans ce
     fichier) restent dans le code mais sont VIDES par défaut -> rien n'est
@@ -36,7 +39,7 @@ BOS Corps de Bougie"), confirmée avec Pie :
     Aucun système d'abonnés/tiers : pas de "groupe VIP", pas de diffusion à
     une liste d'utilisateurs — seulement ces deux canaux.
   - Suivi 100% automatique : dès qu'un signal est publié, le prix est
-    surveillé en continu (monitor_open_signals) pour détecter TP1/TP2/SL —
+    surveillé en continu (monitor_open_signals) pour détecter TP (RR4)/SL —
     aucun clic "j'ai pris le trade" n'est nécessaire pour que le suivi
     fonctionne (les boutons Telegram restent disponibles en plus, pour un
     reporting manuel optionnel de ce qui a été réellement fait du trade).
@@ -126,7 +129,14 @@ class AssetConfig:
 
 ASSETS = {
     "XAUUSD": AssetConfig(
-        symbol="XAUUSD", display_name="Gold (XAUUSD)", data_source="mt5_bridge",
+        # Source principale RÉELLE : chaîne live gold-api.com -> goldapi.io
+        # (voir "BRANCHEMENT RÉEL SUR LE PIPELINE LIVE XAUUSD" plus bas dans
+        # ce fichier). mt5_bridge n'était de toute façon jamais alimenté tant
+        # qu'aucun pont MT5 externe n'est branché sur /api/mt5/push -> chaque
+        # scan retombait déjà systématiquement sur yfinance (futures GC=F).
+        # Le code du pont MT5 reste intact : repasser data_source="mt5_bridge"
+        # suffit si tu branches mt5_price_bridge.py plus tard.
+        symbol="XAUUSD", display_name="Gold (XAUUSD)", data_source="gold_price_service",
         telegram_group="signal_group", session_continuous=False,
         session_start_utc=13, session_end_utc=22, contract_type="classic",
         fallback_data_source="yfinance", lot_value_per_point=100.0,
@@ -169,17 +179,39 @@ ATR_SL_MULTIPLIER = 0.6  # base du SL INCHANGÉE (stratégie ATR x 0.6 pure)
 # ce correctif -> il valait 0.0 partout malgré ce flag à True.
 INCLUDE_SPREAD_COMMISSION_BUFFER = True
 
-# Nb max de bougies pour la reprise (reclaim) après le sweep — aligné sur
-# le réglage Pine actuel (passé de 3 à 8, win rate amélioré côté indicateur).
-SWEEP_RECLAIM_BARS = 8
+# Nb max de bougies pour la reprise (reclaim) après le sweep — remis à 3
+# le 03/09/2026 pour matcher la config AlphaBotV7 (Pine) envoyée par
+# captures d'écran. ⚠️ Ce projet avait été délibérément passé de 3 à 8 lors
+# d'un précédent réglage Pine (voir historique) car cela avait amélioré le
+# win rate côté indicateur — cette valeur repasse ici à 3 car c'est la
+# valeur actuellement affichée sur l'indicateur envoyé. Si les 8 avaient
+# été gardés volontairement pour une autre raison, prévenir pour revenir dessus.
+SWEEP_RECLAIM_BARS = 3
 
-# Grille RR fixe demandée : BE à RR1, sécurisation partielle à RR2, TP1
-# (laisser courir le reste) à RR3, objectif final TP2 à RR6. Plus de cible
-# "intelligente" dynamique (OB/FVG/liquidité) : TP2 = RR6 fixe, toujours.
-BE_TRIGGER_RR = 1.0
-SECURE_TRIGGER_RR = 2.0
-TP1_RR = 3.0
-TP2_RR = 6.0
+# Grille RR simplifiée : BE à RR2, TP unique à RR4 (valeurs par défaut ci-
+# dessous). Plus d'étape de "sécurisation partielle" intermédiaire (remplacée
+# par le passage en BE au même niveau) et plus de TP2 séparé (remplacé par un
+# TP unique). TP2_RR est désactivé (None) : conservé en variable pour compat
+# éventuelle avec du code legacy, mais compute_levels() ne l'utilise plus.
+TP2_RR = None  # désactivé — plus de second objectif
+
+# MODIFICATION 4/5 (03/09/2026) — PERSISTANCE ET SOURCE DE VÉRITÉ UNIQUE.
+# BE_MODE, BE_RR (ex-BE_TRIGGER_RR) et TP_RR (ex-TP1_RR) ÉTAIENT des
+# constantes Python figées au chargement du module (BE_MODE en plus lu
+# depuis une variable d'environnement) : une valeur modifiée en RAM (ou un
+# redéploiement avec une env var différente) revenait donc SILENCIEUSEMENT
+# aux anciennes valeurs au redémarrage, et rien ne garantissait qu'une autre
+# fonction du fichier ne référence pas une valeur différente en dur.
+# Ces trois réglages sont désormais des clés de app_settings (voir
+# DEFAULT_SETTINGS / get_settings() / update_settings() plus bas), EXACTEMENT
+# la même table SQLite et le même gestionnaire déjà utilisés pour
+# capital/risk_percent (MODIFICATION 3/5) : UNE SEULE source de vérité pour
+# tout le fichier, persistée en base, restaurée telle quelle après un
+# redémarrage. Plus aucun code ne doit lire BE_MODE/BE_TRIGGER_RR/TP1_RR
+# comme variable globale — toujours via get_settings()["be_mode"] /
+# ["be_rr"] / ["tp_rr"] (ou un paramètre `settings`/`be_rr`/`tp_rr` déjà
+# résolu à partir de get_settings() plus haut dans l'appel).
+# Valeurs par défaut (premier démarrage / base vide) : voir DEFAULT_SETTINGS.
 
 # Statuts TERMINAUX d'un signal : plus aucun suivi de prix ni action
 # possible. Source unique de vérité réutilisée PARTOUT (index SQL partiel,
@@ -188,11 +220,13 @@ TP2_RR = 6.0
 # dans un seul de ces endroits.
 #   - "closed"        : clôture manuelle (bouton/dashboard) sans résultat R calculable.
 #   - "invalidated"    : SL touché (perte totale, -1R).
-#   - "tp2_hit"        : objectif final atteint (+RR2, trade terminé).
+#   - "tp1_hit"        : objectif unique atteint (+RR4, trade terminé — nouvel état final).
+#   - "tp2_hit"        : (LECTURE SEULE, historique) ancien objectif final RR6, plus jamais
+#                        déclenché pour un nouveau signal — conservé pour l'historique en base.
 #   - "tp1_sl_hit"     : SL initial retouché APRÈS que TP1 a déjà été sécurisé
 #                        -> resultat = +RR_TP1 (pas une perte totale, TP1 est déjà en poche).
 #   - "ignored"        : le leader a explicitement ignoré ce trade (bouton "Trade ignoré").
-TERMINAL_STATUSES = ("closed", "invalidated", "tp2_hit", "tp1_sl_hit", "ignored")
+TERMINAL_STATUSES = ("closed", "invalidated", "tp1_hit", "tp2_hit", "tp1_sl_hit", "ignored")
 
 ENTRY_TYPES = {
     "direct": {"stars": "★★", "label": "Entrée directe"},
@@ -214,7 +248,7 @@ _DEFAULT_TG_TOKEN_SIGNAL = "6950706659:AAFxJFP2DhAlTbFF6Ve5uylypPkMGKRecIE"
 
 # --- Canaux Telegram : il n'y en a que DEUX dans ce projet -----------------
 #   1. "signal_group"  : le groupe public de diffusion des signaux (XAUUSD,
-#      XAGUSD, BTCUSD). Contenu STRICTEMENT public : signal + TP1/TP2/SL.
+#      XAGUSD, BTCUSD). Contenu STRICTEMENT public : signal + TP (RR4)/SL.
 #      Aucune donnée personnelle (lot, risque $, solde, levier) n'y est
 #      jamais publiée.
 #   2. "reports"       : canal optionnel pour les rapports auto (journalier/
@@ -336,19 +370,12 @@ WATCHDOG_CHECK_INTERVAL_SECONDS = 15
 WATCHDOG_MAX_SILENCE_SECONDS = 180     # si aucun scan depuis ce délai -> considéré comme bloqué
 WATCHDOG_RESTART_COOLDOWN_SECONDS = 30 # anti rage-restart
 
-# --- TP2 intelligent SMC/ICT --------------------------------------------
-# Poids de priorité utilisés uniquement comme repère en cas d'égalité de
-# distance entre deux cibles candidates : un Order Block non mitigé est une
-# empreinte institutionnelle plus fiable qu'un simple FVG, lui-même plus
-# fiable qu'un pool de liquidité brut (cible "ultime" mais moins précise).
-TP2_TARGET_PRIORITY = {"order_block": 3, "fvg": 2, "liquidity": 1}
-TP2_TARGET_LABELS = {
-    "order_block": "Order Block",
-    "fvg": "Fair Value Gap",
-    "liquidity_buy": "Liquidité (BSL)",
-    "liquidity_sell": "Liquidité (SSL)",
-}
-OB_IMPULSE_ATR_MULTIPLIER = 1.3  # une bougie est jugée "impulsive" si son corps > ATR x ce facteur
+# --- TP2 intelligent SMC/ICT : SUPPRIMÉ (03/09/2026, TP UNIQUE RR4) --------
+# TP2_TARGET_PRIORITY / TP2_TARGET_LABELS / OB_IMPULSE_ATR_MULTIPLIER ainsi
+# que le sous-système Order Blocks + select_smart_tp2() qui les utilisait
+# ont été retirés — chaque trade a désormais un TP unique, fixé au multiple
+# de RR configuré par app_settings["tp_rr"] (voir DEFAULT_SETTINGS plus bas
+# et compute_levels()).
 
 # --- Export CSV/PDF --------------------------------------------------------
 EXPORT_DIR = os.environ.get("EXPORT_DIR", "exports")
@@ -525,6 +552,11 @@ DEFAULT_SETTINGS = {
     "session_mode": "ny",                    # "ny" (13h-22h UTC) | "24h" (scan en continu)
     "timeframe": TIMEFRAME,                  # "M1" (scalping) | "M5" (par défaut)
     "signals_enabled": True,                 # état ACTIF/DÉSACTIVÉ affiché dans le profil du leader (/signaux)
+    # --- MODIFICATION 4/5 : grille RR + mode BE, persistés (ex-constantes
+    # BE_MODE / BE_TRIGGER_RR / TP1_RR — voir commentaire plus haut) ---
+    "be_mode": "PROPOSE",                    # mode Break-Even : "PROPOSE" (seul mode implémenté actuellement)
+    "be_rr": 2.0,                            # multiple de RR auquel le BE est proposé (ex: 2.0 -> RR2)
+    "tp_rr": 4.0,                            # multiple de RR du TP unique (ex: 4.0 -> RR4)
 }
 
 VALID_RISK_UNITS = {"dollar", "percent"}
@@ -532,6 +564,13 @@ VALID_RISK_UNITS = {"dollar", "percent"}
 VALID_SESSION_MODES = {"ny", "24h"}
 VALID_TIMEFRAMES = {"M1", "M5"}
 TIMEFRAME_TO_INTERVAL = {"M1": "1m", "M5": "5m"}  # -> paramètre `interval` yfinance/Binance
+# Seul "PROPOSE" est implémenté : le bot notifie mais ne déplace jamais le SL
+# lui-même (voir commentaire MODIFICATION 4/5 plus haut). Un futur mode
+# "AUTO" (déplacement automatique réel du SL côté broker) n'existe pas encore
+# côté logique de suivi (_check_signal_progress) — ne pas l'ajouter ici tant
+# que ce mode n'est pas réellement câblé, pour ne jamais accepter une valeur
+# qui laisserait croire à un comportement non implémenté.
+VALID_BE_MODES = {"PROPOSE"}
 
 _SETTINGS_KEY = "config"
 
@@ -633,6 +672,11 @@ def update_settings(patch: Dict) -> Dict:
         "session_mode": (str, lambda v: v in VALID_SESSION_MODES),
         "timeframe": (lambda v: str(v).upper(), lambda v: v in VALID_TIMEFRAMES),
         "signals_enabled": (bool, lambda v: True),
+        # --- MODIFICATION 4/5 : grille RR + mode BE (persistés, source
+        # unique de vérité — voir DEFAULT_SETTINGS) ---
+        "be_mode": (lambda v: str(v).upper(), lambda v: v in VALID_BE_MODES),
+        "be_rr": (float, lambda v: v > 0),
+        "tp_rr": (float, lambda v: v > 0),
     }
 
     for key, raw_value in patch.items():
@@ -646,6 +690,18 @@ def update_settings(patch: Dict) -> Dict:
         if not check(value):
             raise ValueError(f"Valeur hors limites pour '{key}': {raw_value!r}")
         current[key] = value
+
+    # Cohérence de la grille RR : le BE doit être déclenché AVANT le TP,
+    # jamais au même niveau ni au-delà (sinon le suivi automatique
+    # n'atteindrait jamais l'étape "be" avant de clôturer le trade).
+    # Vérifié sur l'état final (current), donc même si un seul des deux
+    # champs est modifié dans ce patch.
+    if "be_rr" in patch or "tp_rr" in patch:
+        if current["be_rr"] >= current["tp_rr"]:
+            raise ValueError(
+                f"BE_RR ({current['be_rr']:g}) doit être strictement inférieur à "
+                f"TP_RR ({current['tp_rr']:g})."
+            )
 
     # Bascule automatique de l'unité de risque : si on touche risk_percent
     # sans préciser risk_unit, on suppose que l'intention est le mode "%"
@@ -906,6 +962,10 @@ def get_stats():
 # Statuts considérés comme gain / perte / neutre pour le calcul du résultat
 # en multiples de R (le SQLite ne stocke pas de solde/lot par trade, donc on
 # raisonne en R — cohérent avec le RR affiché dans chaque signal).
+# "tp1_hit" est désormais l'état final gagnant du nouveau flow (TP unique
+# RR4). "tp2_hit" et "secured" restent listés uniquement pour le calcul de
+# résultat des anciens signaux en base (historique) : plus aucun nouveau
+# signal ne peut les atteindre (voir _check_signal_progress).
 WIN_STATUSES = {"tp1_hit", "tp2_hit", "secured"}
 LOSS_STATUSES = {"invalidated"}
 BE_STATUSES = {"be"}
@@ -1277,7 +1337,12 @@ def can_publish_today(symbol: str) -> bool:
     return True
 
 
-OPEN_STATUSES = ("pending", "taken", "be", "secured", "tp1_hit")
+OPEN_STATUSES = ("pending", "taken", "be", "secured")
+# "tp1_hit" est désormais TERMINAL (TP unique à RR4 = fin du trade) et n'est
+# plus compté comme position ouverte. "secured" reste dans cette liste
+# uniquement pour la compatibilité de lecture des anciens signaux en base
+# (grille précédente, encore au statut "secured" au moment de la migration) —
+# un nouveau signal ne peut plus jamais atteindre ce statut.
 
 
 def count_open_positions() -> int:
@@ -1444,6 +1509,13 @@ def _price_source_label(symbol: str, source: str) -> str:
         return "TWELVEDATA"
     if source == "binance":
         return "BINANCE"
+    if source == "gold_price_service":
+        # Reflète la source RÉELLE ayant répondu au dernier poll de la chaîne
+        # (gold-api.com ou goldapi.io) — voir FallbackChainFeed plus bas.
+        active = None
+        if xauusd_price_service is not None and xauusd_price_service.last_tick is not None:
+            active = xauusd_price_service.last_tick.source
+        return f"GOLD_PRICE_SERVICE({active or '?'})"
     return source.upper()
 
 
@@ -1498,6 +1570,8 @@ def validate_price_data(symbol: str, candles: List[Dict]) -> Optional[str]:
 def _fetch_by_source(data_source: str, symbol: str, limit: int, interval: str) -> List[Dict]:
     if data_source == "mt5_bridge":
         return _fetch_mt5_bridge(symbol, limit)
+    elif data_source == "gold_price_service":
+        return _fetch_gold_price_service(symbol, limit)
     elif data_source == "twelvedata":
         return _fetch_twelvedata(symbol, limit, interval)
     elif data_source == "yfinance":
@@ -1774,161 +1848,17 @@ def detect_fvg(candles: List[Dict], around_index: int, direction: str) -> Option
     return None
 
 
-def scan_all_fvgs(candles: List[Dict]) -> List[FVGZone]:
-    """Scanne TOUTES les bougies (pas seulement autour de la cassure) pour
-    lister les FVG (Fair Value Gap / imbalance) présentes sur la fenêtre, avec
-    leur statut de mitigation (comblée ou non par le prix depuis sa formation)."""
-    zones: List[FVGZone] = []
-    n = len(candles)
-    for i in range(2, n):
-        c0, c2 = candles[i - 2], candles[i]
-        if c2["low"] > c0["high"]:
-            zones.append(FVGZone(top=c2["low"], bottom=c0["high"], index=i, direction="bullish"))
-        elif c2["high"] < c0["low"]:
-            zones.append(FVGZone(top=c0["low"], bottom=c2["high"], index=i, direction="bearish"))
-    for z in zones:
-        for c in candles[z.index + 1:]:
-            if c["low"] <= z.top and c["high"] >= z.bottom:
-                z.mitigated = True
-                break
-    return zones
-
-
 # ============================================================================
-# 5bis. ORDER BLOCKS (pour la sélection intelligente de TP2)
+# 6. RISQUE : ATR, SL, TP (RR4 UNIQUE), LOT
 # ============================================================================
-
-@dataclass
-class OBZone:
-    top: float
-    bottom: float
-    index: int
-    direction: str      # "bullish" (support) | "bearish" (résistance)
-    mitigated: bool = False
-
-
-def find_order_blocks(candles: List[Dict]) -> List[OBZone]:
-    """Order Block ICT simplifié : dernière bougie de couleur opposée juste
-    avant un déplacement impulsif (corps > ATR x facteur). Bullish OB = zone
-    de support (dernière bougie baissière avant une impulsion haussière) ;
-    Bearish OB = zone de résistance (dernière bougie haussière avant une
-    impulsion baissière)."""
-    n = len(candles)
-    if n < ATR_PERIOD + 3:
-        return []
-    atr = compute_atr(candles)
-    if atr <= 0:
-        return []
-
-    zones: List[OBZone] = []
-    for i in range(1, n):
-        c = candles[i]
-        body = abs(c["close"] - c["open"])
-        if body < atr * OB_IMPULSE_ATR_MULTIPLIER:
-            continue
-        prev = candles[i - 1]
-        is_impulse_bullish = c["close"] > c["open"]
-        is_impulse_bearish = c["close"] < c["open"]
-        prev_bearish = prev["close"] < prev["open"]
-        prev_bullish = prev["close"] > prev["open"]
-
-        if is_impulse_bullish and prev_bearish:
-            zones.append(OBZone(top=prev["high"], bottom=prev["low"], index=i - 1, direction="bullish"))
-        elif is_impulse_bearish and prev_bullish:
-            zones.append(OBZone(top=prev["high"], bottom=prev["low"], index=i - 1, direction="bearish"))
-
-    for z in zones:
-        for c in candles[z.index + 1:]:
-            if c["low"] <= z.top and c["high"] >= z.bottom:
-                z.mitigated = True
-                break
-    return zones
-
-
-# ============================================================================
-# 5ter. TP2 INTELLIGENT SMC/ICT — sélection dynamique de la cible
-# ============================================================================
-
-@dataclass
-class TP2Target:
-    price: Optional[float]
-    label: Optional[str]
-
-
-def select_smart_tp2(candles: List[Dict], swing_points: List["SwingPoint"],
-                      entry_price: float, direction: str,
-                      tp1_price: float, risk: float = 0.0) -> "TP2Target":
-    """Choisit le TP2 parmi les cibles SMC/ICT réellement disponibles sur le
-    graphique au lieu d'un simple multiple de RR fixe :
-      - Order Block non mitigé
-      - Fair Value Gap non mitigée
-      - Liquidité (Buy Side / Sell Side) non balayée
-    Règle de sélection : la cible non mitigée la plus proche AU-DELÀ de TP1
-    dans le sens du trade l'emporte ; en cas d'égalité de distance (< 0.05%
-    d'écart), l'empreinte la plus fiable gagne (Order Block > FVG > liquidité
-    pool), conformément à la hiérarchie SMC/ICT usuelle. Si rien n'existe
-    au-delà de TP1, on retombe sur la cible non mitigée la plus proche
-    au-delà de l'entrée. Toute cible sous MIN_TP2_RR (trop proche de TP1
-    pour être un vrai second objectif) est écartée."""
-    candidates = []  # (price, kind, priority)
-
-    for ob in find_order_blocks(candles):
-        if ob.mitigated:
-            continue
-        if direction == "BUY" and ob.direction == "bearish" and ob.bottom > entry_price:
-            candidates.append((ob.bottom, "order_block", TP2_TARGET_PRIORITY["order_block"]))
-        elif direction == "SELL" and ob.direction == "bullish" and ob.top < entry_price:
-            candidates.append((ob.top, "order_block", TP2_TARGET_PRIORITY["order_block"]))
-
-    for fvg in scan_all_fvgs(candles):
-        if fvg.mitigated:
-            continue
-        if direction == "BUY" and fvg.bottom > entry_price:
-            candidates.append((fvg.bottom, "fvg", TP2_TARGET_PRIORITY["fvg"]))
-        elif direction == "SELL" and fvg.top < entry_price:
-            candidates.append((fvg.top, "fvg", TP2_TARGET_PRIORITY["fvg"]))
-
-    unswept_highs = [p.price for p in swing_points if p.kind == "high"
-                      and p.price > entry_price
-                      and not any(c["high"] > p.price for c in candles[p.index + 1:])]
-    unswept_lows = [p.price for p in swing_points if p.kind == "low"
-                     and p.price < entry_price
-                     and not any(c["low"] < p.price for c in candles[p.index + 1:])]
-    if direction == "BUY":
-        for price in unswept_highs:
-            candidates.append((price, "liquidity_buy", TP2_TARGET_PRIORITY["liquidity"]))
-    else:
-        for price in unswept_lows:
-            candidates.append((price, "liquidity_sell", TP2_TARGET_PRIORITY["liquidity"]))
-
-    if risk > 0:
-        min_distance = MIN_TP2_RR * risk
-        candidates = [c for c in candidates if abs(c[0] - entry_price) >= min_distance]
-
-    if not candidates:
-        return TP2Target(None, None)
-
-    def _beyond(price):
-        return price > tp1_price if direction == "BUY" else price < tp1_price
-
-    beyond_tp1 = [c for c in candidates if _beyond(c[0])]
-    pool = beyond_tp1 if beyond_tp1 else candidates
-
-    def _distance(price):
-        return abs(price - entry_price)
-
-    min_dist = min(_distance(c[0]) for c in pool)
-    tolerance = min_dist * 0.0005 if min_dist else 0.0
-    near_best = [c for c in pool if _distance(c[0]) - min_dist <= tolerance]
-    best = max(near_best, key=lambda c: c[2])  # priorité SMC/ICT en cas d'égalité
-
-    label = TP2_TARGET_LABELS[best[1]]
-    return TP2Target(best[0], label)
-
-
-# ============================================================================
-# 6. RISQUE : ATR, SL, TP1/TP2, LOT
-# ============================================================================
+# NOTE : l'ancien sous-système de sélection dynamique du TP2 (Order Blocks +
+# scan_all_fvgs + TP2Target + select_smart_tp2, ~150 lignes) a été supprimé
+# le 03/09/2026 (MODIFICATION 1/5 — TP UNIQUE RR4). Il n'était de toute façon
+# JAMAIS appelé par process_asset() (mort depuis le passage au TP unique) et
+# référençait même une constante MIN_TP2_RR non définie ailleurs dans ce
+# fichier — un appel accidentel aurait crashé. Aucune stratégie d'entrée
+# (Sweep/BOS/CHoCH/FVG) n'est affectée : detect_fvg() et find_swing_points()
+# ci-dessus restent utilisés tels quels par process_asset().
 
 @dataclass
 class TradeLevels:
@@ -1953,11 +1883,19 @@ def compute_atr(candles: List[Dict], period: int = ATR_PERIOD) -> float:
 
 
 def compute_levels(entry, direction, invalidation_price, candles, swing_points=None,
-                    spread_commission_buffer=0.0) -> TradeLevels:
-    """Grille RR fixe : TP1 = RR3 (sécurisation/laisser courir géré côté
-    suivi via BE à RR1 et sécurisation partielle à RR2), TP2 = RR6, toujours.
-    Le choix de cible "intelligente" (OB/FVG/liquidité) a été retiré : trop
-    variable et difficile à anticiper pour le trader -> RR6 fixe, prévisible."""
+                    spread_commission_buffer=0.0, tp_rr: Optional[float] = None) -> TradeLevels:
+    """Grille RR simplifiée : TP unique = RR{tp_rr} (BE au même trigger géré
+    côté suivi à RR{be_rr}, plus d'étape de sécurisation partielle
+    intermédiaire). Plus de TP2 : tp2/rr_tp2 restent à None dans TradeLevels.
+
+    MODIFICATION 4/5 : tp_rr vient de app_settings (get_settings()["tp_rr"]),
+    plus de constante TP1_RR codée en dur. Le paramètre est optionnel
+    uniquement pour permettre à l'appelant (process_asset) de réutiliser un
+    seul get_settings() par scan ; si omis, on relit la config persistée par
+    sécurité — jamais une valeur par défaut différente de celle-ci."""
+    if tp_rr is None:
+        tp_rr = get_settings()["tp_rr"]
+
     atr = compute_atr(candles)
     sl_distance = max(atr * ATR_SL_MULTIPLIER, 1e-9)
     if INCLUDE_SPREAD_COMMISSION_BUFFER:
@@ -1966,15 +1904,13 @@ def compute_levels(entry, direction, invalidation_price, candles, swing_points=N
     if direction == "BUY":
         stop_loss = min(invalidation_price, entry) - sl_distance
         risk = entry - stop_loss
-        tp1 = entry + risk * TP1_RR
-        tp2 = entry + risk * TP2_RR
+        tp1 = entry + risk * tp_rr
     else:
         stop_loss = max(invalidation_price, entry) + sl_distance
         risk = stop_loss - entry
-        tp1 = entry - risk * TP1_RR
-        tp2 = entry - risk * TP2_RR
+        tp1 = entry - risk * tp_rr
 
-    return TradeLevels(entry, stop_loss, tp1, tp2, TP1_RR, TP2_RR, False, None)
+    return TradeLevels(entry, stop_loss, tp1, None, tp_rr, None, False, None)
 
 
 def compute_lot_size(capital, risk_percent, entry, stop_loss,
@@ -2117,30 +2053,34 @@ def _tg_call(token: str, method: str, data: Optional[Dict] = None,
 
 
 def format_signal_message(symbol, display_name, direction, entry_type_label, stars,
-                           entry, sl, tp1, tp2, rr_tp1, rr_tp2, lot: float) -> str:
-    """Message PUBLIC du groupe de signaux — le signal (ENTRY / SL / TP1 /
-    TP2 / RR) PLUS le lot suggéré. Le lot est calculé sur le risque et le
+                           entry, sl, tp1, tp2, rr_tp1, rr_tp2, lot: float,
+                           settings: Optional[Dict] = None) -> str:
+    """Message PUBLIC du groupe de signaux — le signal (ENTRY / SL / TP
+    RR unique) PLUS le lot suggéré. Le lot est calculé sur le risque et le
     capital PERSONNELS du leader (voir compute_lot_size_v2) : il est donc
     accompagné d'un avertissement invitant chacun à l'adapter à son propre
     capital plutôt que de le copier tel quel. Le risque $, le solde et le
     levier du leader, eux, restent strictement dans son DM privé (voir
-    format_leader_signal_dm)."""
+    format_leader_signal_dm).
+
+    MODIFICATION 4/5 : be_rr/tp_rr viennent TOUJOURS de get_settings()
+    (jamais un texte "RR2"/"RR4" codé en dur), pour rester exacts si ces
+    valeurs sont changées depuis Telegram."""
+    s = settings or get_settings()
     direction_emoji = "🟢 ACHAT" if direction == "BUY" else "🔴 VENTE"
     ts = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())
     lines = [
         "📢 *ALPHABOT SMC PRO*", "",
-        f"📊 *Actif* : {display_name} ({get_settings().get('timeframe', TIMEFRAME)})",
+        f"📊 *Actif* : {display_name} ({s.get('timeframe', TIMEFRAME)})",
         f"🎯 *Setup* : Sweep + CHoCH — {entry_type_label} {stars}",
         f"{direction_emoji}", "",
         f"🔹 *ENTRY* : `{entry:.5f}`",
         f"🛑 *SL* : `{sl:.5f}`",
-        f"✅ *TP1 (RR{rr_tp1:g})* : `{tp1:.5f}`",
+        f"🚀 *TP (RR{rr_tp1:g})* : `{tp1:.5f}`",
     ]
-    if tp2:
-        lines.append(f"🚀 *TP2 (RR{rr_tp2:g})* : `{tp2:.5f}`")
-    lines.append(f"📐 *RR* : {rr_tp1:g}" + (f" / {rr_tp2:g}" if tp2 else ""))
+    lines.append(f"📐 *RR* : {rr_tp1:g}")
     lines.append(f"📦 *Lot* : `{lot}` _(calculé sur le capital du leader — à adapter au vôtre)_")
-    lines += ["", "🟡 BE à RR1 · 🔒 Sécurisation partielle à RR2 · 🟢 TP1 (laisser courir) à RR3 · 🚀 TP2 à RR6",
+    lines += ["", f"🟡 BE à RR{s['be_rr']:g} · 🚀 TP à RR{s['tp_rr']:g}",
               "", f"🕒 {ts}"]
     return "\n".join(lines)
 
@@ -2158,16 +2098,15 @@ def format_leader_signal_dm(symbol, display_name, direction, entry_type_label, s
         f"Direction : {direction}",
         f"Entry : `{entry:.5f}`",
         f"SL : `{sl:.5f}`",
-        f"TP1 (RR{rr_tp1:g}) : `{tp1:.5f}`",
+        f"TP (RR{rr_tp1:g}) : `{tp1:.5f}`",
     ]
-    if tp2:
-        lines.append(f"TP2 (RR{rr_tp2:g}) : `{tp2:.5f}`")
     lines += [
         "",
         f"💰 Risque : {risk_amount:.2f}$",
         f"📦 Lot : {lot}",
         f"⚡ Levier : {s.get('leverage', 0):.0f}x",
         f"🎯 Setup : Sweep + CHoCH — {entry_type_label} {stars}",
+        "", f"🟡 BE à RR{s['be_rr']:g} · 🚀 TP à RR{s['tp_rr']:g}",
         "", f"🕒 {ts}",
     ]
     return "\n".join(lines)
@@ -2211,13 +2150,17 @@ def _cleanup_old_charts():
 
 def generate_signal_chart(symbol: str, display_name: str, direction: str,
                            candles: List[Dict], sweep: "LiquiditySweep", bos: "BOSConfirmation",
-                           entry: float, sl: float, tp1: float, tp2: Optional[float],
-                           tp2_source: Optional[str] = None, lookback: int = 60,
-                           signal_id: Optional[int] = None) -> Optional[str]:
+                           entry: float, sl: float, tp1: float, lookback: int = 60,
+                           signal_id: Optional[int] = None, rr_tp1: Optional[float] = None) -> Optional[str]:
     """Génère une image professionnelle du setup AVANT l'envoi Telegram :
-    chandeliers, sweep de liquidité, BOS, zone d'entrée, SL, TP1, TP2 —
+    chandeliers, sweep de liquidité, BOS, zone d'entrée, SL, TP (RR unique) —
     avec annotations couleurs + labels + emojis. Retourne le chemin du
-    fichier PNG, ou None en cas d'échec (le signal reste envoyé en texte)."""
+    fichier PNG, ou None en cas d'échec (le signal reste envoyé en texte).
+
+    MODIFICATION 4/5 : rr_tp1 (le multiple de RR réellement utilisé pour CE
+    signal, déjà calculé par compute_levels() à partir de
+    get_settings()["tp_rr"]) est affiché tel quel sur le graphique — plus de
+    libellé "RR4" codé en dur qui serait faux dès que /tprr change la valeur."""
     try:
         view = candles[-lookback:] if len(candles) > lookback else candles
         offset = len(candles) - len(view)
@@ -2256,7 +2199,7 @@ def generate_signal_chart(symbol: str, display_name: str, direction: str,
         ax.text(len(view) - 1, bos.break_level, "  CHoCH confirme", color="#f59e0b",
                 fontsize=10, fontweight="bold", va="bottom", ha="left")
 
-        # --- Zone d'entrée / SL / TP1 / TP2 ---
+        # --- Zone d'entrée / SL / TP (RR unique, configurable) ---
         entry_emoji = "BUY" if direction == "BUY" else "SELL"
         ax.axhline(entry, color="#3b82f6", linewidth=1.4, zorder=1)
         ax.text(len(view) - 1, entry, f"  {entry_emoji}  Entree {entry:.5f}", color="#3b82f6",
@@ -2266,15 +2209,13 @@ def generate_signal_chart(symbol: str, display_name: str, direction: str,
         ax.text(len(view) - 1, sl, f"  SL {sl:.5f}", color="#ef4444",
                 fontsize=10, fontweight="bold", va="center", ha="left")
 
+        # TP UNIQUE (RR configurable, voir get_settings()["tp_rr"]) — un seul
+        # niveau affiché, plus de TP2/TP3 ni d'objectif intermédiaire (voir
+        # MODIFICATION 1/5, 03/09/2026 ; RR devenu configurable en 4/5).
         ax.axhline(tp1, color="#22c55e", linewidth=1.4, zorder=1)
-        ax.text(len(view) - 1, tp1, f"  TP1 {tp1:.5f}", color="#22c55e",
+        tp_label = f"TP (RR{rr_tp1:g}) {tp1:.5f}" if rr_tp1 is not None else f"TP {tp1:.5f}"
+        ax.text(len(view) - 1, tp1, f"  {tp_label}", color="#22c55e",
                 fontsize=10, fontweight="bold", va="center", ha="left")
-
-        if tp2:
-            ax.axhline(tp2, color="#a855f7", linewidth=1.4, linestyle=":", zorder=1)
-            label = f"  TP2 {tp2:.5f}" + (f" ({tp2_source})" if tp2_source else "")
-            ax.text(len(view) - 1, tp2, label, color="#a855f7",
-                    fontsize=10, fontweight="bold", va="center", ha="left")
 
         ax.set_xlim(-1, len(view) + 22)
         ax.tick_params(colors="#8b93a7")
@@ -2323,9 +2264,12 @@ TRADE_ACTIONS = {
     "taken":   {"emoji": "✅", "label": "Trade pris",   "status": "taken"},
     "ignored": {"emoji": "❌", "label": "Trade ignoré",  "status": "ignored"},
     "be":      {"emoji": "🟡", "label": "Break Even",   "status": "be"},
-    "secured": {"emoji": "🔒", "label": "Sécuriser",    "status": "secured"},
     "closed":  {"emoji": "🔴", "label": "Clôturer",     "status": "closed"},
 }
+# "secured" retiré des actions manuelles disponibles (grille simplifiée
+# BE@RR2 / TP unique@RR4 — plus d'étape de sécurisation partielle pour un
+# nouveau signal). Le statut "secured" reste valide en LECTURE SEULE pour
+# l'historique des anciens signaux déjà en base (dashboard, stats, /report).
 
 
 def _signal_inline_keyboard(signal_id: int) -> Dict:
@@ -2497,7 +2441,7 @@ def broadcast_signal(public_text: str, leader_text: Optional[str] = None,
 # Telegram, API dashboard, ou le moteur de suivi automatique des prix).
 # ----------------------------------------------------------------------
 TRADE_EVENT_MESSAGES = {
-    "be":          ("🟡", "Break Even", "Stop Loss déplacé au point d'entrée — trade désormais sans risque."),
+    "be":          ("🟡", "Break Even", "Break Even PROPOSÉ — SL non modifié automatiquement (à déplacer manuellement)."),
     "secured":     ("🔒", "Sécurisation partielle", "Prise de profit partielle recommandée à ce niveau."),
     "tp1_hit":     ("🥇", "TP1 atteint", "Premier objectif touché."),
     "tp2_hit":     ("🥈", "TP2 atteint", "Objectif final touché — trade clôturé."),
@@ -2505,6 +2449,38 @@ TRADE_EVENT_MESSAGES = {
     "tp1_sl_hit":  ("❌", "SL touché (après TP1)", "Stop Loss initial retouché — TP1 était déjà sécurisé."),
     "closed":      ("🔴", "Trade clôturé", "Position fermée."),
 }
+
+
+def format_be_proposal_message(row: sqlite3.Row, current_price: Optional[float] = None,
+                                be_rr: Optional[float] = None) -> str:
+    """Notification dédiée envoyée au RR de déclenchement du BE
+    (be_mode="PROPOSE") — le bot PROPOSE le Break-Even mais ne déplace
+    jamais le SL lui-même (voir get_settings()["be_mode"]). Format fixe
+    demandé (MODIFICATION 2/5) : Symbole / Direction / Entry / SL initial /
+    Prix actuel / RR atteint.
+
+    MODIFICATION 4/5 : be_rr vient de get_settings()["be_rr"] (persisté) si
+    non fourni — plus de constante BE_TRIGGER_RR codée en dur."""
+    if be_rr is None:
+        be_rr = get_settings()["be_rr"]
+    direction_txt = "🟢 ACHAT" if row["direction"] == "BUY" else "🔴 VENTE"
+    ts = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())
+    lines = [
+        "🔒 *BREAK-EVEN DISPONIBLE*", "",
+        f"Symbole : {row['symbol']} (#{row['id']})",
+        f"Direction : {direction_txt}",
+        f"Entry : `{row['entry_price']:.5f}`",
+        f"SL initial : `{row['stop_loss']:.5f}`",
+    ]
+    if current_price is not None:
+        lines.append(f"Prix actuel : `{current_price:.5f}`")
+    lines += [
+        f"RR atteint : {be_rr:.2f}",
+        "",
+        "➡️ Déplacer le SL à Break-Even.",
+        "", f"🕒 {ts}",
+    ]
+    return "\n".join(lines)
 
 
 def format_trade_event_message(row: sqlite3.Row, status: str) -> Optional[str]:
@@ -2575,18 +2551,25 @@ def format_trade_closed_report(row: sqlite3.Row) -> Optional[str]:
     return "\n".join(lines)
 
 
-def notify_trade_event(signal_id: int, status: str):
+def notify_trade_event(signal_id: int, status: str, current_price: Optional[float] = None):
     """Suivi 100% automatique (déclenché par monitor_open_signals à chaque
     scan de prix — aucun clic 'j'ai pris le trade' n'est nécessaire) :
       - alerte courte publiée sur SIGNAL_BROADCAST_GROUPS si non vide
         (vide par défaut -> aucun groupe averti) ;
       - le leader, lui, reçoit TOUJOURS en DM l'alerte, plus le rapport
         complet (résultat $, cumul du jour) pour les statuts terminaux.
-    Ne fait rien si le statut n'a pas d'alerte dédiée (ex: 'taken', 'ignored')."""
+    Ne fait rien si le statut n'a pas d'alerte dédiée (ex: 'taken', 'ignored').
+    Pour 'be' (be_mode="PROPOSE", get_settings()) : message dédié
+    format_be_proposal_message (Symbole/Direction/Entry/SL initial/Prix
+    actuel/RR atteint) — le bot PROPOSE le Break-Even, il ne déplace jamais
+    le SL lui-même."""
     row = get_signal(signal_id)
     if not row:
         return
-    text = format_trade_event_message(row, status)
+    if status == "be":
+        text = format_be_proposal_message(row, current_price=current_price)
+    else:
+        text = format_trade_event_message(row, status)
     if not text:
         return
 
@@ -2627,11 +2610,17 @@ BOT_COMMANDS_HELP = (
     "/profil — profil complet (solde, risque, levier, lot, état ACTIF/DÉSACTIVÉ)\n"
     "/capital <valeur> — définir le capital ($)\n"
     "/risque <valeur> — définir le risque par trade (%)\n"
+    "/balance [valeur] — voir ou définir le solde ($) — alias de /capital\n"
+    "/risk [valeur] — voir ou définir le risque par trade (%) — alias de /risque\n"
     "/levier <valeur> — définir le levier (x)\n"
+    "/tprr <valeur> — définir le TP unique en multiple de RR (ex: 4 → RR4)\n"
+    "/berr <valeur> — définir le déclenchement du Break-Even en multiple de RR (ex: 2 → RR2)\n"
+    "/bemode [PROPOSE] — voir ou définir le mode Break-Even (seul PROPOSE est disponible)\n"
     "/session <ny|24h> — session NY fixe ou scan 24h/24 en continu\n"
     "/timeframe <M1|M5> — changer le timeframe du scan (M1 = scalping)\n"
     "/signaux <on|off> — activer/désactiver la publication des signaux\n"
     "/profils — lister et activer un profil sauvegardé\n"
+    "/prix — prix en direct Gold (XAUUSD) et BTC/USD\n"
     "/status — état du bot (dernier scan...)\n"
     "/stats — statistiques globales\n"
     "/report [daily|weekly|monthly] — rapport de performance\n"
@@ -2643,6 +2632,7 @@ BOT_COMMANDS_HELP = (
 # a accès au bot — il n'existe pas d'autre canal privé dans ce projet.
 PUBLIC_COMMANDS_HELP = (
     "🤖 *ALPHABOT SMC PRO*\n\n"
+    "/prix — prix en direct Gold (XAUUSD) et BTC/USD\n"
     "/stats — statistiques globales\n"
     "/report [daily|weekly|monthly] — rapport de performance\n"
     "/help — afficher ce message"
@@ -2651,6 +2641,11 @@ PUBLIC_COMMANDS_HELP = (
 _SETTINGS_COMMAND_FIELDS = {
     "/capital": "capital", "/risque": "risk_percent", "/levier": "leverage",
     "/risquedollar": "risk_dollar_amount",
+    # MODIFICATION 4/5 : /tprr et /berr suivent EXACTEMENT le même chemin que
+    # /capital et /risque (validation -> update_settings() -> persistance
+    # SQLite -> réutilisation immédiate) — aucun code séparé, aucune valeur
+    # mise en cache ailleurs.
+    "/tprr": "tp_rr", "/berr": "be_rr",
 }
 
 
@@ -2673,25 +2668,35 @@ _OWNER_ONLY_REPLY = "⛔ Réservé au propriétaire du bot."
 
 
 def format_settings_message(settings: Optional[Dict] = None) -> str:
+    """MODIFICATION 3/5 (03/09/2026) — aperçu compact de /settings, recentré
+    sur ce qui pilote directement le calcul du lot : Balance, Risk, Risk
+    amount, plus la grille RR (TP/BE/BE Mode). Balance et Risk viennent
+    TOUJOURS de get_settings() (capital/risk_percent, app_settings) — la
+    même unique source de vérité déjà utilisée par /balance, /risk,
+    /capital, /risque, les profils, et par get_effective_risk_amount() qui
+    dimensionne chaque nouveau trade (aucune variable capital/risque codée
+    en dur ailleurs dans le fichier). Le reste du profil (levier, session,
+    timeframe, martingale, recovery, profil actif) reste consultable via
+    /profil (format_leader_profile_message), volontairement inchangée.
+
+    MODIFICATION 4/5 — TP/BE/BE Mode viennent maintenant EUX AUSSI
+    exclusivement de get_settings() (clés tp_rr/be_rr/be_mode, persistées en
+    base au même titre que capital/risk_percent). Avant cette modification,
+    ces trois lignes lisaient des constantes Python figées (TP1_RR,
+    BE_TRIGGER_RR, BE_MODE) totalement déconnectées de app_settings : un
+    changement de ces valeurs (une fois une commande de modification
+    ajoutée) ne se serait donc JAMAIS reflété ici. Ce n'est plus le cas."""
     s = settings or get_settings()
-    active = next((p for p in list_profiles() if p["id"] == s.get("active_profile_id")), None)
-    session_label = "24h/24 (continu)" if s.get("session_mode") == "24h" else "NY (13h-22h UTC)"
+    risk_amount = get_effective_risk_amount(settings=s)
     lines = [
-        "⚙️ *Réglages actuels*",
-        f"💰 Capital : {s['capital']:.2f} $",
-        f"📈 Levier : x{s['leverage']:.0f}",
-        "Mode risque actuel : $" if s.get("risk_unit") == "dollar" else "Mode risque actuel : %",
-        f"🎯 Risque par trade : {s['risk_dollar_amount']:.2f} $" if s.get("risk_unit") == "dollar"
-        else f"🎯 Risque par trade : {s['risk_percent']:.2f} %",
-        f"📊 Positions max simultanées : {s['max_open_positions']}",
-        f"🔁 Martingale : {'ON' if s['martingale_enabled'] else 'OFF'} (x{s['martingale_multiplier']:.1f})",
-        f"🛟 Recovery : {'ON' if s['recovery_enabled'] else 'OFF'} (plafond x{s['recovery_max_multiplier']:.1f})",
-        f"🕐 Session : {session_label}",
-        f"⏱ Timeframe : {s.get('timeframe', TIMEFRAME)}",
-        f"👤 Profil actif : {active['name'] if active else '—'}",
+        "⚙️ *SETTINGS*", "",
+        f"Balance : ${s['capital']:.2f}",
+        f"Risk : {s['risk_percent']:.2f} %",
+        f"Risk amount : ${risk_amount:.2f}",
         "",
-        "Modifier : /capital <valeur> · /risque <valeur> · /levier <valeur> · /profils\n"
-        "/session <ny|24h> · /timeframe <M1|M5>",
+        f"TP : RR{s['tp_rr']:g}",
+        f"BE : RR{s['be_rr']:g}",
+        f"BE Mode : {s['be_mode']}",
     ]
     return "\n".join(lines)
 
@@ -2785,6 +2790,7 @@ def _persistent_owner_keyboard() -> Dict:
 
 def _main_menu_keyboard() -> Dict:
     return {"inline_keyboard": [
+        [{"text": "💹 Prix en direct", "callback_data": "menu:prix"}],
         [{"text": "💰 Solde du compte", "callback_data": "menu:capital"},
          {"text": "📈 Levier", "callback_data": "menu:levier"}],
         [{"text": "🎯 Risque ($ fixe)", "callback_data": "menu:risquedollar"},
@@ -2792,6 +2798,48 @@ def _main_menu_keyboard() -> Dict:
         [{"text": "⏱ Timeframe", "callback_data": "menu:timeframe"},
          {"text": "🕐 Session", "callback_data": "menu:session"}],
         [{"text": "👤 Profils", "callback_data": "menu:profils"}],
+    ]}
+
+
+# --- PRIX EN DIRECT (Gold + BTC) — bouton menu + commande /prix -----------
+# Best-effort et isolé PAR ACTIF : si une source de prix échoue pour l'un des
+# deux actifs, l'autre s'affiche quand même. Jamais d'exception qui remonte
+# jusqu'à Telegram (le bouton doit toujours répondre, même en cas d'échec
+# total des deux sources) et jamais de prix inventé — un échec affiche
+# explicitement "indisponible", pas une valeur approximative.
+_PRIX_DECIMALS = {"XAUUSD": 2, "BTCUSD": 1}
+
+
+def _format_live_price_line(symbol: str) -> str:
+    asset = ASSETS[symbol]
+    try:
+        candles, price_source = fetch_candles(symbol, limit=5)
+        reject_reason = validate_price_data(symbol, candles)
+        if reject_reason:
+            return f"⚠️ *{asset.display_name}* : indisponible ({reject_reason})"
+        last = candles[-1]
+        decimals = _PRIX_DECIMALS.get(symbol, 2)
+        source_label = _price_source_label(symbol, price_source)
+        age_s = int(time.time() - last["time"])
+        return (f"{'🥇' if symbol == 'XAUUSD' else '🟠'} *{asset.display_name}* : "
+                f"`{last['close']:.{decimals}f}` _(source {source_label}, il y a {age_s}s)_")
+    except Exception as e:
+        log.warning(f"[{symbol}] /prix — échec de récupération du prix : {e}")
+        return f"⚠️ *{asset.display_name}* : indisponible (source injoignable)"
+
+
+def format_live_prices_message() -> str:
+    lines = ["💹 *Prix en direct*", ""]
+    for symbol in ("XAUUSD", "BTCUSD"):
+        lines.append(_format_live_price_line(symbol))
+    lines += ["", "_Prix de scan utilisés par le moteur — pas nécessairement identiques au tick exact de votre broker._"]
+    return "\n".join(lines)
+
+
+def _prix_inline_keyboard() -> Dict:
+    return {"inline_keyboard": [
+        [{"text": "🔄 Actualiser", "callback_data": "menu:prix"}],
+        [{"text": "⬅️ Retour", "callback_data": "menu:home"}],
     ]}
 
 
@@ -2837,7 +2885,8 @@ def _send_command_reply(group: str, chat_id, text: str, reply_markup: Optional[D
 # /risquedollar) en plus des commandes nommées explicitement.
 _LEADER_ONLY_COMMANDS = (
     "/settings", "/reglages", "/parametres", "/profil", "/status", "/profils", "/menu",
-    "/risqueunite", "/session", "/timeframe", "/signaux",
+    "/risqueunite", "/session", "/timeframe", "/signaux", "/balance", "/risk",
+    "/bemode",  # MODIFICATION 4/5 — validation par enum (VALID_BE_MODES), même principe que /session
 ) + tuple(_SETTINGS_COMMAND_FIELDS.keys())
 
 
@@ -2904,6 +2953,58 @@ def _handle_telegram_command(message: Dict, group: str):
     elif cmd == "/menu":
         _send_command_reply(group, chat_id, "⚙️ *Réglages* — choisis ce que tu veux modifier :",
                              reply_markup=_main_menu_keyboard())
+    elif cmd == "/prix":
+        try:
+            text = format_live_prices_message()
+        except Exception:
+            log.error("Échec de génération du message /prix:\n" + traceback.format_exc())
+            text = "⚠️ Prix indisponibles pour le moment — réessaie dans quelques instants."
+        _send_command_reply(group, chat_id, text, reply_markup=_prix_inline_keyboard())
+    # --- /balance /risk (MODIFICATION 3/5) -----------------------------
+    # Alias directs de /capital et /risque, MÊME champ settings sous-jacent
+    # (capital / risk_percent, get_settings()/update_settings() — source
+    # unique) — mais avec, en plus, un affichage de la valeur actuelle
+    # quand la commande est tapée SANS argument (ce que /capital et
+    # /risque, laissés inchangés ci-dessous, ne font pas). Un changement
+    # ici est repris IMMÉDIATEMENT par le prochain trade : process_asset()
+    # relit get_settings() à chaque itération de scan, il n'y a nulle part
+    # ailleurs de valeur Balance/Risk mise en cache ou codée en dur.
+    elif cmd == "/balance":
+        if arg is None:
+            _send_command_reply(group, chat_id, f"💰 Balance : ${get_settings()['capital']:.2f}")
+            return
+        try:
+            updated = update_settings({"capital": arg})
+        except ValueError as e:
+            _send_command_reply(group, chat_id, f"❌ {e}")
+            return
+        _send_command_reply(group, chat_id, f"✅ Balance mise à jour.\n\n{format_settings_message(updated)}")
+    elif cmd == "/risk":
+        if arg is None:
+            _send_command_reply(group, chat_id, f"🎯 Risk : {get_settings()['risk_percent']:.2f} %")
+            return
+        try:
+            updated = update_settings({"risk_percent": arg})
+        except ValueError as e:
+            _send_command_reply(group, chat_id, f"❌ {e}")
+            return
+        _send_command_reply(group, chat_id, f"✅ Risk mis à jour.\n\n{format_settings_message(updated)}")
+    # --- /bemode (MODIFICATION 4/5) -------------------------------------
+    # Validation par enum (VALID_BE_MODES) comme /session /timeframe : ne
+    # peut donc jamais se déchoir de "PROPOSE" (seul mode implémenté) vers
+    # une valeur qui laisserait croire à un comportement non câblé.
+    elif cmd == "/bemode":
+        if arg is None:
+            _send_command_reply(group, chat_id, f"⚙️ BE Mode : {get_settings()['be_mode']}")
+            return
+        if arg.upper() not in VALID_BE_MODES:
+            _send_command_reply(
+                group, chat_id,
+                f"Usage : /bemode <{'|'.join(sorted(VALID_BE_MODES))}>",
+            )
+            return
+        updated = update_settings({"be_mode": arg.upper()})
+        _send_command_reply(group, chat_id, f"✅ BE Mode mis à jour.\n\n{format_settings_message(updated)}")
     elif cmd in _SETTINGS_COMMAND_FIELDS:
         if arg is None:
             _send_command_reply(group, chat_id, f"Usage : {cmd} <valeur>")
@@ -2914,20 +3015,26 @@ def _handle_telegram_command(message: Dict, group: str):
         except ValueError as e:
             _send_command_reply(group, chat_id, f"❌ {e}")
             return
-        _send_command_reply(group, chat_id, f"✅ Mis à jour.\n\n{format_settings_message(updated)}")
+        # Balance/Risk (capital, risk_percent) ainsi que TP/BE (tp_rr,
+        # be_rr — MODIFICATION 4/5) sont couverts par le résumé compact de
+        # /settings ; levier et risque $ fixe n'y figurent plus depuis
+        # MODIFICATION 3/5 -> confirmation via le profil complet.
+        view = format_settings_message(updated) if field in ("capital", "risk_percent", "tp_rr", "be_rr") \
+            else format_leader_profile_message(updated)
+        _send_command_reply(group, chat_id, f"✅ Mis à jour.\n\n{view}")
     elif cmd == "/risqueunite":
         if not arg or arg.lower() not in VALID_RISK_UNITS:
             _send_command_reply(group, chat_id, "Usage : /risqueunite <dollar|percent>")
             return
         updated = update_settings({"risk_unit": arg.lower()})
-        _send_command_reply(group, chat_id, f"✅ Unité de risque mise à jour.\n\n{format_settings_message(updated)}")
+        _send_command_reply(group, chat_id, f"✅ Unité de risque mise à jour.\n\n{format_leader_profile_message(updated)}")
     elif cmd == "/session":
         if not arg or arg.lower() not in VALID_SESSION_MODES:
             _send_command_reply(group, chat_id, "Usage : /session <ny|24h>")
             return
         updated = update_settings({"session_mode": arg.lower()})
         label = "24h/24 (continu)" if updated["session_mode"] == "24h" else "NY (13h-22h UTC)"
-        _send_command_reply(group, chat_id, f"✅ Session mise à jour : *{label}*.\n\n{format_settings_message(updated)}")
+        _send_command_reply(group, chat_id, f"✅ Session mise à jour : *{label}*.\n\n{format_leader_profile_message(updated)}")
     elif cmd == "/timeframe":
         if not arg or arg.upper() not in VALID_TIMEFRAMES:
             _send_command_reply(group, chat_id, "Usage : /timeframe <M1|M5>")
@@ -2935,7 +3042,7 @@ def _handle_telegram_command(message: Dict, group: str):
         updated = update_settings({"timeframe": arg.upper()})
         _send_command_reply(
             group, chat_id,
-            f"✅ Timeframe mis à jour : *{updated['timeframe']}*.\n\n{format_settings_message(updated)}",
+            f"✅ Timeframe mis à jour : *{updated['timeframe']}*.\n\n{format_leader_profile_message(updated)}",
         )
     elif cmd == "/signaux":
         if not arg or arg.lower() not in ("on", "off"):
@@ -3019,6 +3126,19 @@ def _handle_menu_callback(callback: Dict, group: str):
                              reply_markup=_main_menu_keyboard())
         return
 
+    if data == "menu:prix":
+        try:
+            _telegram_answer_callback(group, callback["id"])
+        except Exception:
+            pass
+        try:
+            text = format_live_prices_message()
+        except Exception:
+            log.error("Échec de génération du message /prix (menu):\n" + traceback.format_exc())
+            text = "⚠️ Prix indisponibles pour le moment — réessaie dans quelques instants."
+        _send_command_reply(group, chat_id, text, reply_markup=_prix_inline_keyboard())
+        return
+
     if data == "menu:profils":
         try:
             _telegram_answer_callback(group, callback["id"])
@@ -3063,7 +3183,9 @@ def _handle_menu_callback(callback: Dict, group: str):
         except Exception:
             log.warning("Échec answerCallbackQuery (menu, set):\n" + traceback.format_exc())
         if updated is not None:
-            _send_command_reply(group, chat_id, f"{confirm_text}\n\n{format_settings_message(updated)}",
+            view = format_settings_message(updated) if settings_key in ("capital", "risk_percent") \
+                else format_leader_profile_message(updated)
+            _send_command_reply(group, chat_id, f"{confirm_text}\n\n{view}",
                                  reply_markup=_main_menu_keyboard())
         return
 
@@ -3112,24 +3234,35 @@ def is_session_open(asset_symbol: str) -> bool:
     return hour_utc >= asset.session_start_utc or hour_utc < asset.session_end_utc
 
 
-def _fire_auto_trade_event(signal_id: int, status: str):
+def _fire_auto_trade_event(signal_id: int, status: str, current_price: Optional[float] = None):
     """Enregistre et notifie un changement de statut détecté automatiquement
     par le moteur de suivi (par opposition aux boutons Telegram, source
     'telegram'). Best-effort : une erreur ici ne doit jamais interrompre le
     scan des autres actifs."""
     try:
         record_trade_action(signal_id, action=status, new_status=status, source="auto")
-        notify_trade_event(signal_id, status)
+        notify_trade_event(signal_id, status, current_price=current_price)
     except Exception:
         log.error(f"Échec notification auto trade #{signal_id} ({status}):\n{traceback.format_exc()}")
 
 
 _AUTO_STATUS_RANK = {"pending": 0, "taken": 0, "be": 1, "secured": 2, "tp1_hit": 3, "tp2_hit": 4}
+# Remarque : "secured" et "tp2_hit" restent dans ce mapping pour la lecture
+# d'anciens signaux en base (historique), mais ne sont plus jamais atteints
+# par la progression active ci-dessous (voir `progression` dans
+# _check_signal_progress) — grille simplifiée BE@RR2 / TP unique@RR4.
 # Alias de TERMINAL_STATUSES (source unique de vérité) pour rester synchronisé.
 _AUTO_STATUS_TERMINAL = set(TERMINAL_STATUSES)
 
 
-def _check_signal_progress(row: sqlite3.Row, high: float, low: float):
+def _check_signal_progress(row: sqlite3.Row, high: float, low: float, close: Optional[float] = None,
+                            be_rr: Optional[float] = None):
+    """MODIFICATION 4/5 : be_rr vient de get_settings()["be_rr"] (persisté)
+    si non fourni par l'appelant — plus de constante BE_TRIGGER_RR codée en
+    dur. monitor_open_signals() le passe déjà, résolu une seule fois par
+    scan à partir du même get_settings() que le reste de process_asset()."""
+    if be_rr is None:
+        be_rr = get_settings()["be_rr"]
     status = row["status"]
     if status in _AUTO_STATUS_TERMINAL:
         return
@@ -3176,29 +3309,40 @@ def _check_signal_progress(row: sqlite3.Row, high: float, low: float):
         return
 
     current_rank = _AUTO_STATUS_RANK.get(status, 0)
-    progression = [("be", level(BE_TRIGGER_RR)), ("secured", level(SECURE_TRIGGER_RR)), ("tp1_hit", tp1)]
-    if tp2:
-        progression.append(("tp2_hit", tp2))
+    # Grille simplifiée : plus d'étape "secured" ni de "tp2_hit" dans la
+    # progression active — BE à be_rr, puis TP unique (tp1_hit) au niveau
+    # déjà figé sur CE signal (tp1, calculé au moment du signal avec le
+    # tp_rr d'alors), qui est désormais l'état final du trade (voir
+    # TERMINAL_STATUSES/WIN_STATUSES).
+    progression = [("be", level(be_rr)), ("tp1_hit", tp1)]
 
     for name, price_level in progression:
         if _AUTO_STATUS_RANK[name] <= current_rank or price_level is None:
             continue
         if reached(price_level):
-            _fire_auto_trade_event(signal_id, name)
+            _fire_auto_trade_event(signal_id, name, current_price=close if name == "be" else None)
             current_rank = _AUTO_STATUS_RANK[name]
 
 
-def monitor_open_signals(symbol: str, candles: List[Dict]):
+def monitor_open_signals(symbol: str, candles: List[Dict], be_rr: Optional[float] = None):
     """Moteur de suivi automatique : à chaque scan, compare la dernière
     bougie de `symbol` aux niveaux de tous ses signaux encore ouverts et
     déclenche BE / Sécurisation / TP1 / TP2 / SL dès qu'ils sont atteints —
     avec notification Telegram (groupes + DM), sans action manuelle requise.
     Résolution = fréquence du scan (~30s) : un mouvement extrême intrabar
-    peut être détecté un peu après coup mais n'est jamais raté."""
+    peut être détecté un peu après coup mais n'est jamais raté.
+
+    MODIFICATION 4/5 : be_rr vient de get_settings()["be_rr"] (persisté) si
+    non fourni — plus de constante BE_TRIGGER_RR codée en dur. process_asset()
+    le passe déjà, résolu une seule fois par scan (même `settings` que pour
+    max_open_positions/tp_rr) pour éviter toute relecture incohérente en
+    cours de scan si une commande Telegram modifie be_rr entre-temps."""
     if not candles:
         return
+    if be_rr is None:
+        be_rr = get_settings()["be_rr"]
     last = candles[-1]
-    high, low = last["high"], last["low"]
+    high, low, close = last["high"], last["low"], last["close"]
     with get_conn() as conn:
         rows = conn.execute(
             f"SELECT * FROM signals WHERE symbol=? AND status NOT IN "
@@ -3207,7 +3351,7 @@ def monitor_open_signals(symbol: str, candles: List[Dict]):
         ).fetchall()
     for row in rows:
         try:
-            _check_signal_progress(row, high, low)
+            _check_signal_progress(row, high, low, close, be_rr=be_rr)
         except Exception:
             log.error(f"Échec suivi auto du signal #{row['id']} ({symbol}):\n{traceback.format_exc()}")
 
@@ -3247,7 +3391,7 @@ def process_asset(symbol: str):
         log.warning(f"[{symbol}] WARNING: FALLBACK FUTURES PRICE (PRICE_SOURCE={source_label}) "
                     f"— MT5 indisponible, ce n'est PAS le prix exact du broker.")
 
-    monitor_open_signals(symbol, candles)
+    monitor_open_signals(symbol, candles, be_rr=settings["be_rr"])
 
     swing_points = find_swing_points(candles)
     sweep = detect_liquidity_sweep(candles, swing_points)
@@ -3276,7 +3420,7 @@ def process_asset(symbol: str):
     entry_type = "fvg_return" if fvg else "direct"
 
     levels = compute_levels(entry_price, direction, sweep.sweep_wick_price, candles, swing_points,
-                             spread_commission_buffer=asset.typical_spread)
+                             spread_commission_buffer=asset.typical_spread, tp_rr=settings["tp_rr"])
 
     setup_key = f"{symbol}:{direction}:{round(sweep.swept_point.price, 5)}"
     if has_active_setup(setup_key):
@@ -3297,6 +3441,35 @@ def process_asset(symbol: str):
     risk_amount = get_effective_risk_amount(symbol, settings)
     lot = compute_lot_size_v2(risk_amount, entry_price, levels.stop_loss, asset.lot_value_per_point)
 
+    # --- GARDE-FOU FINAL (MODIFICATION 5/5) -------------------------------
+    # Dernier verrou avant publication : si balance/risque/entry/SL/lot sont
+    # invalides pour QUELQUE RAISON que ce soit (bug amont, donnée corrompue,
+    # settings incohérents malgré la validation de update_settings...), le
+    # signal n'est JAMAIS publié et AUCUNE valeur n'est inventée en repli.
+    def _is_bad_number(x) -> bool:
+        return x is None or x != x or x in (float("inf"), float("-inf"))  # x != x -> NaN
+
+    reject = None
+    if _is_bad_number(settings.get("capital")) or settings["capital"] <= 0:
+        reject = f"capital invalide ({settings.get('capital')})"
+    elif _is_bad_number(settings.get("risk_percent")) or settings["risk_percent"] <= 0:
+        reject = f"risk_percent invalide ({settings.get('risk_percent')})"
+    elif _is_bad_number(risk_amount) or risk_amount <= 0:
+        reject = f"risk_amount invalide ({risk_amount})"
+    elif _is_bad_number(entry_price) or entry_price <= 0:
+        reject = f"entry invalide ({entry_price})"
+    elif _is_bad_number(levels.stop_loss) or levels.stop_loss <= 0:
+        reject = f"SL invalide ({levels.stop_loss})"
+    elif abs(entry_price - levels.stop_loss) <= 0:
+        reject = "distance Entry/SL nulle"
+    elif _is_bad_number(lot) or lot <= 0:
+        reject = f"lot impossible à calculer (lot={lot})"
+
+    if reject:
+        log.error(f"[{symbol}] SIGNAL BLOQUÉ — {reject} — aucune valeur inventée, signal NON publié "
+                   f"(entry={entry_price}, SL={levels.stop_loss}, risk_amount={risk_amount}, lot={lot}).")
+        return
+
     log.info(f"[{symbol}] SIGNAL VALIDATED — {direction} {entry_type} "
              f"entry={entry_price} SL={levels.stop_loss} lot={lot} PRICE_SOURCE={source_label}")
 
@@ -3313,7 +3486,7 @@ def process_asset(symbol: str):
     message = format_signal_message(
         symbol, asset.display_name, direction, ENTRY_TYPES[entry_type]["label"],
         get_stars(entry_type), entry_price, levels.stop_loss, levels.tp1,
-        levels.tp2, levels.rr_tp1, levels.rr_tp2 or 0, lot=lot,
+        levels.tp2, levels.rr_tp1, levels.rr_tp2 or 0, lot=lot, settings=settings,
     )
     leader_message = format_leader_signal_dm(
         symbol, asset.display_name, direction, ENTRY_TYPES[entry_type]["label"],
@@ -3323,8 +3496,8 @@ def process_asset(symbol: str):
     )
     image_path = generate_signal_chart(
         symbol, asset.display_name, direction, candles, sweep, bos,
-        entry_price, levels.stop_loss, levels.tp1, levels.tp2, levels.tp2_source,
-        signal_id=signal_id,
+        entry_price, levels.stop_loss, levels.tp1,
+        signal_id=signal_id, rr_tp1=levels.rr_tp1,
     )
     try:
         broadcast_signal(message, leader_text=leader_message, image_path=image_path, signal_id=signal_id,
@@ -4187,7 +4360,7 @@ DASHBOARD_HTML = """
       <button onclick="triggerBackup()">💾 Sauvegarder maintenant</button>
     </div>
     <table id="historyTable">
-      <thead><tr><th>Date</th><th>Actif</th><th>Sens</th><th>Type</th><th>Score</th><th>Entrée</th><th>SL</th><th>TP1</th><th>Statut</th></tr></thead>
+      <thead><tr><th>Date</th><th>Actif</th><th>Sens</th><th>Type</th><th>Score</th><th>Entrée</th><th>SL</th><th>TP (RR)</th><th>Statut</th></tr></thead>
       <tbody></tbody>
     </table>
   </section>
@@ -4343,7 +4516,7 @@ async function loadHistory() {
     const dirBadge = t.direction === 'BUY' ? '<span class="badge b-buy">ACHAT</span>' : '<span class="badge b-sell">VENTE</span>';
     return `<tr><td>${date}</td><td>${t.symbol}</td><td>${dirBadge}</td><td>${t.entry_type}</td>
       <td>${t.score}</td><td>${t.entry_price.toFixed(5)}</td><td>${t.stop_loss.toFixed(5)}</td>
-      <td>${t.tp1.toFixed(5)}</td><td><span class="badge b-status">${t.status}</span></td></tr>`;
+      <td>${t.tp1.toFixed(5)} (RR${t.rr_tp1})</td><td><span class="badge b-status">${t.status}</span></td></tr>`;
   }).join('');
 }
 
@@ -4440,6 +4613,1053 @@ if __name__ == "__main__":
     startup_notify_thread = threading.Thread(target=send_startup_notification, daemon=True)
     startup_notify_thread.start()
 
+
+# ============================================================================
+# MODULE AJOUTÉ (autonome) — gold_price_feed.py
+# ----------------------------------------------------------------------------
+# Flux de prix XAU/USD indépendant basé sur GoldAPI.io (GoldPriceService /
+# GoldAPIFeed / CandleBuilder ci-dessous). NON câblé dans process_asset() ni
+# dans fetch_candles() : le pipeline XAUUSD existant (mt5_bridge -> fallback
+# yfinance, plus haut dans ce fichier) continue de tourner sans changement.
+# Ce module est ajouté tel quel, prêt à être branché plus tard si besoin.
+# ============================================================================
+"""
+gold_price_feed.py
+===================
+Module de prix INDÉPENDANT pour XAU/USD, basé sur GoldAPI.io.
+
+Principes durs (non négociables, ne jamais contourner) :
+  - JAMAIS de prix inventé/simulé, jamais de fallback silencieux. Si le flux
+    est absent, périmé (timestamp trop vieux) ou anormal (saut de prix trop
+    important vs dernière cotation), l'état passe à "stale"/"unavailable" et
+    plus AUCUN tick/bougie n'est produit à partir de données inventées : le
+    consommateur (moteur de signal) doit alors arrêter d'émettre des
+    signaux (voir GoldPriceService.should_produce_signals()).
+  - JAMAIS Yahoo Finance comme source, même en secours.
+  - Une bougie M5 ne mélange JAMAIS des ticks venant de deux sources
+    différentes : un changement de source ferme explicitement la bougie en
+    cours (is_complete=True) et une nouvelle bougie démarre avec la
+    nouvelle source.
+  - Chaque cotation loggue explicitement sa source exacte (goldapi.io ici).
+
+Architecture :
+  PriceFeed (ABC)         -> interface générique. Permet de brancher plus
+                             tard un flux MT5/cTrader sans toucher au reste
+                             du système (CandleBuilder, moteur de signal...).
+  GoldAPIFeed(PriceFeed)  -> implémentation GoldAPI.io pour XAU/USD (payant
+                             au-delà de 100 requêtes/mois sur le tier gratuit).
+  GoldApiComFeed(PriceFeed) -> implémentation Gold-API.com pour XAU/USD (ou
+                             tout autre symbole supporté) — endpoint de prix
+                             temps réel GRATUIT et SANS LIMITE DE REQUÊTES,
+                             sans clé API. RECOMMANDÉ par défaut pour un scan
+                             en continu (voir docstring de la classe pour les
+                             limites : pas de bid/ask séparés, endpoints
+                             historique/OHLC payants -> M5 reconstruit
+                             localement via CandleBuilder comme pour GoldAPIFeed.
+  Tick                    -> une cotation VALIDÉE (prix, bid, ask, ts, source).
+  Candle                  -> bougie M5 OHLC construite à partir de Ticks.
+  CandleBuilder           -> agrège des Ticks d'UNE SEULE source à la fois.
+  GoldPriceService        -> service de haut niveau : polling + état exposé
+                             au consommateur.
+"""
+
+import abc
+import logging
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from enum import Enum
+from typing import List, Optional
+
+import requests
+
+log_gold_feed = logging.getLogger("gold_price_feed")
+
+M5_SECONDS = 300
+
+
+# ============================================================================
+# États et structures de données
+# ============================================================================
+
+class FeedState(str, Enum):
+    LIVE = "live"                  # dernière cotation valide et fraîche
+    STALE = "stale"                # dernière cotation trop ancienne / saut anormal rejeté
+    UNAVAILABLE = "unavailable"    # API injoignable / réponse invalide / jamais interrogée
+
+
+@dataclass(frozen=True)
+class Tick:
+    """Une cotation VALIDÉE (a passé tous les contrôles), avec sa source exacte."""
+    symbol: str
+    price: float
+    bid: float
+    ask: float
+    quote_time_utc: datetime       # timestamp de cotation fourni par la source (UTC)
+    received_time_utc: datetime    # heure UTC de réception côté client
+    source: str                    # ex. "goldapi.io" — jamais vide, jamais deviné
+
+
+@dataclass
+class Candle:
+    """Bougie M5 OHLC, construite exclusivement à partir de Ticks d'UNE
+    SEULE source. `is_complete` est False tant que la bougie est en cours
+    (bucket M5 non terminé), True dès qu'elle a été clôturée par l'arrivée
+    d'un tick appartenant au bucket suivant (ou par changement de source)."""
+    open: float
+    high: float
+    low: float
+    close: float
+    timestamp: datetime            # début de la bougie M5 (UTC, aligné sur le bucket)
+    is_complete: bool = False
+    tick_count: int = 0
+    source: Optional[str] = None   # source UNIQUE de tous les ticks agrégés dans cette bougie
+
+
+# ============================================================================
+# Interface abstraite — pour brancher MT5/cTrader plus tard sans rien casser
+# ============================================================================
+
+class PriceFeed(abc.ABC):
+    """Interface générique d'un flux de prix. Toute nouvelle source (GoldAPI,
+    pont MT5, cTrader, etc.) doit l'implémenter pour rester interchangeable
+    avec le reste du système (CandleBuilder, GoldPriceService, moteur de
+    signal). Aucune implémentation ne doit jamais retourner un prix
+    inventé/interpolé — `get_latest_tick()` retourne None si aucune cotation
+    fraîche et valide n'est disponible."""
+
+    @property
+    @abc.abstractmethod
+    def source_name(self) -> str:
+        """Nom exact de la source, utilisé pour le logging et pour empêcher
+        le mélange de sources dans une même bougie M5."""
+        ...
+
+    @abc.abstractmethod
+    def get_latest_tick(self) -> Optional[Tick]:
+        """Retourne la dernière cotation VALIDÉE, ou None si indisponible/
+        périmée/anormale. Ne doit JAMAIS retourner un prix simulé."""
+        ...
+
+    @property
+    @abc.abstractmethod
+    def state(self) -> FeedState:
+        ...
+
+
+# ============================================================================
+# Implémentation GoldAPI.io
+# ============================================================================
+
+class GoldAPIFeed(PriceFeed):
+    """Client GoldAPI.io pour XAU/USD.
+
+    Validation stricte AVANT toute utilisation du prix :
+      1. Réponse API valide (champs attendus présents).
+      2. Prix numérique (price/bid/ask) et strictement positif.
+      3. Timestamp de cotation non périmé (< max_quote_age_seconds).
+      4. Pas de saut de prix anormal vs dernière cotation valide
+         (< max_price_jump_pct).
+    Si un de ces contrôles échoue, get_latest_tick() retourne None et
+    l'état passe à STALE (périmé/saut anormal) ou UNAVAILABLE (API/JSON
+    invalide) — jamais de prix de repli inventé.
+    """
+
+    API_URL = "https://www.goldapi.io/api/XAU/USD"
+
+    def __init__(self, api_key: str, max_quote_age_seconds: float = 30.0,
+                 max_price_jump_pct: float = 1.5, timeout_seconds: float = 5.0):
+        if not api_key:
+            raise ValueError("GoldAPIFeed nécessite une clé API GoldAPI.io (api_key).")
+        self._api_key = api_key
+        self._max_age = max_quote_age_seconds
+        self._max_jump_pct = max_price_jump_pct
+        self._timeout = timeout_seconds
+        self._last_valid_tick: Optional[Tick] = None
+        self._state: FeedState = FeedState.UNAVAILABLE
+
+    @property
+    def source_name(self) -> str:
+        return "goldapi.io"
+
+    @property
+    def state(self) -> FeedState:
+        return self._state
+
+    @property
+    def last_valid_tick(self) -> Optional[Tick]:
+        return self._last_valid_tick
+
+    def _fetch_raw(self) -> Optional[dict]:
+        headers = {"x-access-token": self._api_key, "Content-Type": "application/json"}
+        try:
+            resp = requests.get(self.API_URL, headers=headers, timeout=self._timeout)
+        except requests.RequestException as e:
+            log_gold_feed.error(f"[goldapi.io] Erreur réseau lors de la requête : {e}")
+            return None
+        if resp.status_code != 200:
+            log_gold_feed.error(f"[goldapi.io] Réponse HTTP {resp.status_code} inattendue : {resp.text[:200]!r}")
+            return None
+        try:
+            return resp.json()
+        except ValueError:
+            log_gold_feed.error(f"[goldapi.io] Réponse non-JSON reçue : {resp.text[:200]!r}")
+            return None
+
+    def _validate_and_build_tick(self, data: Optional[dict]) -> Optional[Tick]:
+        # --- 1. Réponse API valide (champs attendus présents) ---
+        required_fields = ("price", "bid", "ask", "timestamp")
+        if not data or any(field_name not in data for field_name in required_fields):
+            log_gold_feed.error(f"[goldapi.io] Réponse invalide, champ(s) manquant(s) : {data}")
+            self._state = FeedState.UNAVAILABLE
+            return None
+
+        # --- 2. Prix numérique et strictement positif ---
+        try:
+            price = float(data["price"])
+            bid = float(data["bid"])
+            ask = float(data["ask"])
+        except (TypeError, ValueError):
+            log_gold_feed.error(f"[goldapi.io] Champ(s) de prix non numérique(s) : {data}")
+            self._state = FeedState.UNAVAILABLE
+            return None
+        if price <= 0 or bid <= 0 or ask <= 0:
+            log_gold_feed.error(f"[goldapi.io] Prix non-positif rejeté : price={price} bid={bid} ask={ask}")
+            self._state = FeedState.UNAVAILABLE
+            return None
+
+        # --- 3. Timestamp de cotation non périmé ---
+        try:
+            quote_time = datetime.fromtimestamp(int(data["timestamp"]), tz=timezone.utc)
+        except (TypeError, ValueError, OSError, OverflowError):
+            log_gold_feed.error(f"[goldapi.io] Timestamp invalide reçu : {data.get('timestamp')!r}")
+            self._state = FeedState.UNAVAILABLE
+            return None
+
+        now = datetime.now(timezone.utc)
+        age_seconds = (now - quote_time).total_seconds()
+        if age_seconds > self._max_age:
+            log_gold_feed.warning(
+                f"[goldapi.io] Cotation PÉRIMÉE rejetée : âge={age_seconds:.1f}s "
+                f"> seuil={self._max_age:.1f}s (quote_time={quote_time.isoformat()}) "
+                f"-> état STALE, aucun prix simulé ne sera utilisé."
+            )
+            self._state = FeedState.STALE
+            return None
+        if age_seconds < -5.0:  # tolérance de 5s pour dérive d'horloge
+            log_gold_feed.warning(f"[goldapi.io] Timestamp dans le futur ({age_seconds:.1f}s) — cotation rejetée.")
+            self._state = FeedState.STALE
+            return None
+
+        # --- 4. Pas de saut de prix anormal vs dernière cotation valide ---
+        if self._last_valid_tick is not None and self._last_valid_tick.price > 0:
+            jump_pct = abs(price - self._last_valid_tick.price) / self._last_valid_tick.price * 100.0
+            if jump_pct > self._max_jump_pct:
+                log_gold_feed.warning(
+                    f"[goldapi.io] SAUT DE PRIX ANORMAL rejeté : "
+                    f"{self._last_valid_tick.price} -> {price} ({jump_pct:.3f}% "
+                    f"> seuil={self._max_jump_pct:.3f}%) -> état STALE, prix ignoré."
+                )
+                self._state = FeedState.STALE
+                return None
+
+        tick = Tick(
+            symbol="XAUUSD", price=price, bid=bid, ask=ask,
+            quote_time_utc=quote_time, received_time_utc=now, source=self.source_name,
+        )
+        log_gold_feed.info(
+            f"[goldapi.io] Cotation validée -> price={price} bid={bid} ask={ask} "
+            f"quote_time={quote_time.isoformat()} source={self.source_name}"
+        )
+        return tick
+
+    def get_latest_tick(self) -> Optional[Tick]:
+        raw = self._fetch_raw()
+        tick = self._validate_and_build_tick(raw)
+        if tick is None:
+            return None
+        self._last_valid_tick = tick
+        self._state = FeedState.LIVE
+        return tick
+
+
+# ============================================================================
+# Implémentation Gold-API.com (gratuite, sans clé API, sans limite de requêtes
+# sur l'endpoint de prix temps réel) — RECOMMANDÉE par défaut face à GoldAPI.io
+# ci-dessus, dont le tier gratuit est limité à 100 requêtes/mois.
+# Contrat d'API vérifié via https://gold-api.com/docs et
+# https://gold-api.com/llms.txt (documentation officielle) le 03/09/2026.
+# ============================================================================
+
+class GoldApiComFeed(PriceFeed):
+    """Client Gold-API.com pour XAU/USD (ou tout autre symbole supporté par
+    ce provider : XAG, XPT, XPD, HG, BTC, ETH).
+
+    Endpoint utilisé : GET https://api.gold-api.com/price/{symbol}
+      -> {"price": 4165.20, "symbol": "XAU", "currency": "USD",
+          "updatedAt": "2026-07-03T16:08:54Z", ...}
+    Gratuit, sans authentification, SANS limite de requêtes (contrairement à
+    GoldAPI.io). La documentation officielle demande de ne pas dépasser une
+    requête toutes les ~30s (le prix côté serveur n'est de toute façon pas
+    mis à jour plus souvent) — c'est cohérent avec poll_interval_seconds de
+    GoldPriceService (5s par défaut est plus prudent de rester >= 20-30s ici).
+
+    ⚠️ Différences importantes avec GoldAPIFeed (GoldAPI.io) :
+      1. Pas de bid/ask séparés dans la réponse -> on ne fabrique JAMAIS un
+         spread inventé. bid = ask = price ici, explicitement (voir
+         `Tick.bid`/`Tick.ask`). Le buffer de spread réel utilisé pour le SL
+         (AssetConfig.typical_spread, plus haut dans ce fichier) reste géré
+         séparément et n'est pas affecté par ce choix.
+      2. Les endpoints /history et /ohlc de Gold-API.com (agrégats
+         historiques) EXIGENT une clé API et sont limités à 10 requêtes/heure
+         sur le tier gratuit -> INUTILISABLES pour un scan en continu toutes
+         les quelques secondes. Comme pour GoldAPIFeed, la construction des
+         bougies M5 passe donc exclusivement par le polling répété de
+         /price/{symbol} + agrégation locale via CandleBuilder — jamais par
+         un appel direct à un endpoint d'historique.
+
+    Mêmes contrôles stricts qu'GoldAPIFeed avant toute utilisation du prix
+    (champs présents, prix numérique positif, timestamp non périmé, pas de
+    saut anormal) : si un contrôle échoue, get_latest_tick() retourne None et
+    l'état passe à STALE/UNAVAILABLE — jamais de prix de repli inventé.
+    """
+
+    API_BASE_URL = "https://api.gold-api.com"
+
+    def __init__(self, symbol: str = "XAU", max_quote_age_seconds: float = 60.0,
+                 max_price_jump_pct: float = 1.5, timeout_seconds: float = 5.0):
+        self._symbol = symbol
+        self._max_age = max_quote_age_seconds
+        self._max_jump_pct = max_price_jump_pct
+        self._timeout = timeout_seconds
+        self._last_valid_tick: Optional[Tick] = None
+        self._state: FeedState = FeedState.UNAVAILABLE
+
+    @property
+    def source_name(self) -> str:
+        return "gold-api.com"
+
+    @property
+    def state(self) -> FeedState:
+        return self._state
+
+    @property
+    def last_valid_tick(self) -> Optional[Tick]:
+        return self._last_valid_tick
+
+    def _fetch_raw(self) -> Optional[dict]:
+        url = f"{self.API_BASE_URL}/price/{self._symbol}"
+        try:
+            resp = requests.get(url, timeout=self._timeout)
+        except requests.RequestException as e:
+            log_gold_feed.error(f"[gold-api.com] Erreur réseau lors de la requête : {e}")
+            return None
+        if resp.status_code != 200:
+            log_gold_feed.error(f"[gold-api.com] Réponse HTTP {resp.status_code} inattendue : {resp.text[:200]!r}")
+            return None
+        try:
+            return resp.json()
+        except ValueError:
+            log_gold_feed.error(f"[gold-api.com] Réponse non-JSON reçue : {resp.text[:200]!r}")
+            return None
+
+    def _validate_and_build_tick(self, data: Optional[dict]) -> Optional[Tick]:
+        # --- 1. Réponse API valide (champs attendus présents) ---
+        required_fields = ("price", "updatedAt")
+        if not data or any(field_name not in data for field_name in required_fields):
+            log_gold_feed.error(f"[gold-api.com] Réponse invalide, champ(s) manquant(s) : {data}")
+            self._state = FeedState.UNAVAILABLE
+            return None
+
+        # --- 2. Prix numérique et strictement positif ---
+        try:
+            price = float(data["price"])
+        except (TypeError, ValueError):
+            log_gold_feed.error(f"[gold-api.com] Champ 'price' non numérique : {data}")
+            self._state = FeedState.UNAVAILABLE
+            return None
+        if price <= 0:
+            log_gold_feed.error(f"[gold-api.com] Prix non-positif rejeté : price={price}")
+            self._state = FeedState.UNAVAILABLE
+            return None
+
+        # --- 3. Timestamp de cotation non périmé ---
+        # Format ISO 8601 avec suffixe "Z" (ex. "2026-07-03T16:08:54Z") ->
+        # converti en "+00:00" pour que fromisoformat() l'accepte.
+        raw_ts = str(data["updatedAt"])
+        try:
+            quote_time = datetime.fromisoformat(raw_ts.replace("Z", "+00:00"))
+            if quote_time.tzinfo is None:
+                quote_time = quote_time.replace(tzinfo=timezone.utc)
+        except (TypeError, ValueError):
+            log_gold_feed.error(f"[gold-api.com] Timestamp invalide reçu : {raw_ts!r}")
+            self._state = FeedState.UNAVAILABLE
+            return None
+
+        now = datetime.now(timezone.utc)
+        age_seconds = (now - quote_time).total_seconds()
+        if age_seconds > self._max_age:
+            log_gold_feed.warning(
+                f"[gold-api.com] Cotation PÉRIMÉE rejetée : âge={age_seconds:.1f}s "
+                f"> seuil={self._max_age:.1f}s (quote_time={quote_time.isoformat()}) "
+                f"-> état STALE, aucun prix simulé ne sera utilisé."
+            )
+            self._state = FeedState.STALE
+            return None
+        if age_seconds < -5.0:  # tolérance de 5s pour dérive d'horloge
+            log_gold_feed.warning(f"[gold-api.com] Timestamp dans le futur ({age_seconds:.1f}s) — cotation rejetée.")
+            self._state = FeedState.STALE
+            return None
+
+        # --- 4. Pas de saut de prix anormal vs dernière cotation valide ---
+        if self._last_valid_tick is not None and self._last_valid_tick.price > 0:
+            jump_pct = abs(price - self._last_valid_tick.price) / self._last_valid_tick.price * 100.0
+            if jump_pct > self._max_jump_pct:
+                log_gold_feed.warning(
+                    f"[gold-api.com] SAUT DE PRIX ANORMAL rejeté : "
+                    f"{self._last_valid_tick.price} -> {price} ({jump_pct:.3f}% "
+                    f"> seuil={self._max_jump_pct:.3f}%) -> état STALE, prix ignoré."
+                )
+                self._state = FeedState.STALE
+                return None
+
+        # Gold-API.com ne renvoie pas de bid/ask séparés (juste un prix
+        # unique) -> bid = ask = price, assumé explicitement (pas de spread
+        # inventé). Voir docstring de la classe.
+        tick = Tick(
+            symbol=f"{self._symbol}USD", price=price, bid=price, ask=price,
+            quote_time_utc=quote_time, received_time_utc=now, source=self.source_name,
+        )
+        log_gold_feed.info(
+            f"[gold-api.com] Cotation validée -> price={price} "
+            f"quote_time={quote_time.isoformat()} source={self.source_name}"
+        )
+        return tick
+
+    def get_latest_tick(self) -> Optional[Tick]:
+        raw = self._fetch_raw()
+        tick = self._validate_and_build_tick(raw)
+        if tick is None:
+            return None
+        self._last_valid_tick = tick
+        self._state = FeedState.LIVE
+        return tick
+
+
+# ============================================================================
+# Construction des bougies M5 — jamais de mélange de sources dans une bougie
+# ============================================================================
+
+def _candle_bucket_start(ts: datetime) -> datetime:
+    """Aligne un timestamp UTC sur le début de son bucket M5 (:00, :05, :10...)."""
+    epoch = int(ts.timestamp())
+    bucket_epoch = epoch - (epoch % M5_SECONDS)
+    return datetime.fromtimestamp(bucket_epoch, tz=timezone.utc)
+
+
+class CandleBuilder:
+    """Construit des bougies M5 OHLC à partir d'une séquence de Ticks.
+
+    Règle stricte : une bougie n'agrège JAMAIS des ticks de deux sources
+    différentes. Si la source change en cours de bougie (ex. bascule de
+    provider), la bougie en cours est immédiatement clôturée
+    (is_complete=True) et une nouvelle bougie démarre avec la nouvelle
+    source — sans aucun mélange de données.
+    """
+
+    def __init__(self):
+        self._current: Optional[Candle] = None
+        self._completed: List[Candle] = []
+
+    def add_tick(self, tick: Tick) -> Optional[Candle]:
+        """Ajoute un tick VALIDÉ (voir PriceFeed.get_latest_tick). Retourne
+        la bougie qui vient d'être clôturée si cet ajout en a fermé une
+        (nouveau bucket M5 ou changement de source), sinon None."""
+        bucket_start = _candle_bucket_start(tick.quote_time_utc)
+
+        if self._current is None:
+            self._current = Candle(
+                open=tick.price, high=tick.price, low=tick.price, close=tick.price,
+                timestamp=bucket_start, is_complete=False, tick_count=1, source=tick.source,
+            )
+            return None
+
+        same_bucket = self._current.timestamp == bucket_start
+        same_source = self._current.source == tick.source
+
+        if same_bucket and same_source:
+            c = self._current
+            c.high = max(c.high, tick.price)
+            c.low = min(c.low, tick.price)
+            c.close = tick.price
+            c.tick_count += 1
+            return None
+
+        # Nouveau bucket M5, OU changement de source -> clôture explicite de
+        # la bougie courante, jamais de mélange.
+        if not same_source:
+            log_gold_feed.warning(
+                f"[CandleBuilder] Changement de source de prix détecté "
+                f"({self._current.source} -> {tick.source}) — bougie en cours "
+                f"clôturée immédiatement pour ne jamais mélanger deux sources."
+            )
+        self._current.is_complete = True
+        closed = self._current
+        self._completed.append(closed)
+
+        self._current = Candle(
+            open=tick.price, high=tick.price, low=tick.price, close=tick.price,
+            timestamp=bucket_start, is_complete=False, tick_count=1, source=tick.source,
+        )
+        return closed
+
+    def get_candles(self, include_incomplete: bool = True) -> List[Candle]:
+        """Retourne les bougies clôturées, plus la bougie en cours si
+        `include_incomplete` (toujours avec is_complete=False sur celle-ci,
+        pour que le consommateur sache explicitement qu'elle n'est pas
+        terminée)."""
+        candles = list(self._completed)
+        if include_incomplete and self._current is not None:
+            candles.append(self._current)
+        return candles
+
+
+# ============================================================================
+# Service de haut niveau : polling + état exposé au consommateur
+# ============================================================================
+
+class GoldPriceService:
+    """Interroge un PriceFeed à intervalle régulier, construit les bougies
+    M5 via CandleBuilder, et expose un état clair au consommateur (moteur de
+    signal). Ne fournit JAMAIS de prix de secours simulé : si le feed passe
+    en STALE/UNAVAILABLE, `should_produce_signals()` renvoie False et le
+    moteur de signal DOIT arrêter d'émettre des signaux tant que ce n'est
+    pas redevenu True — get_m5_candles() continue de refléter fidèlement les
+    seules données réellement reçues (pas de comblement artificiel des
+    bougies manquantes)."""
+
+    def __init__(self, feed: PriceFeed, poll_interval_seconds: float = 5.0):
+        self._feed = feed
+        self._builder = CandleBuilder()
+        self._poll_interval = poll_interval_seconds
+        self._last_tick: Optional[Tick] = None
+
+    @property
+    def state(self) -> FeedState:
+        return self._feed.state
+
+    @property
+    def last_tick(self) -> Optional[Tick]:
+        return self._last_tick
+
+    def should_produce_signals(self) -> bool:
+        """Le moteur de signal ne doit consommer les bougies que si cette
+        méthode renvoie True. False -> flux périmé/indisponible -> pas de
+        nouveau signal, quel que soit l'état technique des bougies déjà en
+        mémoire."""
+        return self._feed.state == FeedState.LIVE
+
+    def poll_once(self) -> Optional[Tick]:
+        tick = self._feed.get_latest_tick()
+        if tick is None:
+            log_gold_feed.warning(
+                f"[GoldPriceService] Aucune cotation valide cette itération "
+                f"(état={self._feed.state.value}) — AUCUN prix simulé ne sera utilisé, "
+                f"production de signaux suspendue tant que l'état n'est pas LIVE."
+            )
+            return None
+        self._last_tick = tick
+        self._builder.add_tick(tick)
+        return tick
+
+    def run_forever(self):
+        """Boucle de polling bloquante — à lancer dans un thread dédié."""
+        while True:
+            try:
+                self.poll_once()
+            except Exception:
+                log_gold_feed.exception("[GoldPriceService] Erreur inattendue dans la boucle de polling.")
+            time.sleep(self._poll_interval)
+
+    def get_m5_candles(self, include_incomplete: bool = True) -> List[Candle]:
+        return self._builder.get_candles(include_incomplete=include_incomplete)
+
+
+# ============================================================================
+# BRANCHEMENT RÉEL SUR LE PIPELINE LIVE XAUUSD
+# ----------------------------------------------------------------------------
+# Ce bloc câble RÉELLEMENT GoldApiComFeed (gratuit, sans clé, source
+# principale) -> GoldAPIFeed (goldapi.io, secours n°1, actif seulement si
+# GOLDAPI_IO_API_KEY est définie) en chaîne de prix temps réel pour XAUUSD.
+# GoldPriceService/CandleBuilder ci-dessus sont UTILISÉS TELS QUELS, sans
+# aucune modification, pour agréger cette chaîne en bougies M5.
+#
+# yfinance n'est PAS mis dans cette chaîne de ticks : il reste le fallback
+# déjà existant de fetch_candles() (asset.fallback_data_source, voir
+# ASSETS["XAUUSD"] plus haut), car il renvoie directement jusqu'à 200
+# bougies M5 historiques réelles en un seul appel (yf.download) — alors
+# qu'un flux tick-par-tick devrait ré-accumuler ~2h30 d'historique (30
+# bougies M5 x 5 min, MIN_CANDLES_REQUIRED) avant de pouvoir produire un
+# signal à chaque redémarrage. Résultat, ordre de repli EXACT :
+#
+#     GoldApiComFeed -> GoldAPIFeed -> yfinance -> XAUUSD indisponible (NO SIGNAL)
+#
+# ============================================================================
+
+class FallbackChainFeed(PriceFeed):
+    """Chaîne de secours entre plusieurs PriceFeed, essayés dans l'ordre.
+
+    À chaque poll (`get_latest_tick`) : tente le 1er feed de la liste, avec
+    un petit nombre de tentatives + backoff court en cas d'échec réseau
+    transitoire (timeout, 5xx...). Si toutes les tentatives échouent, passe
+    au feed suivant, etc. Ne fabrique JAMAIS de prix : si TOUS les feeds
+    échouent, retourne None et l'état passe à UNAVAILABLE — c'est alors au
+    consommateur (fetch_candles(), plus haut dans ce fichier) de basculer
+    sur son propre fallback (yfinance), hors de cette chaîne.
+
+    Chaque tentative loggue explicitement OK / ERROR / FALLBACK avec le nom
+    exact de la source (gold-api.com / goldapi.io), pour un diagnostic clair
+    en prod."""
+
+    def __init__(self, feeds: List[PriceFeed], retries_per_feed: int = 2,
+                 backoff_seconds: float = 1.0):
+        if not feeds:
+            raise ValueError("FallbackChainFeed nécessite au moins un PriceFeed.")
+        self._feeds = feeds
+        self._retries = max(1, retries_per_feed)
+        self._backoff = backoff_seconds
+        self._state: FeedState = FeedState.UNAVAILABLE
+        self._active_source: Optional[str] = None
+
+    @property
+    def source_name(self) -> str:
+        # Reflète la source réellement utilisée lors du dernier succès ;
+        # sinon celle du feed principal (valeur par défaut avant 1er poll).
+        return self._active_source or self._feeds[0].source_name
+
+    @property
+    def state(self) -> FeedState:
+        return self._state
+
+    def get_latest_tick(self) -> Optional[Tick]:
+        for position, feed in enumerate(self._feeds):
+            for attempt in range(1, self._retries + 1):
+                tick = feed.get_latest_tick()
+                if tick is not None:
+                    if position == 0:
+                        log_gold_feed.info(f"[FallbackChainFeed] '{feed.source_name}' -> OK.")
+                    else:
+                        log_gold_feed.warning(
+                            f"[FallbackChainFeed] '{feed.source_name}' -> FALLBACK actif "
+                            f"(source(s) précédente(s) en échec cette itération)."
+                        )
+                    self._active_source = feed.source_name
+                    self._state = FeedState.LIVE
+                    return tick
+                log_gold_feed.error(
+                    f"[FallbackChainFeed] '{feed.source_name}' -> ERROR "
+                    f"(état={feed.state.value}, tentative {attempt}/{self._retries})."
+                )
+                if attempt < self._retries:
+                    time.sleep(self._backoff)
+        log_gold_feed.error(
+            "[FallbackChainFeed] Toutes les sources de la chaîne ont échoué cette "
+            "itération -> UNAVAILABLE. Aucun prix simulé/inventé ne sera utilisé."
+        )
+        self._state = FeedState.UNAVAILABLE
+        self._active_source = None
+        return None
+
+
+# Clé optionnelle goldapi.io pour activer le 2e maillon de la chaîne (le
+# tier gratuit est limité à 100 requêtes/mois — laisser vide si non utilisé,
+# la chaîne fonctionne avec gold-api.com seul).
+GOLDAPI_IO_API_KEY = os.environ.get("GOLDAPI_IO_API_KEY", "")
+# gold-api.com demande de ne pas dépasser ~1 requête/30s (voir docstring de
+# GoldApiComFeed plus haut) -> 20s par défaut, override possible via l'env.
+GOLD_PRICE_SERVICE_POLL_SECONDS = float(os.environ.get("GOLD_PRICE_SERVICE_POLL_SECONDS", "20"))
+
+# Instance réelle, créée au démarrage (voir bloc "if __name__" juste plus
+# bas) et consommée par _fetch_gold_price_service() ci-dessous.
+xauusd_price_service: Optional["GoldPriceService"] = None
+
+
+def _build_xauusd_price_service() -> "GoldPriceService":
+    feeds: List[PriceFeed] = [GoldApiComFeed(symbol="XAU")]
+    if GOLDAPI_IO_API_KEY:
+        feeds.append(GoldAPIFeed(api_key=GOLDAPI_IO_API_KEY))
+        log_gold_feed.info("[GoldPriceService] Chaîne = gold-api.com -> goldapi.io (clé détectée).")
+    else:
+        log_gold_feed.info(
+            "[GoldPriceService] GOLDAPI_IO_API_KEY absente -> chaîne = gold-api.com seul "
+            "(goldapi.io non activé ; yfinance reste le secours final via fetch_candles())."
+        )
+    chain = FallbackChainFeed(feeds, retries_per_feed=2, backoff_seconds=1.0)
+    return GoldPriceService(feed=chain, poll_interval_seconds=GOLD_PRICE_SERVICE_POLL_SECONDS)
+
+
+def _fetch_gold_price_service(symbol: str, limit: int) -> List[Dict]:
+    """Pont entre GoldPriceService (ticks -> bougies M5 en mémoire) et le
+    pipeline existant (fetch_candles()/process_asset()), qui attend une
+    liste de dicts {"time","open","high","low","close"}. Lève une exception
+    (jamais de prix inventé) si le service n'est pas encore prêt, périmé, ou
+    si l'historique M5 accumulé est encore insuffisant -> fetch_candles()
+    bascule alors automatiquement sur asset.fallback_data_source (yfinance),
+    exactement comme pour n'importe quelle autre source qui échoue."""
+    if symbol != "XAUUSD":
+        raise ValueError(f"gold_price_service ne gère que XAUUSD pour le moment (reçu : {symbol}).")
+    if xauusd_price_service is None:
+        raise RuntimeError("GoldPriceService pas encore initialisé (démarrage en cours ?).")
+    if not xauusd_price_service.should_produce_signals():
+        raise RuntimeError(
+            f"GoldPriceService état={xauusd_price_service.state.value} — flux XAU périmé/indisponible."
+        )
+    raw_candles = xauusd_price_service.get_m5_candles(include_incomplete=True)
+    if len(raw_candles) < MIN_CANDLES_REQUIRED:
+        raise RuntimeError(
+            f"GoldPriceService : seulement {len(raw_candles)} bougie(s) M5 accumulée(s) "
+            f"(minimum {MIN_CANDLES_REQUIRED}) — historique encore en cours de constitution."
+        )
+    return [
+        {"time": c.timestamp.timestamp(), "open": c.open, "high": c.high, "low": c.low, "close": c.close}
+        for c in raw_candles[-limit:]
+    ]
+
+
+if __name__ == "__main__":
+    xauusd_price_service = _build_xauusd_price_service()
+    threading.Thread(target=xauusd_price_service.run_forever, daemon=True).start()
+    log_gold_feed.info(
+        f"[GoldPriceService] Thread de polling XAUUSD démarré "
+        f"(intervalle={GOLD_PRICE_SERVICE_POLL_SECONDS:.0f}s)."
+    )
+
+
+# ============================================================================
+# MODULE AJOUTÉ (autonome) — xau_signal_engine.py
+# ----------------------------------------------------------------------------
+# Moteur de détection Sweep -> BOS(corps) -> FVG pour XAUUSD (XAUSignalEngine),
+# INDÉPENDANT du moteur SMC déjà utilisé par process_asset() plus haut dans ce
+# fichier (detect_liquidity_sweep / confirm_bos / detect_fvg, partagé par
+# XAUUSD, XAGUSD et BTCUSD). NON câblé au pipeline existant.
+# Pour éviter tout conflit de nom avec les classes déjà définies plus haut
+# (utilisées par tous les actifs), les symboles suivants ont été renommés :
+#   SwingPoint       -> SwingPointXAU
+#   FVGZone          -> FVGZoneXAU
+#   find_swing_points -> find_swing_points_xau
+#   log (logger)     -> log_xau_engine
+# ============================================================================
+"""
+xau_signal_engine.py
+=====================
+Moteur de détection de signal XAUUSD, INDÉPENDANT, consommant les bougies M5
+produites par `gold_price_feed.py` (Candle : open/high/low/close/timestamp/
+is_complete). Aucun système de score : le signal est un booléen — produit
+uniquement si TOUTES les conditions techniques de la séquence sont réunies.
+
+Séquence stricte, dans cet ordre, sans exception :
+  1. Sweep de liquidité : une mèche dépasse un niveau de liquidité identifié
+     (swing high/low récent).
+  2. BOS (Break of Structure) confirmé UNIQUEMENT par la clôture du CORPS de
+     la bougie au-delà du niveau de structure interne opposé. Une mèche
+     seule ne valide JAMAIS un BOS.
+  3. Détection d'un FVG (Fair Value Gap / imbalance) laissé par la bougie de
+     cassure :
+       - Pas de FVG exploitable -> entrée directe, signal émis immédiatement.
+       - FVG exploitable -> on attend que le prix revienne dans l'imbalance
+         avant d'émettre le signal (entrée sur retour).
+
+BUY et SELL sont détectés de façon totalement indépendante et simultanée :
+un setup SELL en cours de formation ne bloque JAMAIS la détection d'un
+setup BUY sur un swing différent, et réciproquement — chaque direction a son
+propre état interne.
+
+Sortie : SignalCandidate structuré (direction, niveau de sweep, niveau BOS,
+zone FVG éventuelle, bougie associée). PAS de SL/TP, PAS de Telegram ici —
+moteur de détection technique pur, à brancher ensuite sur le module de
+risque (SL/TP/lot) et de diffusion.
+"""
+
+import logging
+from dataclasses import dataclass
+from datetime import datetime
+from enum import Enum
+from typing import Dict, List, Optional
+
+try:
+    from typing import Literal
+    Direction = Literal["BUY", "SELL"]
+except ImportError:  # pragma: no cover - py<3.8 fallback
+    Direction = str
+
+log_xau_engine = logging.getLogger("xau_signal_engine")
+
+
+# ============================================================================
+# Structures de données
+# ============================================================================
+
+@dataclass(frozen=True)
+class SwingPointXAU:
+    index: int
+    price: float
+    kind: str               # "high" | "low"
+    timestamp: datetime
+
+
+@dataclass(frozen=True)
+class FVGZoneXAU:
+    top: float
+    bottom: float
+    direction: str           # "BUY" (imbalance haussière) | "SELL" (baissière)
+    candle_index: int        # index de la bougie de cassure qui a laissé le FVG
+
+
+@dataclass(frozen=True)
+class SignalCandidate:
+    """Signal structuré — sortie UNIQUE de ce moteur. Pas de SL/TP/Lot/
+    Telegram : à consommer par un module de risque séparé."""
+    direction: str                    # "BUY" | "SELL"
+    sweep_level: float
+    sweep_candle_index: int
+    bos_level: float
+    bos_candle_index: int
+    fvg_zone: Optional[FVGZoneXAU]
+    entry_type: str                   # "direct" | "fvg_return"
+    signal_candle_index: int
+    timestamp: datetime
+
+
+class SetupStage(str, Enum):
+    """Étapes de la séquence stricte, suivies indépendamment par direction."""
+    SWEPT = "swept"
+    BOS_CONFIRMED = "bos_confirmed"
+    AWAITING_FVG_RETURN = "awaiting_fvg_return"
+    DONE = "done"
+
+
+@dataclass
+class PendingSetup:
+    """État interne d'un setup en cours de formation, pour UNE direction
+    (BUY ou SELL). Les deux directions ont chacune leur propre instance,
+    totalement indépendante l'une de l'autre."""
+    direction: str
+    stage: SetupStage
+    sweep_level: float
+    sweep_candle_index: int
+    bos_level: Optional[float] = None
+    bos_candle_index: Optional[int] = None
+    fvg_zone: Optional[FVGZoneXAU] = None
+
+
+# ============================================================================
+# Détection des swing points (fractals confirmés)
+# ============================================================================
+
+def find_swing_points_xau(candles: List, lookback: int = 2) -> List[SwingPointXAU]:
+    """Détecte les swing highs/lows confirmés (fractals) : un swing high à
+    l'index i nécessite `lookback` bougies de part et d'autre avec un high
+    strictement inférieur (symétrique pour un swing low). Ces swings servent
+    à la fois de niveaux de liquidité (pour le sweep) et de niveaux de
+    structure interne (pour la confirmation du BOS)."""
+    swings: List[SwingPointXAU] = []
+    n = len(candles)
+    for i in range(lookback, n - lookback):
+        h = candles[i].high
+        if all(candles[j].high < h for j in range(i - lookback, i)) and \
+           all(candles[j].high < h for j in range(i + 1, i + lookback + 1)):
+            swings.append(SwingPointXAU(i, h, "high", candles[i].timestamp))
+        l = candles[i].low
+        if all(candles[j].low > l for j in range(i - lookback, i)) and \
+           all(candles[j].low > l for j in range(i + 1, i + lookback + 1)):
+            swings.append(SwingPointXAU(i, l, "low", candles[i].timestamp))
+    return swings
+
+
+# ============================================================================
+# Détection du FVG (Fair Value Gap / imbalance) laissé par la bougie de cassure
+# ============================================================================
+
+def detect_fvg_from_breakout(candles: List, breakout_index: int, direction: str) -> Optional[FVGZoneXAU]:
+    """Motif ICT/SMC classique à 3 bougies : le FVG associé à la bougie de
+    cassure (breakout_index) est le vide entre la bougie PRÉCÉDENTE et la
+    bougie SUIVANTE la cassure.
+      - Haussier (BUY) : low(bougie suivante) > high(bougie précédente).
+      - Baissier (SELL) : high(bougie suivante) < low(bougie précédente).
+    Retourne None si aucune des deux bougies voisines n'existe encore, ou si
+    aucun vide n'est laissé (pas de FVG exploitable)."""
+    if breakout_index - 1 < 0 or breakout_index + 1 >= len(candles):
+        return None
+    prev_c = candles[breakout_index - 1]
+    next_c = candles[breakout_index + 1]
+
+    if direction == "BUY":
+        if next_c.low > prev_c.high:
+            return FVGZoneXAU(top=next_c.low, bottom=prev_c.high, direction="BUY",
+                            candle_index=breakout_index)
+    else:
+        if next_c.high < prev_c.low:
+            return FVGZoneXAU(top=prev_c.low, bottom=next_c.high, direction="SELL",
+                            candle_index=breakout_index)
+    return None
+
+
+def _fvg_size(fvg: FVGZoneXAU) -> float:
+    return max(fvg.top - fvg.bottom, 0.0)
+
+
+# ============================================================================
+# Moteur principal
+# ============================================================================
+
+class XAUSignalEngine:
+    """Moteur de détection Sweep -> BOS(corps) -> FVG pour XAUUSD.
+
+    Consomme une liste de bougies M5 COMPLÈTES (is_complete=True — les
+    bougies incomplètes du module de prix ne doivent jamais être utilisées
+    pour valider un sweep, un BOS ou un FVG, seulement pour un affichage
+    temps réel éventuel côté consommateur).
+
+    BUY et SELL possèdent chacun leur propre état interne (`PendingSetup`) :
+    aucune direction ne bloque jamais l'autre.
+    """
+
+    def __init__(self, swing_lookback: int = 2, min_fvg_size: float = 0.0):
+        self._swing_lookback = swing_lookback
+        self._min_fvg_size = min_fvg_size
+        self._pending: Dict[str, Optional[PendingSetup]] = {"BUY": None, "SELL": None}
+
+    def reset(self):
+        self._pending = {"BUY": None, "SELL": None}
+
+    def process(self, candles: List) -> List[SignalCandidate]:
+        """Traite l'historique de bougies M5 disponible et retourne les
+        NOUVEAUX signaux détectés lors de cet appel. À rappeler à chaque
+        nouvelle bougie M5 complète reçue du module de prix (voir
+        GoldPriceService.get_m5_candles(include_incomplete=False))."""
+        complete = [c for c in candles if getattr(c, "is_complete", True)]
+        min_len = self._swing_lookback * 2 + 3
+        if len(complete) < min_len:
+            return []
+
+        swings = find_swing_points_xau(complete, self._swing_lookback)
+
+        signals: List[SignalCandidate] = []
+        signals += self._process_direction("BUY", complete, swings)
+        signals += self._process_direction("SELL", complete, swings)
+        return signals
+
+    # ------------------------------------------------------------------
+    # Logique interne — une direction à la fois, état totalement séparé
+    # ------------------------------------------------------------------
+
+    def _process_direction(self, direction: str, candles: List,
+                            swings: List[SwingPointXAU]) -> List[SignalCandidate]:
+        signals: List[SignalCandidate] = []
+        n = len(candles)
+        last_index = n - 1
+
+        sweep_kind = "low" if direction == "BUY" else "high"        # liquidité balayée
+        structure_kind = "high" if direction == "BUY" else "low"    # structure opposée pour le BOS
+
+        pending = self._pending[direction]
+
+        # --- Étape 1 : sweep de liquidité (aucun setup en cours pour cette direction) ---
+        if pending is None:
+            candidate_swings = [s for s in swings if s.kind == sweep_kind and s.index < last_index]
+            if not candidate_swings:
+                return signals
+            level = candidate_swings[-1]  # niveau de liquidité le plus récent
+            c = candles[last_index]
+            swept = (c.low < level.price) if direction == "BUY" else (c.high > level.price)
+            if not swept:
+                return signals
+            pending = PendingSetup(direction=direction, stage=SetupStage.SWEPT,
+                                    sweep_level=level.price, sweep_candle_index=last_index)
+            log_xau_engine.info(f"[{direction}] Sweep de liquidité détecté @ {level.price} "
+                      f"(bougie #{last_index}, ts={c.timestamp}).")
+            self._pending[direction] = pending
+
+        # --- Étape 2 : BOS confirmé UNIQUEMENT par clôture du corps ---
+        if pending.stage == SetupStage.SWEPT:
+            structure_swings = [s for s in swings if s.kind == structure_kind
+                                 and s.index > pending.sweep_candle_index]
+            if structure_swings:
+                struct_level = structure_swings[0].price
+                for i in range(pending.sweep_candle_index + 1, n):
+                    body_close = candles[i].close
+                    body_open = candles[i].open
+                    if direction == "BUY":
+                        confirmed = body_close > struct_level and body_close > body_open
+                    else:
+                        confirmed = body_close < struct_level and body_close < body_open
+                    # Une mèche seule (high/low) au-delà du niveau ne valide
+                    # JAMAIS le BOS : seule la clôture du CORPS compte.
+                    if confirmed:
+                        pending.stage = SetupStage.BOS_CONFIRMED
+                        pending.bos_level = struct_level
+                        pending.bos_candle_index = i
+                        log_xau_engine.info(f"[{direction}] BOS confirmé par clôture du corps @ {body_close} "
+                                  f"au-delà du niveau opposé {struct_level} (bougie #{i}).")
+                        break
+            if pending.stage != SetupStage.BOS_CONFIRMED:
+                self._pending[direction] = pending
+                return signals
+
+        # --- Étape 3 : détection FVG -> entrée directe ou attente de retour ---
+        if pending.stage == SetupStage.BOS_CONFIRMED:
+            fvg = detect_fvg_from_breakout(candles, pending.bos_candle_index, direction)
+            exploitable = fvg is not None and _fvg_size(fvg) >= self._min_fvg_size
+            if not exploitable:
+                signal = SignalCandidate(
+                    direction=direction, sweep_level=pending.sweep_level,
+                    sweep_candle_index=pending.sweep_candle_index, bos_level=pending.bos_level,
+                    bos_candle_index=pending.bos_candle_index, fvg_zone=None,
+                    entry_type="direct", signal_candle_index=pending.bos_candle_index,
+                    timestamp=candles[pending.bos_candle_index].timestamp,
+                )
+                signals.append(signal)
+                log_xau_engine.info(f"[{direction}] Signal DIRECT (pas de FVG exploitable) "
+                          f"@ bougie #{pending.bos_candle_index}.")
+                pending.stage = SetupStage.DONE
+            else:
+                pending.fvg_zone = fvg
+                pending.stage = SetupStage.AWAITING_FVG_RETURN
+                log_xau_engine.info(f"[{direction}] FVG exploitable détecté [{fvg.bottom}, {fvg.top}] "
+                          f"— attente du retour dans l'imbalance avant signal.")
+
+        # --- Étape 4 : attente du retour effectif dans l'imbalance (FVG) ---
+        if pending.stage == SetupStage.AWAITING_FVG_RETURN:
+            fvg = pending.fvg_zone
+            for i in range(pending.bos_candle_index + 1, n):
+                c = candles[i]
+                # Retour dans l'imbalance = chevauchement du range de la
+                # bougie avec la zone FVG, quelle que soit la direction.
+                overlaps = c.low <= fvg.top and c.high >= fvg.bottom
+                if overlaps:
+                    signal = SignalCandidate(
+                        direction=direction, sweep_level=pending.sweep_level,
+                        sweep_candle_index=pending.sweep_candle_index, bos_level=pending.bos_level,
+                        bos_candle_index=pending.bos_candle_index, fvg_zone=fvg,
+                        entry_type="fvg_return", signal_candle_index=i,
+                        timestamp=c.timestamp,
+                    )
+                    signals.append(signal)
+                    log_xau_engine.info(f"[{direction}] Signal RETOUR IMBALANCE (FVG) @ bougie #{i}.")
+                    pending.stage = SetupStage.DONE
+                    break
+
+        # Setup terminé -> on libère l'état pour permettre la détection du
+        # prochain setup sur cette même direction, indépendamment de l'autre.
+        if pending.stage == SetupStage.DONE:
+            self._pending[direction] = None
+        else:
+            self._pending[direction] = pending
+
+        return signals
+
+
+if __name__ == "__main__":
     scan_loop()  # boucle infinie dans le thread principal
 
 
@@ -4514,7 +5734,7 @@ if __name__ == "__main__":
 #    dans ce projet ; tout message reçu hors DM est ignoré :
 #      /stats /report [daily|weekly|monthly] /help
 #      /settings /profil /capital /risque /levier /session /timeframe
-#      /signaux <on|off> /profils /status /menu
+#      /tprr /berr /bemode /signaux <on|off> /profils /status /menu
 #    Pour que le menu "/" apparaisse dans Telegram, exécute UNE FOIS
 #    (optionnel, juste pour l'UI) :
 #      curl -X POST "https://api.telegram.org/bot<TOKEN>/setMyCommands" \
@@ -4526,9 +5746,15 @@ if __name__ == "__main__":
 #                 {"command": "settings", "description": "Voir les réglages actuels"},
 #                 {"command": "capital", "description": "Définir le capital ($)"},
 #                 {"command": "risque", "description": "Définir le risque par trade (%)"},
+#                 {"command": "balance", "description": "Voir/définir le solde ($)"},
+#                 {"command": "risk", "description": "Voir/définir le risque par trade (%)"},
 #                 {"command": "levier", "description": "Définir le levier (x)"},
+#                 {"command": "tprr", "description": "Définir le TP en multiple de RR"},
+#                 {"command": "berr", "description": "Définir le déclenchement du BE en multiple de RR"},
+#                 {"command": "bemode", "description": "Voir/définir le mode Break-Even"},
 #                 {"command": "signaux", "description": "Activer/désactiver les signaux"},
 #                 {"command": "profils", "description": "Lister/activer un profil"},
 #                 {"command": "status", "description": "État du bot"},
 #                 {"command": "help", "description": "Liste des commandes"}
 #               ]}'
+
