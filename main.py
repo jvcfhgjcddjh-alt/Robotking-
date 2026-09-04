@@ -109,6 +109,11 @@ class AssetConfig:
     # Source utilisée si data_source échoue ou renvoie une erreur (ex. pont
     # MT5 pas encore connecté, ou en panne) — jamais de scan bloqué en silence.
     fallback_data_source: Optional[str] = None
+    # 2e niveau de secours, utilisé si data_source ET fallback_data_source
+    # échouent tous les deux (ex. XAUUSD : mt5_bridge -> gold_price_service
+    # -> twelvedata). None = pas de 2e niveau (comportement inchangé pour
+    # les autres actifs).
+    fallback_data_source_2: Optional[str] = None
     # $ de P&L par lot standard pour 1$ de mouvement de prix — sert au calcul
     # du lot à partir du risque $ (voir compute_lot_size_v2). À AJUSTER si la
     # taille de contrat de ton broker diffère (vérifie les spécifications du
@@ -129,17 +134,21 @@ class AssetConfig:
 
 ASSETS = {
     "XAUUSD": AssetConfig(
-        # Source principale RÉELLE : chaîne live gold-api.com -> goldapi.io
+        # MODIFICATION (04/09/2026) : MT5/Exness ajouté en TÊTE de chaîne --
+        # c'est le prix RÉEL de ton broker, celui qui détermine tes fills,
+        # donc plus fidèle que n'importe quelle API tierce (voir
+        # mt5_price_bridge.py, à lancer sur un PC/VPS Windows avec MT5+Exness
+        # ouverts -- pousse les bougies M5 vers /api/mt5/push toutes les
+        # 20-30s). Tant que ce pont ne pousse rien (ou devient périmé >90s,
+        # cf. MT5_BRIDGE_STALE_AFTER_SECONDS), repli automatique et silencieux
+        # sur la chaîne gold-api.com -> xaus.com -> goldprice.dev -> goldapi.io
         # (voir "BRANCHEMENT RÉEL SUR LE PIPELINE LIVE XAUUSD" plus bas dans
-        # ce fichier). mt5_bridge n'était de toute façon jamais alimenté tant
-        # qu'aucun pont MT5 externe n'est branché sur /api/mt5/push -> chaque
-        # scan retombait déjà systématiquement sur yfinance (futures GC=F).
-        # Le code du pont MT5 reste intact : repasser data_source="mt5_bridge"
-        # suffit si tu branches mt5_price_bridge.py plus tard.
-        symbol="XAUUSD", display_name="Gold (XAUUSD)", data_source="gold_price_service",
+        # ce fichier), puis sur twelvedata en tout dernier recours.
+        symbol="XAUUSD", display_name="Gold (XAUUSD)", data_source="mt5_bridge",
         telegram_group="signal_group", session_continuous=False,
         session_start_utc=13, session_end_utc=22, contract_type="classic",
-        fallback_data_source="yfinance", lot_value_per_point=100.0,
+        fallback_data_source="gold_price_service",
+        fallback_data_source_2="twelvedata", lot_value_per_point=100.0,
         typical_spread=float(os.environ.get("SPREAD_XAUUSD", "0.30")),
     ),
     "BTCUSD": AssetConfig(
@@ -147,6 +156,11 @@ ASSETS = {
         telegram_group="signal_group", session_continuous=False,
         session_start_utc=13, session_end_utc=22, contract_type="crypto",
         lot_value_per_point=1.0,
+        # MODIFICATION : aucun fallback n'existait -> un échec Binance
+        # (geo-blocage 451 fréquent depuis une IP US, ex. région par défaut
+        # de Render) rendait BTC totalement indisponible. twelvedata prend
+        # le relais (même clé que XAUUSD, voir TWELVEDATA_API_KEY).
+        fallback_data_source="twelvedata",
         typical_spread=float(os.environ.get("SPREAD_BTCUSD", "8.0")),
     ),
     "XAGUSD": AssetConfig(
@@ -1521,23 +1535,37 @@ def _price_source_label(symbol: str, source: str) -> str:
 
 def fetch_candles(symbol: str, limit: int = 200):
     """Retourne (candles, source_utilisee). Ordre STRICT : source principale
-    de l'actif (MT5 pour XAUUSD/XAGUSD) -> fallback (Yahoo futures GC=F/SI=F)
-    -> si tout échoue, l'exception remonte et l'appelant doit émettre NO SIGNAL.
-    Ne remplace JAMAIS silencieusement par une source approximative non prévue
-    dans AssetConfig (ex. PAXG-USD)."""
+    de l'actif (MT5 pour XAUUSD/XAGUSD) -> fallback_data_source -> (si défini)
+    fallback_data_source_2 -> si tout échoue, l'exception remonte et
+    l'appelant doit émettre NO SIGNAL. Ne remplace JAMAIS silencieusement par
+    une source approximative non prévue dans AssetConfig (ex. PAXG-USD)."""
     asset = ASSETS[symbol]
     timeframe = get_settings().get("timeframe", TIMEFRAME)
     interval = TIMEFRAME_TO_INTERVAL.get(timeframe, "5m")
-    try:
-        candles = _fetch_by_source(asset.data_source, symbol, limit, interval)
-        return candles, asset.data_source
-    except Exception as e:
-        if not asset.fallback_data_source:
-            raise
-        log.warning(f"[{symbol}] source '{asset.data_source}' indisponible ({e}) "
-                    f"-> repli sur '{asset.fallback_data_source}'.")
-        candles = _fetch_by_source(asset.fallback_data_source, symbol, limit, interval)
-        return candles, asset.fallback_data_source
+    # Chaîne ordonnée des sources à essayer pour cet actif -- construite à
+    # partir de AssetConfig, jamais codée en dur ici. None filtré (2e niveau
+    # de secours optionnel, absent pour la plupart des actifs).
+    chain = [s for s in (asset.data_source, asset.fallback_data_source, asset.fallback_data_source_2) if s]
+    last_error: Optional[Exception] = None
+    for position, data_source in enumerate(chain):
+        try:
+            candles = _fetch_by_source(data_source, symbol, limit, interval)
+            if position > 0:
+                log.warning(
+                    f"[{symbol}] repli sur '{data_source}' (niveau {position + 1}/{len(chain)}) "
+                    f"-- source(s) précédente(s) en échec : {last_error}"
+                )
+            return candles, data_source
+        except Exception as e:
+            last_error = e
+            if position < len(chain) - 1:
+                log.warning(f"[{symbol}] source '{data_source}' indisponible ({e}) "
+                            f"-> repli sur '{chain[position + 1]}'.")
+    # Toutes les sources de la chaîne ont échoué -> l'appelant doit traiter
+    # ceci comme NO SIGNAL (jamais de prix inventé/simulé).
+    raise last_error if last_error is not None else RuntimeError(
+        f"[{symbol}] aucune source de données configurée (chaîne vide)."
+    )
 
 
 def validate_price_data(symbol: str, candles: List[Dict]) -> Optional[str]:
@@ -1582,7 +1610,7 @@ def _fetch_by_source(data_source: str, symbol: str, limit: int, interval: str) -
 
 
 _TWELVEDATA_INTERVAL_MAP = {"1m": "1min", "5m": "5min"}
-_TWELVEDATA_SYMBOL_MAP = {"XAUUSD": "XAU/USD", "XAGUSD": "XAG/USD"}
+_TWELVEDATA_SYMBOL_MAP = {"XAUUSD": "XAU/USD", "XAGUSD": "XAG/USD", "BTCUSD": "BTC/USD"}
 
 
 def _fetch_twelvedata(symbol: str, limit: int, interval: str = "5m") -> List[Dict]:
@@ -1653,8 +1681,17 @@ def _fetch_yfinance(symbol: str, limit: int, interval: str = "5m") -> List[Dict]
 
 
 def _fetch_binance(symbol: str, limit: int, interval: str = "5m") -> List[Dict]:
+    # MODIFICATION : api.binance.com -> data-api.binance.vision. C'est le
+    # domaine que Binance documente explicitement pour les données de marché
+    # publiques (klines inclus), séparé de l'API de trading -- cf.
+    # https://developers.binance.com/docs/binance-spot-api-docs/faqs/market_data_only
+    # Objectif : contourner le blocage géographique HTTP 451 qui touche
+    # api.binance.com pour les IP US (le cas le plus probable pour la région
+    # par défaut d'un service Render). Pas de garantie à 100% que ce domaine
+    # échappe au même geo-blocage -> si ça échoue quand même, fetch_candles()
+    # bascule automatiquement sur asset.fallback_data_source (twelvedata).
     pair = "BTCUSDT"
-    url = f"https://api.binance.com/api/v3/klines?symbol={pair}&interval={interval}&limit={limit}"
+    url = f"https://data-api.binance.vision/api/v3/klines?symbol={pair}&interval={interval}&limit={limit}"
     with urllib.request.urlopen(url, timeout=10) as resp:
         raw = json.loads(resp.read().decode())
     return [{
@@ -3375,7 +3412,10 @@ def process_asset(symbol: str):
     try:
         candles, price_source = fetch_candles(symbol, limit=200)
     except Exception as e:
-        log.warning(f"[{symbol}] NO SIGNAL — aucune source de prix disponible (MT5 et fallback en échec) : {e}")
+        chain_desc = " -> ".join(
+            s for s in (asset.data_source, asset.fallback_data_source, asset.fallback_data_source_2) if s
+        )
+        log.warning(f"[{symbol}] NO SIGNAL — toute la chaîne de sources a échoué ({chain_desc}) : {e}")
         return
 
     reject_reason = validate_price_data(symbol, candles)
@@ -5047,6 +5087,363 @@ class GoldApiComFeed(PriceFeed):
 
 
 # ============================================================================
+# MODIFICATION : Implémentation XAUS.com (gratuite, sans clé API, sans limite
+# stricte de requêtes pour un usage raisonnable — cf. https://xaus.com/api/,
+# section "Rate limits & fair use" : "No API key required... no hard rate
+# limit"). Ajoutée en 2e position de la chaîne (juste après gold-api.com) pour
+# diversifier les sources amont : un incident sur l'un des deux ne fait plus
+# tomber XAUUSD en dessous de goldapi.io (limité, lui, à 100 requêtes/mois).
+# Contrat d'API vérifié via https://xaus.com/api/ (page /api/, section
+# "Response") le 04/09/2026.
+# ============================================================================
+
+class XausComFeed(PriceFeed):
+    """Client XAUS.com pour XAU/USD.
+
+    Endpoint utilisé : GET https://xaus.com/api/v1/spot?compact=1
+      -> {"spot_usd_oz": 4007.20, "updated_at": "2026-07-02T09:00:00.000Z",
+          "price_as_of": "...", "data_state": {"status": "fresh", ...},
+          "stale": false, ...}
+    `?compact=1` retire la table des ~160 devises FX, inutile ici (on ne lit
+    que le prix USD/oz) -- réponse ~75% plus légère.
+
+    Comme Gold-API.com : pas de bid/ask séparés -> bid = ask = price,
+    assumé explicitement, jamais de spread inventé.
+
+    `price_as_of` (heure réelle de la cotation) est utilisé de préférence à
+    `updated_at` (heure de génération de la réponse, qui peut être plus
+    récente qu'une cotation servie `stale` pendant une panne amont) -- notre
+    propre contrôle de fraîcheur (max_quote_age_seconds) rejette de toute
+    façon une cotation trop vieille, qu'elle soit signalée `stale` par
+    XAUS.com ou non : pas besoin de traiter ce cas séparément.
+
+    Mêmes contrôles stricts que les autres PriceFeed de ce fichier (champs
+    présents, prix positif, timestamp non périmé, pas de saut anormal) :
+    si un contrôle échoue, get_latest_tick() retourne None -- jamais de prix
+    de repli inventé."""
+
+    API_URL = "https://xaus.com/api/v1/spot?compact=1"
+
+    def __init__(self, max_quote_age_seconds: float = 60.0,
+                 max_price_jump_pct: float = 1.5, timeout_seconds: float = 5.0):
+        self._max_age = max_quote_age_seconds
+        self._max_jump_pct = max_price_jump_pct
+        self._timeout = timeout_seconds
+        self._last_valid_tick: Optional[Tick] = None
+        self._state: FeedState = FeedState.UNAVAILABLE
+
+    @property
+    def source_name(self) -> str:
+        return "xaus.com"
+
+    @property
+    def state(self) -> FeedState:
+        return self._state
+
+    @property
+    def last_valid_tick(self) -> Optional[Tick]:
+        return self._last_valid_tick
+
+    def _fetch_raw(self) -> Optional[dict]:
+        try:
+            resp = requests.get(self.API_URL, timeout=self._timeout)
+        except requests.RequestException as e:
+            log_gold_feed.error(f"[xaus.com] Erreur réseau lors de la requête : {e}")
+            return None
+        if resp.status_code != 200:
+            # 503 = source amont indisponible sans prix en cache (cf. docs
+            # XAUS.com) -> traité comme un échec normal de ce maillon.
+            log_gold_feed.error(f"[xaus.com] Réponse HTTP {resp.status_code} inattendue : {resp.text[:200]!r}")
+            return None
+        try:
+            return resp.json()
+        except ValueError:
+            log_gold_feed.error(f"[xaus.com] Réponse non-JSON reçue : {resp.text[:200]!r}")
+            return None
+
+    def _validate_and_build_tick(self, data: Optional[dict]) -> Optional[Tick]:
+        # --- 1. Réponse API valide (champs attendus présents) ---
+        required_fields = ("spot_usd_oz", "updated_at")
+        if not data or any(field_name not in data for field_name in required_fields):
+            log_gold_feed.error(f"[xaus.com] Réponse invalide, champ(s) manquant(s) : {data}")
+            self._state = FeedState.UNAVAILABLE
+            return None
+
+        # --- 2. Prix numérique et strictement positif ---
+        try:
+            price = float(data["spot_usd_oz"])
+        except (TypeError, ValueError):
+            log_gold_feed.error(f"[xaus.com] Champ 'spot_usd_oz' non numérique : {data}")
+            self._state = FeedState.UNAVAILABLE
+            return None
+        if price <= 0:
+            log_gold_feed.error(f"[xaus.com] Prix non-positif rejeté : price={price}")
+            self._state = FeedState.UNAVAILABLE
+            return None
+
+        # --- 3. Timestamp de cotation non périmé ---
+        # price_as_of = heure réelle de la cotation (préférée) ; à défaut,
+        # updated_at = heure de génération de la réponse.
+        raw_ts = str(data.get("price_as_of") or data["updated_at"])
+        try:
+            quote_time = datetime.fromisoformat(raw_ts.replace("Z", "+00:00"))
+            if quote_time.tzinfo is None:
+                quote_time = quote_time.replace(tzinfo=timezone.utc)
+        except (TypeError, ValueError):
+            log_gold_feed.error(f"[xaus.com] Timestamp invalide reçu : {raw_ts!r}")
+            self._state = FeedState.UNAVAILABLE
+            return None
+
+        now = datetime.now(timezone.utc)
+        age_seconds = (now - quote_time).total_seconds()
+        if age_seconds > self._max_age:
+            log_gold_feed.warning(
+                f"[xaus.com] Cotation PÉRIMÉE rejetée : âge={age_seconds:.1f}s "
+                f"> seuil={self._max_age:.1f}s (quote_time={quote_time.isoformat()}) "
+                f"-> état STALE, aucun prix simulé ne sera utilisé."
+            )
+            self._state = FeedState.STALE
+            return None
+        if age_seconds < -5.0:  # tolérance de 5s pour dérive d'horloge
+            log_gold_feed.warning(f"[xaus.com] Timestamp dans le futur ({age_seconds:.1f}s) — cotation rejetée.")
+            self._state = FeedState.STALE
+            return None
+
+        # --- 4. Pas de saut de prix anormal vs dernière cotation valide ---
+        if self._last_valid_tick is not None and self._last_valid_tick.price > 0:
+            jump_pct = abs(price - self._last_valid_tick.price) / self._last_valid_tick.price * 100.0
+            if jump_pct > self._max_jump_pct:
+                log_gold_feed.warning(
+                    f"[xaus.com] SAUT DE PRIX ANORMAL rejeté : "
+                    f"{self._last_valid_tick.price} -> {price} ({jump_pct:.3f}% "
+                    f"> seuil={self._max_jump_pct:.3f}%) -> état STALE, prix ignoré."
+                )
+                self._state = FeedState.STALE
+                return None
+
+        # XAUS.com ne renvoie pas de bid/ask séparés (juste un prix médian
+        # indicatif) -> bid = ask = price, assumé explicitement.
+        tick = Tick(
+            symbol="XAUUSD", price=price, bid=price, ask=price,
+            quote_time_utc=quote_time, received_time_utc=now, source=self.source_name,
+        )
+        log_gold_feed.info(
+            f"[xaus.com] Cotation validée -> price={price} "
+            f"quote_time={quote_time.isoformat()} source={self.source_name}"
+        )
+        return tick
+
+    def get_latest_tick(self) -> Optional[Tick]:
+        raw = self._fetch_raw()
+        tick = self._validate_and_build_tick(raw)
+        if tick is None:
+            return None
+        self._last_valid_tick = tick
+        self._state = FeedState.LIVE
+        return tick
+
+
+# ============================================================================
+# MODIFICATION : Implémentation goldprice.dev (gratuit, sans clé pour la
+# requête spot anonyme — cf. https://goldprice.dev/docs/quickstart :
+# "No API key is required for this request."). Ajoutée en 3e position de la
+# chaîne (après gold-api.com et xaus.com, avant goldapi.io) pour donner un
+# 3e maillon indépendant AVANT de retomber sur goldapi.io, dont le tier
+# gratuit est limité à 100 requêtes/mois.
+#
+# ⚠️ CORRECTIF vs les chiffres avancés initialement pour goldprice.dev :
+# vérification faite le 04/09/2026 directement sur la documentation
+# officielle (https://goldprice.dev/docs/quickstart,
+# https://goldprice.dev/docs/api-reference, https://goldprice.dev/pricing) :
+#   - Il s'agit d'un produit très récent (lancement public le 01/05/2026),
+#     donc absent de mes données d'entraînement -- vérifié en direct plutôt
+#     que supposé.
+#   - Le tier "Free" (avec clé) annonce 30 requêtes/minute et un quota de
+#     1000 appels/MOIS (pas "100/heure sans clé" comme avancé) : le quota
+#     mensuel est strict et se coupe (429 quota_exceeded) une fois atteint,
+#     sans facturation surprise, mais aussi sans accès de secours ce mois-là.
+#   - La requête anonyme (sans clé) documentée pour le spot XAU/USD est bien
+#     sans clé, mais soumise à une limite partagée par IP dont la valeur
+#     exacte n'est PAS publiée (seulement "shared IP limits") -- donc pas de
+#     chiffre fiable à annoncer ici.
+#   - `price`, `bid`, `ask`, `computed_at` sont des champs OPTIONNELS dans la
+#     réponse (omis quand indisponibles) -- seuls `symbol`, `quote_currency`,
+#     `unit`, `contract_type` et `is_stale` sont garantis. Le code ci-dessous
+#     traite un `price` absent comme un échec de ce maillon (jamais de prix
+#     inventé), exactement comme pour les autres PriceFeed de ce fichier.
+#   - Usage "Free" annoncé pour un usage interne (dashboards/backtests/outils
+#     perso) -- cohérent avec un usage privé DM leader comme ici, mais PAS
+#     couvert pour un usage commercial (ça, c'est réservé aux tiers Pro+ avec
+#     attribution visible).
+# Étant en 3e position de la chaîne (donc rarement sollicité si gold-api.com
+# et xaus.com répondent), le volume réel consommé sur le quota mensuel de
+# 1000 appels devrait rester marginal -- mais à surveiller si les deux
+# premiers maillons deviennent instables sur une période prolongée.
+# ============================================================================
+
+class GoldPriceDevFeed(PriceFeed):
+    """Client goldprice.dev pour XAU/USD (requête spot anonyme, sans clé).
+
+    Endpoint utilisé : GET https://api.goldprice.dev/v1/prices?symbol=XAU-USD-SPOT
+      -> {"symbols": [{"symbol": "XAU", "quote_currency": "USD",
+                        "unit": "troy_ounce", "contract_type": "spot",
+                        "price": "4826.40", "bid": "4825.00", "ask": "4827.00",
+                        "is_stale": false,
+                        "computed_at": "2026-04-27T01:00:00+00:00"}]}
+
+    `price`, `bid`, `ask` et `computed_at` sont documentés comme OPTIONNELS
+    (omis si indisponibles côté goldprice.dev) -- un `price` absent est donc
+    traité comme un échec normal de ce maillon, jamais comme un prix à 0 ou
+    inventé. `is_stale`, lui, est toujours présent : une réponse is_stale=true
+    est rejetée directement, sans même regarder l'âge de `computed_at`.
+
+    Mêmes contrôles stricts que les autres PriceFeed de ce fichier (champs
+    présents, prix positif, timestamp non périmé, pas de saut anormal) :
+    si un contrôle échoue, get_latest_tick() retourne None -- jamais de prix
+    de repli inventé."""
+
+    API_URL = "https://api.goldprice.dev/v1/prices"
+
+    def __init__(self, max_quote_age_seconds: float = 60.0,
+                 max_price_jump_pct: float = 1.5, timeout_seconds: float = 5.0):
+        self._max_age = max_quote_age_seconds
+        self._max_jump_pct = max_price_jump_pct
+        self._timeout = timeout_seconds
+        self._last_valid_tick: Optional[Tick] = None
+        self._state: FeedState = FeedState.UNAVAILABLE
+
+    @property
+    def source_name(self) -> str:
+        return "goldprice.dev"
+
+    @property
+    def state(self) -> FeedState:
+        return self._state
+
+    @property
+    def last_valid_tick(self) -> Optional[Tick]:
+        return self._last_valid_tick
+
+    def _fetch_raw(self) -> Optional[dict]:
+        try:
+            resp = requests.get(
+                self.API_URL, params={"symbol": "XAU-USD-SPOT"}, timeout=self._timeout
+            )
+        except requests.RequestException as e:
+            log_gold_feed.error(f"[goldprice.dev] Erreur réseau lors de la requête : {e}")
+            return None
+        if resp.status_code == 429:
+            # Limite IP anonyme ou quota mensuel atteint (429 rate_limited /
+            # rate_limit_exceeded / quota_exceeded) -- échec normal de ce
+            # maillon, jamais de prix inventé en repli.
+            log_gold_feed.warning(f"[goldprice.dev] 429 (limite atteinte) : {resp.text[:200]!r}")
+            return None
+        if resp.status_code != 200:
+            log_gold_feed.error(f"[goldprice.dev] Réponse HTTP {resp.status_code} inattendue : {resp.text[:200]!r}")
+            return None
+        try:
+            return resp.json()
+        except ValueError:
+            log_gold_feed.error(f"[goldprice.dev] Réponse non-JSON reçue : {resp.text[:200]!r}")
+            return None
+
+    def _validate_and_build_tick(self, raw: Optional[dict]) -> Optional[Tick]:
+        # --- 1. Enveloppe "symbols" présente et non vide ---
+        if not raw or not isinstance(raw.get("symbols"), list) or not raw["symbols"]:
+            log_gold_feed.error(f"[goldprice.dev] Réponse invalide, champ 'symbols' manquant/vide : {raw}")
+            self._state = FeedState.UNAVAILABLE
+            return None
+        data = raw["symbols"][0]
+
+        # --- 2. is_stale toujours présent -- rejet immédiat si vrai ---
+        if data.get("is_stale", True):
+            log_gold_feed.warning(f"[goldprice.dev] Cotation signalée is_stale=true -> rejetée : {data}")
+            self._state = FeedState.STALE
+            return None
+
+        # --- 3. price/bid/ask/computed_at sont OPTIONNELS -- absence = échec ---
+        required_optional_fields = ("price", "computed_at")
+        if any(field_name not in data for field_name in required_optional_fields):
+            log_gold_feed.error(
+                f"[goldprice.dev] Champ(s) optionnel(s) requis absent(s) "
+                f"(price/computed_at indisponibles côté source) : {data}"
+            )
+            self._state = FeedState.UNAVAILABLE
+            return None
+
+        # --- 4. Prix numérique et strictement positif (decimal-as-string) ---
+        try:
+            price = float(data["price"])
+            bid = float(data["bid"]) if "bid" in data else price
+            ask = float(data["ask"]) if "ask" in data else price
+        except (TypeError, ValueError):
+            log_gold_feed.error(f"[goldprice.dev] Champ(s) de prix non numérique(s) : {data}")
+            self._state = FeedState.UNAVAILABLE
+            return None
+        if price <= 0:
+            log_gold_feed.error(f"[goldprice.dev] Prix non-positif rejeté : price={price}")
+            self._state = FeedState.UNAVAILABLE
+            return None
+
+        # --- 5. Timestamp de cotation non périmé ---
+        raw_ts = str(data["computed_at"])
+        try:
+            quote_time = datetime.fromisoformat(raw_ts.replace("Z", "+00:00"))
+            if quote_time.tzinfo is None:
+                quote_time = quote_time.replace(tzinfo=timezone.utc)
+        except (TypeError, ValueError):
+            log_gold_feed.error(f"[goldprice.dev] Timestamp invalide reçu : {raw_ts!r}")
+            self._state = FeedState.UNAVAILABLE
+            return None
+
+        now = datetime.now(timezone.utc)
+        age_seconds = (now - quote_time).total_seconds()
+        if age_seconds > self._max_age:
+            log_gold_feed.warning(
+                f"[goldprice.dev] Cotation PÉRIMÉE rejetée : âge={age_seconds:.1f}s "
+                f"> seuil={self._max_age:.1f}s (quote_time={quote_time.isoformat()}) "
+                f"-> état STALE, aucun prix simulé ne sera utilisé."
+            )
+            self._state = FeedState.STALE
+            return None
+        if age_seconds < -5.0:  # tolérance de 5s pour dérive d'horloge
+            log_gold_feed.warning(f"[goldprice.dev] Timestamp dans le futur ({age_seconds:.1f}s) — cotation rejetée.")
+            self._state = FeedState.STALE
+            return None
+
+        # --- 6. Pas de saut de prix anormal vs dernière cotation valide ---
+        if self._last_valid_tick is not None and self._last_valid_tick.price > 0:
+            jump_pct = abs(price - self._last_valid_tick.price) / self._last_valid_tick.price * 100.0
+            if jump_pct > self._max_jump_pct:
+                log_gold_feed.warning(
+                    f"[goldprice.dev] SAUT DE PRIX ANORMAL rejeté : "
+                    f"{self._last_valid_tick.price} -> {price} ({jump_pct:.3f}% "
+                    f"> seuil={self._max_jump_pct:.3f}%) -> état STALE, prix ignoré."
+                )
+                self._state = FeedState.STALE
+                return None
+
+        tick = Tick(
+            symbol="XAUUSD", price=price, bid=bid, ask=ask,
+            quote_time_utc=quote_time, received_time_utc=now, source=self.source_name,
+        )
+        log_gold_feed.info(
+            f"[goldprice.dev] Cotation validée -> price={price} bid={bid} ask={ask} "
+            f"quote_time={quote_time.isoformat()} source={self.source_name}"
+        )
+        return tick
+
+    def get_latest_tick(self) -> Optional[Tick]:
+        raw = self._fetch_raw()
+        tick = self._validate_and_build_tick(raw)
+        if tick is None:
+            return None
+        self._last_valid_tick = tick
+        self._state = FeedState.LIVE
+        return tick
+
+
+# ============================================================================
 # Construction des bougies M5 — jamais de mélange de sources dans une bougie
 # ============================================================================
 
@@ -5194,16 +5591,19 @@ class GoldPriceService:
 # GoldPriceService/CandleBuilder ci-dessus sont UTILISÉS TELS QUELS, sans
 # aucune modification, pour agréger cette chaîne en bougies M5.
 #
-# yfinance n'est PAS mis dans cette chaîne de ticks : il reste le fallback
+# twelvedata n'est PAS mis dans cette chaîne de ticks : il reste le fallback
 # déjà existant de fetch_candles() (asset.fallback_data_source, voir
 # ASSETS["XAUUSD"] plus haut), car il renvoie directement jusqu'à 200
-# bougies M5 historiques réelles en un seul appel (yf.download) — alors
-# qu'un flux tick-par-tick devrait ré-accumuler ~2h30 d'historique (30
-# bougies M5 x 5 min, MIN_CANDLES_REQUIRED) avant de pouvoir produire un
-# signal à chaque redémarrage. Résultat, ordre de repli EXACT :
+# bougies M5 historiques réelles en un seul appel — alors qu'un flux
+# tick-par-tick devrait ré-accumuler ~2h30 d'historique (30 bougies M5 x
+# 5 min, MIN_CANDLES_REQUIRED) avant de pouvoir produire un signal à chaque
+# redémarrage. Résultat, ordre de repli EXACT :
 #
-#     GoldApiComFeed -> GoldAPIFeed -> yfinance -> XAUUSD indisponible (NO SIGNAL)
+#     GoldApiComFeed -> XausComFeed -> GoldAPIFeed -> twelvedata -> XAUUSD indisponible (NO SIGNAL)
 #
+# gold-api.com et xaus.com sont tous les deux gratuits/sans clé/sans limite
+# stricte -> goldapi.io (100 req/mois) et twelvedata (800 req/jour) ne sont
+# donc sollicités qu'en dernier recours, une fois les deux premiers en panne.
 # ============================================================================
 
 class FallbackChainFeed(PriceFeed):
@@ -5219,17 +5619,42 @@ class FallbackChainFeed(PriceFeed):
 
     Chaque tentative loggue explicitement OK / ERROR / FALLBACK avec le nom
     exact de la source (gold-api.com / goldapi.io), pour un diagnostic clair
-    en prod."""
+    en prod.
+
+    ⚠️ CORRECTIF (04/09/2026, suite à un écart constaté en prod ~4484 signal
+    vs ~4431 broker/MT5) : chaque PriceFeed individuel a SON PROPRE garde-fou
+    anti-saut de prix (`max_price_jump_pct`), mais celui-ci compare toujours
+    le nouveau prix au dernier prix accepté PAR CE MÊME FEED. Or, quand la
+    chaîne bascule d'une source à une autre (ex. gold-api.com -> xaus.com),
+    le nouveau feed n'a souvent aucun historique récent -> son propre garde-
+    fou ne peut rien comparer, et un prix aberrant peut passer sans jamais
+    être comparé au dernier prix RÉELLEMENT utilisé par le bot, toutes
+    sources confondues. C'est un trou de conception : le garde-fou doit être
+    global à la chaîne, pas isolé par source. `_last_accepted_tick` /
+    `chain_max_jump_pct` ci-dessous ferment ce trou : tout tick, quelle que
+    soit sa source, est comparé au dernier tick RETENU par la chaîne elle-
+    même avant d'être transmis plus haut. Seuil délibérément plus serré que
+    celui de chaque feed pris isolément (0.5% par défaut, vs 1.5% par feed) :
+    à un intervalle de poll de ~20s, un mouvement XAUUSD de 0.5% est déjà
+    un événement rare (hors news majeure) -> un écart plus grand est traité
+    comme suspect par défaut plutôt que comme un vrai mouvement de marché."""
 
     def __init__(self, feeds: List[PriceFeed], retries_per_feed: int = 2,
-                 backoff_seconds: float = 1.0):
+                 backoff_seconds: float = 1.0, chain_max_jump_pct: float = 0.5,
+                 chain_max_quote_age_seconds: float = 90.0):
         if not feeds:
             raise ValueError("FallbackChainFeed nécessite au moins un PriceFeed.")
         self._feeds = feeds
         self._retries = max(1, retries_per_feed)
         self._backoff = backoff_seconds
+        self._chain_max_jump_pct = chain_max_jump_pct
+        self._chain_max_age = chain_max_quote_age_seconds
         self._state: FeedState = FeedState.UNAVAILABLE
         self._active_source: Optional[str] = None
+        # Dernier tick RETENU par la chaîne (toutes sources confondues) —
+        # baseline globale pour le garde-fou anti-saut, indépendante du
+        # feed qui a produit ce tick.
+        self._last_accepted_tick: Optional[Tick] = None
 
     @property
     def source_name(self) -> str:
@@ -5241,11 +5666,45 @@ class FallbackChainFeed(PriceFeed):
     def state(self) -> FeedState:
         return self._state
 
+    def _passes_chain_level_check(self, tick: Tick, feed_source_name: str) -> bool:
+        """Deuxième garde-fou, GLOBAL à la chaîne (voir docstring de classe).
+        Ne fait JAMAIS confiance au seul garde-fou interne du feed source."""
+        baseline = self._last_accepted_tick
+        if baseline is None:
+            return True  # premier tick jamais accepté -> rien à comparer
+        age_since_baseline = (tick.received_time_utc - baseline.received_time_utc).total_seconds()
+        if age_since_baseline > self._chain_max_age:
+            # Trop de temps depuis le dernier tick accepté (ex. la chaîne
+            # vient de sortir d'une longue panne totale) -> la baseline
+            # n'est plus pertinente pour juger d'un "saut" ; on l'accepte
+            # sans comparaison plutôt que de bloquer un redémarrage légitime.
+            return True
+        if baseline.price <= 0:
+            return True
+        jump_pct = abs(tick.price - baseline.price) / baseline.price * 100.0
+        if jump_pct > self._chain_max_jump_pct:
+            log_gold_feed.error(
+                f"[FallbackChainFeed] SAUT DE PRIX INTER-SOURCES rejeté : "
+                f"'{baseline.source}'={baseline.price} -> '{feed_source_name}'={tick.price} "
+                f"({jump_pct:.3f}% en {age_since_baseline:.1f}s > seuil chaîne="
+                f"{self._chain_max_jump_pct:.3f}%) -> tick ignoré, AUCUN prix "
+                f"simulé ne sera utilisé. Vérifier '{feed_source_name}' vs le broker réel."
+            )
+            return False
+        return True
+
     def get_latest_tick(self) -> Optional[Tick]:
         for position, feed in enumerate(self._feeds):
             for attempt in range(1, self._retries + 1):
                 tick = feed.get_latest_tick()
                 if tick is not None:
+                    if not self._passes_chain_level_check(tick, feed.source_name):
+                        # Rejeté par le garde-fou GLOBAL malgré un feed qui se
+                        # déclare lui-même LIVE -> traité comme un échec de ce
+                        # maillon pour cette itération, jamais comme un prix
+                        # utilisable. On continue vers le maillon suivant.
+                        self._state = FeedState.STALE
+                        break
                     if position == 0:
                         log_gold_feed.info(f"[FallbackChainFeed] '{feed.source_name}' -> OK.")
                     else:
@@ -5255,6 +5714,7 @@ class FallbackChainFeed(PriceFeed):
                         )
                     self._active_source = feed.source_name
                     self._state = FeedState.LIVE
+                    self._last_accepted_tick = tick
                     return tick
                 log_gold_feed.error(
                     f"[FallbackChainFeed] '{feed.source_name}' -> ERROR "
@@ -5263,8 +5723,9 @@ class FallbackChainFeed(PriceFeed):
                 if attempt < self._retries:
                     time.sleep(self._backoff)
         log_gold_feed.error(
-            "[FallbackChainFeed] Toutes les sources de la chaîne ont échoué cette "
-            "itération -> UNAVAILABLE. Aucun prix simulé/inventé ne sera utilisé."
+            "[FallbackChainFeed] Toutes les sources de la chaîne ont échoué (ou ont été "
+            "rejetées par le garde-fou inter-sources) cette itération -> UNAVAILABLE. "
+            "Aucun prix simulé/inventé ne sera utilisé."
         )
         self._state = FeedState.UNAVAILABLE
         self._active_source = None
@@ -5278,6 +5739,12 @@ GOLDAPI_IO_API_KEY = os.environ.get("GOLDAPI_IO_API_KEY", "")
 # gold-api.com demande de ne pas dépasser ~1 requête/30s (voir docstring de
 # GoldApiComFeed plus haut) -> 20s par défaut, override possible via l'env.
 GOLD_PRICE_SERVICE_POLL_SECONDS = float(os.environ.get("GOLD_PRICE_SERVICE_POLL_SECONDS", "20"))
+# Garde-fou anti-saut GLOBAL à la chaîne (voir docstring FallbackChainFeed,
+# correctif du 04/09/2026) -- volontairement plus serré que le seuil interne
+# de chaque feed (1.5%), car il compare des ticks qui peuvent venir de
+# sources différentes d'un poll à l'autre.
+GOLD_CHAIN_MAX_JUMP_PCT = float(os.environ.get("GOLD_CHAIN_MAX_JUMP_PCT", "0.5"))
+GOLD_CHAIN_MAX_QUOTE_AGE_SECONDS = float(os.environ.get("GOLD_CHAIN_MAX_QUOTE_AGE_SECONDS", "90"))
 
 # Instance réelle, créée au démarrage (voir bloc "if __name__" juste plus
 # bas) et consommée par _fetch_gold_price_service() ci-dessous.
@@ -5285,16 +5752,30 @@ xauusd_price_service: Optional["GoldPriceService"] = None
 
 
 def _build_xauusd_price_service() -> "GoldPriceService":
-    feeds: List[PriceFeed] = [GoldApiComFeed(symbol="XAU")]
+    # MODIFICATION : xaus.com (2e position) puis goldprice.dev (3e position)
+    # -- toutes deux gratuites et sans clé pour la requête spot utilisée ici
+    # (voir XausComFeed et GoldPriceDevFeed plus haut) -- pour ne dépendre de
+    # goldapi.io (100 requêtes/mois) qu'en tout dernier recours, une fois les
+    # trois sources sans-clé épuisées. Le fallback ultime hors chaîne reste
+    # twelvedata, via asset.fallback_data_source dans fetch_candles().
+    feeds: List[PriceFeed] = [GoldApiComFeed(symbol="XAU"), XausComFeed(), GoldPriceDevFeed()]
     if GOLDAPI_IO_API_KEY:
         feeds.append(GoldAPIFeed(api_key=GOLDAPI_IO_API_KEY))
-        log_gold_feed.info("[GoldPriceService] Chaîne = gold-api.com -> goldapi.io (clé détectée).")
+        log_gold_feed.info(
+            "[GoldPriceService] Chaîne = gold-api.com -> xaus.com -> goldprice.dev -> "
+            "goldapi.io (clé détectée)."
+        )
     else:
         log_gold_feed.info(
-            "[GoldPriceService] GOLDAPI_IO_API_KEY absente -> chaîne = gold-api.com seul "
-            "(goldapi.io non activé ; yfinance reste le secours final via fetch_candles())."
+            "[GoldPriceService] GOLDAPI_IO_API_KEY absente -> chaîne = gold-api.com -> "
+            "xaus.com -> goldprice.dev (goldapi.io non activé ; twelvedata reste le "
+            "secours final via fetch_candles())."
         )
-    chain = FallbackChainFeed(feeds, retries_per_feed=2, backoff_seconds=1.0)
+    chain = FallbackChainFeed(
+        feeds, retries_per_feed=2, backoff_seconds=1.0,
+        chain_max_jump_pct=GOLD_CHAIN_MAX_JUMP_PCT,
+        chain_max_quote_age_seconds=GOLD_CHAIN_MAX_QUOTE_AGE_SECONDS,
+    )
     return GoldPriceService(feed=chain, poll_interval_seconds=GOLD_PRICE_SERVICE_POLL_SECONDS)
 
 
