@@ -1,6 +1,7 @@
 
 
 
+
 """
 ALPHABOT SMC PRO — FUSION (fichier unique, prêt à déployer sur Render)
 ========================================================================
@@ -5520,6 +5521,21 @@ class CandleBuilder:
             candles.append(self._current)
         return candles
 
+    def seed_completed(self, candles: List[Candle]) -> bool:
+        """Pré-charge un historique de bougies déjà clôturées (ex. bootstrap
+        depuis une source tierce au démarrage), UNIQUEMENT si aucune bougie
+        n'a encore été accumulée par des ticks live -- ne remplace jamais des
+        données live déjà en mémoire. Les bougies injectées ici ne sont
+        jamais mélangées à un tick live : le premier tick reçu après un seed
+        clôturera naturellement la dernière bougie seedée si elle tombe dans
+        le même bucket M5 (comportement normal du changement de source).
+        Retourne True si le seed a été appliqué, False s'il a été ignoré
+        (des bougies live existaient déjà)."""
+        if self._completed or self._current is not None:
+            return False
+        self._completed = list(candles)
+        return True
+
 
 # ============================================================================
 # Service de haut niveau : polling + état exposé au consommateur
@@ -5580,6 +5596,27 @@ class GoldPriceService:
 
     def get_m5_candles(self, include_incomplete: bool = True) -> List[Candle]:
         return self._builder.get_candles(include_incomplete=include_incomplete)
+
+    def bootstrap_from_historical(self, raw_candles: List[Dict]) -> int:
+        """Pré-charge l'historique M5 à partir d'une liste de dicts
+        {"time","open","high","low","close"} (ex. yfinance GC=F, gratuit et
+        sans clé) -- pour ne PAS attendre l'accumulation de MIN_CANDLES_REQUIRED
+        ticks live (~2h30 à chaque redémarrage) avant que should_produce_signals()
+        puisse être exploité par fetch_candles(). Ces bougies sont étiquetées
+        source="bootstrap_yfinance" pour rester traçables et ne jamais être
+        confondues avec un flux temps réel gold-api.com/goldapi.io dans les logs.
+        Ignoré silencieusement si des bougies live sont déjà accumulées (voir
+        CandleBuilder.seed_completed). Retourne le nombre de bougies injectées."""
+        seeded = [
+            Candle(
+                open=c["open"], high=c["high"], low=c["low"], close=c["close"],
+                timestamp=datetime.fromtimestamp(c["time"], tz=timezone.utc),
+                is_complete=True, tick_count=0, source="bootstrap_yfinance",
+            )
+            for c in raw_candles
+        ]
+        applied = self._builder.seed_completed(seeded)
+        return len(seeded) if applied else 0
 
 
 # ============================================================================
@@ -5809,6 +5846,30 @@ def _fetch_gold_price_service(symbol: str, limit: int) -> List[Dict]:
 
 if __name__ == "__main__":
     xauusd_price_service = _build_xauusd_price_service()
+    # MODIFICATION (04/09/2026) : bootstrap de l'historique M5 via yfinance
+    # (GC=F, gratuit, sans clé) AVANT de démarrer le polling live -- pour que
+    # gold_price_service soit immédiatement exploitable au démarrage/redémarrage
+    # au lieu d'exiger ~2h30 d'accumulation de ticks live (MIN_CANDLES_REQUIRED).
+    # N'affecte QUE le bootstrap initial : dès que le flux live (gold-api.com
+    # etc.) tourne, chaque nouveau tick clôture naturellement la dernière
+    # bougie bootstrap et prend le relais avec des données 100% live -- jamais
+    # de mélange entre les deux sources dans une même bougie (voir
+    # CandleBuilder.add_tick). Best-effort : si yfinance échoue (Yahoo bloque
+    # parfois les IP cloud), le service démarre simplement vide comme avant,
+    # sans jamais bloquer le démarrage du bot.
+    try:
+        historical = _fetch_yfinance("XAUUSD", limit=MIN_CANDLES_REQUIRED + 10, interval="5m")
+        n = xauusd_price_service.bootstrap_from_historical(historical)
+        log_gold_feed.info(
+            f"[GoldPriceService] Bootstrap historique yfinance (GC=F) : {n} bougie(s) "
+            f"M5 pré-chargée(s) -- signal exploitable immédiatement (pas d'attente "
+            f"de {MIN_CANDLES_REQUIRED} bougies live)."
+        )
+    except Exception as e:
+        log_gold_feed.warning(
+            f"[GoldPriceService] Bootstrap yfinance impossible ({e}) -- démarrage "
+            f"à vide, accumulation live habituelle (~2h30) via gold-api.com."
+        )
     threading.Thread(target=xauusd_price_service.run_forever, daemon=True).start()
     log_gold_feed.info(
         f"[GoldPriceService] Thread de polling XAUUSD démarré "
@@ -6238,4 +6299,3 @@ if __name__ == "__main__":
 #                 {"command": "status", "description": "État du bot"},
 #                 {"command": "help", "description": "Liste des commandes"}
 #               ]}'
-
