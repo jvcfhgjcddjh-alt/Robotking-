@@ -1,4 +1,3 @@
-
 """
 main.py
 =======
@@ -22,7 +21,8 @@ tournent sur les mêmes flux asynchrones non bloquants : un marché en erreur
 ou une position ouverte ne bloquent jamais le scan des autres marchés.
 
 Marchés : V75, V25, GOLD, BTC (jamais Boom / Crash, jamais les "(1s)").
-Données : API publique Deriv (ticks -> bougies), aucun token requis.
+Données : API Deriv (ticks -> bougies). Publique par défaut ; authentifiée par PAT/OTP si
+DERIV_PAT + DERIV_PAT_APP_ID + DERIV_ACCOUNT_ID sont définis dans .env.
 
 Utilisation :
     pip install -r requirements.txt
@@ -108,13 +108,15 @@ except ImportError:  # pragma: no cover
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = Path(os.getenv("CONFIG_PATH", BASE_DIR / "config.json"))
 
-# Valeurs Telegram par défaut (fichier unique, sans .env). Les variables
-# d'environnement TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID / TELEGRAM_ADMIN_ID,
-# quand elles sont définies et non vides, les remplacent (voir telegram_credentials).
-# Ne publie pas ce fichier (dépôt public) tant que le token y figure.
-DEFAULT_TELEGRAM_BOT_TOKEN = "8882189271:AAEIZ4hOC5v2AtfOq6FnHQ_pBJID2nG3nFc"
-DEFAULT_TELEGRAM_CHAT_ID = "-5281258868"       # groupe des signaux
-DEFAULT_TELEGRAM_ADMIN_ID = "6982051442"       # seul ID autorisé à piloter le bot
+# Valeurs Telegram par défaut : AUCUN secret en dur ici. Définis
+# TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID / TELEGRAM_ADMIN_ID dans un fichier
+# .env local (jamais commité). Sans ces variables, telegram.enabled=true
+# retombe proprement sur data/signals.log (voir build_notifier).
+# ⚠️ Un token était codé en dur ici auparavant : considère-le compromis et
+# régénère-le via @BotFather avant toute réutilisation.
+DEFAULT_TELEGRAM_BOT_TOKEN = ""
+DEFAULT_TELEGRAM_CHAT_ID = ""
+DEFAULT_TELEGRAM_ADMIN_ID = ""
 
 # Granularités Deriv valides (secondes) pour ticks_history / style=candles
 TF_SECONDS: dict[str, int] = {"M1": 60, "M5": 300, "M15": 900, "M30": 1800, "H1": 3600}
@@ -214,6 +216,17 @@ class ConnectionSettings:
     deriv_ws_base: str = "wss://ws.derivws.com/websockets/v3"
     history_candle_count: int = 500
 
+    # Nouvelle API Deriv (authentifiée par PAT). AUCUN secret en dur : tout vient de .env.
+    #   DERIV_PAT         : Personal Access Token (pat_...)
+    #   DERIV_PAT_APP_ID  : App ID de l'application PAT enregistrée sur developers.deriv.com
+    #                       (les anciens App IDs, dont 1089, ne fonctionnent PAS avec la nouvelle API)
+    #   DERIV_ACCOUNT_ID  : ID du compte (ex. DOT90004580) pour lequel demander l'OTP
+    # Si l'un des trois manque -> repli automatique sur l'API publique historique.
+    deriv_pat: str = field(default_factory=lambda: os.getenv("DERIV_PAT", "").strip())
+    deriv_pat_app_id: str = field(default_factory=lambda: os.getenv("DERIV_PAT_APP_ID", "").strip())
+    deriv_account_id: str = field(default_factory=lambda: os.getenv("DERIV_ACCOUNT_ID", "").strip())
+    deriv_rest_base: str = "https://api.derivws.com"
+
     # Reconnexion : délai progressif 5s -> 10s -> 20s -> 30s -> 60s, puis 60s
     # en boucle tant que la connexion n'est pas rétablie.
     reconnect_delays: tuple[float, ...] = (5.0, 10.0, 20.0, 30.0, 60.0)
@@ -223,6 +236,14 @@ class ConnectionSettings:
     @property
     def deriv_ws_url(self) -> str:
         return f"{self.deriv_ws_base}?app_id={self.deriv_app_id}"
+
+    @property
+    def pat_enabled(self) -> bool:
+        return bool(self.deriv_pat and self.deriv_pat_app_id and self.deriv_account_id)
+
+    @property
+    def otp_url(self) -> str:
+        return f"{self.deriv_rest_base}/trading/v1/options/accounts/{self.deriv_account_id}/otp"
 
 
 @dataclass
@@ -412,9 +433,35 @@ class DerivClient:
             raise ConnectionClosed(None, None)
         await self._ws.send(json.dumps(payload))
 
+    def _fetch_otp_url(self) -> str:
+        """POST /otp avec le PAT -> URL WebSocket authentifiée (OTP à usage unique,
+        valable 120 s : on en redemande un à chaque (re)connexion). Bloquant : appelé via to_thread."""
+        st = self.settings
+        if requests is None:
+            raise RuntimeError("le paquet 'requests' est requis pour l'authentification PAT")
+        resp = requests.post(
+            st.otp_url,
+            headers={"Authorization": f"Bearer {st.deriv_pat}", "Deriv-App-ID": st.deriv_pat_app_id},
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            # jamais de token dans les logs : on n'affiche que le code HTTP et le message serveur
+            raise ConnectionError(f"OTP Deriv refusé (HTTP {resp.status_code}) : {resp.text[:200]}")
+        url = (resp.json().get("data") or {}).get("url")
+        if not url:
+            raise ConnectionError("réponse OTP Deriv sans champ data.url")
+        return url
+
+    async def _resolve_ws_url(self) -> str:
+        if self.settings.pat_enabled:
+            return await asyncio.to_thread(self._fetch_otp_url)
+        return self.settings.deriv_ws_url
+
     async def _run_once(self) -> None:
-        url = self.settings.deriv_ws_url
-        log_client.info("Connexion à Deriv : %s", url.split("?")[0])
+        url = await self._resolve_ws_url()
+        log_client.info("Connexion à Deriv (%s) : %s",
+                        "PAT/OTP" if self.settings.pat_enabled else "API publique",
+                        url.split("?")[0])
         async with websockets.connect(url, ping_interval=20, ping_timeout=20) as ws:
             self._ws = ws
             self._connected_event.set()
@@ -1772,9 +1819,23 @@ async def run(app: AppConfig) -> None:
     client_task = asyncio.create_task(client.run_forever())
 
     definitions = [m for m in ALL_MARKETS if m["key"] in app.markets]
-    markets = await discover_symbols(client, definitions)
+    markets: dict[str, MarketSymbol] = {}
+    discover_delays = (10.0, 20.0, 30.0, 60.0, 120.0)
+    attempt = 0
+    while not markets and not client._stop:
+        attempt += 1
+        markets = await discover_symbols(client, definitions)
+        if not markets:
+            delay = discover_delays[min(attempt - 1, len(discover_delays) - 1)]
+            log_main.error(
+                "Aucun marché résolu via active_symbols (tentative %d). Cause fréquente : "
+                "le serveur se connecte depuis un pays où Deriv n'opère pas (ex. Etats-Unis, "
+                "Canada, Israël, Hong Kong, Malaisie, Singapour, EAU, Belarus) -> liste renvoyée "
+                "vide sans erreur explicite. Nouvelle tentative dans %.0fs.",
+                attempt, delay,
+            )
+            await asyncio.sleep(delay)
     if not markets:
-        log_main.error("Aucun marché résolu via active_symbols. Arrêt.")
         client_task.cancel()
         return
 
@@ -2809,6 +2870,69 @@ class TestReconnectSchedule(unittest.TestCase):
         self.assertEqual(sleeps, [5.0, 10.0])   # palier progressif, jamais de crash
 
 
+class TestPatAuth(unittest.TestCase):
+    ENV = ("DERIV_PAT", "DERIV_PAT_APP_ID", "DERIV_ACCOUNT_ID")
+
+    def test_disabled_without_env(self):
+        with mock.patch.dict(os.environ):
+            for k in self.ENV:
+                os.environ.pop(k, None)
+            st = ConnectionSettings()
+            self.assertFalse(st.pat_enabled)
+            client = DerivClient(st)
+            self.assertEqual(asyncio.run(client._resolve_ws_url()), st.deriv_ws_url)
+
+    def test_enabled_uses_otp_url_and_headers(self):
+        env = {"DERIV_PAT": "pat_x", "DERIV_PAT_APP_ID": "123", "DERIV_ACCOUNT_ID": "DOT1"}
+        with mock.patch.dict(os.environ, env):
+            st = ConnectionSettings()
+            self.assertTrue(st.pat_enabled)
+            self.assertTrue(st.otp_url.endswith("/trading/v1/options/accounts/DOT1/otp"))
+
+            class Resp:
+                status_code = 200
+                text = ""
+                def json(self): return {"data": {"url": "wss://api.derivws.com/x/ws/demo?otp=abc"}}
+
+            class Req:
+                calls = []
+                @staticmethod
+                def post(url, headers=None, timeout=None):
+                    Req.calls.append((url, headers))
+                    return Resp()
+
+            orig = globals()["requests"]
+            globals()["requests"] = Req
+            try:
+                url = asyncio.run(DerivClient(st)._resolve_ws_url())
+            finally:
+                globals()["requests"] = orig
+            self.assertEqual(url, "wss://api.derivws.com/x/ws/demo?otp=abc")
+            self.assertEqual(Req.calls[0][1]["Authorization"], "Bearer pat_x")
+            self.assertEqual(Req.calls[0][1]["Deriv-App-ID"], "123")
+
+    def test_otp_http_error_never_leaks_token(self):
+        env = {"DERIV_PAT": "pat_secret", "DERIV_PAT_APP_ID": "123", "DERIV_ACCOUNT_ID": "DOT1"}
+        with mock.patch.dict(os.environ, env):
+            class Resp:
+                status_code = 401
+                text = "Unauthorized"
+                def json(self): return {}
+
+            class Req:
+                @staticmethod
+                def post(url, headers=None, timeout=None): return Resp()
+
+            orig = globals()["requests"]
+            globals()["requests"] = Req
+            try:
+                with self.assertRaises(ConnectionError) as cm:
+                    DerivClient(ConnectionSettings())._fetch_otp_url()
+            finally:
+                globals()["requests"] = orig
+            self.assertNotIn("pat_secret", str(cm.exception))
+
+
 class TestExampleConfig(unittest.TestCase):
     """Le modèle intégré (ex config_example.json) doit rester valide."""
 
@@ -2854,7 +2978,9 @@ class TestTelegramCredentials(unittest.TestCase):
         with mock.patch.dict(os.environ, {"TELEGRAM_BOT_TOKEN": ""}):
             self.assertEqual(telegram_credentials()[0], DEFAULT_TELEGRAM_BOT_TOKEN)
 
-    def test_build_notifier_uses_defaults_when_enabled(self):
+    def test_build_notifier_falls_back_without_credentials(self):
+        """Sans .env et sans défaut codé en dur (sécurité), build_notifier ne doit
+        jamais fabriquer un TelegramNotifier avec un token vide : repli fichier."""
         orig = requests
         globals()["requests"] = FakeRequests()          # aucun accès réseau
         try:
@@ -2862,8 +2988,21 @@ class TestTelegramCredentials(unittest.TestCase):
                 self._clean_env()
                 app = AppConfig(strategy=StrategyConfig(), markets=[], data_dir=Path(d), telegram_enabled=True)
                 n = build_notifier(app)
+                self.assertIsInstance(n, Notifier)
+                self.assertNotIsInstance(n, TelegramNotifier)
+        finally:
+            globals()["requests"] = orig
+
+    def test_build_notifier_uses_env_when_set(self):
+        orig = requests
+        globals()["requests"] = FakeRequests()
+        try:
+            env = {"TELEGRAM_BOT_TOKEN": "T", "TELEGRAM_CHAT_ID": "-1"}
+            with mock.patch.dict(os.environ, env), tempfile.TemporaryDirectory() as d:
+                app = AppConfig(strategy=StrategyConfig(), markets=[], data_dir=Path(d), telegram_enabled=True)
+                n = build_notifier(app)
                 self.assertIsInstance(n, TelegramNotifier)
-                self.assertEqual((n.bot_token, n.chat_id), (DEFAULT_TELEGRAM_BOT_TOKEN, DEFAULT_TELEGRAM_CHAT_ID))
+                self.assertEqual((n.bot_token, n.chat_id), ("T", "-1"))
         finally:
             globals()["requests"] = orig
 
@@ -2877,3 +3016,4 @@ def run_tests(verbosity: int = 1) -> int:
 
 if __name__ == "__main__":
     main()
+
