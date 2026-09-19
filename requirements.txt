@@ -3,6 +3,7 @@ python-dotenv>=1.0,<2
 websocket-client>=1.6,<2
 flask>=3.0,<4
 matplotlib>=3.8,<4
+matplotlib>=3.10.8
 
 Flask==3.0.3
 waitress==3.0.0
