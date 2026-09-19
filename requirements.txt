@@ -1,19 +1,6 @@
-requests>=2.31,<3
-python-dotenv>=1.0,<2
-websocket-client>=1.6,<2
-flask>=3.0,<4
-matplotlib>=3.8,<4
-matplotlib>=3.10.8
 
-Flask==3.0.3
-waitress==3.0.0
-requests==2.32.3
-yfinance>=1.5.2
-curl_cffi>=0.7.0
-pandas
-numpy
-matplotlib==3.9.2
-websocket-client
-colorama
-ccxt
-python-dotenv
+requests>=2.32
+flask>=3.0
+websocket-client>=1.8
+python-dotenv>=1.0
+matplotlib>=3.10.8
