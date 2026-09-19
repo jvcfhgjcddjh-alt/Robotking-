@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """AlphaBot BOS + CHoCH — Gold & BTC — version en un seul fichier.
 
-Signaux Telegram sur XAUUSD et BTCUSD, timeframe modifiable à tout moment via /timeframe (M5 par défaut),
+Signaux Telegram sur XAUUSD et BTCUSD, timeframe modifiable à tout moment via /timeframe (M1 par défaut, réglable via DEFAULT_TIMEFRAME),
 entrée directe sur CHoCH.
 Prix : Gold via l'API publique Deriv (WebSocket), BTC via l'API publique Binance. Aucune clé de prix.
 
@@ -112,9 +112,10 @@ def _parse_timeframe(txt):
     return int(m.group(1) or m.group(2)) * 60 if m else None
 
 
-# Timeframe courant : M5 au départ, puis recalculé par load_timeframe() (section 2) et modifiable à chaud
+# Timeframe courant : DEFAULT_TIMEFRAME au départ, puis recalculé par load_timeframe() (section 2) et modifiable à chaud
 # via /timeframe. TIMEFRAME_MIN / TF_LABEL / TF_SEC ne sont donc pas des constantes.
-TIMEFRAME_MIN = 5
+DEFAULT_TIMEFRAME = "M1"   # 1er démarrage : ni variable TIMEFRAME sur Render, ni choix Telegram enregistré
+TIMEFRAME_MIN = _parse_timeframe(DEFAULT_TIMEFRAME)
 TF_LABEL = TF_LABELS[TIMEFRAME_MIN]
 TF_SEC = TIMEFRAME_MIN * 60
 
@@ -214,6 +215,9 @@ _ensure_column("trades", "rr1_hit", "INTEGER DEFAULT 0")
 _ensure_column("trades", "rr2_hit", "INTEGER DEFAULT 0")
 _ensure_column("trades", "rr3_hit", "INTEGER DEFAULT 0")
 _ensure_column("trades", "timeframe", "TEXT")
+# Suivi de l'envoi du signal d'ouverture (1 = envoyé). Les anciens trades restent à 1 : pas de renvoi.
+_ensure_column("trades", "sent_admin", "INTEGER DEFAULT 1")
+_ensure_column("trades", "sent_group", "INTEGER DEFAULT 1")
 
 
 # --- paramètres / méta -------------------------------------------------------
@@ -264,7 +268,7 @@ def _apply_timeframe(minutes):
 
 def load_timeframe():
     """Timeframe au démarrage : la variable TIMEFRAME (Render / .env) reprend la main dès qu'elle change ;
-    sinon on reprend le dernier choix fait via Telegram ; à défaut M5."""
+    sinon on reprend le dernier choix fait via Telegram ; à défaut DEFAULT_TIMEFRAME. Retourne la source."""
     env_raw = os.getenv("TIMEFRAME", "").strip().upper()
     env_tf = _parse_timeframe(env_raw) if env_raw else None
     if env_raw and env_tf not in TF_LABELS:
@@ -274,13 +278,18 @@ def load_timeframe():
     if env_tf and env_raw != get_setting("timeframe_env"):
         set_setting("timeframe_env", env_raw)
         set_setting("timeframe", env_tf)
-        chosen = env_tf
+        chosen, source = env_tf, "variable TIMEFRAME de Render"
+    elif saved in TF_LABELS:
+        chosen, source = saved, "dernier choix fait sur Telegram"
+    elif env_tf:
+        chosen, source = env_tf, "variable TIMEFRAME de Render"
     else:
-        chosen = saved if saved in TF_LABELS else (env_tf or TIMEFRAME_MIN)
+        chosen, source = TIMEFRAME_MIN, "défaut du code"
     _apply_timeframe(chosen)
+    return source
 
 
-load_timeframe()
+_TF_SOURCE = load_timeframe()
 
 
 # --- trades ------------------------------------------------------------------
@@ -780,16 +789,24 @@ TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
 
 # --- envoi ------------------------------------------------------------------------
-def _post(method, data=None, files=None):
+def _post(method, data=None, files=None, _retry=True):
     if not TELEGRAM_TOKEN:
         print(f"[telegram OFF] {method}: {(data or {}).get('text', '')[:80]}")
         return None
     try:
         r = requests.post(f"{TELEGRAM_API}/{method}", data=data, files=files, timeout=30)
-        return r.json()
+        res = r.json()
     except Exception as e:
         print(f"[telegram] erreur {method}: {e}")
         return None
+    if not res.get("ok"):
+        print(f"[telegram] {method} REFUSÉ vers {(data or {}).get('chat_id')} : "
+              f"{res.get('error_code')} {res.get('description')}")
+        wait = (res.get("parameters") or {}).get("retry_after")
+        if wait and _retry and not files and wait <= 30:   # flood control : on patiente puis on retente
+            time.sleep(wait + 1)
+            return _post(method, data, files, _retry=False)
+    return res
 
 
 def send(chat_id, text, photo=None, reply_markup=None):
@@ -809,7 +826,19 @@ def send(chat_id, text, photo=None, reply_markup=None):
             pass
     data["text"] = text
     data.pop("caption", None)
-    return _post("sendMessage", data)
+    res = _post("sendMessage", data)
+    if res and not res.get("ok") and "parse entities" in str(res.get("description", "")):
+        data.pop("parse_mode", None)          # balise HTML invalide : on renvoie en texte brut
+        data["text"] = re.sub(r"<[^>]+>", "", text)
+        res = _post("sendMessage", data)
+    return res
+
+
+def _delivered(chat_id, res):
+    """True si le message est bien parti (ou s'il n'y avait rien à envoyer : pas de chat / mode console)."""
+    if not chat_id or not TELEGRAM_TOKEN:
+        return True
+    return bool(res and res.get("ok"))
 
 
 def to_group(text, photo=None):
@@ -875,21 +904,21 @@ def _rr_price(sig, level):
     return sig["entry"] + side * level * sig["risk"]
 
 
-def group_signal(symbol, sig, position_n, dec):
+def group_signal(symbol, sig, position_n, dec, tf=None):
     icon = "🟢" if sig["side"] == "BUY" else "🔴"
     rr_lines = "\n".join(
         f"RR{int(lvl)} : {_fmt(_rr_price(sig, lvl), dec)}" for lvl in RR_LEVELS)
     return (
         f"Nouveau signal\n"
-        f"{icon} <b>{sig['side']} {symbol}</b> · {TF_LABEL}\n"
+        f"{icon} <b>{sig['side']} {symbol}</b> · {tf or TF_LABEL}\n"
         f"Type : {_kind_label(sig['type'])}\n\n"
         f"Entrée : <b>{_fmt(sig['entry'], dec)}</b>\n"
         f"SL : {_fmt(sig['sl'], dec)}\n"
         f"{rr_lines}\n"
         f"TP : {_fmt(sig['tp'], dec)}\n\n"
         f"BE → RR{BE_RR:g}\n"
-        f"TP final → RR{TP_RR:g}\n\n"
-        f"Position {position_n}/{MAX_POSITIONS} sur {symbol}"
+        f"TP final → RR{TP_RR:g}"
+        + (f"\n\nPosition {position_n}/{MAX_POSITIONS} sur {symbol}" if position_n else "")
     )
 
 
@@ -1349,7 +1378,8 @@ def publish_signal(symbol, candles, events, sig):
         return
     margin = calc_margin(symbol, lot_info["lot"], sig["entry"], leverage)
 
-    add_trade(
+    trade_id = add_trade(
+        sent_admin=0, sent_group=0,   # passent à 1 seulement quand Telegram a confirmé l'envoi
         signal_key=key, symbol=symbol, side=sig["side"], kind=sig["type"], timeframe=TF_LABEL,
         entry=sig["entry"], sl=sig["sl"], sl_initial=sig["sl"], tp=sig["tp"],
         risk_usd=lot_info["real_risk"],  # risque réel du lot pris (= risque demandé sauf lot minimum)
@@ -1357,9 +1387,70 @@ def publish_signal(symbol, candles, events, sig):
     print(f"[{symbol}] SIGNAL {sig['side']} {sig['type']} @ {sig['entry']:.{dec}f} "
           f"(bougie {_ts_str(sig['t'])})")
 
-    chart = make_chart(symbol, candles, events, sig, dec)
-    to_group(group_signal(symbol, sig, n_open + 1, dec), photo=chart)
-    to_admin(admin_signal(symbol, sig, risk_usd, leverage, lot_info, margin, dec))
+    try:
+        chart = make_chart(symbol, candles, events, sig, dec)
+    except Exception as e:   # un souci de graphique ne doit JAMAIS empêcher l'envoi du signal
+        print(f"[{symbol}] make_chart a échoué ({type(e).__name__}) : signal envoyé sans image")
+        if isinstance(e, RecursionError):
+            print("[chart] matplotlib incompatible avec cette version de Python -> "
+                  "fixer PYTHON_VERSION=3.13.x sur Render (ou mettre matplotlib à jour)")
+        traceback.print_exc(limit=-3)   # 3 dernières lignes seulement (évite les logs de 1000 lignes)
+        chart = None
+
+    _deliver_signal(trade_id, symbol,
+                    admin_txt=admin_signal(symbol, sig, risk_usd, leverage, lot_info, margin, dec),
+                    group_txt=group_signal(symbol, sig, n_open + 1, dec),
+                    chart=chart)
+
+
+def _deliver_signal(trade_id, symbol, admin_txt, group_txt, chart=None, only_missing=None):
+    """Envoie le signal d'ouverture (admin d'abord, puis groupe) et note en base ce qui est bien parti."""
+    row = _q("SELECT sent_admin, sent_group FROM trades WHERE id=?", (trade_id,)).fetchone()
+    if row is None:
+        return
+    for who, chat_id, sender, txt, photo in (
+            ("admin", CHAT_ID_ADMIN, to_admin, admin_txt, None),
+            ("group", CHAT_ID_GROUPE, to_group, group_txt, chart)):
+        if row[f"sent_{who}"]:
+            continue
+        try:
+            res = sender(txt, photo=photo) if who == "group" else sender(txt)
+            if _delivered(chat_id, res):
+                update_trade(trade_id, **{f"sent_{who}": 1})
+            else:
+                print(f"[{symbol}] signal #{trade_id} NON envoyé ({who}) — nouvel essai automatique")
+        except Exception:
+            print(f"[{symbol}] signal #{trade_id} : erreur d'envoi ({who}) :")
+            traceback.print_exc()
+
+
+_retry_state = {}   # trade_id -> [nb d'essais, dernier essai]
+
+
+def retry_unsent_signals():
+    """Renvoie les signaux d'ouverture jamais confirmés par Telegram (tant que le trade est ouvert)."""
+    rows = _q("SELECT * FROM trades WHERE sent_admin=0 OR sent_group=0 ORDER BY id").fetchall()
+    for r in rows:
+        t = dict(r)
+        tries, last = _retry_state.get(t["id"], [0, 0.0])
+        if time.time() - last < 30:
+            continue
+        if t["status"] != "OPEN" or tries >= 8:
+            print(f"[retry] signal #{t['id']} abandonné (trade {t['status']}, {tries} essais)")
+            update_trade(t["id"], sent_admin=1, sent_group=1)
+            continue
+        _retry_state[t["id"]] = [tries + 1, time.time()]
+        sym = t["symbol"]
+        dec = SYMBOLS[sym]["decimals"]
+        sig = {"side": t["side"], "type": t["kind"], "entry": t["entry"], "sl": t["sl_initial"],
+               "tp": t["tp"], "risk": abs(t["entry"] - t["sl_initial"])}
+        lot_info = {"lot": t["lot"], "real_risk": t["risk_usd"], "raised_to_min": False}
+        lev = t["leverage"] or get_leverage()
+        margin = calc_margin(sym, t["lot"], t["entry"], lev)
+        late = "⏱ <i>Envoi différé</i>\n"
+        _deliver_signal(t["id"], sym,
+                        admin_txt=late + admin_signal(sym, sig, t["risk_usd"], lev, lot_info, margin, dec),
+                        group_txt=late + group_signal(sym, sig, None, dec, tf=t["timeframe"]))
 
 
 def process_symbol(symbol):
@@ -1383,6 +1474,9 @@ def process_symbol(symbol):
         return
     if last_t <= last_seen:
         return  # pas encore de nouvelle bougie clôturée
+
+    # 0) signaux d'ouverture pas encore confirmés : ils partent avant tout message de suivi
+    retry_unsent_signals()
 
     # 1) suivi des positions ouvertes (BE / TP / SL)
     for trade in open_trades(symbol):
@@ -1423,6 +1517,10 @@ def _trading_loop():
     """La boucle de scan (symboles + rapport quotidien), tourne en continu en arrière-plan."""
     try:
         while True:
+            try:
+                retry_unsent_signals()
+            except Exception:
+                traceback.print_exc()
             for symbol in SYMBOLS:
                 try:
                     with _tf_lock:   # un changement de timeframe attend la fin du passage en cours
@@ -1468,6 +1566,7 @@ def _run(port):
 
 def main():
     print(f"AlphaBot BOS + CHoCH — Gold & BTC ({TF_LABEL})")
+    print(f"Timeframe {TF_LABEL} — source : {_TF_SOURCE} | TIMEFRAME vu par le process : {os.getenv('TIMEFRAME')!r}")
     sources = " | ".join(f"{s} <- {c['source'].capitalize()} ({c.get('deriv_symbol') or c.get('binance_symbol')})"
                          for s, c in SYMBOLS.items())
     print(f"Prix : {sources} | scan toutes les {scan_interval()}s")
@@ -1482,6 +1581,7 @@ def main():
             print("⚠️  CHAT_ID_ADMIN absent : ni lot, ni commandes.")
 
     start_polling()
+    to_admin(f"🤖 AlphaBot démarré — timeframe <b>{TF_LABEL}</b> ({_TF_SOURCE}). Change-le avec /timeframe.")
     _run(_env_int("PORT", 10000))
 
 
