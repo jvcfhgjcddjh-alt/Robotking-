@@ -1,8 +1,8 @@
-
 #!/usr/bin/env python3
 """AlphaBot BOS + CHoCH — Gold & BTC — version en un seul fichier.
 
-Signaux Telegram sur XAUUSD et BTCUSD, timeframe configurable (M5 par défaut), entrée directe sur CHoCH.
+Signaux Telegram sur XAUUSD et BTCUSD, timeframe modifiable à tout moment via /timeframe (M5 par défaut),
+entrée directe sur CHoCH.
 Prix : Gold via l'API publique Deriv (WebSocket), BTC via l'API publique Binance. Aucune clé de prix.
 
 Lancer :
@@ -24,6 +24,10 @@ RR2, TP finale à RR4 (réglable via BE_RR / TP_RR / RR_LEVELS). Aucun PnL $ n'e
 ni au groupe ni en privé Leader — uniquement des R et des taux de réussite par RR.
 
 Réglages : section 1 (CONFIGURATION) ou fichier .env (voir README) — ex. TIMEFRAME=M15.
+Le timeframe se change aussi à chaud depuis Telegram (/timeframe) : le dernier choix est mémorisé, sauf si la
+variable TIMEFRAME est modifiée sur Render (elle reprend alors la main au démarrage suivant).
+Stickers / images / GIF du groupe (TP, SL, BE, motivation) : envoyer le média au bot en privé, puis choisir la
+catégorie (gestion via /medias). Optionnel : variables MEDIA_TP, MEDIA_SL, MEDIA_BE, MEDIA_MOTIV.
 Sommaire : 1 Configuration · 2 Base de données · 3 Données de prix · 4 Signaux
            5 Risque · 6 Suivi des positions · 7 Graphique · 8 Telegram · 9 Boucle principale
            10 Serveur web (Render)
@@ -31,14 +35,21 @@ Sommaire : 1 Configuration · 2 Base de données · 3 Données de prix · 4 Sign
 import json
 import math
 import os
+import random
 import re
 import sqlite3
+import sys
 import threading
 import time
 import traceback
 from datetime import datetime, timezone
 
 import requests
+
+try:  # logs Render en temps réel : pas de buffering des print()
+    sys.stdout.reconfigure(line_buffering=True)
+except Exception:
+    pass
 
 try:
     from dotenv import load_dotenv
@@ -87,7 +98,7 @@ DERIV_WS_URL = os.getenv("DERIV_WS_URL", "wss://api.derivws.com/trading/v1/optio
 
 # --- Marchés (Gold + BTC uniquement) ---------------------------------------
 # Timeframe commun aux deux actifs : M1, M3, M5, M15, M30 ou H1 (aussi accepté : 1m, 5m, 15m, 1h...).
-# Réglable dans le .env : TIMEFRAME=M15
+# Valeur de départ : variable TIMEFRAME (Render / .env), ex. TIMEFRAME=M15 ; ensuite /timeframe sur Telegram.
 TF_LABELS = {1: "M1", 3: "M3", 5: "M5", 15: "M15", 30: "M30", 60: "H1"}
 
 
@@ -101,11 +112,11 @@ def _parse_timeframe(txt):
     return int(m.group(1) or m.group(2)) * 60 if m else None
 
 
-TIMEFRAME_MIN = _parse_timeframe(os.getenv("TIMEFRAME", "M5"))
-if TIMEFRAME_MIN not in TF_LABELS:
-    raise SystemExit(f"TIMEFRAME={os.getenv('TIMEFRAME')!r} non supporté. Choisir parmi : "
-                     + ", ".join(TF_LABELS.values()))
+# Timeframe courant : M5 au départ, puis recalculé par load_timeframe() (section 2) et modifiable à chaud
+# via /timeframe. TIMEFRAME_MIN / TF_LABEL / TF_SEC ne sont donc pas des constantes.
+TIMEFRAME_MIN = 5
 TF_LABEL = TF_LABELS[TIMEFRAME_MIN]
+TF_SEC = TIMEFRAME_MIN * 60
 
 SYMBOLS = {
     "XAUUSD": {
@@ -142,7 +153,12 @@ DEFAULT_LEVERAGE = _env_float("DEFAULT_LEVERAGE", 200.0)  # modifiable via /levi
 LEVERAGE_PRESETS = (50, 100, 200, 500)
 
 # --- Système ---------------------------------------------------------------
-SCAN_INTERVAL = _env_int("SCAN_INTERVAL", 5 if TIMEFRAME_MIN == 1 else 20)    # secondes entre deux vérifications
+_SCAN_INTERVAL_ENV = _env_int("SCAN_INTERVAL", 0)    # secondes entre deux vérifications ; 0 = automatique
+
+
+def scan_interval():
+    """Secondes entre deux vérifications : SCAN_INTERVAL si défini, sinon 5 s en M1 et 20 s au-delà."""
+    return _SCAN_INTERVAL_ENV or (5 if TIMEFRAME_MIN == 1 else 20)
 CANDLES_LIMIT = 300
 DB_PATH = os.getenv("DB_PATH", "alphabot.db")
 DAILY_REPORT_HOUR_UTC = _env_int("DAILY_REPORT_HOUR_UTC", 21)
@@ -235,6 +251,36 @@ def get_leverage():
 
 def set_leverage(v):
     set_setting("leverage", round(float(v), 2))
+
+
+# --- timeframe (modifiable à chaud) --------------------------------------------------------
+_tf_lock = threading.RLock()   # un passage de scan et un changement de timeframe ne se chevauchent jamais
+
+
+def _apply_timeframe(minutes):
+    global TIMEFRAME_MIN, TF_LABEL, TF_SEC
+    TIMEFRAME_MIN, TF_LABEL, TF_SEC = minutes, TF_LABELS[minutes], minutes * 60
+
+
+def load_timeframe():
+    """Timeframe au démarrage : la variable TIMEFRAME (Render / .env) reprend la main dès qu'elle change ;
+    sinon on reprend le dernier choix fait via Telegram ; à défaut M5."""
+    env_raw = os.getenv("TIMEFRAME", "").strip().upper()
+    env_tf = _parse_timeframe(env_raw) if env_raw else None
+    if env_raw and env_tf not in TF_LABELS:
+        print(f"⚠️  TIMEFRAME={env_raw!r} non supporté (choix : {', '.join(TF_LABELS.values())}) — ignoré.")
+        env_tf = None
+    saved = _parse_timeframe(get_setting("timeframe", ""))
+    if env_tf and env_raw != get_setting("timeframe_env"):
+        set_setting("timeframe_env", env_raw)
+        set_setting("timeframe", env_tf)
+        chosen = env_tf
+    else:
+        chosen = saved if saved in TF_LABELS else (env_tf or TIMEFRAME_MIN)
+    _apply_timeframe(chosen)
+
+
+load_timeframe()
 
 
 # --- trades ------------------------------------------------------------------
@@ -330,7 +376,6 @@ def now_ts():
 # Format d'une bougie : {"t": epoch_ouverture_sec, "o":, "h":, "l":, "c":}
 # ============================================================================
 
-TF_SEC = TIMEFRAME_MIN * 60
 CLOSE_GRACE_SEC = 2   # marge après la clôture : décalage d'horloge / finalisation de la bougie chez la source
 BINANCE_BASES = ["https://api.binance.com", "https://data-api.binance.vision"]  # 2e = miroir public Binance
 BINANCE_INTERVALS = {1: "1m", 3: "3m", 5: "5m", 15: "15m", 30: "30m", 60: "1h"}
@@ -775,6 +820,47 @@ def to_admin(text, reply_markup=None):
     return send(CHAT_ID_ADMIN, text, reply_markup=reply_markup)
 
 
+# --- stickers / images / GIF du groupe (TP, SL, BE, motivation) --------------------------------
+# Un média est mémorisé sous la forme "type:file_id" (type : sticker | photo | animation).
+# L'admin en ajoute en envoyant simplement un sticker, une image ou un GIF au bot EN PRIVÉ, puis en choisissant
+# la catégorie (voir _handle_update). Stockage : base SQLite + variables d'env optionnelles MEDIA_TP, MEDIA_SL,
+# MEDIA_BE, MEDIA_MOTIV (liste séparée par des virgules, cf. /medias export) qui survivent à un redéploiement
+# Render sans disque persistant. Plusieurs médias par catégorie : un est tiré au hasard à chaque événement.
+MEDIA_CATS = {"TP": "🎯 TP", "SL": "🔴 SL", "BE": "➖ BE", "MOTIV": "💪 Motivation"}
+_MEDIA_SEND = {"sticker": "sendSticker", "photo": "sendPhoto", "animation": "sendAnimation"}
+_pending_media = {}   # (chat_id, message_id) -> "type:file_id" en attente du choix de catégorie
+
+
+def get_media(cat):
+    stored = json.loads(get_setting(f"media:{cat}", "[]"))
+    env = [m.strip() for m in os.getenv(f"MEDIA_{cat}", "").split(",") if m.strip()]
+    return list(dict.fromkeys(stored + env))
+
+
+def add_media(cat, item):
+    stored = json.loads(get_setting(f"media:{cat}", "[]"))
+    if item not in stored:
+        set_setting(f"media:{cat}", json.dumps(stored + [item]))
+    return len(get_media(cat))
+
+
+def clear_media(cat):
+    set_setting(f"media:{cat}", "[]")
+
+
+def to_group_media(cat):
+    """Envoie au groupe un média tiré au hasard dans la catégorie (silencieux si aucun n'est configuré)."""
+    items = get_media(cat)
+    if not items or not CHAT_ID_GROUPE:
+        return
+    kind, _, file_id = random.choice(items).partition(":")
+    if kind not in _MEDIA_SEND:
+        return
+    res = _post(_MEDIA_SEND[kind], {"chat_id": CHAT_ID_GROUPE, kind: file_id})
+    if res is not None and not res.get("ok"):
+        print(f"[telegram] média {cat} refusé : {res.get('description')}")
+
+
 # --- formats ---------------------------------------------------------------------
 def _fmt(v, dec):
     return f"{v:,.{dec}f}".replace(",", " ")
@@ -824,6 +910,21 @@ def admin_signal(symbol, sig, risk_usd, leverage, lot_info, margin, dec):
     return txt
 
 
+MOTIVATION_LINES = (
+    "💪 Un SL fait partie du jeu : capital protégé, on passe au prochain setup.",
+    "🧠 Discipline avant émotion : l'avantage se joue sur la série, pas sur un trade.",
+    "🔥 Une perte maîtrisée prépare le prochain gain. On reste concentrés.",
+    "📈 Même les meilleurs traders perdent — la différence, c'est le risque maîtrisé.",
+)
+_EVENT_MEDIA = {"TP": ("TP",), "SL": ("SL", "MOTIV"), "BE": ("BE",)}   # événement -> catégories envoyées
+
+
+def group_event_media(name):
+    """Sticker / image / GIF envoyé au groupe après une clôture (TP, SL, BE)."""
+    for cat in _EVENT_MEDIA.get(name, ()):
+        to_group_media(cat)
+
+
 def group_event(ev, dec):
     t, name = ev["trade"], ev["name"]
     head = f"{t['symbol']} {t['side']} @ {_fmt(t['entry'], dec)}"
@@ -841,7 +942,8 @@ def group_event(ev, dec):
         return f"🎯 <b>RR{TP_RR:g} atteint — TP ✅</b> — {head}\nRésultat : <b>WIN ({t['result_r']:+.2f} R)</b>"
     if name == "BE":
         return f"➖ <b>Clôture à l'entrée (BE)</b> — {head}\nRésultat : <b>{t['result_r']:+.2f} R</b>"
-    return f"🔴 <b>SL touché ❌</b> — {head}\nRésultat : <b>LOSS ({t['result_r']:+.2f} R)</b>"
+    return (f"🔴 <b>SL touché ❌</b> — {head}\nRésultat : <b>LOSS ({t['result_r']:+.2f} R)</b>\n\n"
+            f"<i>{random.choice(MOTIVATION_LINES)}</i>")
 
 
 def admin_event(ev):
@@ -895,9 +997,57 @@ def _leverage_text():
             f"Choisis un préréglage ou tape /levier 100")
 
 
+def _with_back(kb):
+    kb["inline_keyboard"].append([{"text": "🔙 Menu", "callback_data": "menu:home"}])
+    return kb
+
+
+def _tf_keyboard():
+    btns = [{"text": ("✅ " if m == TIMEFRAME_MIN else "") + lbl, "callback_data": f"tf:{m}"}
+            for m, lbl in TF_LABELS.items()]
+    return _with_back({"inline_keyboard": [btns[:3], btns[3:]]})
+
+
+def _tf_text():
+    n = len(open_trades())
+    note = f"\n⚠️ {n} position(s) ouverte(s) : suivies avec les bougies du nouveau timeframe." if n else ""
+    return (f"⏱ Timeframe : <b>{TF_LABEL}</b> (Gold + BTC)\n"
+            f"Choisis avec les boutons ou tape /timeframe M15. Effet immédiat : le bot se recale sur la dernière "
+            f"bougie clôturée, sans rejouer l'historique.{note}")
+
+
+def _media_keyboard(prefix, suffix="", verb=""):
+    """Boutons des catégories, 2 par ligne ; callback_data = prefix:CAT[suffix]."""
+    cats = list(MEDIA_CATS.items())
+    return {"inline_keyboard": [
+        [{"text": verb + lbl, "callback_data": f"{prefix}:{cat}{suffix}"} for cat, lbl in cats[i:i + 2]]
+        for i in range(0, len(cats), 2)]}
+
+
+def _media_text():
+    counts = "\n".join(f"{lbl} : {len(get_media(cat))}" for cat, lbl in MEDIA_CATS.items())
+    return (f"🎭 <b>Stickers / images / GIF du groupe</b>\n{counts}\n\n"
+            "➕ Ajouter : envoie-moi ici (en privé) un sticker, une image ou un GIF, puis choisis la catégorie.\n"
+            "🗑 Vider : boutons ci-dessous (les MEDIA_* définis sur Render restent).\n"
+            "🧪 Tester : /testmedia TP (envoi au groupe)\n"
+            "💾 /medias export : lignes à coller sur Render pour survivre aux redéploiements.")
+
+
+def _media_from_message(msg):
+    """'type:file_id' si le message contient un sticker / GIF / image, sinon None."""
+    if "sticker" in msg:
+        return f"sticker:{msg['sticker']['file_id']}"
+    if "animation" in msg:
+        return f"animation:{msg['animation']['file_id']}"
+    if "photo" in msg:
+        return f"photo:{msg['photo'][-1]['file_id']}"
+    return None
+
+
 def _menu_keyboard():
     return {"inline_keyboard": [
         [{"text": "💰 Risque", "callback_data": "menu:risque"}, {"text": "⚙️ Levier", "callback_data": "menu:levier"}],
+        [{"text": "⏱ Timeframe", "callback_data": "menu:timeframe"}, {"text": "🎭 Médias", "callback_data": "menu:medias"}],
         [{"text": "📊 Stats", "callback_data": "menu:stats"}, {"text": "📈 Positions", "callback_data": "menu:trades"}],
         [{"text": "🔄 Actualiser", "callback_data": "menu:home"}],
     ]}
@@ -929,6 +1079,8 @@ def handle_command(text):
                "/levier [valeur] — levier (indicatif, calcul de marge)\n"
                "/stats — statistiques (jour / semaine + taux par RR)\n"
                "/trades — positions en cours (avec RR actuel)\n"
+               "/timeframe [M1|M3|M5|M15|M30|H1] — change le timeframe à chaud\n"
+               "/medias — stickers / images / GIF du groupe (TP, SL, BE, motivation)\n"
                "/menu — menu à boutons")
         return (txt, _menu_keyboard())
     if cmd == "/menu":
@@ -953,6 +1105,28 @@ def handle_command(text):
             except ValueError:
                 return ("Levier invalide. Exemple : /levier 100", None)
         return (_leverage_text(), _leverage_keyboard())
+    if cmd in ("/timeframe", "/tf"):
+        if len(parts) > 1:
+            tf = _parse_timeframe(parts[1])
+            if tf not in TF_LABELS:
+                return ("Timeframe invalide. Choix : " + ", ".join(TF_LABELS.values())
+                        + "\nExemple : /timeframe M15", None)
+            set_timeframe(tf)
+        return (_tf_text(), _tf_keyboard())
+    if cmd == "/medias":
+        if len(parts) > 1 and parts[1].lower() == "export":
+            lines = [f"<code>MEDIA_{c}={','.join(get_media(c))}</code>" for c in MEDIA_CATS if get_media(c)]
+            return ("\n".join(lines) or "Aucun média enregistré.", None)
+        return (_media_text(), _with_back(_media_keyboard("mclr", verb="🗑 ")))
+    if cmd == "/testmedia":
+        cat = parts[1].upper() if len(parts) > 1 else ""
+        cat = "MOTIV" if cat.startswith("MOTIV") else cat
+        if cat not in MEDIA_CATS:
+            return ("Exemple : /testmedia TP — catégories : TP, SL, BE, MOTIV (envoi au groupe).", None)
+        if not get_media(cat):
+            return (f"Aucun média enregistré pour {MEDIA_CATS[cat]}.", None)
+        to_group_media(cat)
+        return (f"✅ Envoyé au groupe ({MEDIA_CATS[cat]}).", None)
     if cmd == "/stats":
         d, w, mo = _period_starts()
         lines = [
@@ -993,6 +1167,7 @@ def handle_command(text):
 
 _MENU_ACTIONS = {
     "risque": "/risque", "levier": "/levier", "stats": "/stats", "trades": "/trades",
+    "timeframe": "/timeframe", "medias": "/medias",
 }
 
 
@@ -1020,6 +1195,25 @@ def _handle_update(u):
             set_leverage(float(data[4:]))
             _edit(cq, _leverage_text(), _leverage_keyboard())
             ack = f"{get_leverage():g}x"
+        elif data.startswith("tf:"):
+            tf = int(data[3:])
+            if tf in TF_LABELS:
+                set_timeframe(tf)
+                _edit(cq, _tf_text(), _tf_keyboard())
+                ack = TF_LABEL
+        elif data.startswith("mset:"):
+            _, cat, mid = data.split(":")
+            item = _pending_media.pop((cq["message"]["chat"]["id"], int(mid)), None)
+            if item and cat in MEDIA_CATS:
+                _edit(cq, f"✅ Ajouté à {MEDIA_CATS[cat]} — {add_media(cat, item)} au total.", None)
+                ack = "Ajouté"
+            else:
+                _edit(cq, "⌛ Média plus en attente (bot redémarré ?) — renvoie-le.", None)
+        elif data.startswith("mclr:"):
+            if data[5:] in MEDIA_CATS:
+                clear_media(data[5:])
+                _edit(cq, _media_text(), _with_back(_media_keyboard("mclr", verb="🗑 ")))
+                ack = "Vidé"
         elif data == "menu:home":
             _edit(cq, _home_text(), _menu_keyboard())
         elif data.startswith("menu:") and data[5:] in _MENU_ACTIONS:
@@ -1030,6 +1224,12 @@ def _handle_update(u):
     msg = u.get("message")
     if not msg or msg["chat"].get("type") != "private" or not _is_admin(msg["from"]["id"]):
         return  # les membres du groupe ne peuvent rien modifier
+    item = _media_from_message(msg)
+    if item:  # sticker / image / GIF reçu en privé : on propose de l'assigner à une catégorie
+        _pending_media[(msg["chat"]["id"], msg["message_id"])] = item
+        send(msg["chat"]["id"], "🎭 Pour quel événement ce média ?",
+             reply_markup=_media_keyboard("mset", f":{msg['message_id']}"))
+        return
     text = msg.get("text", "")
     if text.startswith("/"):
         reply, kb = handle_command(text)
@@ -1074,6 +1274,22 @@ SIGNAL_MAX_AGE = 2
 
 _fetch_state = {}  # symbole -> {"slot": ouverture de la bougie attendue, "tries": nb d'essais}
 _last_price = {}   # symbole -> dernier prix de clôture connu (pour le RR actuel affiché dans /trades)
+
+
+def set_timeframe(minutes):
+    """Change le timeframe à chaud (Telegram) et le mémorise pour les prochains démarrages.
+
+    Les repères « dernière bougie vue » du nouveau timeframe sont effacés : au prochain passage le bot se
+    recale silencieusement sur la dernière bougie clôturée (pas de rejeu de l'historique). Les positions
+    ouvertes restent suivies, avec les bougies du nouveau timeframe."""
+    with _tf_lock:
+        if minutes == TIMEFRAME_MIN:
+            return
+        set_setting("timeframe", minutes)
+        _apply_timeframe(minutes)
+        _q("DELETE FROM meta WHERE key LIKE ?", (f"last_t:%:{TF_LABEL}",), commit=True)
+        _fetch_state.clear()
+    print(f"[config] timeframe -> {TF_LABEL}")
 
 
 def current_rr(trade):
@@ -1172,6 +1388,7 @@ def process_symbol(symbol):
     for trade in open_trades(symbol):
         for ev in track_trade(trade, candles):
             to_group(group_event(ev, dec))
+            group_event_media(ev["name"])
             txt = admin_event(ev)
             if txt:
                 to_admin(txt)
@@ -1199,6 +1416,7 @@ def maybe_daily_report():
         return
     set_meta("last_report", today)
     to_group(daily_report())
+    to_group_media("MOTIV")
 
 
 def _trading_loop():
@@ -1207,7 +1425,8 @@ def _trading_loop():
         while True:
             for symbol in SYMBOLS:
                 try:
-                    process_symbol(symbol)
+                    with _tf_lock:   # un changement de timeframe attend la fin du passage en cours
+                        process_symbol(symbol)
                 except Exception:
                     print(f"[{symbol}] erreur :")
                     traceback.print_exc()
@@ -1215,7 +1434,7 @@ def _trading_loop():
                 maybe_daily_report()
             except Exception:
                 traceback.print_exc()
-            time.sleep(SCAN_INTERVAL)
+            time.sleep(scan_interval())
     except KeyboardInterrupt:
         print("\nArrêt demandé.")
 
@@ -1251,7 +1470,7 @@ def main():
     print(f"AlphaBot BOS + CHoCH — Gold & BTC ({TF_LABEL})")
     sources = " | ".join(f"{s} <- {c['source'].capitalize()} ({c.get('deriv_symbol') or c.get('binance_symbol')})"
                          for s, c in SYMBOLS.items())
-    print(f"Prix : {sources} | scan toutes les {SCAN_INTERVAL}s")
+    print(f"Prix : {sources} | scan toutes les {scan_interval()}s")
     if websocket is None:
         raise SystemExit("Module manquant pour les prix du Gold (Deriv) : pip install websocket-client")
     if not TELEGRAM_TOKEN:
@@ -1268,3 +1487,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
