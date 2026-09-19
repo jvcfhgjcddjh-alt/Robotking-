@@ -1,6301 +1,2879 @@
 
-
-
-
 """
-ALPHABOT SMC PRO — FUSION (fichier unique, prêt à déployer sur Render)
-========================================================================
-Fusion des deux cahiers des charges (PDF "SMC PRO" + DOCX "Liquidity Sweep +
-BOS Corps de Bougie"), confirmée avec Pie :
+main.py
+=======
+AlphaBot — MOTEUR CRT V1 (signaux + paper trading, AUCUN ordre réel)
 
-  - Actifs : Gold (XAUUSD), BTC/USD
-  - Sessions : Gold + BTC -> session US/NY, 13h-22h UTC.
-  - Timeframe : M5 uniquement, sur tous les actifs.
-  - Signal : sweep de liquidité (mèche dépasse un niveau) PUIS cassure de
-    structure validée UNIQUEMENT par la clôture du CORPS de la bougie au-delà
-    du niveau de structure interne opposé (pas le niveau balayé lui-même).
-    Une mèche seule ne valide jamais -> signal ignoré.
-  - Entrée : directe (★★) si pas de FVG laissé par la bougie de cassure,
-    retour dans l'imbalance (★★★) si un FVG est détecté (plus haute confiance).
-  - SL : ATR(14) x 0,6 au-delà de l'extrémité du sweep, marge spread/commission incluse.
-  - TP unique : RR4 par défaut, avec passage en Break Even proposé au même
-    niveau RR2 par défaut (plus d'étape de sécurisation partielle
-    intermédiaire, ni de second TP). Ces deux multiples de RR, ainsi que le
-    mode BE, sont configurables et persistés (voir get_settings()["tp_rr"] /
-    ["be_rr"] / ["be_mode"], MODIFICATION 4/5) — /tprr, /berr, /bemode.
-  - Pas de score 0-100 : tout setup Sweep + CHoCH confirmé par clôture du
-    corps de bougie est publié tel quel, sans filtre de qualité.
-  - Lot recalculé à chaque signal à partir du risque choisi (mode $ fixe,
-    ex. 3$/10$, ou % du capital), de l'entrée et du Stop Loss.
-  - Diffusion Telegram 100% DM PRIVÉ DU LEADER (TELEGRAM_OWNER_ID, seul
-    destinataire) : signal complet (ENTRY/SL/TP unique RR4/RR/Lot), message de
-    lancement au démarrage/redémarrage, suivi automatique de chaque trade
-    (🥇 TP / ❌ SL / BE), rapport $ à la clôture,
-    solde, risque/trade, levier, paramètres, état ACTIF/DÉSACTIVÉ.
-    SIGNAL_BROADCAST_GROUPS et STARTUP_NOTIFY_GROUPS (plus bas dans ce
-    fichier) restent dans le code mais sont VIDES par défaut -> rien n'est
-    publié dans un groupe Telegram. Pour republier aussi dans un groupe
-    plus tard, il suffit d'y remettre "signal_group" ; tout le formatage
-    public (y compris le lot, avec son avertissement) est déjà prêt.
-    Aucun système d'abonnés/tiers : pas de "groupe VIP", pas de diffusion à
-    une liste d'utilisateurs — seulement ces deux canaux.
-  - Suivi 100% automatique : dès qu'un signal est publié, le prix est
-    surveillé en continu (monitor_open_signals) pour détecter TP (RR4)/SL —
-    aucun clic "j'ai pris le trade" n'est nécessaire pour que le suivi
-    fonctionne (les boutons Telegram restent disponibles en plus, pour un
-    reporting manuel optionnel de ce qui a été réellement fait du trade).
-  - Dashboard Flask : capital/levier/risque/lot, stats, profils de risque,
-    statut des trades (pris/ignoré/clôturé), endpoint /health pour Render.
-  - Persistance SQLite : historique complet, anti-doublon, cap quotidien de signaux.
-  - Robustesse : chaque itération de scan est protégée par try/except, la
-    boucle ne s'arrête jamais ; à faire tourner avec redémarrage automatique
-    côté Render (Background Worker ou Web Service, cf. section DÉPLOIEMENT
-    en bas de fichier).
+Moteur simple, déterministe et testable. Pas d'ATR, pas de score, pas de
+BOS/OB. Deux modes cohabitent selon la config (config.json / strategy) :
 
-  - Rapports automatiques : journalier (21h UTC), hebdomadaire (dimanche
-    21h30 UTC), mensuel (dernier jour du mois, 22h UTC) — envoyés sur
-    Telegram (TG_CHAT_REPORTS si défini, sinon sur le groupe de signaux)
-    et consultables via /api/reports/daily, /weekly, /monthly.
+  - V1 timeframe unique (recommandé, crt_tf == entry_tf, ex. "M5" partout) :
+        CRT (sweep + clôture dans le range, bougie M5 clôturée)
+        -> ENTRÉE DIRECTE immédiate, au prix de clôture de la bougie de sweep
+        -> SL au sweep -> TP = RR x risque -> suivi RR1/RR2/RR3 (paper)
+    Aucune attente de nouvelle bougie ni de retest FVG.
 
-⚠️ POINTS OUVERTS avant la prod réelle (voir aussi les commentaires inline) :
-  1. Flux Gold via yfinance (GC=F) est un flux "best effort" — remplacer par
-     un flux broker/MT5 si tu veux un prix plus fidèle à ton exécution réelle.
-  2. Génération d'image annotée (chart-img.com) non branchée ici — la fonction
-     send_telegram_signal() accepte déjà un `image_path` optionnel, prêt à
-     recevoir un screenshot si tu veux l'ajouter.
-  3. Les rapports raisonnent en multiples de R (pas de $ réel), car aucun
-     capital/lot n'est stocké par trade dans la base — cohérent avec le RR
-     déjà affiché dans chaque signal.
+  - Mode legacy CRT (HTF) -> FVG (LTF) -> retest -> entrée, ou repli "entrée
+    directe" après N bougies sans FVG (crt_tf != entry_tf, ex. M30 -> M5) :
+    conservé pour compatibilité, activé par fvg_enabled=true.
+
+Le scan (bougies M5 clôturées) et le suivi des positions ouvertes (ticks)
+tournent sur les mêmes flux asynchrones non bloquants : un marché en erreur
+ou une position ouverte ne bloquent jamais le scan des autres marchés.
+
+Marchés : V75, V25, GOLD, BTC (jamais Boom / Crash, jamais les "(1s)").
+Données : API publique Deriv (ticks -> bougies), aucun token requis.
+
+Utilisation :
+    pip install -r requirements.txt
+    python3 main.py                   # lance le moteur
+    python3 main.py --stats           # statistiques par marché (trades.jsonl)
+    python3 main.py --test            # tests intégrés de la logique (sans réseau)
+    python3 main.py --init-config     # écrit config.json (modèle intégré) s'il n'existe pas
+
+Réglages : config.json (section "strategy"), voir StrategyConfig ci-dessous.
+Modèle de config : EXAMPLE_CONFIG_JSON (fichier unique : moteur + tests + modèle).
+
+Telegram (texte + image PNG par signal) : mettre "telegram": {"enabled": true}
+dans config.json. Token / chat / admin : valeurs par défaut intégrées
+(DEFAULT_TELEGRAM_*, section 1), remplacées par TELEGRAM_BOT_TOKEN /
+TELEGRAM_CHAT_ID / TELEGRAM_ADMIN_ID dans .env quand ils sont définis. Sans
+telegram.enabled, ou sans le paquet 'requests', les signaux restent écrits
+dans data/signals.log comme en V1.
+
+Images de signal : nécessite matplotlib (voir requirements.txt). Désactivable
+via "chart_enabled": false dans config.json.
+
+Rapport journalier : envoyé chaque jour à l'heure définie par config.json
+("report": {"hour": 21, "minute": 0}), via le même notifier (Telegram ou fichier).
+
+Exness (exécution d'ordres réels) : NON inclus. Ce moteur reste 100% paper
+trading — aucun ordre n'est jamais envoyé à un broker.
 """
 
-import os
-import sys
-import time
+from __future__ import annotations
+
+import argparse
+import asyncio
+import difflib
+import itertools
 import json
-import sqlite3
 import logging
-import threading
-import traceback
-import urllib.request
-import urllib.parse
-from contextlib import contextmanager
-from dataclasses import dataclass
-from datetime import datetime, timezone, timedelta
-from typing import List, Dict, Optional
+import os
+import re
+import sys
+import tempfile
+import time as _time
+import unittest
+from collections import defaultdict, deque
+from dataclasses import asdict, dataclass, field, fields
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any, Awaitable, Callable, Optional
+from unittest import mock
 
-import requests
-from flask import Flask, request, jsonify, render_template_string
+try:  # la logique et les tests fonctionnent sans le réseau
+    import websockets
+    from websockets.exceptions import ConnectionClosed
+except ImportError:  # pragma: no cover
+    websockets = None  # type: ignore[assignment]
 
-import matplotlib
-matplotlib.use("Agg")  # pas d'affichage graphique — génération d'images en fichier uniquement
-import matplotlib.pyplot as plt
-from matplotlib.patches import Rectangle
+    class ConnectionClosed(Exception):  # type: ignore[no-redef]
+        pass
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:  # pragma: no cover
+    pass
+
+try:  # requis uniquement pour l'envoi Telegram
+    import requests
+except ImportError:  # pragma: no cover
+    requests = None  # type: ignore[assignment]
+
+try:  # requis uniquement pour la génération d'images de signal
+    import matplotlib
+    matplotlib.use("Agg")  # pas d'affichage : on écrit directement des PNG
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Rectangle
+except ImportError:  # pragma: no cover
+    plt = None  # type: ignore[assignment]
 
 
-# ============================================================================
+# =============================================================================
 # 1. CONFIGURATION
-# ============================================================================
+# =============================================================================
+
+BASE_DIR = Path(__file__).resolve().parent
+CONFIG_PATH = Path(os.getenv("CONFIG_PATH", BASE_DIR / "config.json"))
+
+# Valeurs Telegram par défaut (fichier unique, sans .env). Les variables
+# d'environnement TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID / TELEGRAM_ADMIN_ID,
+# quand elles sont définies et non vides, les remplacent (voir telegram_credentials).
+# Ne publie pas ce fichier (dépôt public) tant que le token y figure.
+DEFAULT_TELEGRAM_BOT_TOKEN = "8882189271:AAEIZ4hOC5v2AtfOq6FnHQ_pBJID2nG3nFc"
+DEFAULT_TELEGRAM_CHAT_ID = "-5281258868"       # groupe des signaux
+DEFAULT_TELEGRAM_ADMIN_ID = "6982051442"       # seul ID autorisé à piloter le bot
+
+# Granularités Deriv valides (secondes) pour ticks_history / style=candles
+TF_SECONDS: dict[str, int] = {"M1": 60, "M5": 300, "M15": 900, "M30": 1800, "H1": 3600}
+
+CRT_TIMEFRAMES = ("M5", "M15", "M30", "H1")
+ENTRY_TIMEFRAMES = ("M1", "M5")
+
+# Marchés décrits par des ALIAS (jamais un code symbole supposé) :
+# discover_symbols() fait le matching réel via active_symbols.
+# "exclude" écarte les variantes (ex. "Volatility 75 (1s) Index").
+ALL_MARKETS: list[dict[str, Any]] = [
+    {"key": "V75", "label": "Volatility 75 Index",
+     "aliases": ["volatility 75 index", "volatility 75", "vol 75"],
+     "exclude": ["(1s)", "1hz"]},
+    {"key": "V25", "label": "Volatility 25 Index",
+     "aliases": ["volatility 25 index", "volatility 25", "vol 25"],
+     "exclude": ["(1s)", "1hz"]},
+    {"key": "GOLD", "label": "GOLD / XAUUSD",
+     "aliases": ["gold/usd", "gold", "xau/usd", "xauusd", "xau"]},
+    {"key": "BTC", "label": "BTC / BTCUSD",
+     "aliases": ["btc/usd", "bitcoin", "btcusd", "btc"]},
+]
+ALL_MARKET_KEYS = [m["key"] for m in ALL_MARKETS]
+
+
+@dataclass
+class StrategyConfig:
+    """Réglages de la stratégie (mutable : un menu Telegram pourra les changer)."""
+
+    crt_tf: str = "M30"              # M15 | M30 | H1
+    entry_tf: str = "M5"             # M5 (M1 possible)
+    rr: float = 3.0                  # RR cible : TP = entrée ± risque x rr
+
+    fvg_enabled: bool = True         # entrée sur retest d'une FVG
+    direct_entry: bool = False       # entrée directe sur confirmation M5 (mode secours, OFF par défaut)
+    direct_fallback_bars: int = 12   # FVG ON + DIRECT ON : bougies d'entrée à attendre sans FVG avant l'entrée directe
+
+    trend_filter: str = "OFF"        # OFF | EMA | STRUCTURE
+    trend_tf: str = ""               # vide = même timeframe que le CRT
+    ema_fast: int = 50
+    ema_slow: int = 200
+    structure_swing_length: int = 3
+
+    break_even: str = "OFF"          # OFF | 1 | 1.5 | 2 (RR auquel le SL passe à l'entrée)
+    sl_buffer: float = 0.0           # marge ajoutée au SL (en prix), 0 par défaut
+    max_positions: int = 1           # trades paper ouverts simultanément, PAR MARCHÉ
+
+    setup_expiry_crt_candles: int = 2  # un setup expire après N bougies CRT sans entrée
+
+    # --- utilitaires ---------------------------------------------------------
+
+    @property
+    def be_rr(self) -> float:
+        value = str(self.break_even).strip().upper().replace("RR", "")
+        return 0.0 if value in ("", "OFF", "0") else float(value)
+
+    @property
+    def effective_trend_tf(self) -> str:
+        return self.trend_tf or self.crt_tf
+
+    def validate(self) -> None:
+        if self.crt_tf not in CRT_TIMEFRAMES:
+            raise ValueError(f"crt_tf doit être dans {CRT_TIMEFRAMES}, reçu {self.crt_tf!r}")
+        if self.entry_tf not in ENTRY_TIMEFRAMES:
+            raise ValueError(f"entry_tf doit être dans {ENTRY_TIMEFRAMES}, reçu {self.entry_tf!r}")
+        if self.rr <= 0:
+            raise ValueError("rr doit être > 0")
+        if str(self.trend_filter).upper() not in ("OFF", "EMA", "STRUCTURE"):
+            raise ValueError("trend_filter doit être OFF, EMA ou STRUCTURE")
+        if self.effective_trend_tf not in TF_SECONDS:
+            raise ValueError(f"trend_tf inconnu : {self.effective_trend_tf!r}")
+        if self.ema_fast >= self.ema_slow:
+            raise ValueError("ema_fast doit être < ema_slow")
+        if self.be_rr < 0 or (self.be_rr and self.be_rr >= self.rr):
+            raise ValueError("break_even doit être OFF ou un RR strictement inférieur à rr")
+        if self.sl_buffer < 0:
+            raise ValueError("sl_buffer doit être >= 0")
+        if self.max_positions < 1:
+            raise ValueError("max_positions doit être >= 1")
+        if not self.fvg_enabled and not self.direct_entry:
+            raise ValueError("fvg_enabled et direct_entry sont tous deux OFF : aucune entrée possible")
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "StrategyConfig":
+        known = {f.name for f in fields(cls)}
+        unknown = set(data) - known
+        if unknown:
+            raise ValueError(f"Paramètres de stratégie inconnus : {sorted(unknown)}")
+        cfg = cls(**data)
+        cfg.validate()
+        return cfg
+
 
 @dataclass(frozen=True)
-class AssetConfig:
-    symbol: str
-    display_name: str
-    data_source: str            # "mt5_bridge" | "twelvedata" | "yfinance" | "binance"
-    telegram_group: str         # "signal_group"
-    session_continuous: bool
-    session_start_utc: Optional[int] = None
-    session_end_utc: Optional[int] = None
-    pip_size: float = 0.01
-    contract_type: str = "classic"
-    # Source utilisée si data_source échoue ou renvoie une erreur (ex. pont
-    # MT5 pas encore connecté, ou en panne) — jamais de scan bloqué en silence.
-    fallback_data_source: Optional[str] = None
-    # 2e niveau de secours, utilisé si data_source ET fallback_data_source
-    # échouent tous les deux (ex. XAUUSD : mt5_bridge -> gold_price_service
-    # -> twelvedata). None = pas de 2e niveau (comportement inchangé pour
-    # les autres actifs).
-    fallback_data_source_2: Optional[str] = None
-    # $ de P&L par lot standard pour 1$ de mouvement de prix — sert au calcul
-    # du lot à partir du risque $ (voir compute_lot_size_v2). À AJUSTER si la
-    # taille de contrat de ton broker diffère (vérifie les spécifications du
-    # symbole côté MT5 : "Taille du contrat").
-    #   XAUUSD : lot standard = 100 oz -> 1$ de mouvement = 100$/lot
-    #   XAGUSD : lot standard = 5000 oz -> 1$ de mouvement = 5000$/lot
-    #   BTCUSD : lot standard = 1 BTC (courant chez la plupart des brokers CFD)
-    #            -> 1$ de mouvement = 1$/lot
-    lot_value_per_point: float = 100.0
-    # Spread broker typique (en unités de PRIX, ex. 0.30 = 0.30$ pour XAUUSD,
-    # 8.0 = 8$ pour BTCUSD) — ajouté à la distance SL (ATR x 0.6) pour éviter
-    # qu'un SL basé sur l'ATR seul soit stoppé par le spread lui-même plutôt
-    # que par un vrai mouvement de marché. Ne remplace PAS ni ne modifie le
-    # calcul ATR x 0.6 (stratégie inchangée) : c'est un buffer ADDITIONNEL.
-    # Surchargeable par variable d'environnement (voir _default_spread ci-dessous).
-    typical_spread: float = 0.0
+class ConnectionSettings:
+    deriv_app_id: str = field(default_factory=lambda: os.getenv("DERIV_APP_ID", "1089"))
+    deriv_ws_base: str = "wss://ws.derivws.com/websockets/v3"
+    history_candle_count: int = 500
+
+    # Reconnexion : délai progressif 5s -> 10s -> 20s -> 30s -> 60s, puis 60s
+    # en boucle tant que la connexion n'est pas rétablie.
+    reconnect_delays: tuple[float, ...] = (5.0, 10.0, 20.0, 30.0, 60.0)
+    heartbeat_interval_sec: float = 20.0
+    heartbeat_timeout_sec: float = 45.0
+
+    @property
+    def deriv_ws_url(self) -> str:
+        return f"{self.deriv_ws_base}?app_id={self.deriv_app_id}"
 
 
-ASSETS = {
-    "XAUUSD": AssetConfig(
-        # MODIFICATION (04/09/2026) : MT5/Exness ajouté en TÊTE de chaîne --
-        # c'est le prix RÉEL de ton broker, celui qui détermine tes fills,
-        # donc plus fidèle que n'importe quelle API tierce (voir
-        # mt5_price_bridge.py, à lancer sur un PC/VPS Windows avec MT5+Exness
-        # ouverts -- pousse les bougies M5 vers /api/mt5/push toutes les
-        # 20-30s). Tant que ce pont ne pousse rien (ou devient périmé >90s,
-        # cf. MT5_BRIDGE_STALE_AFTER_SECONDS), repli automatique et silencieux
-        # sur la chaîne gold-api.com -> xaus.com -> goldprice.dev -> goldapi.io
-        # (voir "BRANCHEMENT RÉEL SUR LE PIPELINE LIVE XAUUSD" plus bas dans
-        # ce fichier), puis sur twelvedata en tout dernier recours.
-        symbol="XAUUSD", display_name="Gold (XAUUSD)", data_source="mt5_bridge",
-        telegram_group="signal_group", session_continuous=False,
-        session_start_utc=13, session_end_utc=22, contract_type="classic",
-        fallback_data_source="gold_price_service",
-        fallback_data_source_2="twelvedata", lot_value_per_point=100.0,
-        typical_spread=float(os.environ.get("SPREAD_XAUUSD", "0.30")),
-    ),
-    "BTCUSD": AssetConfig(
-        symbol="BTCUSD", display_name="BTC/USD", data_source="binance",
-        telegram_group="signal_group", session_continuous=False,
-        session_start_utc=13, session_end_utc=22, contract_type="crypto",
-        lot_value_per_point=1.0,
-        # MODIFICATION : aucun fallback n'existait -> un échec Binance
-        # (geo-blocage 451 fréquent depuis une IP US, ex. région par défaut
-        # de Render) rendait BTC totalement indisponible. twelvedata prend
-        # le relais (même clé que XAUUSD, voir TWELVEDATA_API_KEY).
-        fallback_data_source="twelvedata",
-        typical_spread=float(os.environ.get("SPREAD_BTCUSD", "8.0")),
-    ),
-    "XAGUSD": AssetConfig(
-        symbol="XAGUSD", display_name="Silver (XAGUSD)", data_source="mt5_bridge",
-        telegram_group="signal_group", session_continuous=False,
-        session_start_utc=13, session_end_utc=22, contract_type="classic",
-        fallback_data_source="yfinance", lot_value_per_point=5000.0,
-        typical_spread=float(os.environ.get("SPREAD_XAGUSD", "0.02")),
-    ),
+@dataclass
+class AppConfig:
+    strategy: StrategyConfig
+    markets: list[str]
+    data_dir: Path
+    history_candle_count: int = 500
+    telegram_enabled: bool = False       # jetons/chat_id lus depuis .env, jamais depuis config.json
+    chart_enabled: bool = True           # image PNG annotée à chaque entrée (nécessite matplotlib)
+    report_hour: int = 21                # heure locale du serveur pour le rapport journalier
+    report_minute: int = 0
+    # Override de strategy.max_positions PAR MARCHÉ, ex. {"V75": 2, "GOLD": 1}.
+    # Un marché absent de ce mapping utilise strategy.max_positions (comportement inchangé).
+    max_positions_by_market: dict[str, int] = field(default_factory=dict)
+
+
+def load_app_config(path: Path = CONFIG_PATH) -> AppConfig:
+    raw: dict = {}
+    if path.exists():
+        with open(path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+
+    strategy = StrategyConfig.from_dict(raw.get("strategy", {}))
+
+    markets = raw.get("markets", ALL_MARKET_KEYS)
+    bad = [m for m in markets if m not in ALL_MARKET_KEYS]
+    if bad:
+        raise ValueError(f"Marchés non supportés : {bad}. Autorisés : {ALL_MARKET_KEYS}")
+
+    data_dir = Path(raw.get("data_dir", "data"))
+    if not data_dir.is_absolute():
+        data_dir = BASE_DIR / data_dir
+
+    telegram = raw.get("telegram", {})
+    report = raw.get("report", {})
+    report_hour = int(report.get("hour", 21))
+    report_minute = int(report.get("minute", 0))
+    if not (0 <= report_hour <= 23 and 0 <= report_minute <= 59):
+        raise ValueError("report.hour doit être 0-23 et report.minute 0-59")
+
+    max_positions_by_market = raw.get("max_positions_by_market", {})
+    bad_mp_keys = [k for k in max_positions_by_market if k not in ALL_MARKET_KEYS]
+    if bad_mp_keys:
+        raise ValueError(f"max_positions_by_market : marchés inconnus {bad_mp_keys}")
+    max_positions_by_market = {k: int(v) for k, v in max_positions_by_market.items()}
+    if any(v < 1 for v in max_positions_by_market.values()):
+        raise ValueError("max_positions_by_market : toutes les valeurs doivent être >= 1")
+
+    return AppConfig(strategy=strategy, markets=list(markets), data_dir=data_dir,
+                     history_candle_count=int(raw.get("history_candle_count", 500)),
+                     telegram_enabled=bool(telegram.get("enabled", False)),
+                     chart_enabled=bool(raw.get("chart_enabled", True)),
+                     report_hour=report_hour, report_minute=report_minute,
+                     max_positions_by_market=max_positions_by_market)
+
+
+# Modèle de config.json (ancien config_example.json), intégré pour le fichier unique.
+# Écrit tel quel par `python3 main.py --init-config`.
+EXAMPLE_CONFIG_JSON = '''{
+  "markets": ["V75", "V25", "GOLD", "BTC"],
+  "history_candle_count": 500,
+  "data_dir": "data",
+  "chart_enabled": true,
+  "telegram": {
+    "enabled": false
+  },
+  "report": {
+    "hour": 21,
+    "minute": 0
+  },
+  "max_positions_by_market": {},
+  "strategy": {
+    "crt_tf": "M30",
+    "entry_tf": "M5",
+    "rr": 3,
+    "fvg_enabled": true,
+    "direct_entry": false,
+    "direct_fallback_bars": 12,
+    "trend_filter": "OFF",
+    "trend_tf": "",
+    "ema_fast": 50,
+    "ema_slow": 200,
+    "structure_swing_length": 3,
+    "break_even": "OFF",
+    "sl_buffer": 0,
+    "max_positions": 1,
+    "setup_expiry_crt_candles": 2
+  }
 }
-
-TIMEFRAME = "M5"
-SCAN_INTERVAL_SECONDS = 20  # suivi des trades ouverts toutes les 20s (fourchette demandée : 10-30s)
-
-# Anti-doublon "temps" : délai minimum entre deux signaux sur le MÊME actif,
-# quel que soit leur statut (même après clôture). Vient en plus de la
-# protection structurelle par setup_key (symbol:direction:niveau balayé), qui
-# ne couvre que les setups encore actifs. Ce cooldown couvre le cas où le
-# même niveau est re-balayé peu après la clôture d'un premier signal.
-SIGNAL_COOLDOWN_MINUTES = float(os.environ.get("SIGNAL_COOLDOWN_MINUTES", "15"))
-SIGNAL_COOLDOWN_SECONDS = SIGNAL_COOLDOWN_MINUTES * 60
-
-ATR_PERIOD = 14
-ATR_SL_MULTIPLIER = 0.6  # base du SL INCHANGÉE (stratégie ATR x 0.6 pure)
-# Buffer de spread AJOUTÉ par-dessus ATR x 0.6 (ne le remplace ni ne le
-# modifie) — évite qu'un SL basé sur l'ATR seul soit stoppé par le spread
-# lui-même. Valeur réelle = asset.typical_spread (par actif, voir ASSETS
-# plus haut, surchargeable via SPREAD_XAUUSD/SPREAD_BTCUSD/SPREAD_XAGUSD).
-# NB : ce buffer était défini mais jamais transmis à compute_levels() avant
-# ce correctif -> il valait 0.0 partout malgré ce flag à True.
-INCLUDE_SPREAD_COMMISSION_BUFFER = True
-
-# Nb max de bougies pour la reprise (reclaim) après le sweep — remis à 3
-# le 03/09/2026 pour matcher la config AlphaBotV7 (Pine) envoyée par
-# captures d'écran. ⚠️ Ce projet avait été délibérément passé de 3 à 8 lors
-# d'un précédent réglage Pine (voir historique) car cela avait amélioré le
-# win rate côté indicateur — cette valeur repasse ici à 3 car c'est la
-# valeur actuellement affichée sur l'indicateur envoyé. Si les 8 avaient
-# été gardés volontairement pour une autre raison, prévenir pour revenir dessus.
-SWEEP_RECLAIM_BARS = 3
-
-# Grille RR simplifiée : BE à RR2, TP unique à RR4 (valeurs par défaut ci-
-# dessous). Plus d'étape de "sécurisation partielle" intermédiaire (remplacée
-# par le passage en BE au même niveau) et plus de TP2 séparé (remplacé par un
-# TP unique). TP2_RR est désactivé (None) : conservé en variable pour compat
-# éventuelle avec du code legacy, mais compute_levels() ne l'utilise plus.
-TP2_RR = None  # désactivé — plus de second objectif
-
-# MODIFICATION 4/5 (03/09/2026) — PERSISTANCE ET SOURCE DE VÉRITÉ UNIQUE.
-# BE_MODE, BE_RR (ex-BE_TRIGGER_RR) et TP_RR (ex-TP1_RR) ÉTAIENT des
-# constantes Python figées au chargement du module (BE_MODE en plus lu
-# depuis une variable d'environnement) : une valeur modifiée en RAM (ou un
-# redéploiement avec une env var différente) revenait donc SILENCIEUSEMENT
-# aux anciennes valeurs au redémarrage, et rien ne garantissait qu'une autre
-# fonction du fichier ne référence pas une valeur différente en dur.
-# Ces trois réglages sont désormais des clés de app_settings (voir
-# DEFAULT_SETTINGS / get_settings() / update_settings() plus bas), EXACTEMENT
-# la même table SQLite et le même gestionnaire déjà utilisés pour
-# capital/risk_percent (MODIFICATION 3/5) : UNE SEULE source de vérité pour
-# tout le fichier, persistée en base, restaurée telle quelle après un
-# redémarrage. Plus aucun code ne doit lire BE_MODE/BE_TRIGGER_RR/TP1_RR
-# comme variable globale — toujours via get_settings()["be_mode"] /
-# ["be_rr"] / ["tp_rr"] (ou un paramètre `settings`/`be_rr`/`tp_rr` déjà
-# résolu à partir de get_settings() plus haut dans l'appel).
-# Valeurs par défaut (premier démarrage / base vide) : voir DEFAULT_SETTINGS.
-
-# Statuts TERMINAUX d'un signal : plus aucun suivi de prix ni action
-# possible. Source unique de vérité réutilisée PARTOUT (index SQL partiel,
-# has_active_setup, update_status, monitor_open_signals, rapports) pour
-# qu'un nouveau statut terminal ajouté un jour ne puisse pas être oublié
-# dans un seul de ces endroits.
-#   - "closed"        : clôture manuelle (bouton/dashboard) sans résultat R calculable.
-#   - "invalidated"    : SL touché (perte totale, -1R).
-#   - "tp1_hit"        : objectif unique atteint (+RR4, trade terminé — nouvel état final).
-#   - "tp2_hit"        : (LECTURE SEULE, historique) ancien objectif final RR6, plus jamais
-#                        déclenché pour un nouveau signal — conservé pour l'historique en base.
-#   - "tp1_sl_hit"     : SL initial retouché APRÈS que TP1 a déjà été sécurisé
-#                        -> resultat = +RR_TP1 (pas une perte totale, TP1 est déjà en poche).
-#   - "ignored"        : le leader a explicitement ignoré ce trade (bouton "Trade ignoré").
-TERMINAL_STATUSES = ("closed", "invalidated", "tp1_hit", "tp2_hit", "tp1_sl_hit", "ignored")
-
-ENTRY_TYPES = {
-    "direct": {"stars": "★★", "label": "Entrée directe"},
-    "fvg_return": {"stars": "★★★", "label": "Retour Imbalance (FVG)"},
-}
-
-MAX_SIGNALS_PER_DAY_GLOBAL = 3
-MAX_SIGNALS_PER_DAY_PER_ASSET = 2
-
-# ⚠️ SÉCURITÉ — valeur par défaut codée en dur à la demande explicite du
-# porteur du projet (token/chat ID communiqués en clair dans la conversation
-# de configuration). Utilisée UNIQUEMENT si la variable d'environnement
-# correspondante n'est pas définie sur Render — définis TELEGRAM_BOT_TOKEN_SIGNAL
-# / TG_CHAT_SIGNAL sur Render pour prendre le dessus sans toucher au code.
-# Recommandé : régénère ce token via @BotFather dès que possible puisqu'il a
-# transité en clair dans un chat, puis passe par les variables d'environnement.
-_DEFAULT_TG_CHAT_SIGNAL = "-1002335466840"
-_DEFAULT_TG_TOKEN_SIGNAL = "6950706659:AAFxJFP2DhAlTbFF6Ve5uylypPkMGKRecIE"
-
-# --- Canaux Telegram : il n'y en a que DEUX dans ce projet -----------------
-#   1. "signal_group"  : le groupe public de diffusion des signaux (XAUUSD,
-#      XAGUSD, BTCUSD). Contenu STRICTEMENT public : signal + TP (RR4)/SL.
-#      Aucune donnée personnelle (lot, risque $, solde, levier) n'y est
-#      jamais publiée.
-#   2. "reports"       : canal optionnel pour les rapports auto (journalier/
-#      hebdo/mensuel) ; si TG_CHAT_REPORTS n'est pas défini, les rapports
-#      sont envoyés sur "signal_group" à la place.
-# Le DM privé du leader (paramètres, lot, risque, solde, levier, suivi
-# détaillé) n'est PAS un "groupe" : c'est un message privé envoyé au seul
-# TELEGRAM_OWNER_ID via le bot du groupe de signaux (voir send_leader_dm()).
-TELEGRAM_GROUPS = {
-    "signal_group": {
-        "token_env": "TELEGRAM_BOT_TOKEN_SIGNAL",
-        "chat_id_env": "TG_CHAT_SIGNAL",
-        "assets": ["XAUUSD", "BTCUSD", "XAGUSD"],
-        "token_default": _DEFAULT_TG_TOKEN_SIGNAL,
-        "chat_id_default": _DEFAULT_TG_CHAT_SIGNAL,
-    },
-    # Optionnel : si TG_CHAT_REPORTS n'est pas défini, les rapports sont
-    # envoyés sur "signal_group" à la place. TELEGRAM_BOT_TOKEN_REPORTS est
-    # optionnel ; à défaut, le token de "signal_group" est réutilisé.
-    "reports": {"token_env": "TELEGRAM_BOT_TOKEN_REPORTS", "chat_id_env": "TG_CHAT_REPORTS", "assets": []},
-}
-
-
-def enforce_group_asset_whitelist():
-    """Vérifie au démarrage que chaque actif n'est routé QUE vers le groupe
-    Telegram autorisé pour lui (XAUUSD/XAGUSD/BTCUSD -> signal_group).
-    Lève une erreur explicite si la config a été modifiée de façon incohérente."""
-    for symbol, asset in ASSETS.items():
-        allowed = TELEGRAM_GROUPS.get(asset.telegram_group, {}).get("assets", [])
-        if allowed and symbol not in allowed:
-            raise RuntimeError(
-                f"Incohérence de configuration : l'actif '{symbol}' est routé vers le "
-                f"groupe Telegram '{asset.telegram_group}', qui n'autorise que {allowed}."
-            )
-
-REPORT_DAILY_HOUR_UTC = 21
-REPORT_WEEKLY_HOUR_UTC = 21
-REPORT_WEEKLY_MINUTE_UTC = 30   # décalé de la journalière pour ne pas se chevaucher
-REPORT_MONTHLY_HOUR_UTC = 22
-
-# --- Promotion (lien d'affiliation) dans les rapports -----------------------
-# Ajoutée UNIQUEMENT en pied des rapports auto (quotidien/hebdo/mensuel), au
-# maximum une fois par jour civil (UTC) — peu importe combien de rapports
-# tombent le même jour (ex : rapport journalier + mensuel le dernier jour du
-# mois), via _try_claim_report("promo", jour) qui garantit l'unicité.
-PROMO_ENABLED = os.environ.get("PROMO_ENABLED", "true").lower() == "true"
-PROMO_TEXT = os.environ.get(
-    "PROMO_TEXT",
-    "🚀 *Envie de vous entraîner sans risque ?*\n"
-    "Ouvrez un compte démo Exness et recevez 10 000 $ de fonds virtuels "
-    "pour tester vos stratégies sur le Forex, l'or et le Bitcoin.",
-)
-PROMO_LINK = os.environ.get(
-    "PROMO_LINK", "https://one.exnessonelink.com/a/nb3fx0bpnm?source=app&platform=mobile&pid=mobile_share",
-)
-
-DB_PATH = os.environ.get("DB_PATH", "alphabot_smc_fusion.db")
-TELEGRAM_API = "https://api.telegram.org/bot{token}/{method}"
-
-CHARTS_DIR = os.environ.get("CHARTS_DIR", "charts")
-CHARTS_KEEP_LAST = 300  # nettoyage automatique — ne garde que les N dernières images
-
-# --- Telegram : boutons interactifs -------------------------------------
-# Secret optionnel utilisé pour vérifier l'origine des appels webhook Telegram
-# (envoyé par Telegram dans le header X-Telegram-Bot-Api-Secret-Token si tu le
-# configures lors de l'appel à setWebhook, cf. section DÉPLOIEMENT en bas).
-TELEGRAM_WEBHOOK_SECRET = os.environ.get("TELEGRAM_WEBHOOK_SECRET", "")
-
-# ID Telegram numérique du SEUL utilisateur autorisé à modifier quoi que ce
-# soit (commandes /capital /risque /levier, activation d'un profil via
-# /profils, et boutons ✅❌🟡🔒🔴 sous chaque signal). Le reste du groupe
-# continue de VOIR les signaux et les boutons, mais un tap/une commande d'un
-# autre utilisateur est rejeté. Récupère ton ID en écrivant à @userinfobot
-# sur Telegram, puis définis TELEGRAM_OWNER_ID dans les variables
-# d'environnement Render. ⚠️ Si laissé vide, l'accès reste ouvert à tout le
-# groupe (comportement historique, aucune restriction).
-TELEGRAM_OWNER_ID = os.environ.get("TELEGRAM_OWNER_ID", "")
-# Flux spot réel pour XAUUSD/XAGUSD (remplace le proxy futures yfinance
-# GC=F/SI=F, décalé de plusieurs dizaines de dollars par rapport au spot).
-# Compte gratuit sur https://twelvedata.com/ — ⚠️ le tier gratuit (800
-# crédits/jour) est TROP JUSTE pour scanner 2 actifs en continu à 20-30s
-# d'intervalle ; non utilisé par défaut ici (voir ASSETS plus haut), à
-# activer uniquement si tu passes sur un plan payant TwelveData, ou en
-# complément du pont MT5 ci-dessous (fallback secondaire).
-TWELVEDATA_API_KEY = os.environ.get("TWELVEDATA_API_KEY", "")
-
-# --- Pont de prix MT5 (optionnel) -----------------------------------------
-# MetaTrader5 (le package Python) exige un terminal MT5 Windows ouvert en
-# continu -> IMPOSSIBLE à faire tourner directement sur Render (Linux,
-# headless). Solution : un petit script (mt5_price_bridge.py, fourni à côté)
-# tourne sur TON PC/VPS Windows avec MT5 ouvert, et POST les bougies M5
-# XAUUSD (prix EXACT de ton broker) vers ce bot toutes les 20-30s via
-# /api/mt5/push. Tant qu'aucune donnée fraîche n'est reçue (ou si
-# MT5_BRIDGE_SECRET n'est pas défini), l'actif retombe automatiquement sur
-# sa source de secours (fallback_data_source dans AssetConfig).
-MT5_BRIDGE_SECRET = os.environ.get("MT5_BRIDGE_SECRET", "")
-MT5_BRIDGE_STALE_AFTER_SECONDS = 90  # au-delà, on considère le flux MT5 mort -> fallback
-_mt5_bridge_lock = threading.Lock()
-_MT5_BRIDGE_CACHE: Dict[str, Dict] = {}  # {symbol: {"candles": [...], "updated_at": float}}
-
-
-def _mt5_bridge_push(symbol: str, candles: List[Dict]):
-    with _mt5_bridge_lock:
-        _MT5_BRIDGE_CACHE[symbol] = {"candles": candles, "updated_at": time.time()}
-
-
-def _fetch_mt5_bridge(symbol: str, limit: int) -> List[Dict]:
-    with _mt5_bridge_lock:
-        entry = _MT5_BRIDGE_CACHE.get(symbol)
-    if not entry:
-        raise RuntimeError(f"Pont MT5 : aucune donnée reçue pour {symbol} pour le moment.")
-    age = time.time() - entry["updated_at"]
-    if age > MT5_BRIDGE_STALE_AFTER_SECONDS:
-        raise RuntimeError(f"Pont MT5 : dernière donnée pour {symbol} vieille de {age:.0f}s (source considérée morte).")
-    return entry["candles"][-limit:]
-
-# --- Watchdog VPS / Render ------------------------------------------------
-WATCHDOG_CHECK_INTERVAL_SECONDS = 15
-WATCHDOG_MAX_SILENCE_SECONDS = 180     # si aucun scan depuis ce délai -> considéré comme bloqué
-WATCHDOG_RESTART_COOLDOWN_SECONDS = 30 # anti rage-restart
-
-# --- TP2 intelligent SMC/ICT : SUPPRIMÉ (03/09/2026, TP UNIQUE RR4) --------
-# TP2_TARGET_PRIORITY / TP2_TARGET_LABELS / OB_IMPULSE_ATR_MULTIPLIER ainsi
-# que le sous-système Order Blocks + select_smart_tp2() qui les utilisait
-# ont été retirés — chaque trade a désormais un TP unique, fixé au multiple
-# de RR configuré par app_settings["tp_rr"] (voir DEFAULT_SETTINGS plus bas
-# et compute_levels()).
-
-# --- Export CSV/PDF --------------------------------------------------------
-EXPORT_DIR = os.environ.get("EXPORT_DIR", "exports")
-EXPORT_KEEP_LAST = int(os.environ.get("EXPORT_KEEP_LAST", "50"))  # nettoyage auto par type de fichier
-
-# --- Sauvegarde automatique de la base SQLite -------------------------------
-BACKUP_DIR = os.environ.get("BACKUP_DIR", "backups")
-BACKUP_INTERVAL_HOURS = float(os.environ.get("BACKUP_INTERVAL_HOURS", "6"))
-BACKUP_KEEP_LAST = int(os.environ.get("BACKUP_KEEP_LAST", "20"))
-BACKUP_SEND_TO_TELEGRAM = os.environ.get("BACKUP_SEND_TO_TELEGRAM", "false").lower() == "true"
-
-# --- Journalisation ----------------------------------------------------------
-LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
-LOG_MAX_BYTES = int(os.environ.get("LOG_MAX_BYTES", str(5 * 1024 * 1024)))  # 5 Mo par fichier
-LOG_BACKUP_COUNT = int(os.environ.get("LOG_BACKUP_COUNT", "5"))
-
-os.makedirs("logs", exist_ok=True)
-os.makedirs(CHARTS_DIR, exist_ok=True)
-os.makedirs(EXPORT_DIR, exist_ok=True)
-os.makedirs(BACKUP_DIR, exist_ok=True)
-
-from logging.handlers import RotatingFileHandler
-
-_log_formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
-
-_console_handler = logging.StreamHandler()
-_console_handler.setFormatter(_log_formatter)
-
-# Fichier principal (tous niveaux), avec rotation automatique pour ne jamais
-# saturer le disque sur un service tournant en continu (Render).
-_main_file_handler = RotatingFileHandler(
-    "logs/alphabot_smc.log", maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUP_COUNT, encoding="utf-8",
-)
-_main_file_handler.setFormatter(_log_formatter)
-
-# Fichier séparé, ERROR uniquement — pour retrouver rapidement les incidents
-# sans avoir à fouiller dans les milliers de lignes INFO du fichier principal.
-_error_file_handler = RotatingFileHandler(
-    "logs/alphabot_smc_errors.log", maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUP_COUNT, encoding="utf-8",
-)
-_error_file_handler.setFormatter(_log_formatter)
-_error_file_handler.setLevel(logging.ERROR)
-
-logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL, logging.INFO),
-    handlers=[_console_handler, _main_file_handler, _error_file_handler],
-)
-log = logging.getLogger("alphabot_smc")
-
-
-# ============================================================================
-# 2. PERSISTANCE SQLITE
-# ============================================================================
-
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS signals (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    symbol TEXT NOT NULL,
-    setup_key TEXT NOT NULL,
-    direction TEXT NOT NULL,
-    entry_type TEXT NOT NULL,
-    stars TEXT NOT NULL,
-    score INTEGER NOT NULL,
-    entry_price REAL NOT NULL,
-    stop_loss REAL NOT NULL,
-    tp1 REAL NOT NULL,
-    tp2 REAL,
-    rr_tp1 REAL NOT NULL,
-    rr_tp2 REAL,
-    status TEXT NOT NULL DEFAULT 'pending',
-    telegram_group TEXT NOT NULL,
-    created_at REAL NOT NULL,
-    updated_at REAL NOT NULL,
-    closed_at REAL,
-    risk_amount REAL
-);
-
-CREATE UNIQUE INDEX IF NOT EXISTS idx_active_setup
-    ON signals(setup_key)
-    WHERE status NOT IN ('closed', 'invalidated', 'tp2_hit', 'tp1_sl_hit', 'ignored');
-
-CREATE TABLE IF NOT EXISTS daily_counters (
-    day TEXT NOT NULL,
-    symbol TEXT NOT NULL,
-    count INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (day, symbol)
-);
-
-CREATE TABLE IF NOT EXISTS report_log (
-    report_type TEXT NOT NULL,
-    period_key TEXT NOT NULL,
-    sent_at REAL NOT NULL,
-    PRIMARY KEY (report_type, period_key)
-);
-
-CREATE TABLE IF NOT EXISTS app_settings (
-    key TEXT PRIMARY KEY,
-    value TEXT NOT NULL,
-    updated_at REAL NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS profiles (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL UNIQUE,
-    capital REAL NOT NULL,
-    leverage REAL NOT NULL,
-    risk_percent REAL NOT NULL,
-    max_open_positions INTEGER NOT NULL,
-    created_at REAL NOT NULL,
-    updated_at REAL NOT NULL
-);
-
--- Journal de toutes les actions déclenchées par les boutons Telegram
--- interactifs (✅ pris / ❌ ignoré / 🟡 BE / 🔒 sécurisé / 🔴 clôturé).
-CREATE TABLE IF NOT EXISTS trade_actions (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    signal_id INTEGER NOT NULL,
-    action TEXT NOT NULL,
-    previous_status TEXT,
-    new_status TEXT NOT NULL,
-    source TEXT NOT NULL DEFAULT 'telegram',
-    actor TEXT,
-    created_at REAL NOT NULL,
-    FOREIGN KEY (signal_id) REFERENCES signals(id)
-);
-
-CREATE INDEX IF NOT EXISTS idx_trade_actions_signal ON trade_actions(signal_id);
-
--- Table à ligne unique (id=1) utilisée par le watchdog pour suivre l'état de
--- vie de la boucle de scan (heartbeat) et le nombre de redémarrages forcés.
-CREATE TABLE IF NOT EXISTS watchdog_heartbeat (
-    id INTEGER PRIMARY KEY CHECK (id = 1),
-    last_scan_at REAL,
-    last_heartbeat_at REAL,
-    restart_count INTEGER NOT NULL DEFAULT 0,
-    last_restart_at REAL,
-    last_restart_reason TEXT
-);
-
--- (Le projet n'a que DEUX canaux : le groupe de signaux public, et le DM
--- privé du seul propriétaire du bot — TELEGRAM_OWNER_ID. Il n'existe pas de
--- système d'abonnés multiples/tiers : aucune table n'est nécessaire pour ça.)
-"""
-
-
-def _migrate_schema():
-    """Ajoute les colonnes introduites après la première mise en prod, sans
-    jamais toucher aux données existantes (ALTER TABLE best-effort)."""
-    with get_conn() as conn:
-        cols = {row["name"] for row in conn.execute("PRAGMA table_info(signals)")}
-        if "tp2_source" not in cols:
-            conn.execute("ALTER TABLE signals ADD COLUMN tp2_source TEXT")
-        if "risk_amount" not in cols:
-            conn.execute("ALTER TABLE signals ADD COLUMN risk_amount REAL")
-
-# ----------------------------------------------------------------------
-# Paramètres modifiables depuis le dashboard (sans toucher au code).
-# Stockés en SQLite (table app_settings, une ligne JSON), avec ces valeurs
-# par défaut au premier démarrage.
-# ----------------------------------------------------------------------
-DEFAULT_SETTINGS = {
-    "capital": 1000.0,                      # capital du compte ($)
-    "leverage": 100,                        # levier (x)
-    "risk_unit": "dollar",                  # "dollar" (risk_dollar_amount) | "percent" (risk_percent x capital)
-    "risk_dollar_amount": 10.0,             # risque par trade en $ (ex. 3$, 10$...) — utilisé si risk_unit="dollar"
-    "risk_percent": 1.0,                    # risque par trade (%) — utilisé si risk_unit="percent"
-    "risk_mode": "standard",                # conservé pour compatibilité (voir table `profiles`)
-    "active_profile_id": None,              # id du profil actuellement sélectionné (table `profiles`)
-    "martingale_enabled": False,             # martingale ON/OFF
-    "martingale_multiplier": 2.0,            # multiplicateur de risque après une perte
-    "recovery_enabled": False,               # mode recovery ON/OFF
-    "recovery_max_multiplier": 1.5,          # plafond du multiplicateur de risque en recovery
-    "max_open_positions": 3,                 # nombre maximum de positions ouvertes simultanées
-    "session_mode": "ny",                    # "ny" (13h-22h UTC) | "24h" (scan en continu)
-    "timeframe": TIMEFRAME,                  # "M1" (scalping) | "M5" (par défaut)
-    "signals_enabled": True,                 # état ACTIF/DÉSACTIVÉ affiché dans le profil du leader (/signaux)
-    # --- MODIFICATION 4/5 : grille RR + mode BE, persistés (ex-constantes
-    # BE_MODE / BE_TRIGGER_RR / TP1_RR — voir commentaire plus haut) ---
-    "be_mode": "PROPOSE",                    # mode Break-Even : "PROPOSE" (seul mode implémenté actuellement)
-    "be_rr": 2.0,                            # multiple de RR auquel le BE est proposé (ex: 2.0 -> RR2)
-    "tp_rr": 4.0,                            # multiple de RR du TP unique (ex: 4.0 -> RR4)
-}
-
-VALID_RISK_UNITS = {"dollar", "percent"}
-
-VALID_SESSION_MODES = {"ny", "24h"}
-VALID_TIMEFRAMES = {"M1", "M5"}
-TIMEFRAME_TO_INTERVAL = {"M1": "1m", "M5": "5m"}  # -> paramètre `interval` yfinance/Binance
-# Seul "PROPOSE" est implémenté : le bot notifie mais ne déplace jamais le SL
-# lui-même (voir commentaire MODIFICATION 4/5 plus haut). Un futur mode
-# "AUTO" (déplacement automatique réel du SL côté broker) n'existe pas encore
-# côté logique de suivi (_check_signal_progress) — ne pas l'ajouter ici tant
-# que ce mode n'est pas réellement câblé, pour ne jamais accepter une valeur
-# qui laisserait croire à un comportement non implémenté.
-VALID_BE_MODES = {"PROPOSE"}
-
-_SETTINGS_KEY = "config"
-
-
-@contextmanager
-def get_conn():
-    conn = sqlite3.connect(DB_PATH, timeout=30)
-    conn.row_factory = sqlite3.Row
-    # Mode WAL : lecteurs et écrivain ne se bloquent plus mutuellement, ce qui
-    # évite les "database is locked" quand le dashboard lit pendant que la
-    # boucle de scan écrit. synchronous=NORMAL est le compromis recommandé
-    # par SQLite pour le mode WAL (sûr en cas de crash process, tout en étant
-    # nettement plus rapide que FULL).
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
-    conn.execute("PRAGMA foreign_keys=ON")
-    try:
-        yield conn
-        conn.commit()
-    finally:
-        conn.close()
-
-
-# Index additionnels (au-delà de ceux déjà déclarés dans SCHEMA) posés sur les
-# colonnes les plus filtrées/triées par le dashboard et les rapports, pour
-# éviter les scans complets de la table `signals` à mesure qu'elle grossit.
-_EXTRA_INDEXES = """
-CREATE INDEX IF NOT EXISTS idx_signals_created_at ON signals(created_at);
-CREATE INDEX IF NOT EXISTS idx_signals_symbol ON signals(symbol);
-CREATE INDEX IF NOT EXISTS idx_signals_status ON signals(status);
-CREATE INDEX IF NOT EXISTS idx_signals_closed_at ON signals(closed_at);
-"""
-
-
-def init_db():
-    with get_conn() as conn:
-        conn.executescript(SCHEMA)
-        conn.executescript(_EXTRA_INDEXES)
-    _migrate_schema()
-    _seed_default_settings()
-    _seed_default_profiles()
-    _seed_watchdog_heartbeat()
-
-
-def _seed_watchdog_heartbeat():
-    now = time.time()
-    with get_conn() as conn:
-        conn.execute(
-            """INSERT INTO watchdog_heartbeat (id, last_scan_at, last_heartbeat_at, restart_count)
-               VALUES (1, ?, ?, 0)
-               ON CONFLICT(id) DO NOTHING""",
-            (now, now),
-        )
-
-
-def _seed_default_settings():
-    """Insère les réglages par défaut au tout premier démarrage uniquement
-    (n'écrase jamais des réglages déjà personnalisés depuis le dashboard)."""
-    with get_conn() as conn:
-        row = conn.execute("SELECT value FROM app_settings WHERE key=?", (_SETTINGS_KEY,)).fetchone()
-        if row is None:
-            conn.execute(
-                "INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, ?)",
-                (_SETTINGS_KEY, json.dumps(DEFAULT_SETTINGS), time.time()),
-            )
-
-
-def get_settings() -> Dict:
-    """Retourne les réglages actuels (fusionnés avec les défauts, pour rester
-    compatible si de nouvelles clés sont ajoutées après une mise à jour)."""
-    with get_conn() as conn:
-        row = conn.execute("SELECT value FROM app_settings WHERE key=?", (_SETTINGS_KEY,)).fetchone()
-    settings = dict(DEFAULT_SETTINGS)
-    if row:
-        try:
-            settings.update(json.loads(row["value"]))
-        except (json.JSONDecodeError, TypeError):
-            log.error("app_settings corrompu, retour aux valeurs par défaut.")
-    return settings
-
-
-def update_settings(patch: Dict) -> Dict:
-    """Met à jour uniquement les clés fournies (validation légère des types),
-    persiste, et retourne les réglages complets à jour."""
-    current = get_settings()
-
-    validators = {
-        "capital": (float, lambda v: v > 0),
-        "leverage": (float, lambda v: v > 0),
-        "risk_percent": (float, lambda v: 0 < v <= 100),
-        "risk_unit": (str, lambda v: v in VALID_RISK_UNITS),
-        "risk_dollar_amount": (float, lambda v: v > 0),
-        "risk_mode": (str, lambda v: True),  # champ hérité, remplacé par le système de profils (table `profiles`)
-        "martingale_enabled": (bool, lambda v: True),
-        "martingale_multiplier": (float, lambda v: v >= 1),
-        "recovery_enabled": (bool, lambda v: True),
-        "recovery_max_multiplier": (float, lambda v: v >= 1),
-        "max_open_positions": (int, lambda v: v >= 1),
-        "session_mode": (str, lambda v: v in VALID_SESSION_MODES),
-        "timeframe": (lambda v: str(v).upper(), lambda v: v in VALID_TIMEFRAMES),
-        "signals_enabled": (bool, lambda v: True),
-        # --- MODIFICATION 4/5 : grille RR + mode BE (persistés, source
-        # unique de vérité — voir DEFAULT_SETTINGS) ---
-        "be_mode": (lambda v: str(v).upper(), lambda v: v in VALID_BE_MODES),
-        "be_rr": (float, lambda v: v > 0),
-        "tp_rr": (float, lambda v: v > 0),
-    }
-
-    for key, raw_value in patch.items():
-        if key not in validators:
-            continue  # clé inconnue -> ignorée silencieusement (pas d'injection de champs arbitraires)
-        cast, check = validators[key]
-        try:
-            value = cast(raw_value)
-        except (TypeError, ValueError):
-            raise ValueError(f"Valeur invalide pour '{key}': {raw_value!r}")
-        if not check(value):
-            raise ValueError(f"Valeur hors limites pour '{key}': {raw_value!r}")
-        current[key] = value
-
-    # Cohérence de la grille RR : le BE doit être déclenché AVANT le TP,
-    # jamais au même niveau ni au-delà (sinon le suivi automatique
-    # n'atteindrait jamais l'étape "be" avant de clôturer le trade).
-    # Vérifié sur l'état final (current), donc même si un seul des deux
-    # champs est modifié dans ce patch.
-    if "be_rr" in patch or "tp_rr" in patch:
-        if current["be_rr"] >= current["tp_rr"]:
-            raise ValueError(
-                f"BE_RR ({current['be_rr']:g}) doit être strictement inférieur à "
-                f"TP_RR ({current['tp_rr']:g})."
-            )
-
-    # Bascule automatique de l'unité de risque : si on touche risk_percent
-    # sans préciser risk_unit, on suppose que l'intention est le mode "%"
-    # (et inversement pour risk_dollar_amount) — évite le piège où le lot
-    # continue d'être calculé sur l'ancienne unité restée active en silence.
-    if "risk_unit" not in patch:
-        if "risk_percent" in patch and "risk_dollar_amount" not in patch:
-            current["risk_unit"] = "percent"
-        elif "risk_dollar_amount" in patch and "risk_percent" not in patch:
-            current["risk_unit"] = "dollar"
-
-    with get_conn() as conn:
-        conn.execute(
-            "UPDATE app_settings SET value=?, updated_at=? WHERE key=?",
-            (json.dumps(current), time.time(), _SETTINGS_KEY),
-        )
-    return current
-
-
-def _set_active_profile_id(profile_id: Optional[int]):
-    current = get_settings()
-    current["active_profile_id"] = profile_id
-    with get_conn() as conn:
-        conn.execute(
-            "UPDATE app_settings SET value=?, updated_at=? WHERE key=?",
-            (json.dumps(current), time.time(), _SETTINGS_KEY),
-        )
-
-
-# ----------------------------------------------------------------------
-# 2bis. SYSTÈME DE PROFILS (sauvegardés en SQLite, gérables sans toucher au code)
-# ----------------------------------------------------------------------
-DEFAULT_PROFILES = [
-    # (nom, capital, levier, risque %, positions max)
-    ("Scalping",     1000.0, 200, 2.0, 5),
-    ("Standard",     1000.0, 100, 1.0, 3),
-    ("Conservative", 1000.0,  50, 0.5, 2),
-]
-
-
-def _seed_default_profiles():
-    """Crée les 3 profils de départ (Scalping / Standard / Conservative)
-    uniquement s'il n'existe encore aucun profil, et active 'Standard'."""
-    with get_conn() as conn:
-        count = conn.execute("SELECT COUNT(*) AS n FROM profiles").fetchone()["n"]
-        if count > 0:
-            return
-        now = time.time()
-        standard_id = None
-        for name, capital, leverage, risk_percent, max_pos in DEFAULT_PROFILES:
-            cur = conn.execute(
-                "INSERT INTO profiles (name, capital, leverage, risk_percent, "
-                "max_open_positions, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (name, capital, leverage, risk_percent, max_pos, now, now),
-            )
-            if name == "Standard":
-                standard_id = cur.lastrowid
-    if standard_id:
-        _set_active_profile_id(standard_id)
-
-
-def list_profiles() -> List[Dict]:
-    with get_conn() as conn:
-        rows = conn.execute("SELECT * FROM profiles ORDER BY id ASC").fetchall()
-    active_id = get_settings().get("active_profile_id")
-    return [dict(r, active=(r["id"] == active_id)) for r in rows]
-
-
-def get_profile(profile_id: int) -> Optional[Dict]:
-    with get_conn() as conn:
-        row = conn.execute("SELECT * FROM profiles WHERE id=?", (profile_id,)).fetchone()
-    return dict(row) if row else None
-
-
-def create_profile(name: str, capital: float, leverage: float,
-                    risk_percent: float, max_open_positions: int) -> Dict:
-    if not name or not name.strip():
-        raise ValueError("Le nom du profil est obligatoire.")
-    if capital <= 0 or leverage <= 0 or not (0 < risk_percent <= 100) or max_open_positions < 1:
-        raise ValueError("Paramètres de profil invalides.")
-    now = time.time()
-    with get_conn() as conn:
-        try:
-            cur = conn.execute(
-                "INSERT INTO profiles (name, capital, leverage, risk_percent, "
-                "max_open_positions, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (name.strip(), capital, leverage, risk_percent, max_open_positions, now, now),
-            )
-        except sqlite3.IntegrityError:
-            raise ValueError(f"Un profil nommé '{name}' existe déjà.")
-    return get_profile(cur.lastrowid)
-
-
-def update_profile(profile_id: int, patch: Dict) -> Dict:
-    existing = get_profile(profile_id)
-    if not existing:
-        raise ValueError("Profil introuvable.")
-    fields = {
-        "name": str, "capital": float, "leverage": float,
-        "risk_percent": float, "max_open_positions": int,
-    }
-    updates = dict(existing)
-    for key, cast in fields.items():
-        if key in patch:
-            updates[key] = cast(patch[key])
-    if updates["capital"] <= 0 or updates["leverage"] <= 0 \
-            or not (0 < updates["risk_percent"] <= 100) or updates["max_open_positions"] < 1:
-        raise ValueError("Paramètres de profil invalides.")
-    with get_conn() as conn:
-        try:
-            conn.execute(
-                "UPDATE profiles SET name=?, capital=?, leverage=?, risk_percent=?, "
-                "max_open_positions=?, updated_at=? WHERE id=?",
-                (updates["name"], updates["capital"], updates["leverage"], updates["risk_percent"],
-                 updates["max_open_positions"], time.time(), profile_id),
-            )
-        except sqlite3.IntegrityError:
-            raise ValueError(f"Un profil nommé '{updates['name']}' existe déjà.")
-    # Si le profil modifié est actif, on répercute immédiatement ses valeurs
-    # sur les réglages en cours (capital/levier/risque/positions max).
-    if get_settings().get("active_profile_id") == profile_id:
-        activate_profile(profile_id)
-    return get_profile(profile_id)
-
-
-def delete_profile(profile_id: int):
-    settings = get_settings()
-    if settings.get("active_profile_id") == profile_id:
-        raise ValueError("Impossible de supprimer le profil actif — active un autre profil d'abord.")
-    with get_conn() as conn:
-        conn.execute("DELETE FROM profiles WHERE id=?", (profile_id,))
-
-
-def activate_profile(profile_id: int) -> Dict:
-    """Sélectionne un profil comme actif ET applique immédiatement ses valeurs
-    (capital, levier, risque %, positions max) aux réglages utilisés par le
-    bot — aucune modification de code nécessaire."""
-    p = get_profile(profile_id)
-    if not p:
-        raise ValueError("Profil introuvable.")
-    update_settings({
-        "capital": p["capital"],
-        "leverage": p["leverage"],
-        "risk_percent": p["risk_percent"],
-        "risk_unit": "percent",  # les profils sont toujours en % du capital
-        "max_open_positions": p["max_open_positions"],
-    })
-    _set_active_profile_id(profile_id)
-    return get_settings()
-
-
-def has_active_setup(setup_key: str) -> bool:
-    with get_conn() as conn:
-        row = conn.execute(
-            f"SELECT 1 FROM signals WHERE setup_key = ? "
-            f"AND status NOT IN ({','.join('?' for _ in TERMINAL_STATUSES)}) LIMIT 1",
-            (setup_key, *TERMINAL_STATUSES),
-        ).fetchone()
-        return row is not None
-
-
-def seconds_since_last_signal(symbol: str) -> Optional[float]:
-    """Ancienneté (en secondes) du dernier signal publié pour cet actif, quel
-    que soit son statut (y compris déjà clôturé). Retourne None si aucun
-    signal n'a jamais été publié pour cet actif."""
-    with get_conn() as conn:
-        row = conn.execute(
-            "SELECT created_at FROM signals WHERE symbol = ? ORDER BY created_at DESC LIMIT 1",
-            (symbol,),
-        ).fetchone()
-    if not row:
-        return None
-    return time.time() - row["created_at"]
-
-
-def insert_signal(symbol, setup_key, direction, entry_type, stars, score,
-                   entry_price, stop_loss, tp1, tp2, rr_tp1, rr_tp2, telegram_group,
-                   tp2_source=None, risk_amount=None) -> int:
-    now = time.time()
-    with get_conn() as conn:
-        cur = conn.execute(
-            """INSERT INTO signals
-               (symbol, setup_key, direction, entry_type, stars, score,
-                entry_price, stop_loss, tp1, tp2, rr_tp1, rr_tp2, status,
-                telegram_group, created_at, updated_at, tp2_source, risk_amount)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?, 'pending', ?, ?, ?, ?, ?)""",
-            (symbol, setup_key, direction, entry_type, stars, score,
-             entry_price, stop_loss, tp1, tp2, rr_tp1, rr_tp2, telegram_group, now, now,
-             tp2_source, risk_amount),
-        )
-        return cur.lastrowid
-
-
-def update_status(signal_id: int, status: str):
-    now = time.time()
-    closed = now if status in TERMINAL_STATUSES else None
-    with get_conn() as conn:
-        conn.execute(
-            "UPDATE signals SET status=?, updated_at=?, closed_at=COALESCE(?, closed_at) WHERE id=?",
-            (status, now, closed, signal_id),
-        )
-    try:
-        invalidate_dashboard_cache()
-    except NameError:
-        pass  # appelé avant que le cache dashboard soit initialisé (ne devrait pas arriver en pratique)
-
-
-def get_signal(signal_id: int) -> Optional[sqlite3.Row]:
-    with get_conn() as conn:
-        return conn.execute("SELECT * FROM signals WHERE id=?", (signal_id,)).fetchone()
-
-
-def record_trade_action(signal_id: int, action: str, new_status: str,
-                         source: str = "telegram", actor: Optional[str] = None) -> int:
-    """Enregistre une action déclenchée par un bouton Telegram (ou l'API) dans
-    trade_actions, met à jour le statut du signal, et retourne l'id de l'action.
-    Les statistiques (get_stats / get_period_stats / ...) sont calculées à la
-    volée depuis `signals`, donc elles reflètent immédiatement ce changement."""
-    row = get_signal(signal_id)
-    previous_status = row["status"] if row else None
-    now = time.time()
-    with get_conn() as conn:
-        cur = conn.execute(
-            """INSERT INTO trade_actions
-               (signal_id, action, previous_status, new_status, source, actor, created_at)
-               VALUES (?,?,?,?,?,?,?)""",
-            (signal_id, action, previous_status, new_status, source, actor, now),
-        )
-        action_id = cur.lastrowid
-    update_status(signal_id, new_status)
-    return action_id
-
-
-def get_trade_actions(signal_id: int) -> List[sqlite3.Row]:
-    with get_conn() as conn:
-        return conn.execute(
-            "SELECT * FROM trade_actions WHERE signal_id=? ORDER BY created_at ASC",
-            (signal_id,),
-        ).fetchall()
-
-
-def get_stats():
-    with get_conn() as conn:
-        total = conn.execute("SELECT COUNT(*) c FROM signals").fetchone()["c"]
-        by_status = conn.execute("SELECT status, COUNT(*) c FROM signals GROUP BY status").fetchall()
-        by_symbol = conn.execute("SELECT symbol, COUNT(*) c FROM signals GROUP BY symbol").fetchall()
-        return {
-            "total": total,
-            "by_status": {r["status"]: r["c"] for r in by_status},
-            "by_symbol": {r["symbol"]: r["c"] for r in by_symbol},
-        }
-
-
-# ----------------------------------------------------------------------
-# Statistiques par période (pour les rapports auto)
-# ----------------------------------------------------------------------
-
-# Statuts considérés comme gain / perte / neutre pour le calcul du résultat
-# en multiples de R (le SQLite ne stocke pas de solde/lot par trade, donc on
-# raisonne en R — cohérent avec le RR affiché dans chaque signal).
-# "tp1_hit" est désormais l'état final gagnant du nouveau flow (TP unique
-# RR4). "tp2_hit" et "secured" restent listés uniquement pour le calcul de
-# résultat des anciens signaux en base (historique) : plus aucun nouveau
-# signal ne peut les atteindre (voir _check_signal_progress).
-WIN_STATUSES = {"tp1_hit", "tp2_hit", "secured"}
-LOSS_STATUSES = {"invalidated"}
-BE_STATUSES = {"be"}
-
-
-def _r_result(row: sqlite3.Row) -> Optional[float]:
-    status = row["status"]
-    if status == "tp2_hit" and row["rr_tp2"]:
-        return float(row["rr_tp2"])
-    if status in ("tp1_hit", "secured", "tp1_sl_hit"):
-        return float(row["rr_tp1"])
-    if status in BE_STATUSES:
-        return 0.0
-    if status in LOSS_STATUSES:
-        return -1.0
-    return None  # pending / taken / ignored / closed -> exclu du calcul R
-
-
-def get_period_stats(start_ts: float, end_ts: float) -> Dict:
-    with get_conn() as conn:
-        rows = conn.execute(
-            "SELECT * FROM signals WHERE created_at >= ? AND created_at < ? "
-            "ORDER BY created_at ASC",
-            (start_ts, end_ts),
-        ).fetchall()
-
-    total = len(rows)
-    wins = losses = be = 0
-    best = worst = None
-    by_symbol: Dict[str, Dict] = {}
-    cum, peak, max_dd = 0.0, 0.0, 0.0
-    total_r = 0.0
-
-    for row in rows:
-        sym_stats = by_symbol.setdefault(row["symbol"], {"total": 0, "wins": 0, "losses": 0})
-        sym_stats["total"] += 1
-
-        r = _r_result(row)
-        if r is None:
-            continue
-
-        total_r += r
-        cum += r
-        peak = max(peak, cum)
-        max_dd = max(max_dd, peak - cum)
-
-        if r > 0:
-            wins += 1
-            sym_stats["wins"] += 1
-        elif r < 0:
-            losses += 1
-            sym_stats["losses"] += 1
-        else:
-            be += 1
-
-        entry = {"r": r, "symbol": row["symbol"], "direction": row["direction"]}
-        if best is None or r > best["r"]:
-            best = entry
-        if worst is None or r < worst["r"]:
-            worst = entry
-
-    decided = wins + losses
-    win_rate = (wins / decided * 100) if decided else 0.0
-
-    return {
-        "total_signals": total, "wins": wins, "losses": losses, "be": be,
-        "win_rate": win_rate, "total_r": total_r, "max_drawdown_r": max_dd,
-        "best": best, "worst": worst, "by_symbol": by_symbol,
-    }
-
-
-def get_all_time_stats() -> Dict:
-    """Stats sur toute l'historique (pas de bornes de date)."""
-    return get_period_stats(0, time.time() + 1)
-
-
-def get_dashboard_overview() -> Dict:
-    """Agrège réglages + stats globales + équivalent $ pour les cartes du
-    dashboard (capital actuel, profits, pertes, drawdown, winrate)."""
-    settings = get_settings()
-    overall = get_all_time_stats()
-    capital = settings["capital"]
-    risk_percent = settings["risk_percent"]
-
-    # NB : le $ par trade est estimé avec le risque par trade ACTUEL des
-    # réglages (le risque effectif historique par trade n'est pas persisté
-    # en base) — cohérent avec l'approche "raisonnement en R" déjà en place.
-    dollar_per_r = capital * (risk_percent / 100.0)
-    total_pnl = overall["total_r"] * dollar_per_r
-    max_drawdown_dollar = overall["max_drawdown_r"] * dollar_per_r
-    current_capital = capital + total_pnl
-
-    return {
-        "settings": settings,
-        "capital_initial": capital,
-        "capital_actuel": round(current_capital, 2),
-        "profit_net_total": round(total_pnl, 2),
-        "drawdown_max": round(max_drawdown_dollar, 2),
-        "winrate": round(overall["win_rate"], 1),
-        "total_signals": overall["total_signals"],
-        "wins": overall["wins"],
-        "losses": overall["losses"],
-        "be": overall["be"],
-        "total_r": round(overall["total_r"], 2),
-        "open_positions": count_open_positions(),
-    }
-
-
-def get_stats_by_asset() -> Dict[str, Dict]:
-    """Statistiques détaillées par actif : total, winrate, R cumulé, moyenne R."""
-    with get_conn() as conn:
-        rows = conn.execute("SELECT * FROM signals").fetchall()
-    by_symbol: Dict[str, Dict] = {sym: {"total": 0, "wins": 0, "losses": 0, "be": 0, "total_r": 0.0}
-                                   for sym in ASSETS}
-    for row in rows:
-        sym = row["symbol"]
-        if sym not in by_symbol:
-            by_symbol[sym] = {"total": 0, "wins": 0, "losses": 0, "be": 0, "total_r": 0.0}
-        by_symbol[sym]["total"] += 1
-        r = _r_result(row)
-        if r is None:
-            continue
-        by_symbol[sym]["total_r"] += r
-        if r > 0:
-            by_symbol[sym]["wins"] += 1
-        elif r < 0:
-            by_symbol[sym]["losses"] += 1
-        else:
-            by_symbol[sym]["be"] += 1
-
-    for sym, s in by_symbol.items():
-        decided = s["wins"] + s["losses"]
-        s["win_rate"] = round((s["wins"] / decided * 100) if decided else 0.0, 1)
-        s["total_r"] = round(s["total_r"], 2)
-        s["display_name"] = ASSETS[sym].display_name if sym in ASSETS else sym
-    return by_symbol
-
-
-def get_monthly_performance(n_months: int = 6) -> List[Dict]:
-    """Performance des `n_months` derniers mois (le mois courant inclus, en
-    dernier dans la liste)."""
-    now = datetime.now(timezone.utc)
-    months = []
-    for i in range(n_months - 1, -1, -1):
-        year = now.year
-        month = now.month - i
-        while month <= 0:
-            month += 12
-            year -= 1
-        start = datetime(year, month, 1, tzinfo=timezone.utc)
-        if month == 12:
-            end = datetime(year + 1, 1, 1, tzinfo=timezone.utc)
-        else:
-            end = datetime(year, month + 1, 1, tzinfo=timezone.utc)
-        stats = get_period_stats(start.timestamp(), end.timestamp())
-        months.append({
-            "period_key": f"{year}-{month:02d}",
-            "total_signals": stats["total_signals"],
-            "wins": stats["wins"], "losses": stats["losses"], "be": stats["be"],
-            "win_rate": round(stats["win_rate"], 1),
-            "total_r": round(stats["total_r"], 2),
-        })
-    return months
-
-
-def get_trade_history(limit: int = 100, symbol: Optional[str] = None,
-                       status: Optional[str] = None) -> List[Dict]:
-    query = "SELECT * FROM signals WHERE 1=1"
-    params: List = []
-    if symbol:
-        query += " AND symbol = ?"
-        params.append(symbol)
-    if status:
-        query += " AND status = ?"
-        params.append(status)
-    query += " ORDER BY created_at DESC LIMIT ?"
-    params.append(limit)
-    with get_conn() as conn:
-        rows = conn.execute(query, params).fetchall()
-    return [dict(r) for r in rows]
-
-
-def _day_bounds(now: datetime):
-    start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    return start.timestamp(), now.timestamp()
-
-
-def _week_bounds(now: datetime):
-    start = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
-    iso_year, iso_week, _ = now.isocalendar()
-    return start.timestamp(), now.timestamp(), f"{iso_year}-W{iso_week:02d}"
-
-
-def _month_bounds(now: datetime):
-    start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    return start.timestamp(), now.timestamp()
-
-
-def _is_last_day_of_month(now: datetime) -> bool:
-    return (now + timedelta(days=1)).month != now.month
-
-
-def format_daily_report(stats: Dict, day_key: str) -> str:
-    lines = [
-        "📅 *RAPPORT JOURNALIER*", f"🗓 {day_key}", "",
-        f"📊 Signaux publiés : {stats['total_signals']}",
-        f"✅ Gagnants : {stats['wins']} · ❌ Perdants : {stats['losses']} · ⚪ BE : {stats['be']}",
-        f"🎯 Taux de réussite (winrate) : {stats['win_rate']:.1f}%",
-        f"💰 Profit net : {stats['total_r']:+.2f} R",
-        f"📉 Drawdown : {stats['max_drawdown_r']:.2f} R",
-    ]
-    if stats["best"]:
-        b = stats["best"]
-        lines.append(f"🏆 Meilleur trade : {b['symbol']} {b['direction']} ({b['r']:+.2f} R)")
-    if stats["worst"]:
-        w = stats["worst"]
-        lines.append(f"💀 Pire trade : {w['symbol']} {w['direction']} ({w['r']:+.2f} R)")
-    return "\n".join(lines)
-
-
-def format_weekly_report(stats: Dict, period_key: str) -> str:
-    lines = [
-        "🗓 *RAPPORT HEBDOMADAIRE*", f"Semaine {period_key}", "",
-        f"📊 Signaux publiés : {stats['total_signals']}",
-        f"✅ Gagnants : {stats['wins']} · ❌ Perdants : {stats['losses']} · ⚪ BE : {stats['be']}",
-        f"🎯 Taux de réussite : {stats['win_rate']:.1f}%",
-        f"💰 Résultat net : {stats['total_r']:+.2f} R",
-        f"📉 Drawdown max : {stats['max_drawdown_r']:.2f} R", "",
-        "*Par actif :*",
-    ]
-    for symbol, s in stats["by_symbol"].items():
-        lines.append(f"  • {symbol} : {s['total']} signaux ({s['wins']}✅ / {s['losses']}❌)")
-    if stats["best"]:
-        b = stats["best"]
-        lines.append(f"🏆 Meilleur trade : {b['symbol']} {b['direction']} ({b['r']:+.2f} R)")
-    if stats["worst"]:
-        w = stats["worst"]
-        lines.append(f"💀 Pire trade : {w['symbol']} {w['direction']} ({w['r']:+.2f} R)")
-    return "\n".join(lines)
-
-
-def format_monthly_report(stats: Dict, period_key: str) -> str:
-    lines = [
-        "📆 *BILAN MENSUEL*", f"{period_key}", "",
-        f"📊 Signaux publiés : {stats['total_signals']}",
-        f"✅ Gagnants : {stats['wins']} · ❌ Perdants : {stats['losses']} · ⚪ BE : {stats['be']}",
-        f"🎯 Taux de réussite : {stats['win_rate']:.1f}%",
-        f"💰 Profit net cumulé : {stats['total_r']:+.2f} R",
-        f"📉 Drawdown maximal : {stats['max_drawdown_r']:.2f} R", "",
-        "*Performance par actif :*",
-    ]
-    for symbol, s in stats["by_symbol"].items():
-        lines.append(f"  • {symbol} : {s['total']} signaux ({s['wins']}✅ / {s['losses']}❌)")
-    if stats["best"]:
-        b = stats["best"]
-        lines.append(f"🏆 Meilleur trade du mois : {b['symbol']} {b['direction']} ({b['r']:+.2f} R)")
-    if stats["worst"]:
-        w = stats["worst"]
-        lines.append(f"💀 Pire trade du mois : {w['symbol']} {w['direction']} ({w['r']:+.2f} R)")
-    return "\n".join(lines)
-
-
-def _try_claim_report(report_type: str, period_key: str) -> bool:
-    """Retourne True si ce rapport n'a pas encore été envoyé pour cette période
-    (et l'enregistre comme envoyé), False s'il l'a déjà été -> évite les doublons."""
-    with get_conn() as conn:
-        try:
-            conn.execute(
-                "INSERT INTO report_log (report_type, period_key, sent_at) VALUES (?, ?, ?)",
-                (report_type, period_key, time.time()),
-            )
-            return True
-        except sqlite3.IntegrityError:
-            return False
-
-
-def _dispatch_report(message: str):
-    """Envoie sur TG_CHAT_REPORTS si configuré, sinon en DM au leader (plus
-    aucun groupe Telegram dans ce projet)."""
-    reports_env = TELEGRAM_GROUPS["reports"]["chat_id_env"]
-    reports_chat_id = os.environ.get(reports_env)
-    if reports_chat_id:
-        try:
-            token = _bot_token("reports")
-            url = TELEGRAM_API.format(token=token, method="sendMessage")
-            resp = requests.post(
-                url, data={"chat_id": reports_chat_id, "text": message, "parse_mode": "Markdown"},
-                timeout=15,
-            )
-            resp.raise_for_status()
-            return
-        except Exception:
-            log.error(f"Échec d'envoi du rapport sur {reports_env}:\n{traceback.format_exc()}")
-    try:
-        send_leader_dm(message)
-    except Exception:
-        log.error(f"Échec d'envoi du rapport en DM leader:\n{traceback.format_exc()}")
-
-
-def _maybe_append_promo(message: str, now: datetime) -> str:
-    """Ajoute le bloc promo au message si PROMO_ENABLED et qu'aucune promo n'a
-    déjà été jointe à un rapport aujourd'hui (toutes claims confondues,
-    jour civil UTC) — garantit le plafond '1 fois par jour max' même si
-    plusieurs rapports (journalier + hebdo/mensuel) tombent le même jour."""
-    if not PROMO_ENABLED:
-        return message
-    day_key = now.strftime("%Y-%m-%d")
-    if not _try_claim_report("promo", day_key):
-        return message
-    return f"{message}\n\n{PROMO_TEXT}\n👉 {PROMO_LINK}"
-
-
-def _maybe_send_daily_report(now: datetime):
-    day_key = now.strftime("%Y-%m-%d")
-    if not _try_claim_report("daily", day_key):
-        return
-    start_ts, end_ts = _day_bounds(now)
-    stats = get_period_stats(start_ts, end_ts)
-    _dispatch_report(_maybe_append_promo(format_daily_report(stats, day_key), now))
-    log.info(f"Rapport journalier envoyé ({day_key}).")
-
-
-def _maybe_send_weekly_report(now: datetime):
-    start_ts, end_ts, period_key = _week_bounds(now)
-    if not _try_claim_report("weekly", period_key):
-        return
-    stats = get_period_stats(start_ts, end_ts)
-    _dispatch_report(_maybe_append_promo(format_weekly_report(stats, period_key), now))
-    log.info(f"Rapport hebdomadaire envoyé ({period_key}).")
-
-
-def _maybe_send_monthly_report(now: datetime):
-    period_key = now.strftime("%Y-%m")
-    if not _try_claim_report("monthly", period_key):
-        return
-    start_ts, end_ts = _month_bounds(now)
-    stats = get_period_stats(start_ts, end_ts)
-    _dispatch_report(_maybe_append_promo(format_monthly_report(stats, period_key), now))
-    log.info(f"Rapport mensuel envoyé ({period_key}).")
-
-
-def report_scheduler_loop():
-    """Vérifie chaque minute si un rapport doit être déclenché. L'idempotence
-    est garantie par report_log (via _try_claim_report), donc une vérification
-    sur toute la minute (pas seulement minute==0 pile) reste sûre."""
-    log.info("Planificateur de rapports démarré.")
-    while True:
-        try:
-            now = datetime.now(timezone.utc)
-            if now.hour == REPORT_DAILY_HOUR_UTC:
-                _maybe_send_daily_report(now)
-            if now.weekday() == 6 and now.hour == REPORT_WEEKLY_HOUR_UTC and now.minute >= REPORT_WEEKLY_MINUTE_UTC:
-                _maybe_send_weekly_report(now)
-            if _is_last_day_of_month(now) and now.hour == REPORT_MONTHLY_HOUR_UTC:
-                _maybe_send_monthly_report(now)
-        except Exception:
-            log.error(f"Erreur planificateur de rapports:\n{traceback.format_exc()}")
-        time.sleep(60)
-
-
-def _today_key() -> str:
-    return time.strftime("%Y-%m-%d", time.gmtime())
-
-
-def can_publish_today(symbol: str) -> bool:
-    # Plafond quotidien désactivé à la demande : le bot publie tout signal
-    # détecté (Sweep+BOS confirmé), sans limite de nombre. La décision de
-    # prendre ou non la position revient entièrement à l'utilisateur.
+'''
+
+
+def write_example_config(path: Path) -> bool:
+    """Écrit le modèle de config s'il n'existe pas (jamais d'écrasement). True si écrit."""
+    if path.exists():
+        return False
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(EXAMPLE_CONFIG_JSON, encoding="utf-8")
     return True
 
 
-OPEN_STATUSES = ("pending", "taken", "be", "secured")
-# "tp1_hit" est désormais TERMINAL (TP unique à RR4 = fin du trade) et n'est
-# plus compté comme position ouverte. "secured" reste dans cette liste
-# uniquement pour la compatibilité de lecture des anciens signaux en base
-# (grille précédente, encore au statut "secured" au moment de la migration) —
-# un nouveau signal ne peut plus jamais atteindre ce statut.
+def configure_logging() -> None:
+    logging.basicConfig(
+        level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
+        format="%(asctime)s UTC | %(levelname)-8s | %(name)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    logging.Formatter.converter = _time.gmtime
 
 
-def count_open_positions() -> int:
-    """Nombre de positions actuellement considérées comme 'ouvertes'
-    (pas encore fermées/invalidées), utilisé pour plafonner via
-    settings['max_open_positions']."""
-    with get_conn() as conn:
-        row = conn.execute(
-            f"SELECT COUNT(*) c FROM signals WHERE status IN "
-            f"({','.join('?' for _ in OPEN_STATUSES)})",
-            OPEN_STATUSES,
-        ).fetchone()
-        return row["c"]
+# =============================================================================
+# 2. CLIENT WEBSOCKET DERIV
+# =============================================================================
+
+log_client = logging.getLogger("deriv.client")
+
+MessageHandler = Callable[[dict], Awaitable[None]]
 
 
-def last_closed_result(symbol: Optional[str] = None) -> Optional[float]:
-    """Résultat en R du dernier trade clôturé (tous actifs, ou un actif
-    précis si `symbol` est fourni). Utilisé pour le calcul martingale/recovery."""
-    query = "SELECT * FROM signals WHERE status IN ('tp1_hit','tp2_hit','secured','invalidated','be','tp1_sl_hit')"
-    params: List = []
-    if symbol:
-        query += " AND symbol = ?"
-        params.append(symbol)
-    query += " ORDER BY COALESCE(closed_at, updated_at) DESC LIMIT 1"
-    with get_conn() as conn:
-        row = conn.execute(query, params).fetchone()
-    return _r_result(row) if row else None
+class DerivClient:
+    def __init__(self, settings: ConnectionSettings):
+        self.settings = settings
+        self._ws: Optional[websockets.WebSocketClientProtocol] = None
+        self._req_id_counter = itertools.count(1)
+        self._pending: dict[int, asyncio.Future] = {}
+        self._msg_type_handlers: dict[str, list[MessageHandler]] = {}
+        self._subscribed_requests: list[dict] = []
+        self._connected_event = asyncio.Event()
+        self._stop = False
+        self._last_message_at = 0.0
+
+    def on(self, msg_type: str, handler: MessageHandler) -> None:
+        self._msg_type_handlers.setdefault(msg_type, []).append(handler)
+
+    async def run_forever(self) -> None:
+        """Boucle de connexion permanente : ne se termine jamais d'elle-même
+        (seul self.stop() l'arrête). Toute erreur — réseau, protocole, ou
+        inattendue — déclenche une reconnexion avec palier progressif, sans
+        jamais laisser une exception remonter et tuer le programme."""
+        attempt = 0
+        while not self._stop:
+            try:
+                await self._run_once()
+                attempt = 0   # connexion réussie : on repart du 1er palier au prochain incident
+            except (ConnectionClosed, OSError, asyncio.TimeoutError) as exc:
+                log_client.warning("Connexion Deriv perdue (%s).", exc)
+            except Exception:
+                log_client.exception("Erreur inattendue dans la boucle WebSocket (le bot continue).")
+            finally:
+                self._connected_event.clear()
+                self._ws = None
+                self._fail_all_pending("connexion fermée")
+
+            if self._stop:
+                break
+            delays = self.settings.reconnect_delays
+            delay = delays[min(attempt, len(delays) - 1)]
+            log_client.info("Reconnexion dans %.0fs (tentative %d).", delay, attempt + 1)
+            await asyncio.sleep(delay)
+            attempt += 1
+
+    async def stop(self) -> None:
+        self._stop = True
+        if self._ws is not None:
+            await self._ws.close()
+
+    async def request(self, payload: dict, timeout: float = 15.0) -> dict:
+        await self._connected_event.wait()
+        req_id = next(self._req_id_counter)
+        payload = dict(payload, req_id=req_id)
+        fut: asyncio.Future = asyncio.get_event_loop().create_future()
+        self._pending[req_id] = fut
+        await self._send(payload)
+        try:
+            return await asyncio.wait_for(fut, timeout=timeout)
+        finally:
+            self._pending.pop(req_id, None)
+
+    async def subscribe(self, payload: dict) -> None:
+        self._subscribed_requests.append(payload)
+        await self._connected_event.wait()
+        await self._send(dict(payload, req_id=next(self._req_id_counter)))
+
+    async def _send(self, payload: dict) -> None:
+        if self._ws is None:
+            raise ConnectionClosed(None, None)
+        await self._ws.send(json.dumps(payload))
+
+    async def _run_once(self) -> None:
+        url = self.settings.deriv_ws_url
+        log_client.info("Connexion à Deriv : %s", url.split("?")[0])
+        async with websockets.connect(url, ping_interval=20, ping_timeout=20) as ws:
+            self._ws = ws
+            self._connected_event.set()
+            self._last_message_at = asyncio.get_event_loop().time()
+            log_client.info("Connecté à Deriv.")
+
+            await self._resubscribe_all()
+
+            heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+            try:
+                async for raw in ws:
+                    self._last_message_at = asyncio.get_event_loop().time()
+                    await self._handle_raw_message(raw)
+            finally:
+                heartbeat_task.cancel()
+
+    async def _resubscribe_all(self) -> None:
+        for payload in self._subscribed_requests:
+            try:
+                await self._send(dict(payload, req_id=next(self._req_id_counter)))
+            except Exception:
+                log_client.exception("Échec de réabonnement pour %s", payload)
+
+    async def _heartbeat_loop(self) -> None:
+        interval = self.settings.heartbeat_interval_sec
+        timeout = self.settings.heartbeat_timeout_sec
+        try:
+            while True:
+                await asyncio.sleep(interval)
+                if self._ws is None:
+                    return
+                idle = asyncio.get_event_loop().time() - self._last_message_at
+                if idle > timeout:
+                    log_client.warning("Heartbeat : aucune donnée reçue depuis %.0fs, connexion morte.", idle)
+                    await self._ws.close()
+                    return
+                try:
+                    await self._send({"ping": 1, "req_id": next(self._req_id_counter)})
+                except Exception:
+                    return
+        except asyncio.CancelledError:
+            return
+
+    async def _handle_raw_message(self, raw: str) -> None:
+        try:
+            msg = json.loads(raw)
+        except json.JSONDecodeError:
+            log_client.error("Message non-JSON reçu, ignoré.")
+            return
+
+        if msg.get("error"):
+            log_client.error("Erreur API Deriv : %s", msg["error"])
+
+        req_id = msg.get("req_id")
+        fut = self._pending.get(req_id) if req_id is not None else None
+        if fut is not None and not fut.done():
+            fut.set_result(msg)
+
+        msg_type = msg.get("msg_type")
+        for handler in self._msg_type_handlers.get(msg_type, []):
+            try:
+                await handler(msg)
+            except Exception:
+                log_client.exception("Erreur dans un handler pour msg_type=%s", msg_type)
+
+    def _fail_all_pending(self, reason: str) -> None:
+        for fut in self._pending.values():
+            if not fut.done():
+                fut.set_exception(ConnectionError(reason))
+        self._pending.clear()
 
 
-def get_effective_risk_percent(symbol: Optional[str] = None, settings: Optional[Dict] = None) -> float:
-    """Calcule le risque par trade (%) réellement appliqué, en tenant compte
-    du mode risque de base, de la martingale (augmente après une perte) et
-    du recovery (augmente progressivement tant que le compte est en drawdown).
-    Les deux logiques ne se cumulent pas au-delà du plafond recovery_max_multiplier
-    / martingale_multiplier, pour ne jamais s'emballer."""
-    s = settings or get_settings()
-    base_risk = s["risk_percent"]
+# =============================================================================
+# 3. DÉCOUVERTE DES SYMBOLES (active_symbols)
+# =============================================================================
 
-    if s.get("martingale_enabled"):
-        r = last_closed_result(symbol)
-        if r is not None and r < 0:
-            return round(base_risk * s.get("martingale_multiplier", 2.0), 4)
+log_symbols = logging.getLogger("deriv.symbols")
 
-    if s.get("recovery_enabled"):
-        now = datetime.now(timezone.utc)
-        start_ts, end_ts = _month_bounds(now)
-        month_stats = get_period_stats(start_ts, end_ts)
-        if month_stats["total_r"] < 0:
-            # Plus le drawdown du mois est marqué, plus on augmente le risque,
-            # borné par recovery_max_multiplier.
-            factor = min(1 + abs(month_stats["total_r"]) / 10.0, s.get("recovery_max_multiplier", 1.5))
-            return round(base_risk * factor, 4)
-
-    return base_risk
+_FUZZY_THRESHOLD = 0.55
 
 
-def get_effective_risk_amount(symbol: Optional[str] = None, settings: Optional[Dict] = None) -> float:
-    """Calcule le risque $ réellement appliqué au prochain signal, en tenant
-    compte du mode choisi (dollar fixe ou % du capital) et de la martingale /
-    recovery (même logique que get_effective_risk_percent, appliquée au montant $)."""
-    s = settings or get_settings()
-    if s.get("risk_unit") == "dollar":
-        base_amount = s.get("risk_dollar_amount", 10.0)
-    else:
-        base_amount = s["capital"] * (get_effective_risk_percent(symbol, s) / 100.0)
-        return round(base_amount, 2)  # martingale/recovery déjà appliqués dans get_effective_risk_percent
-
-    if s.get("martingale_enabled"):
-        r = last_closed_result(symbol)
-        if r is not None and r < 0:
-            return round(base_amount * s.get("martingale_multiplier", 2.0), 2)
-
-    if s.get("recovery_enabled"):
-        now = datetime.now(timezone.utc)
-        start_ts, end_ts = _month_bounds(now)
-        month_stats = get_period_stats(start_ts, end_ts)
-        if month_stats["total_r"] < 0:
-            factor = min(1 + abs(month_stats["total_r"]) / 10.0, s.get("recovery_max_multiplier", 1.5))
-            return round(base_amount * factor, 2)
-
-    return round(base_amount, 2)
+@dataclass
+class MarketSymbol:
+    key: str
+    label: str
+    display_name: str
+    symbol: str
+    market: str
+    available: bool
 
 
-def increment_daily_counter(symbol: str):
-    day = _today_key()
-    with get_conn() as conn:
-        conn.execute(
-            """INSERT INTO daily_counters (day, symbol, count) VALUES (?, ?, 1)
-               ON CONFLICT(day, symbol) DO UPDATE SET count = count + 1""",
-            (day, symbol),
-        )
+def _normalize(text: str) -> str:
+    text = text.lower()
+    text = re.sub(r"[^a-z0-9 /]+", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
 
 
-def record_heartbeat(mark_scan: bool = True):
-    """Appelé à chaque itération de la boucle de scan (et périodiquement par
-    le watchdog) pour prouver que le processus est vivant."""
-    now = time.time()
-    with get_conn() as conn:
-        if mark_scan:
-            conn.execute(
-                "UPDATE watchdog_heartbeat SET last_scan_at=?, last_heartbeat_at=? WHERE id=1",
-                (now, now),
+def _match_score(aliases: list[str], candidate_name: str) -> float:
+    norm_candidate = _normalize(candidate_name)
+    best = 0.0
+    for alias in aliases:
+        norm_alias = _normalize(alias)
+        if norm_alias == norm_candidate:
+            return 1.0
+        if norm_alias in norm_candidate or norm_candidate in norm_alias:
+            best = max(best, 0.9)
+        ratio = difflib.SequenceMatcher(None, norm_alias, norm_candidate).ratio()
+        best = max(best, ratio)
+    return best
+
+
+async def discover_symbols(client: DerivClient, market_definitions: list[dict]) -> dict[str, MarketSymbol]:
+    """Interroge active_symbols et retourne {key: MarketSymbol} pour les
+    marchés trouvés. Les marchés introuvables sont journalisés et omis :
+    le bot continue avec les marchés disponibles."""
+    response = await client.request({"active_symbols": "brief", "product_type": "basic"})
+
+    if response.get("error"):
+        log_symbols.error("active_symbols a échoué : %s", response["error"])
+        return {}
+
+    raw_symbols = response.get("active_symbols", [])
+    log_symbols.info("active_symbols : %d marchés actifs reçus depuis Deriv.", len(raw_symbols))
+
+    result: dict[str, MarketSymbol] = {}
+
+    for market_def in market_definitions:
+        key = market_def["key"]
+        label = market_def["label"]
+        aliases = market_def["aliases"]
+
+        excludes = [t.lower() for t in market_def.get("exclude", [])]
+
+        best_entry = None
+        best_score = 0.0
+        for entry in raw_symbols:
+            haystack = f"{entry.get('display_name', '')} {entry.get('symbol', '')}".lower()
+            if any(tok in haystack for tok in excludes):
+                continue
+            candidate_names = [entry.get("display_name", ""), entry.get("symbol", "")]
+            score = max(_match_score(aliases, name) for name in candidate_names if name)
+            if score > best_score:
+                best_score = score
+                best_entry = entry
+
+        if best_entry is not None and best_score >= _FUZZY_THRESHOLD:
+            market_symbol = MarketSymbol(
+                key=key, label=label,
+                display_name=best_entry.get("display_name", ""),
+                symbol=best_entry.get("symbol", ""),
+                market=best_entry.get("market", ""),
+                available=bool(best_entry.get("exchange_is_open", 1))
+                and not bool(best_entry.get("is_trading_suspended", 0)),
             )
+            result[key] = market_symbol
+            log_symbols.info("%s -> symbol réel : %s (display_name=%r, score=%.2f)",
+                              label, market_symbol.symbol, market_symbol.display_name, best_score)
         else:
-            conn.execute(
-                "UPDATE watchdog_heartbeat SET last_heartbeat_at=? WHERE id=1",
-                (now,),
-            )
+            log_symbols.warning("[MARCHÉ INDISPONIBLE] %s", label)
 
+    return result
 
-def get_heartbeat_status() -> Dict:
-    with get_conn() as conn:
-        row = conn.execute("SELECT * FROM watchdog_heartbeat WHERE id=1").fetchone()
-    now = time.time()
-    if not row:
-        return {"last_scan_at": None, "seconds_since_scan": None, "healthy": False,
-                "restart_count": 0}
-    last_scan = row["last_scan_at"]
-    seconds_since = (now - last_scan) if last_scan else None
-    return {
-        "last_scan_at": last_scan,
-        "last_heartbeat_at": row["last_heartbeat_at"],
-        "seconds_since_scan": seconds_since,
-        "healthy": seconds_since is not None and seconds_since < WATCHDOG_MAX_SILENCE_SECONDS,
-        "restart_count": row["restart_count"],
-        "last_restart_at": row["last_restart_at"],
-        "last_restart_reason": row["last_restart_reason"],
-    }
 
+# =============================================================================
+# 4. TICKS
+# =============================================================================
 
-def record_watchdog_restart(reason: str):
-    now = time.time()
-    with get_conn() as conn:
-        conn.execute(
-            """UPDATE watchdog_heartbeat
-               SET restart_count = restart_count + 1, last_restart_at=?, last_restart_reason=?
-               WHERE id=1""",
-            (now, reason),
-        )
+log_ticks = logging.getLogger("deriv.ticks")
 
-
-# ============================================================================
-# 3. SOURCES DE DONNÉES
-# ============================================================================
-
-# --- PRICE SAFETY : ordre obligatoire MT5 -> Yahoo futures (fallback) -> ---
-# aucune donnée = PAS DE SIGNAL. Ne jamais utiliser une donnée périmée/vide.
-MAX_CANDLE_AGE_SECONDS = int(os.environ.get("MAX_CANDLE_AGE_SECONDS", "900"))
-MIN_CANDLES_REQUIRED = 30
-
-# Étiquette affichée dans les logs / messages pour identifier la source EXACTE
-# du prix utilisé pour un signal donné (MT5 = prix broker réel, YAHOO_GC_F /
-# YAHOO_SI_F = futures Yahoo Finance, fallback uniquement — jamais présenté
-# comme le prix exact du broker).
-_YFINANCE_LABELS = {"XAUUSD": "YAHOO_GC_F", "XAGUSD": "YAHOO_SI_F"}
-
-
-def _price_source_label(symbol: str, source: str) -> str:
-    if source == "mt5_bridge":
-        return "MT5"
-    if source == "yfinance":
-        return _YFINANCE_LABELS.get(symbol, "YAHOO")
-    if source == "twelvedata":
-        return "TWELVEDATA"
-    if source == "binance":
-        return "BINANCE"
-    if source == "gold_price_service":
-        # Reflète la source RÉELLE ayant répondu au dernier poll de la chaîne
-        # (gold-api.com ou goldapi.io) — voir FallbackChainFeed plus bas.
-        active = None
-        if xauusd_price_service is not None and xauusd_price_service.last_tick is not None:
-            active = xauusd_price_service.last_tick.source
-        return f"GOLD_PRICE_SERVICE({active or '?'})"
-    return source.upper()
-
-
-def fetch_candles(symbol: str, limit: int = 200):
-    """Retourne (candles, source_utilisee). Ordre STRICT : source principale
-    de l'actif (MT5 pour XAUUSD/XAGUSD) -> fallback_data_source -> (si défini)
-    fallback_data_source_2 -> si tout échoue, l'exception remonte et
-    l'appelant doit émettre NO SIGNAL. Ne remplace JAMAIS silencieusement par
-    une source approximative non prévue dans AssetConfig (ex. PAXG-USD)."""
-    asset = ASSETS[symbol]
-    timeframe = get_settings().get("timeframe", TIMEFRAME)
-    interval = TIMEFRAME_TO_INTERVAL.get(timeframe, "5m")
-    # Chaîne ordonnée des sources à essayer pour cet actif -- construite à
-    # partir de AssetConfig, jamais codée en dur ici. None filtré (2e niveau
-    # de secours optionnel, absent pour la plupart des actifs).
-    chain = [s for s in (asset.data_source, asset.fallback_data_source, asset.fallback_data_source_2) if s]
-    last_error: Optional[Exception] = None
-    for position, data_source in enumerate(chain):
-        try:
-            candles = _fetch_by_source(data_source, symbol, limit, interval)
-            if position > 0:
-                log.warning(
-                    f"[{symbol}] repli sur '{data_source}' (niveau {position + 1}/{len(chain)}) "
-                    f"-- source(s) précédente(s) en échec : {last_error}"
-                )
-            return candles, data_source
-        except Exception as e:
-            last_error = e
-            if position < len(chain) - 1:
-                log.warning(f"[{symbol}] source '{data_source}' indisponible ({e}) "
-                            f"-> repli sur '{chain[position + 1]}'.")
-    # Toutes les sources de la chaîne ont échoué -> l'appelant doit traiter
-    # ceci comme NO SIGNAL (jamais de prix inventé/simulé).
-    raise last_error if last_error is not None else RuntimeError(
-        f"[{symbol}] aucune source de données configurée (chaîne vide)."
-    )
-
-
-def validate_price_data(symbol: str, candles: List[Dict]) -> Optional[str]:
-    """Retourne None si les données sont exploitables pour générer un signal,
-    sinon une raison de rejet (-> NO SIGNAL). Vérifie : présence, nombre
-    minimum de bougies, OHLC complets et valides, et âge de la dernière bougie
-    (donnée périmée = rejetée, jamais utilisée pour un signal)."""
-    if not candles:
-        return "aucune donnée reçue"
-    if len(candles) < MIN_CANDLES_REQUIRED:
-        return f"seulement {len(candles)} bougies reçues (minimum {MIN_CANDLES_REQUIRED})"
-    last = candles[-1]
-    for key in ("time", "open", "high", "low", "close"):
-        if last.get(key) is None:
-            return f"champ '{key}' manquant sur la dernière bougie (OHLC incomplet)"
-    o, h, l, c = last["open"], last["high"], last["low"], last["close"]
-    try:
-        if min(o, h, l, c) <= 0:
-            return "prix invalide (<= 0) sur la dernière bougie"
-    except TypeError:
-        return "prix non numérique sur la dernière bougie"
-    if h < l or h < o or h < c or l > o or l > c:
-        return "OHLC incohérent sur la dernière bougie (high/low invalides)"
-    age = time.time() - last["time"]
-    if age > MAX_CANDLE_AGE_SECONDS:
-        return f"donnée périmée (dernière bougie vieille de {age:.0f}s, max toléré {MAX_CANDLE_AGE_SECONDS}s)"
-    return None
-
-
-def _fetch_by_source(data_source: str, symbol: str, limit: int, interval: str) -> List[Dict]:
-    if data_source == "mt5_bridge":
-        return _fetch_mt5_bridge(symbol, limit)
-    elif data_source == "gold_price_service":
-        return _fetch_gold_price_service(symbol, limit)
-    elif data_source == "twelvedata":
-        return _fetch_twelvedata(symbol, limit, interval)
-    elif data_source == "yfinance":
-        return _fetch_yfinance(symbol, limit, interval)
-    elif data_source == "binance":
-        return _fetch_binance(symbol, limit, interval)
-    raise ValueError(f"Source de données inconnue : {data_source}")
-
-
-_TWELVEDATA_INTERVAL_MAP = {"1m": "1min", "5m": "5min"}
-_TWELVEDATA_SYMBOL_MAP = {"XAUUSD": "XAU/USD", "XAGUSD": "XAG/USD", "BTCUSD": "BTC/USD"}
-
-
-def _fetch_twelvedata(symbol: str, limit: int, interval: str = "5m") -> List[Dict]:
-    """Flux spot réel (XAU/USD, XAG/USD) via TwelveData — remplace le proxy
-    futures yfinance (GC=F/SI=F), décalé de plusieurs dizaines de dollars par
-    rapport au prix affiché sur MT5."""
-    if not TWELVEDATA_API_KEY:
-        raise RuntimeError(
-            "TWELVEDATA_API_KEY manquante — créer un compte gratuit sur "
-            "twelvedata.com et ajouter la clé dans les variables d'environnement Render."
-        )
-    td_symbol = _TWELVEDATA_SYMBOL_MAP.get(symbol, symbol)
-    td_interval = _TWELVEDATA_INTERVAL_MAP.get(interval, "5min")
-    url = (
-        "https://api.twelvedata.com/time_series"
-        f"?symbol={urllib.parse.quote(td_symbol)}&interval={td_interval}"
-        f"&outputsize={limit}&apikey={TWELVEDATA_API_KEY}"
-    )
-    with urllib.request.urlopen(url, timeout=10) as resp:
-        raw = json.loads(resp.read().decode())
-    if raw.get("status") == "error" or "values" not in raw:
-        raise RuntimeError(f"TwelveData erreur pour {symbol}: {raw.get('message', raw)}")
-    values = list(reversed(raw["values"]))  # TwelveData renvoie du plus récent au plus ancien
-    candles = []
-    for v in values:
-        candles.append({
-            "time": datetime.strptime(v["datetime"], "%Y-%m-%d %H:%M:%S").timestamp()
-            if len(v["datetime"]) > 10 else
-            datetime.strptime(v["datetime"], "%Y-%m-%d").timestamp(),
-            "open": float(v["open"]), "high": float(v["high"]),
-            "low": float(v["low"]), "close": float(v["close"]),
-        })
-    return candles
-
-
-def _fetch_yfinance(symbol: str, limit: int, interval: str = "5m") -> List[Dict]:
-    import yfinance as yf
-    import pandas as pd  # dépendance de yfinance, toujours présente
-    ticker_map = {"XAUUSD": "GC=F", "XAGUSD": "SI=F"}
-    ticker = ticker_map.get(symbol, symbol)
-    # yfinance limite l'historique disponible en intraday : 1m -> 7 jours max,
-    # 5m -> 60 jours max. "2d" reste largement suffisant pour les deux, et
-    # évite un rejet de l'API sur des périodes trop longues en 1m.
-    period = "1d" if interval == "1m" else "2d"
-    # Yahoo Finance bloque de plus en plus les requêtes dont l'empreinte
-    # technique (TLS/HTTP) ne ressemble pas à un vrai navigateur -> réponse
-    # vide qui casse le parsing JSON de yfinance (fréquent sur IP de serveurs
-    # cloud comme Render). yfinance >= 0.2.4x gère `curl_cffi` en interne dès
-    # qu'il est installé (cf. requirements.txt) — NE PAS lui passer de
-    # session curl_cffi manuelle : ça casse sa gestion interne du cookie
-    # Yahoo et provoque l'erreur "'str' object has no attribute 'name'".
-    # Depuis yfinance >= 0.2.31, download() renvoie par défaut des colonnes
-    # MultiIndex (ex. ("Open", "GC=F")) même pour un seul ticker. Sans
-    # multi_level_index=False, row["Open"] renvoie alors une Series (et non
-    # un scalaire) -> `float(row["Open"])` plantait avec
-    # "TypeError: float() argument must be a string or a real number, not 'Series'".
-    data = yf.download(ticker, period=period, interval=interval, progress=False)
-    if isinstance(data.columns, pd.MultiIndex):  # filet de sécurité si l'argument ci-dessus est ignoré
-        data.columns = data.columns.get_level_values(0)
-    candles = []
-    for idx, row in data.tail(limit).iterrows():
-        candles.append({
-            "time": idx.timestamp(),
-            "open": float(row["Open"]), "high": float(row["High"]),
-            "low": float(row["Low"]), "close": float(row["Close"]),
-        })
-    return candles
-
-
-def _fetch_binance(symbol: str, limit: int, interval: str = "5m") -> List[Dict]:
-    # MODIFICATION : api.binance.com -> data-api.binance.vision. C'est le
-    # domaine que Binance documente explicitement pour les données de marché
-    # publiques (klines inclus), séparé de l'API de trading -- cf.
-    # https://developers.binance.com/docs/binance-spot-api-docs/faqs/market_data_only
-    # Objectif : contourner le blocage géographique HTTP 451 qui touche
-    # api.binance.com pour les IP US (le cas le plus probable pour la région
-    # par défaut d'un service Render). Pas de garantie à 100% que ce domaine
-    # échappe au même geo-blocage -> si ça échoue quand même, fetch_candles()
-    # bascule automatiquement sur asset.fallback_data_source (twelvedata).
-    pair = "BTCUSDT"
-    url = f"https://data-api.binance.vision/api/v3/klines?symbol={pair}&interval={interval}&limit={limit}"
-    with urllib.request.urlopen(url, timeout=10) as resp:
-        raw = json.loads(resp.read().decode())
-    return [{
-        "time": k[0] / 1000, "open": float(k[1]), "high": float(k[2]),
-        "low": float(k[3]), "close": float(k[4]),
-    } for k in raw]
-
-
-# ============================================================================
-# 4. STRUCTURE : SWING POINTS, LIQUIDITÉ, SWEEP
-# ============================================================================
-
-@dataclass
-class SwingPoint:
-    index: int
-    price: float
-    kind: str          # "high" | "low"
-    mitigated: bool = False
-
-
-@dataclass
-class LiquiditySweep:
-    swept_point: SwingPoint
-    sweep_index: int
-    sweep_wick_price: float
-    direction: str      # "bullish" | "bearish"
-
-
-def find_swing_points(candles: List[Dict], lookback: int = 3) -> List[SwingPoint]:
-    points = []
-    n = len(candles)
-    for i in range(lookback, n - lookback):
-        window = candles[i - lookback:i + lookback + 1]
-        high_i, low_i = candles[i]["high"], candles[i]["low"]
-        if high_i == max(c["high"] for c in window):
-            points.append(SwingPoint(index=i, price=high_i, kind="high"))
-        if low_i == min(c["low"] for c in window):
-            points.append(SwingPoint(index=i, price=low_i, kind="low"))
-    return points
-
-
-def _reclaimed_within(
-    candles: List[Dict], sweep_index: int, level: float, kind: str, reclaim_bars: int = SWEEP_RECLAIM_BARS
-) -> bool:
-    """Vérifie que le prix reclaim la zone (clôture revenue du bon côté du
-    niveau balayé) dans les `reclaim_bars` bougies suivant le sweep. Sert de
-    garde-fou pour le sweep par bougie institutionnelle (corps déjà cassé au
-    moment du sweep, donc pas de rejet immédiat par la mèche seule)."""
-    n = len(candles)
-    end = min(n, sweep_index + 1 + reclaim_bars)
-    for i in range(sweep_index, end):
-        c = candles[i]
-        if kind == "high" and c["close"] <= level:
-            return True
-        if kind == "low" and c["close"] >= level:
-            return True
-    return False
-
-
-def detect_liquidity_sweep(
-    candles: List[Dict], swing_points: List[SwingPoint], search_window: int = 8
-) -> Optional[LiquiditySweep]:
-    """Cherche un sweep sur les `search_window` dernières bougies (pas seulement
-    la toute dernière — nécessaire en scan continu pour ne pas perdre le setup
-    le temps que la BOS se confirme sur les bougies suivantes)."""
-    if not candles:
-        return None
-    n = len(candles)
-    start_scan = max(0, n - search_window)
-
-    for idx in range(n - 1, start_scan - 1, -1):
-        candle = candles[idx]
-        body_high = max(candle["open"], candle["close"])
-        body_low = min(candle["open"], candle["close"])
-        candidates = sorted(
-            [p for p in swing_points if not p.mitigated and p.index < idx],
-            key=lambda p: -p.index,
-        )
-        for point in candidates:
-            # Sweep classique : la mèche dépasse le niveau, le corps reste de l'autre côté.
-            # Reclaim déjà satisfait sur la même bougie (comportement identique à avant).
-            if point.kind == "high" and candle["high"] > point.price and body_high <= point.price:
-                return LiquiditySweep(point, idx, candle["high"], "bearish")
-            if point.kind == "low" and candle["low"] < point.price and body_low >= point.price:
-                return LiquiditySweep(point, idx, candle["low"], "bullish")
-            # Sweep par bougie institutionnelle : le corps casse déjà le niveau —
-            # on exige un reclaim (clôture revenue du bon côté) dans les
-            # SWEEP_RECLAIM_BARS bougies suivantes, sinon ce n'est pas un vrai
-            # piège de liquidité mais une cassure franche.
-            if point.kind == "high" and body_high > point.price:
-                if _reclaimed_within(candles, idx, point.price, "high"):
-                    return LiquiditySweep(point, idx, candle["high"], "bearish")
-                continue
-            if point.kind == "low" and body_low < point.price:
-                if _reclaimed_within(candles, idx, point.price, "low"):
-                    return LiquiditySweep(point, idx, candle["low"], "bullish")
-                continue
-    return None
-
-
-# ============================================================================
-# 5. BOS / CHoCH + FVG
-# ============================================================================
-
-@dataclass
-class BOSConfirmation:
-    confirmed: bool
-    break_index: int
-    break_level: float
-    direction: str
-
-
-@dataclass
-class FVGZone:
-    top: float
-    bottom: float
-    index: int
-    direction: str
-    mitigated: bool = False
-
-
-def _find_structure_level(swing_points: List[SwingPoint], sweep: LiquiditySweep) -> Optional[float]:
-    """Le niveau à casser pour valider le BOS = dernier swing OPPOSÉ avant le sweep
-    (pas le niveau balayé lui-même, qui serait trivialement toujours franchi)."""
-    opposite_kind = "high" if sweep.direction == "bullish" else "low"
-    prior_points = [p for p in swing_points if p.kind == opposite_kind and p.index < sweep.sweep_index]
-    if not prior_points:
-        return None
-    return max(prior_points, key=lambda p: p.index).price
-
-
-def confirm_bos(
-    candles: List[Dict], sweep: LiquiditySweep, swing_points: List[SwingPoint], max_lookahead: int = 15
-) -> Optional[BOSConfirmation]:
-    """RÈGLE STRICTE : validée uniquement par clôture du CORPS au-delà du niveau.
-    Une mèche seule ne valide jamais -> signal ignoré."""
-    level = _find_structure_level(swing_points, sweep)
-    if level is None:
-        return None
-    start = sweep.sweep_index + 1
-    end = min(len(candles), start + max_lookahead)
-    for i in range(start, end):
-        c = candles[i]
-        if sweep.direction == "bullish" and c["close"] > level and c["close"] > c["open"]:
-            return BOSConfirmation(True, i, level, "bullish")
-        if sweep.direction == "bearish" and c["close"] < level and c["close"] < c["open"]:
-            return BOSConfirmation(True, i, level, "bearish")
-    return None
-
-
-def wick_only_break_pending(candles: List[Dict], sweep: LiquiditySweep,
-                             swing_points: List[SwingPoint], max_lookahead: int = 15) -> bool:
-    """Distingue, quand le BOS n'est PAS encore confirmé, deux cas pour le
-    logging : une mèche a déjà dépassé le niveau de structure interne opposé
-    SANS qu'aucune clôture de corps ne le valide (WICK BREAK REJECTED), vs.
-    aucune bougie n'a encore approché ce niveau (WAITING FOR BODY CLOSE
-    SHIFT, cas normal d'attente). N'affecte jamais la décision de signal :
-    seule confirm_bos() (clôture du corps) valide un setup."""
-    level = _find_structure_level(swing_points, sweep)
-    if level is None:
-        return False
-    start = sweep.sweep_index + 1
-    end = min(len(candles), start + max_lookahead)
-    for i in range(start, end):
-        c = candles[i]
-        body_confirmed = (
-            (sweep.direction == "bullish" and c["close"] > level and c["close"] > c["open"]) or
-            (sweep.direction == "bearish" and c["close"] < level and c["close"] < c["open"])
-        )
-        if body_confirmed:
-            return False  # déjà validé par le corps -> pas un cas de rejet
-        wick_crossed = (
-            (sweep.direction == "bullish" and c["high"] > level) or
-            (sweep.direction == "bearish" and c["low"] < level)
-        )
-        if wick_crossed:
-            return True
-    return False
-
-
-def detect_fvg(candles: List[Dict], around_index: int, direction: str) -> Optional[FVGZone]:
-    """FVG sur la séquence à 3 bougies de la cassure (méthode ICT)."""
-    i = around_index
-    if i < 2 or i >= len(candles):
-        return None
-    c0, c2 = candles[i - 2], candles[i]
-    if direction == "bullish" and c2["low"] > c0["high"]:
-        return FVGZone(top=c2["low"], bottom=c0["high"], index=i, direction="bullish")
-    if direction == "bearish" and c2["high"] < c0["low"]:
-        return FVGZone(top=c0["low"], bottom=c2["high"], index=i, direction="bearish")
-    return None
-
-
-# ============================================================================
-# 6. RISQUE : ATR, SL, TP (RR4 UNIQUE), LOT
-# ============================================================================
-# NOTE : l'ancien sous-système de sélection dynamique du TP2 (Order Blocks +
-# scan_all_fvgs + TP2Target + select_smart_tp2, ~150 lignes) a été supprimé
-# le 03/09/2026 (MODIFICATION 1/5 — TP UNIQUE RR4). Il n'était de toute façon
-# JAMAIS appelé par process_asset() (mort depuis le passage au TP unique) et
-# référençait même une constante MIN_TP2_RR non définie ailleurs dans ce
-# fichier — un appel accidentel aurait crashé. Aucune stratégie d'entrée
-# (Sweep/BOS/CHoCH/FVG) n'est affectée : detect_fvg() et find_swing_points()
-# ci-dessus restent utilisés tels quels par process_asset().
-
-@dataclass
-class TradeLevels:
-    entry: float
-    stop_loss: float
-    tp1: float
-    tp2: Optional[float]
-    rr_tp1: float
-    rr_tp2: Optional[float]
-    high_rr_warning: bool
-    tp2_source: Optional[str] = None
-
-
-def compute_atr(candles: List[Dict], period: int = ATR_PERIOD) -> float:
-    if len(candles) < period + 1:
-        return 0.0
-    trs = []
-    for i in range(1, len(candles)):
-        h, l, prev_c = candles[i]["high"], candles[i]["low"], candles[i - 1]["close"]
-        trs.append(max(h - l, abs(h - prev_c), abs(l - prev_c)))
-    return sum(trs[-period:]) / period
-
-
-def compute_levels(entry, direction, invalidation_price, candles, swing_points=None,
-                    spread_commission_buffer=0.0, tp_rr: Optional[float] = None) -> TradeLevels:
-    """Grille RR simplifiée : TP unique = RR{tp_rr} (BE au même trigger géré
-    côté suivi à RR{be_rr}, plus d'étape de sécurisation partielle
-    intermédiaire). Plus de TP2 : tp2/rr_tp2 restent à None dans TradeLevels.
-
-    MODIFICATION 4/5 : tp_rr vient de app_settings (get_settings()["tp_rr"]),
-    plus de constante TP1_RR codée en dur. Le paramètre est optionnel
-    uniquement pour permettre à l'appelant (process_asset) de réutiliser un
-    seul get_settings() par scan ; si omis, on relit la config persistée par
-    sécurité — jamais une valeur par défaut différente de celle-ci."""
-    if tp_rr is None:
-        tp_rr = get_settings()["tp_rr"]
-
-    atr = compute_atr(candles)
-    sl_distance = max(atr * ATR_SL_MULTIPLIER, 1e-9)
-    if INCLUDE_SPREAD_COMMISSION_BUFFER:
-        sl_distance += spread_commission_buffer
-
-    if direction == "BUY":
-        stop_loss = min(invalidation_price, entry) - sl_distance
-        risk = entry - stop_loss
-        tp1 = entry + risk * tp_rr
-    else:
-        stop_loss = max(invalidation_price, entry) + sl_distance
-        risk = stop_loss - entry
-        tp1 = entry - risk * tp_rr
-
-    return TradeLevels(entry, stop_loss, tp1, None, tp_rr, None, False, None)
-
-
-def compute_lot_size(capital, risk_percent, entry, stop_loss,
-                      pip_value_per_lot=10.0, pip_size=0.01) -> float:
-    """Conservée pour le calculateur manuel du dashboard (/api/lot) — inchangée,
-    ne concerne pas le calcul automatique du lot par signal (voir compute_lot_size_v2)."""
-    risk_amount = capital * (risk_percent / 100)
-    sl_pips = abs(entry - stop_loss) / pip_size
-    if sl_pips <= 0:
-        return 0.0
-    return round(risk_amount / (sl_pips * pip_value_per_lot), 2)
-
-
-MAX_LOT_DEFAULT = float(os.environ.get("MAX_LOT_DEFAULT", "50.0"))
-
-
-def compute_lot_size_v2(risk_amount: float, entry: float, stop_loss: float,
-                         value_per_point: float, lot_step: float = 0.01,
-                         min_lot: float = 0.01, max_lot: float = MAX_LOT_DEFAULT) -> float:
-    """Lot ENTIÈREMENT dynamique, recalculé à chaque signal — jamais de lot
-    fixe codé en dur. raw_lot = risk_usd / (abs(entry - SL) * value_per_point),
-    puis application du min lot, du max lot (garde-fou anti fat-finger), du
-    pas de lot (lot_step) et arrondi conforme au broker."""
-    price_diff = abs(entry - stop_loss)
-    if price_diff <= 0 or value_per_point <= 0 or risk_amount <= 0:
-        return 0.0
-    raw_lot = risk_amount / (price_diff * value_per_point)
-    lot = round(raw_lot / lot_step) * lot_step
-    lot = max(min_lot, min(lot, max_lot))
-    return round(lot, 2)
-
-
-def get_stars(entry_type: str) -> str:
-    return ENTRY_TYPES[entry_type]["stars"]
-
-
-# ============================================================================
-# 8. TELEGRAM
-# ============================================================================
-
-def _bot_token(group: str = "signal_group") -> str:
-    """Chaque groupe Telegram a son propre bot (donc son propre token).
-    'reports' retombe sur le token du groupe 'signal_group' si
-    TELEGRAM_BOT_TOKEN_REPORTS n'est pas défini. Si la variable d'env n'est
-    pas définie du tout, on retombe sur token_default (cf. avertissement de
-    sécurité au niveau de TELEGRAM_GROUPS)."""
-    group_cfg = TELEGRAM_GROUPS[group]
-    env_key = group_cfg["token_env"]
-    token = os.environ.get(env_key) or group_cfg.get("token_default")
-    if not token and group == "reports":
-        bg = TELEGRAM_GROUPS["signal_group"]
-        token = os.environ.get(bg["token_env"]) or bg.get("token_default")
-    if not token:
-        raise RuntimeError(f"Variable d'environnement {env_key} manquante pour le groupe '{group}'.")
-    return token
-
-
-def _chat_id_for_group(group: str) -> str:
-    group_cfg = TELEGRAM_GROUPS[group]
-    env_key = group_cfg["chat_id_env"]
-    chat_id = os.environ.get(env_key) or group_cfg.get("chat_id_default")
-    if not chat_id:
-        raise RuntimeError(f"Variable d'environnement {env_key} manquante pour le groupe '{group}'.")
-    return chat_id
-
-
-# --- Gestion des erreurs Telegram (retry, rate limit, bot bloqué) --------
-class TelegramForbiddenError(Exception):
-    """Le bot a été bloqué, ou l'utilisateur/groupe a supprimé la conversation
-    (Telegram renvoie 403). Ne sert à rien de retenter : c'est à l'appelant
-    de désactiver le destinataire concerné (cf. _send_command_reply)."""
-
-
-TELEGRAM_MAX_RETRIES = 3
-TELEGRAM_RETRY_BACKOFF_SECONDS = 1.5
-
-
-def _tg_error_reason(resp) -> str:
-    try:
-        return resp.json().get("description", resp.text)
-    except ValueError:
-        return resp.text
-
-
-def _tg_retry_after(resp) -> float:
-    try:
-        return float(resp.json().get("parameters", {}).get("retry_after", 3))
-    except (ValueError, TypeError):
-        return 3.0
-
-
-def _tg_call(token: str, method: str, data: Optional[Dict] = None,
-             files: Optional[Dict] = None, timeout: int = 15) -> Dict:
-    """Point de passage UNIQUE pour tous les appels à l'API Telegram
-    (sendMessage, sendPhoto, answerCallbackQuery, editMessageReplyMarkup...).
-    Centralise la gestion des erreurs :
-      - 429 (rate limit) : attend le `retry_after` renvoyé par Telegram puis
-        retente, jusqu'à TELEGRAM_MAX_RETRIES fois.
-      - 403 (bot bloqué/supprimé par le destinataire) : jamais de retry,
-        lève TelegramForbiddenError pour que l'appelant puisse désactiver
-        l'abonné concerné plutôt que de reloguer l'erreur en boucle.
-      - Erreur réseau/timeout : backoff progressif puis abandon.
-      - Autre code d'erreur HTTP : loggé avec le motif Telegram, puis levé
-        (comportement best-effort : ne doit jamais faire planter la boucle
-        de scan chez l'appelant, qui reste responsable de son propre try/except)."""
-    url = TELEGRAM_API.format(token=token, method=method)
-    last_exc: Optional[Exception] = None
-    for attempt in range(1, TELEGRAM_MAX_RETRIES + 1):
-        try:
-            if files:
-                resp = requests.post(url, data=data, files=files, timeout=timeout)
-            else:
-                resp = requests.post(url, data=data, timeout=timeout)
-        except requests.RequestException as e:
-            last_exc = e
-            log.warning(f"Telegram {method}: erreur réseau (tentative {attempt}/{TELEGRAM_MAX_RETRIES}): {e}")
-            time.sleep(TELEGRAM_RETRY_BACKOFF_SECONDS * attempt)
-            continue
-
-        if resp.status_code == 403:
-            raise TelegramForbiddenError(_tg_error_reason(resp))
-
-        if resp.status_code == 429:
-            retry_after = _tg_retry_after(resp)
-            log.warning(f"Telegram {method}: rate limit (429), pause {retry_after:.1f}s "
-                        f"(tentative {attempt}/{TELEGRAM_MAX_RETRIES}).")
-            time.sleep(retry_after)
-            continue
-
-        if not resp.ok:
-            reason = _tg_error_reason(resp)
-            log.warning(f"Telegram {method} a échoué ({resp.status_code}): {reason}")
-            resp.raise_for_status()
-
-        return resp.json()
-
-    if last_exc:
-        raise last_exc
-    raise RuntimeError(f"Telegram {method}: échec après {TELEGRAM_MAX_RETRIES} tentatives.")
-
-
-def format_signal_message(symbol, display_name, direction, entry_type_label, stars,
-                           entry, sl, tp1, tp2, rr_tp1, rr_tp2, lot: float,
-                           settings: Optional[Dict] = None) -> str:
-    """Message PUBLIC du groupe de signaux — le signal (ENTRY / SL / TP
-    RR unique) PLUS le lot suggéré. Le lot est calculé sur le risque et le
-    capital PERSONNELS du leader (voir compute_lot_size_v2) : il est donc
-    accompagné d'un avertissement invitant chacun à l'adapter à son propre
-    capital plutôt que de le copier tel quel. Le risque $, le solde et le
-    levier du leader, eux, restent strictement dans son DM privé (voir
-    format_leader_signal_dm).
-
-    MODIFICATION 4/5 : be_rr/tp_rr viennent TOUJOURS de get_settings()
-    (jamais un texte "RR2"/"RR4" codé en dur), pour rester exacts si ces
-    valeurs sont changées depuis Telegram."""
-    s = settings or get_settings()
-    direction_emoji = "🟢 ACHAT" if direction == "BUY" else "🔴 VENTE"
-    ts = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())
-    lines = [
-        "📢 *ALPHABOT SMC PRO*", "",
-        f"📊 *Actif* : {display_name} ({s.get('timeframe', TIMEFRAME)})",
-        f"🎯 *Setup* : Sweep + CHoCH — {entry_type_label} {stars}",
-        f"{direction_emoji}", "",
-        f"🔹 *ENTRY* : `{entry:.5f}`",
-        f"🛑 *SL* : `{sl:.5f}`",
-        f"🚀 *TP (RR{rr_tp1:g})* : `{tp1:.5f}`",
-    ]
-    lines.append(f"📐 *RR* : {rr_tp1:g}")
-    lines.append(f"📦 *Lot* : `{lot}` _(calculé sur le capital du leader — à adapter au vôtre)_")
-    lines += ["", f"🟡 BE à RR{s['be_rr']:g} · 🚀 TP à RR{s['tp_rr']:g}",
-              "", f"🕒 {ts}"]
-    return "\n".join(lines)
-
-
-def format_leader_signal_dm(symbol, display_name, direction, entry_type_label, stars,
-                             entry, sl, tp1, tp2, rr_tp1, rr_tp2,
-                             lot: float, risk_amount: float, settings: Optional[Dict] = None) -> str:
-    """DM PRIVÉ du leader UNIQUEMENT — détail complet du signal : direction,
-    niveaux, ET les infos personnelles (risque $, lot, levier) qui ne
-    doivent jamais apparaître dans le groupe public."""
-    s = settings or get_settings()
-    ts = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())
-    lines = [
-        f"📡 *SIGNAL {symbol}* (privé — leader uniquement)", "",
-        f"Direction : {direction}",
-        f"Entry : `{entry:.5f}`",
-        f"SL : `{sl:.5f}`",
-        f"TP (RR{rr_tp1:g}) : `{tp1:.5f}`",
-    ]
-    lines += [
-        "",
-        f"💰 Risque : {risk_amount:.2f}$",
-        f"📦 Lot : {lot}",
-        f"⚡ Levier : {s.get('leverage', 0):.0f}x",
-        f"🎯 Setup : Sweep + CHoCH — {entry_type_label} {stars}",
-        "", f"🟡 BE à RR{s['be_rr']:g} · 🚀 TP à RR{s['tp_rr']:g}",
-        "", f"🕒 {ts}",
-    ]
-    return "\n".join(lines)
-
-
-def format_leader_profile_message(settings: Optional[Dict] = None) -> str:
-    """Profil complet du leader — solde, risque, levier, lot type, état
-    ACTIF/DÉSACTIVÉ. Envoyé UNIQUEMENT en DM au leader (ex: /profil,
-    au démarrage du bot, ou sur demande)."""
-    s = settings or get_settings()
-    risk_txt = f"{s['risk_dollar_amount']:.2f}$" if s.get("risk_unit") == "dollar" \
-        else f"{s['risk_percent']:.2f}%"
-    active = s.get("signals_enabled", True)
-    lines = [
-        "📊 *PROFIL LEADER*", "",
-        f"💰 Solde : {s['capital']:.0f}$",
-        f"🎯 Risque/trade : {risk_txt}",
-        f"⚡ Levier : {s['leverage']:.0f}x",
-        f"📊 Positions max simultanées : {s['max_open_positions']}",
-        f"🕐 Session : {'24h/24' if s.get('session_mode') == '24h' else 'NY (13h-22h UTC)'}",
-        f"⏱ Timeframe : {s.get('timeframe', TIMEFRAME)}",
-        f"{'🟢 Signaux : ACTIVÉS' if active else '🔴 Signaux : DÉSACTIVÉS'}",
-    ]
-    return "\n".join(lines)
-
-
-
-
-
-def _cleanup_old_charts():
-    """Garde uniquement les CHARTS_KEEP_LAST images les plus récentes pour ne
-    pas saturer le disque sur un déploiement de longue durée."""
-    try:
-        files = [os.path.join(CHARTS_DIR, f) for f in os.listdir(CHARTS_DIR) if f.endswith(".png")]
-        files.sort(key=os.path.getmtime, reverse=True)
-        for f in files[CHARTS_KEEP_LAST:]:
-            os.remove(f)
-    except Exception:
-        pass
-
-
-def generate_signal_chart(symbol: str, display_name: str, direction: str,
-                           candles: List[Dict], sweep: "LiquiditySweep", bos: "BOSConfirmation",
-                           entry: float, sl: float, tp1: float, lookback: int = 60,
-                           signal_id: Optional[int] = None, rr_tp1: Optional[float] = None) -> Optional[str]:
-    """Génère une image professionnelle du setup AVANT l'envoi Telegram :
-    chandeliers, sweep de liquidité, BOS, zone d'entrée, SL, TP (RR unique) —
-    avec annotations couleurs + labels + emojis. Retourne le chemin du
-    fichier PNG, ou None en cas d'échec (le signal reste envoyé en texte).
-
-    MODIFICATION 4/5 : rr_tp1 (le multiple de RR réellement utilisé pour CE
-    signal, déjà calculé par compute_levels() à partir de
-    get_settings()["tp_rr"]) est affiché tel quel sur le graphique — plus de
-    libellé "RR4" codé en dur qui serait faux dès que /tprr change la valeur."""
-    try:
-        view = candles[-lookback:] if len(candles) > lookback else candles
-        offset = len(candles) - len(view)
-        x = list(range(len(view)))
-
-        fig, ax = plt.subplots(figsize=(11, 6.5), dpi=150)
-        fig.patch.set_facecolor("#0f1420")
-        ax.set_facecolor("#0f1420")
-
-        up_color, down_color = "#22c55e", "#ef4444"
-        for i, c in enumerate(view):
-            color = up_color if c["close"] >= c["open"] else down_color
-            ax.plot([i, i], [c["low"], c["high"]], color=color, linewidth=1, zorder=2)
-            body_bottom = min(c["open"], c["close"])
-            body_height = max(abs(c["close"] - c["open"]), 1e-9)
-            ax.add_patch(Rectangle((i - 0.3, body_bottom), 0.6, body_height,
-                                    facecolor=color, edgecolor=color, zorder=3))
-
-        # --- Sweep de liquidité --------------------------------------------
-        # NB : pas d'emoji dans le texte matplotlib (title/text/annotate) —
-        # le rendu d'emoji couleur via fallback de polices a provoqué un
-        # RecursionError (copy.deepcopy sur des Path très imbriqués côté
-        # matplotlib/Python 3.14) qui a fait planter la génération d'image.
-        sweep_i = sweep.sweep_index - offset
-        if 0 <= sweep_i < len(view):
-            ax.scatter([sweep_i], [sweep.sweep_wick_price], color="#38bdf8", s=90,
-                       marker="D", zorder=5, edgecolors="white", linewidths=0.8)
-            ax.annotate("SWEEP", xy=(sweep_i, sweep.sweep_wick_price),
-                        xytext=(sweep_i, sweep.sweep_wick_price), textcoords="data",
-                        color="#38bdf8", fontsize=10, fontweight="bold",
-                        va="bottom" if direction == "SELL" else "top", ha="left")
-
-        # --- CHoCH confirmé (structure cassée dans le sens INVERSE du sweep
-        # -> c'est un Change of Character, pas un BOS de continuation) ------
-        ax.axhline(bos.break_level, color="#f59e0b", linestyle="--", linewidth=1.2, zorder=1)
-        ax.text(len(view) - 1, bos.break_level, "  CHoCH confirme", color="#f59e0b",
-                fontsize=10, fontweight="bold", va="bottom", ha="left")
-
-        # --- Zone d'entrée / SL / TP (RR unique, configurable) ---
-        entry_emoji = "BUY" if direction == "BUY" else "SELL"
-        ax.axhline(entry, color="#3b82f6", linewidth=1.4, zorder=1)
-        ax.text(len(view) - 1, entry, f"  {entry_emoji}  Entree {entry:.5f}", color="#3b82f6",
-                fontsize=10, fontweight="bold", va="center", ha="left")
-
-        ax.axhline(sl, color="#ef4444", linewidth=1.4, zorder=1)
-        ax.text(len(view) - 1, sl, f"  SL {sl:.5f}", color="#ef4444",
-                fontsize=10, fontweight="bold", va="center", ha="left")
-
-        # TP UNIQUE (RR configurable, voir get_settings()["tp_rr"]) — un seul
-        # niveau affiché, plus de TP2/TP3 ni d'objectif intermédiaire (voir
-        # MODIFICATION 1/5, 03/09/2026 ; RR devenu configurable en 4/5).
-        ax.axhline(tp1, color="#22c55e", linewidth=1.4, zorder=1)
-        tp_label = f"TP (RR{rr_tp1:g}) {tp1:.5f}" if rr_tp1 is not None else f"TP {tp1:.5f}"
-        ax.text(len(view) - 1, tp1, f"  {tp_label}", color="#22c55e",
-                fontsize=10, fontweight="bold", va="center", ha="left")
-
-        ax.set_xlim(-1, len(view) + 22)
-        ax.tick_params(colors="#8b93a7")
-        for spine in ax.spines.values():
-            spine.set_color("#262e42")
-        ax.set_xticks([])
-        ax.grid(axis="y", color="#262e42", linewidth=0.5, alpha=0.5)
-
-        title_emoji = "BUY" if direction == "BUY" else "SELL"
-        ax.set_title(f"ALPHABOT SMC PRO — {display_name} ({get_settings().get('timeframe', TIMEFRAME)})  ·  {title_emoji}",
-                     color="#e8ecf4", fontsize=13, fontweight="bold", loc="left", pad=14)
-
-        fname = f"{symbol}_{signal_id or int(time.time())}_{int(time.time())}.png"
-        path = os.path.join(CHARTS_DIR, fname)
-        fig.tight_layout()
-        fig.savefig(path, facecolor=fig.get_facecolor())
-        plt.close(fig)
-        _cleanup_old_charts()
-        return path
-    except RecursionError:
-        # Garde-fou : évite que traceback.format_exc() (lui-même récursif)
-        # ne replante en cascade si la limite de récursion vient d'être
-        # atteinte pendant le rendu matplotlib (ex. emoji + fallback de
-        # polices sur certains environnements) — log court, pas de trace.
-        log.error(f"[{symbol}] échec de génération de l'image du signal : RecursionError "
-                  "(rendu matplotlib) — signal envoyé en texte seul.")
-        try:
-            plt.close("all")
-        except Exception:
-            pass
-        return None
-    except Exception:
-        log.error(f"[{symbol}] échec de génération de l'image du signal:\n{traceback.format_exc()}")
-        try:
-            plt.close("all")
-        except Exception:
-            pass
-        return None
-
-
-# --- Boutons interactifs -------------------------------------------------
-# Actions disponibles sous chaque signal Telegram. callback_data suit le
-# format compact "act:<signal_id>:<action>" (largement sous la limite de 64
-# octets imposée par Telegram pour callback_data).
-TRADE_ACTIONS = {
-    "taken":   {"emoji": "✅", "label": "Trade pris",   "status": "taken"},
-    "ignored": {"emoji": "❌", "label": "Trade ignoré",  "status": "ignored"},
-    "be":      {"emoji": "🟡", "label": "Break Even",   "status": "be"},
-    "closed":  {"emoji": "🔴", "label": "Clôturer",     "status": "closed"},
-}
-# "secured" retiré des actions manuelles disponibles (grille simplifiée
-# BE@RR2 / TP unique@RR4 — plus d'étape de sécurisation partielle pour un
-# nouveau signal). Le statut "secured" reste valide en LECTURE SEULE pour
-# l'historique des anciens signaux déjà en base (dashboard, stats, /report).
-
-
-def _signal_inline_keyboard(signal_id: int) -> Dict:
-    """Construit le clavier inline Telegram (2 boutons par ligne) affiché
-    sous chaque signal, pour permettre au trader de reporter en un tap ce
-    qu'il a réellement fait du trade."""
-    buttons = [
-        {"text": f"{a['emoji']} {a['label']}", "callback_data": f"act:{signal_id}:{key}"}
-        for key, a in TRADE_ACTIONS.items()
-    ]
-    rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
-    return {"inline_keyboard": rows}
-
-
-def send_telegram_signal(group: str, text: str, image_path: str = None, signal_id: int = None):
-    chat_id = _chat_id_for_group(group)
-    token = _bot_token(group)
-    reply_markup = _signal_inline_keyboard(signal_id) if signal_id is not None else None
-    if image_path:
-        data = {"chat_id": chat_id, "caption": text, "parse_mode": "Markdown"}
-        if reply_markup:
-            data["reply_markup"] = json.dumps(reply_markup)
-        with open(image_path, "rb") as img:
-            return _tg_call(token, "sendPhoto", data=data, files={"photo": img}, timeout=15)
-    data = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
-    if reply_markup:
-        data["reply_markup"] = json.dumps(reply_markup)
-    return _tg_call(token, "sendMessage", data=data, timeout=15)
-
-
-# --- Message de démarrage --------------------------------------------------
-# Envoyé sur le groupe de signaux (signal_group) à chaque lancement OU
-# redémarrage du process, pour que tu saches immédiatement sur Telegram que le
-# bot est bien en ligne (et pas seulement silencieusement en train de tourner
-# côté serveur). Si le redémarrage a été forcé par le watchdog, le message le
-# précise avec la raison, pour distinguer un déploiement normal d'un incident.
-STARTUP_NOTIFY_GROUPS = ()  # vide -> DM leader UNIQUEMENT (voir send_startup_notification) ; remettre "signal_group" ici pour avertir aussi un groupe au lancement/redémarrage
-
-
-def format_startup_message() -> str:
-    hb = get_heartbeat_status()
-    now = time.time()
-    forced_restart = bool(hb.get("last_restart_at")) and (now - hb["last_restart_at"]) < 300
-    ts = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())
-
-    lines = ["🟢 *ALPHABOT SMC PRO* — bot en ligne", ""]
-    if forced_restart:
-        lines += [
-            "⚠️ *Redémarrage automatique* déclenché par le watchdog.",
-            f"Raison : {hb.get('last_restart_reason') or 'inconnue'}",
-            f"Nombre total de redémarrages forcés : {hb.get('restart_count', 0)}",
-            "",
-        ]
-    lines += [
-        f"📊 *Actifs surveillés* : {', '.join(a.display_name for a in ASSETS.values())} ({get_settings().get('timeframe', TIMEFRAME)})",
-        f"🕒 {ts}",
-    ]
-    return "\n".join(lines)
-
-
-def send_startup_notification():
-    """Notifie en DM le leader (TELEGRAM_OWNER_ID) que le bot est
-    démarré/redémarré. STARTUP_NOTIFY_GROUPS est vide par défaut : aucun
-    groupe n'est averti. Pour avertir aussi un groupe, y remettre
-    "signal_group" — le message ne contient aucune donnée personnelle (pas
-    de lot, de risque $, de solde ou de levier), il peut donc être publié
-    tel quel. Chaque canal est indépendant et best-effort : une erreur
-    (token manquant, réseau...) est loggée mais ne doit jamais empêcher le
-    bot de démarrer/scanner, ni bloquer les autres canaux."""
-    text = format_startup_message()
-    send_leader_dm(text)
-    for group in STARTUP_NOTIFY_GROUPS:
-        try:
-            send_telegram_signal(group, text)
-        except RuntimeError:
-            pass  # groupe non configuré (token/chat_id manquant) -> ignoré silencieusement
-        except Exception:
-            log.error(f"Échec d'envoi du message de lancement sur le groupe '{group}':\n{traceback.format_exc()}")
-
-
-def _telegram_answer_callback(group: str, callback_query_id: str, text: str = "", show_alert: bool = False):
-    token = _bot_token(group)
-    return _tg_call(token, "answerCallbackQuery", data={
-        "callback_query_id": callback_query_id, "text": text[:200], "show_alert": show_alert,
-    }, timeout=10)
-
-
-def _telegram_edit_reply_markup(group: str, chat_id, message_id: int, reply_markup: Optional[Dict]):
-    token = _bot_token(group)
-    payload = {"chat_id": chat_id, "message_id": message_id,
-               "reply_markup": json.dumps(reply_markup or {"inline_keyboard": []})}
-    try:
-        return _tg_call(token, "editMessageReplyMarkup", data=payload, timeout=10)
-    except Exception:
-        # best-effort : un message déjà édité/supprimé ne doit jamais faire planter le webhook.
-        log.warning("Telegram editMessageReplyMarkup a échoué:\n" + traceback.format_exc())
-        return None
-
-
-# ----------------------------------------------------------------------
-# Diffusion — DM PRIVÉ DU LEADER UNIQUEMENT (send_leader_dm, TELEGRAM_OWNER_ID).
-# SIGNAL_BROADCAST_GROUPS est VIDE : plus aucun signal ni suivi de trade
-# n'est publié dans un groupe Telegram, tout part exclusivement en DM au
-# leader (solde, risque $, levier, lot, paramètres, suivi détaillé). Pour
-# republier aussi dans un groupe : remettre "signal_group" dans le tuple
-# ci-dessous — le texte public (SANS risque $/solde/levier, avec lot
-# indicatif) est déjà généré par format_signal_message, rien d'autre à
-# modifier.
-# ----------------------------------------------------------------------
-SIGNAL_BROADCAST_GROUPS = ()
-
-
-def send_leader_dm(text: str, image_path: Optional[str] = None):
-    """Envoie un message privé UNIQUEMENT au leader (TELEGRAM_OWNER_ID) — le
-    seul DM privé de tout le projet. C'est ici, et ici seulement, que
-    transitent les infos personnelles (solde, risque, levier, lot,
-    paramètres, suivi détaillé du signal). Si TELEGRAM_OWNER_ID n'est pas
-    défini, le message est simplement journalisé comme non envoyé (aucun
-    canal privé configuré) — jamais publié ailleurs en remplacement."""
-    if not TELEGRAM_OWNER_ID:
-        log.info("TELEGRAM_OWNER_ID non défini — DM leader non envoyé (aucun canal privé configuré).")
-        return
-    try:
-        token = _bot_token("signal_group")
-    except RuntimeError:
-        log.warning("Bot 'signal_group' non configuré (token manquant) — DM leader non envoyé.")
-        return
-    chat_id = str(TELEGRAM_OWNER_ID)
-    try:
-        if image_path:
-            with open(image_path, "rb") as img:
-                _tg_call(token, "sendPhoto",
-                         data={"chat_id": chat_id, "caption": text, "parse_mode": "Markdown"},
-                         files={"photo": img}, timeout=15)
-        else:
-            _tg_call(token, "sendMessage",
-                     data={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}, timeout=10)
-        log.info(f"DM leader envoyé avec succès (chat_id={chat_id}).")
-    except Exception:
-        log.warning(f"Échec d'envoi du DM leader (chat_id={chat_id}):\n{traceback.format_exc()}")
-
-
-def broadcast_signal(public_text: str, leader_text: Optional[str] = None,
-                      image_path: Optional[str] = None, signal_id: Optional[int] = None,
-                      symbol: Optional[str] = None, entry_price: Optional[float] = None,
-                      stop_loss: Optional[float] = None):
-    """Publie `public_text` sur le(s) groupe(s) listés dans
-    SIGNAL_BROADCAST_GROUPS (vide par défaut -> rien n'est publié dans un
-    groupe), puis — si fourni — envoie `leader_text` (détail complet : lot,
-    risque, solde, levier, paramètres) exclusivement en DM au leader. Les
-    deux canaux sont indépendants (best-effort)."""
-    for group in SIGNAL_BROADCAST_GROUPS:
-        try:
-            send_telegram_signal(group, public_text, image_path=image_path, signal_id=signal_id)
-        except RuntimeError:
-            pass  # groupe non configuré (token/chat_id manquant) -> ignoré silencieusement
-        except Exception:
-            log.error(f"Échec de diffusion du signal sur le groupe '{group}':\n{traceback.format_exc()}")
-
-    if leader_text:
-        send_leader_dm(leader_text, image_path=image_path)
-
-
-# ----------------------------------------------------------------------
-# Notifications TP / SL / Break Even — l'alerte courte (statut uniquement,
-# aucune donnée personnelle) part sur le groupe de signaux ; le rapport
-# complet (résultat en $, cumul du jour) part UNIQUEMENT en DM au leader.
-# Déclenché par tout changement de statut pertinent d'un trade (bouton
-# Telegram, API dashboard, ou le moteur de suivi automatique des prix).
-# ----------------------------------------------------------------------
-TRADE_EVENT_MESSAGES = {
-    "be":          ("🟡", "Break Even", "Break Even PROPOSÉ — SL non modifié automatiquement (à déplacer manuellement)."),
-    "secured":     ("🔒", "Sécurisation partielle", "Prise de profit partielle recommandée à ce niveau."),
-    "tp1_hit":     ("🥇", "TP1 atteint", "Premier objectif touché."),
-    "tp2_hit":     ("🥈", "TP2 atteint", "Objectif final touché — trade clôturé."),
-    "invalidated": ("❌", "SL touché", "Le trade est invalidé."),
-    "tp1_sl_hit":  ("❌", "SL touché (après TP1)", "Stop Loss initial retouché — TP1 était déjà sécurisé."),
-    "closed":      ("🔴", "Trade clôturé", "Position fermée."),
-}
-
-
-def format_be_proposal_message(row: sqlite3.Row, current_price: Optional[float] = None,
-                                be_rr: Optional[float] = None) -> str:
-    """Notification dédiée envoyée au RR de déclenchement du BE
-    (be_mode="PROPOSE") — le bot PROPOSE le Break-Even mais ne déplace
-    jamais le SL lui-même (voir get_settings()["be_mode"]). Format fixe
-    demandé (MODIFICATION 2/5) : Symbole / Direction / Entry / SL initial /
-    Prix actuel / RR atteint.
-
-    MODIFICATION 4/5 : be_rr vient de get_settings()["be_rr"] (persisté) si
-    non fourni — plus de constante BE_TRIGGER_RR codée en dur."""
-    if be_rr is None:
-        be_rr = get_settings()["be_rr"]
-    direction_txt = "🟢 ACHAT" if row["direction"] == "BUY" else "🔴 VENTE"
-    ts = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())
-    lines = [
-        "🔒 *BREAK-EVEN DISPONIBLE*", "",
-        f"Symbole : {row['symbol']} (#{row['id']})",
-        f"Direction : {direction_txt}",
-        f"Entry : `{row['entry_price']:.5f}`",
-        f"SL initial : `{row['stop_loss']:.5f}`",
-    ]
-    if current_price is not None:
-        lines.append(f"Prix actuel : `{current_price:.5f}`")
-    lines += [
-        f"RR atteint : {be_rr:.2f}",
-        "",
-        "➡️ Déplacer le SL à Break-Even.",
-        "", f"🕒 {ts}",
-    ]
-    return "\n".join(lines)
-
-
-def format_trade_event_message(row: sqlite3.Row, status: str) -> Optional[str]:
-    """Message COURT et 100% public : statut du trade uniquement, aucune
-    donnée personnelle (pas de lot, pas de $ de risque/gain)."""
-    info = TRADE_EVENT_MESSAGES.get(status)
-    if not info:
-        return None
-    emoji, title, detail = info
-    ts = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())
-    direction_txt = "🟢 ACHAT" if row["direction"] == "BUY" else "🔴 VENTE"
-    return (
-        f"{emoji} *{title}* — {row['symbol']} #{row['id']} ({direction_txt})\n"
-        f"{detail}\n"
-        f"🕒 {ts}"
-    )
-
-
-# Statuts terminaux : plus aucune action possible sur ce trade -> c'est le
-# bon moment pour envoyer le "rapport après trade" complet au leader, en plus
-# de l'alerte courte publique habituelle. Alias de TERMINAL_STATUTES (source
-# unique de vérité, définie en haut du fichier) pour rester synchronisé.
-TERMINAL_TRADE_STATUSES = set(TERMINAL_STATUSES)
-
-
-def format_trade_closed_report(row: sqlite3.Row) -> Optional[str]:
-    """Compte-rendu complet — résultat en R **et en $** (dérivé du risque
-    personnel du leader), durée du trade, cumul du jour. Contient des
-    données personnelles (gain $) : réservé STRICTEMENT au DM du leader,
-    ne doit jamais être publié dans le groupe de signaux."""
-    r = _r_result(row)
-    if r is None:
-        return None
-
-    created_at = row["created_at"]
-    closed_at = row["closed_at"] or time.time()
-    duration_s = max(0, closed_at - created_at)
-    hours, rem = divmod(int(duration_s), 3600)
-    minutes = rem // 60
-    duration_txt = f"{hours}h{minutes:02d}" if hours else f"{minutes}min"
-
-    result_emoji = "✅" if r > 0 else ("🟡" if r == 0 else "❌")
-    result_txt = f"+{r:.2f}R" if r > 0 else f"{r:.2f}R"
-
-    # Gain réel en $ = résultat en R x risque $ engagé sur CE signal précis
-    # (figé au moment de l'ouverture — indépendant d'un changement de
-    # réglages depuis). Absent pour les signaux ouverts avant cette mise à
-    # jour (risk_amount NULL en base) -> ligne $ simplement omise.
-    risk_amount = row["risk_amount"] if "risk_amount" in row.keys() else None
-    gain_txt = None
-    if risk_amount:
-        gain = r * float(risk_amount)
-        gain_txt = f"+{gain:.2f}$" if gain >= 0 else f"{gain:.2f}$"
-
-    now = datetime.now(timezone.utc)
-    start_ts, end_ts = _day_bounds(now)
-    day_stats = get_period_stats(start_ts, end_ts)
-    cumul = day_stats["total_r"]
-    cumul_txt = f"+{cumul:.2f}R" if cumul >= 0 else f"{cumul:.2f}R"
-
-    direction_txt = "🟢 ACHAT" if row["direction"] == "BUY" else "🔴 VENTE"
-    lines = [
-        f"📊 *Rapport de trade (privé)* — {row['symbol']} #{row['id']} ({direction_txt})",
-        f"{result_emoji} Résultat : *{result_txt}*" + (f" · Gain : *{gain_txt}*" if gain_txt else ""),
-        f"⏱️ Durée : {duration_txt}",
-        f"📈 Cumul du jour (tous actifs) : {cumul_txt} sur {day_stats['total_signals']} signal(aux)",
-    ]
-    return "\n".join(lines)
-
-
-def notify_trade_event(signal_id: int, status: str, current_price: Optional[float] = None):
-    """Suivi 100% automatique (déclenché par monitor_open_signals à chaque
-    scan de prix — aucun clic 'j'ai pris le trade' n'est nécessaire) :
-      - alerte courte publiée sur SIGNAL_BROADCAST_GROUPS si non vide
-        (vide par défaut -> aucun groupe averti) ;
-      - le leader, lui, reçoit TOUJOURS en DM l'alerte, plus le rapport
-        complet (résultat $, cumul du jour) pour les statuts terminaux.
-    Ne fait rien si le statut n'a pas d'alerte dédiée (ex: 'taken', 'ignored').
-    Pour 'be' (be_mode="PROPOSE", get_settings()) : message dédié
-    format_be_proposal_message (Symbole/Direction/Entry/SL initial/Prix
-    actuel/RR atteint) — le bot PROPOSE le Break-Even, il ne déplace jamais
-    le SL lui-même."""
-    row = get_signal(signal_id)
-    if not row:
-        return
-    if status == "be":
-        text = format_be_proposal_message(row, current_price=current_price)
-    else:
-        text = format_trade_event_message(row, status)
-    if not text:
-        return
-
-    for group in SIGNAL_BROADCAST_GROUPS:
-        try:
-            send_telegram_signal(group, text)
-        except RuntimeError:
-            pass
-        except Exception:
-            log.warning(f"Échec notification trade #{signal_id} sur '{group}':\n{traceback.format_exc()}")
-
-    leader_text = text
-    if status in TERMINAL_TRADE_STATUSES:
-        try:
-            report_text = format_trade_closed_report(row)
-            if report_text:
-                leader_text = f"{text}\n\n{report_text}"
-        except Exception:
-            log.warning(f"Échec génération rapport de trade #{signal_id}:\n{traceback.format_exc()}")
-    send_leader_dm(leader_text)
-
-
-# --- Commandes Telegram natives (/settings, /capital, /profils...) --------
-# Objectif : piloter les réglages directement depuis le bot Telegram, sans
-# passer par le dashboard web Flask. Le bot (signal_group) a sa propre URL de
-# webhook (/telegram/webhook/<bot_key>, section DÉPLOIEMENT en bas de
-# fichier) : le bot destinataire est donc toujours connu sans ambiguïté, y
-# compris en DM (message privé). En DM — canal 1-à-1 — les commandes en
-# lecture seule (/settings /status /profils /help) sont réservées au
-# propriétaire (TELEGRAM_OWNER_ID) ; dans le groupe elles restent ouvertes à
-# tous comme avant. Les commandes qui modifient un réglage (/capital /risque
-# /levier, activation de profil) restent réservées au propriétaire partout,
-# groupe comme DM.
-BOT_COMMANDS_HELP = (
-    "🤖 *ALPHABOT SMC PRO* — commandes leader\n\n"
-    "/menu — menu à boutons pour tous les réglages ci-dessous\n"
-    "/settings — voir les réglages actuels\n"
-    "/profil — profil complet (solde, risque, levier, lot, état ACTIF/DÉSACTIVÉ)\n"
-    "/capital <valeur> — définir le capital ($)\n"
-    "/risque <valeur> — définir le risque par trade (%)\n"
-    "/balance [valeur] — voir ou définir le solde ($) — alias de /capital\n"
-    "/risk [valeur] — voir ou définir le risque par trade (%) — alias de /risque\n"
-    "/levier <valeur> — définir le levier (x)\n"
-    "/tprr <valeur> — définir le TP unique en multiple de RR (ex: 4 → RR4)\n"
-    "/berr <valeur> — définir le déclenchement du Break-Even en multiple de RR (ex: 2 → RR2)\n"
-    "/bemode [PROPOSE] — voir ou définir le mode Break-Even (seul PROPOSE est disponible)\n"
-    "/session <ny|24h> — session NY fixe ou scan 24h/24 en continu\n"
-    "/timeframe <M1|M5> — changer le timeframe du scan (M1 = scalping)\n"
-    "/signaux <on|off> — activer/désactiver la publication des signaux\n"
-    "/profils — lister et activer un profil sauvegardé\n"
-    "/prix — prix en direct Gold (XAUUSD) et BTC/USD\n"
-    "/status — état du bot (dernier scan...)\n"
-    "/stats — statistiques globales\n"
-    "/report [daily|weekly|monthly] — rapport de performance\n"
-    "/help — afficher ce message"
-)
-
-# Commandes en lecture seule ouvertes à tout le monde DANS LE GROUPE de
-# signaux (stats/rapports publics). En DM, seul le leader (TELEGRAM_OWNER_ID)
-# a accès au bot — il n'existe pas d'autre canal privé dans ce projet.
-PUBLIC_COMMANDS_HELP = (
-    "🤖 *ALPHABOT SMC PRO*\n\n"
-    "/prix — prix en direct Gold (XAUUSD) et BTC/USD\n"
-    "/stats — statistiques globales\n"
-    "/report [daily|weekly|monthly] — rapport de performance\n"
-    "/help — afficher ce message"
-)
-
-_SETTINGS_COMMAND_FIELDS = {
-    "/capital": "capital", "/risque": "risk_percent", "/levier": "leverage",
-    "/risquedollar": "risk_dollar_amount",
-    # MODIFICATION 4/5 : /tprr et /berr suivent EXACTEMENT le même chemin que
-    # /capital et /risque (validation -> update_settings() -> persistance
-    # SQLite -> réutilisation immédiate) — aucun code séparé, aucune valeur
-    # mise en cache ailleurs.
-    "/tprr": "tp_rr", "/berr": "be_rr",
-}
-
-
-def _is_owner(user_id) -> bool:
-    """Vrai UNIQUEMENT si TELEGRAM_OWNER_ID est défini, se parse comme un
-    entier Telegram valide, ET correspond à user_id. Si la variable d'env
-    est absente, vide, ou invalide (non numérique), l'accès est REFUSÉ par
-    défaut — jamais ouvert à tout le monde. C'est le seul comportement sûr
-    pour un bot qui transite du solde/risque/lot en DM."""
-    if not TELEGRAM_OWNER_ID:
-        return False
-    try:
-        owner_id_int = int(TELEGRAM_OWNER_ID)
-        return user_id is not None and int(user_id) == owner_id_int
-    except (TypeError, ValueError):
-        return False
-
-
-_OWNER_ONLY_REPLY = "⛔ Réservé au propriétaire du bot."
-
-
-def format_settings_message(settings: Optional[Dict] = None) -> str:
-    """MODIFICATION 3/5 (03/09/2026) — aperçu compact de /settings, recentré
-    sur ce qui pilote directement le calcul du lot : Balance, Risk, Risk
-    amount, plus la grille RR (TP/BE/BE Mode). Balance et Risk viennent
-    TOUJOURS de get_settings() (capital/risk_percent, app_settings) — la
-    même unique source de vérité déjà utilisée par /balance, /risk,
-    /capital, /risque, les profils, et par get_effective_risk_amount() qui
-    dimensionne chaque nouveau trade (aucune variable capital/risque codée
-    en dur ailleurs dans le fichier). Le reste du profil (levier, session,
-    timeframe, martingale, recovery, profil actif) reste consultable via
-    /profil (format_leader_profile_message), volontairement inchangée.
-
-    MODIFICATION 4/5 — TP/BE/BE Mode viennent maintenant EUX AUSSI
-    exclusivement de get_settings() (clés tp_rr/be_rr/be_mode, persistées en
-    base au même titre que capital/risk_percent). Avant cette modification,
-    ces trois lignes lisaient des constantes Python figées (TP1_RR,
-    BE_TRIGGER_RR, BE_MODE) totalement déconnectées de app_settings : un
-    changement de ces valeurs (une fois une commande de modification
-    ajoutée) ne se serait donc JAMAIS reflété ici. Ce n'est plus le cas."""
-    s = settings or get_settings()
-    risk_amount = get_effective_risk_amount(settings=s)
-    lines = [
-        "⚙️ *SETTINGS*", "",
-        f"Balance : ${s['capital']:.2f}",
-        f"Risk : {s['risk_percent']:.2f} %",
-        f"Risk amount : ${risk_amount:.2f}",
-        "",
-        f"TP : RR{s['tp_rr']:g}",
-        f"BE : RR{s['be_rr']:g}",
-        f"BE Mode : {s['be_mode']}",
-    ]
-    return "\n".join(lines)
-
-
-def format_public_stats_message() -> str:
-    s = get_all_time_stats()
-    lines = [
-        "📊 *Statistiques globales*", "",
-        f"Signaux comptabilisés : {s['total_signals']}",
-        f"Gagnants : {s['wins']} · Perdants : {s['losses']} · BE : {s['be']}",
-        f"Winrate : {s['win_rate']:.1f}%",
-        f"Résultat cumulé : {s['total_r']:+.2f} R",
-        f"Drawdown max : {s['max_drawdown_r']:.2f} R",
-    ]
-    return "\n".join(lines)
-
-
-def format_report_message(period: Optional[str]) -> str:
-    now = datetime.now(timezone.utc)
-    period = (period or "daily").lower()
-    if period == "weekly":
-        start_ts, end_ts, period_key = _week_bounds(now)
-        label = f"Semaine {period_key}"
-    elif period == "monthly":
-        start_ts, end_ts = _month_bounds(now)
-        label = now.strftime("Mois %Y-%m")
-    else:
-        period = "daily"
-        start_ts, end_ts = _day_bounds(now)
-        label = now.strftime("Jour %Y-%m-%d")
-
-    s = get_period_stats(start_ts, end_ts)
-    lines = [f"🗓️ *Rapport — {label}*", ""]
-
-    # Détail par marché, avant le résumé global.
-    if s["by_symbol"]:
-        lines.append("*Par marché :*")
-        for sym, sym_stats in sorted(s["by_symbol"].items()):
-            decided = sym_stats["wins"] + sym_stats["losses"]
-            sym_wr = (sym_stats["wins"] / decided * 100) if decided else 0.0
-            lines.append(
-                f"  • {sym} — {sym_stats['total']} signaux · "
-                f"{sym_stats['wins']}G/{sym_stats['losses']}P · {sym_wr:.1f}%"
-            )
-        lines.append("")
-
-    lines += [
-        "*Global (tous marchés) :*",
-        f"Signaux : {s['total_signals']}",
-        f"Gagnants : {s['wins']} · Perdants : {s['losses']} · BE : {s['be']}",
-        f"Winrate : {s['win_rate']:.1f}%",
-        f"Résultat : {s['total_r']:+.2f} R",
-    ]
-    if s["best"]:
-        lines.append(f"🏆 Meilleur trade : {s['best']['symbol']} {s['best']['r']:+.2f} R")
-    if s["worst"]:
-        lines.append(f"📉 Pire trade : {s['worst']['symbol']} {s['worst']['r']:+.2f} R")
-    return "\n".join(lines)
-
-
-
-def _profiles_inline_keyboard() -> Dict:
-    rows = []
-    for p in list_profiles():
-        label = f"{'✅ ' if p['active'] else '▫️ '}{p['name']} — {p['capital']:.0f}$ x{p['leverage']:.0f} risque {p['risk_percent']:.1f}%"
-        rows.append([{"text": label, "callback_data": f"prof:{p['id']}"}])
-    return {"inline_keyboard": rows}
-
-
-# Valeurs prédéfinies proposées par bouton pour chaque réglage, + rappel de
-# la commande texte pour une valeur libre (les deux méthodes cohabitent).
-_MENU_PRESETS = {
-    "capital": [500, 1000, 2000, 5000],
-    "risque": [0.5, 1, 2, 3],
-    "risquedollar": [3, 5, 10, 25],
-    "levier": [50, 100, 200, 500],
-    "timeframe": ["M1", "M5"],
-    "session": ["ny", "24h"],
-}
-
-
-def _persistent_owner_keyboard() -> Dict:
-    """Clavier persistant (barre du bas), distinct du clavier inline de /menu.
-    Remplace tout clavier persistant précédent (ex: ancien clavier resté
-    affiché depuis une version antérieure du bot)."""
-    return {
-        "keyboard": [["/menu", "/status"], ["/report", "/help"]],
-        "resize_keyboard": True,
-    }
-
-
-def _main_menu_keyboard() -> Dict:
-    return {"inline_keyboard": [
-        [{"text": "💹 Prix en direct", "callback_data": "menu:prix"}],
-        [{"text": "💰 Solde du compte", "callback_data": "menu:capital"},
-         {"text": "📈 Levier", "callback_data": "menu:levier"}],
-        [{"text": "🎯 Risque ($ fixe)", "callback_data": "menu:risquedollar"},
-         {"text": "🎯 Risque (%)", "callback_data": "menu:risque"}],
-        [{"text": "⏱ Timeframe", "callback_data": "menu:timeframe"},
-         {"text": "🕐 Session", "callback_data": "menu:session"}],
-        [{"text": "👤 Profils", "callback_data": "menu:profils"}],
-    ]}
-
-
-# --- PRIX EN DIRECT (Gold + BTC) — bouton menu + commande /prix -----------
-# Best-effort et isolé PAR ACTIF : si une source de prix échoue pour l'un des
-# deux actifs, l'autre s'affiche quand même. Jamais d'exception qui remonte
-# jusqu'à Telegram (le bouton doit toujours répondre, même en cas d'échec
-# total des deux sources) et jamais de prix inventé — un échec affiche
-# explicitement "indisponible", pas une valeur approximative.
-_PRIX_DECIMALS = {"XAUUSD": 2, "BTCUSD": 1}
-
-
-def _format_live_price_line(symbol: str) -> str:
-    asset = ASSETS[symbol]
-    try:
-        candles, price_source = fetch_candles(symbol, limit=5)
-        reject_reason = validate_price_data(symbol, candles)
-        if reject_reason:
-            return f"⚠️ *{asset.display_name}* : indisponible ({reject_reason})"
-        last = candles[-1]
-        decimals = _PRIX_DECIMALS.get(symbol, 2)
-        source_label = _price_source_label(symbol, price_source)
-        age_s = int(time.time() - last["time"])
-        return (f"{'🥇' if symbol == 'XAUUSD' else '🟠'} *{asset.display_name}* : "
-                f"`{last['close']:.{decimals}f}` _(source {source_label}, il y a {age_s}s)_")
-    except Exception as e:
-        log.warning(f"[{symbol}] /prix — échec de récupération du prix : {e}")
-        return f"⚠️ *{asset.display_name}* : indisponible (source injoignable)"
-
-
-def format_live_prices_message() -> str:
-    lines = ["💹 *Prix en direct*", ""]
-    for symbol in ("XAUUSD", "BTCUSD"):
-        lines.append(_format_live_price_line(symbol))
-    lines += ["", "_Prix de scan utilisés par le moteur — pas nécessairement identiques au tick exact de votre broker._"]
-    return "\n".join(lines)
-
-
-def _prix_inline_keyboard() -> Dict:
-    return {"inline_keyboard": [
-        [{"text": "🔄 Actualiser", "callback_data": "menu:prix"}],
-        [{"text": "⬅️ Retour", "callback_data": "menu:home"}],
-    ]}
-
-
-def _preset_submenu_keyboard(field: str) -> Dict:
-    values = _MENU_PRESETS[field]
-    row = [{"text": (f"{v}" if field in ("timeframe", "session") else f"{v}"), "callback_data": f"set:{field}:{v}"}
-           for v in values]
-    # Telegram limite la largeur lisible d'une ligne -> 2 boutons par ligne pour les valeurs numériques.
-    rows = [row[i:i + 2] for i in range(0, len(row), 2)]
-    rows.append([{"text": "⬅️ Retour", "callback_data": "menu:home"}])
-    return {"inline_keyboard": rows}
-
-
-_MENU_FIELD_LABELS = {
-    "capital": ("💰 Solde du compte", "capital", "/capital <valeur>"),
-    "risque": ("🎯 Risque par trade (%)", "risk_percent", "/risque <valeur>"),
-    "risquedollar": ("🎯 Risque par trade ($ fixe)", "risk_dollar_amount", "/risquedollar <valeur>"),
-    "levier": ("📈 Levier", "leverage", "/levier <valeur>"),
-    "timeframe": ("⏱ Timeframe", "timeframe", "/timeframe <M1|M5>"),
-    "session": ("🕐 Session", "session_mode", "/session <ny|24h>"),
-}
-
-
-def _send_command_reply(group: str, chat_id, text: str, reply_markup: Optional[Dict] = None):
-    token = _bot_token(group)
-    data = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
-    if reply_markup:
-        data["reply_markup"] = json.dumps(reply_markup)
-    try:
-        return _tg_call(token, "sendMessage", data=data, timeout=10)
-    except TelegramForbiddenError:
-        log.info(f"Telegram: {chat_id} a bloqué/supprimé le bot '{group}'.")
-        return None
-    except Exception:
-        log.warning("Telegram sendMessage (commande) a échoué:\n" + traceback.format_exc())
-        return None
-
-
-# Toutes les commandes qui touchent aux réglages trading ou aux données
-# personnelles du leader (lecture ET écriture) — réservées au leader
-# (TELEGRAM_OWNER_ID), QUEL QUE SOIT le contexte (groupe ou DM). Inclut les
-# clés dynamiques de _SETTINGS_COMMAND_FIELDS (/capital /risque /levier
-# /risquedollar) en plus des commandes nommées explicitement.
-_LEADER_ONLY_COMMANDS = (
-    "/settings", "/reglages", "/parametres", "/profil", "/status", "/profils", "/menu",
-    "/risqueunite", "/session", "/timeframe", "/signaux", "/balance", "/risk",
-    "/bemode",  # MODIFICATION 4/5 — validation par enum (VALID_BE_MODES), même principe que /session
-) + tuple(_SETTINGS_COMMAND_FIELDS.keys())
-
-
-def _handle_telegram_command(message: Dict, group: str):
-    """Plus de groupe Telegram dans ce projet : tout se passe exclusivement
-    en DM privé avec le bot, et en DM seul le leader (TELEGRAM_OWNER_ID) est
-    reconnu ; il n'existe pas d'autre abonné privé. Tout message reçu hors
-    DM (groupe, canal...) est ignoré silencieusement."""
-    chat = message.get("chat") or {}
-    chat_id = chat.get("id")
-    is_private = chat.get("type") == "private"
-    text = (message.get("text") or "").strip()
-    if not text.startswith("/") or chat_id is None:
-        return
-
-    if not is_private:
-        # Plus de groupe : un message reçu hors DM est simplement ignoré.
-        return
-
-    parts = text.split()
-    cmd = parts[0].lower().split("@")[0]  # tolère "/settings@NomDuBot"
-    arg = parts[1] if len(parts) > 1 else None
-    sender = message.get("from") or {}
-    sender_id = sender.get("id")
-
-    # En DM (canal 1-à-1), seul le leader peut utiliser le bot : ce DM est
-    # strictement privé (solde/risque/levier/lot y transitent).
-    if is_private and not _is_owner(sender_id):
-        _send_command_reply(group, chat_id, _OWNER_ONLY_REPLY)
-        return
-
-    # Toute commande touchant aux réglages trading ou aux données
-    # personnelles du leader (/capital /risque /levier /session /timeframe
-    # /signaux /settings /profil /status /profils /menu ...) est réservée au
-    # leader, DANS LE GROUPE COMME EN DM. (Le check is_private ci-dessus
-    # couvre déjà tout le DM, mais on revérifie explicitement ici pour ne
-    # JAMAIS dépendre uniquement du contexte : un utilisateur quelconque du
-    # groupe ne doit pas pouvoir toucher aux réglages ni activer/désactiver
-    # les signaux.)
-    if cmd in _LEADER_ONLY_COMMANDS and not _is_owner(sender_id):
-        _send_command_reply(group, chat_id, _OWNER_ONLY_REPLY)
-        return
-
-    # --- Commandes publiques (groupe de signaux) ----------------------------
-    if cmd in ("/help", "/aide"):
-        text_out = BOT_COMMANDS_HELP if _is_owner(sender_id) else PUBLIC_COMMANDS_HELP
-        _send_command_reply(group, chat_id, text_out,
-                             reply_markup=(_persistent_owner_keyboard() if _is_owner(sender_id) else None))
-    elif cmd == "/stats":
-        _send_command_reply(group, chat_id, format_public_stats_message())
-    elif cmd == "/report":
-        _send_command_reply(group, chat_id, format_report_message(arg))
-
-    # --- Commandes leader (réglages trading + profil privé) -----------------
-    elif cmd in ("/settings", "/reglages", "/parametres"):
-        _send_command_reply(group, chat_id, format_settings_message())
-    elif cmd == "/profil":
-        _send_command_reply(group, chat_id, format_leader_profile_message())
-    elif cmd == "/status":
-        _send_command_reply(group, chat_id, format_startup_message())
-    elif cmd == "/profils":
-        _send_command_reply(group, chat_id, "👤 *Profils sauvegardés* — tape pour activer :",
-                             reply_markup=_profiles_inline_keyboard())
-    elif cmd == "/menu":
-        _send_command_reply(group, chat_id, "⚙️ *Réglages* — choisis ce que tu veux modifier :",
-                             reply_markup=_main_menu_keyboard())
-    elif cmd == "/prix":
-        try:
-            text = format_live_prices_message()
-        except Exception:
-            log.error("Échec de génération du message /prix:\n" + traceback.format_exc())
-            text = "⚠️ Prix indisponibles pour le moment — réessaie dans quelques instants."
-        _send_command_reply(group, chat_id, text, reply_markup=_prix_inline_keyboard())
-    # --- /balance /risk (MODIFICATION 3/5) -----------------------------
-    # Alias directs de /capital et /risque, MÊME champ settings sous-jacent
-    # (capital / risk_percent, get_settings()/update_settings() — source
-    # unique) — mais avec, en plus, un affichage de la valeur actuelle
-    # quand la commande est tapée SANS argument (ce que /capital et
-    # /risque, laissés inchangés ci-dessous, ne font pas). Un changement
-    # ici est repris IMMÉDIATEMENT par le prochain trade : process_asset()
-    # relit get_settings() à chaque itération de scan, il n'y a nulle part
-    # ailleurs de valeur Balance/Risk mise en cache ou codée en dur.
-    elif cmd == "/balance":
-        if arg is None:
-            _send_command_reply(group, chat_id, f"💰 Balance : ${get_settings()['capital']:.2f}")
-            return
-        try:
-            updated = update_settings({"capital": arg})
-        except ValueError as e:
-            _send_command_reply(group, chat_id, f"❌ {e}")
-            return
-        _send_command_reply(group, chat_id, f"✅ Balance mise à jour.\n\n{format_settings_message(updated)}")
-    elif cmd == "/risk":
-        if arg is None:
-            _send_command_reply(group, chat_id, f"🎯 Risk : {get_settings()['risk_percent']:.2f} %")
-            return
-        try:
-            updated = update_settings({"risk_percent": arg})
-        except ValueError as e:
-            _send_command_reply(group, chat_id, f"❌ {e}")
-            return
-        _send_command_reply(group, chat_id, f"✅ Risk mis à jour.\n\n{format_settings_message(updated)}")
-    # --- /bemode (MODIFICATION 4/5) -------------------------------------
-    # Validation par enum (VALID_BE_MODES) comme /session /timeframe : ne
-    # peut donc jamais se déchoir de "PROPOSE" (seul mode implémenté) vers
-    # une valeur qui laisserait croire à un comportement non câblé.
-    elif cmd == "/bemode":
-        if arg is None:
-            _send_command_reply(group, chat_id, f"⚙️ BE Mode : {get_settings()['be_mode']}")
-            return
-        if arg.upper() not in VALID_BE_MODES:
-            _send_command_reply(
-                group, chat_id,
-                f"Usage : /bemode <{'|'.join(sorted(VALID_BE_MODES))}>",
-            )
-            return
-        updated = update_settings({"be_mode": arg.upper()})
-        _send_command_reply(group, chat_id, f"✅ BE Mode mis à jour.\n\n{format_settings_message(updated)}")
-    elif cmd in _SETTINGS_COMMAND_FIELDS:
-        if arg is None:
-            _send_command_reply(group, chat_id, f"Usage : {cmd} <valeur>")
-            return
-        field = _SETTINGS_COMMAND_FIELDS[cmd]
-        try:
-            updated = update_settings({field: arg})
-        except ValueError as e:
-            _send_command_reply(group, chat_id, f"❌ {e}")
-            return
-        # Balance/Risk (capital, risk_percent) ainsi que TP/BE (tp_rr,
-        # be_rr — MODIFICATION 4/5) sont couverts par le résumé compact de
-        # /settings ; levier et risque $ fixe n'y figurent plus depuis
-        # MODIFICATION 3/5 -> confirmation via le profil complet.
-        view = format_settings_message(updated) if field in ("capital", "risk_percent", "tp_rr", "be_rr") \
-            else format_leader_profile_message(updated)
-        _send_command_reply(group, chat_id, f"✅ Mis à jour.\n\n{view}")
-    elif cmd == "/risqueunite":
-        if not arg or arg.lower() not in VALID_RISK_UNITS:
-            _send_command_reply(group, chat_id, "Usage : /risqueunite <dollar|percent>")
-            return
-        updated = update_settings({"risk_unit": arg.lower()})
-        _send_command_reply(group, chat_id, f"✅ Unité de risque mise à jour.\n\n{format_leader_profile_message(updated)}")
-    elif cmd == "/session":
-        if not arg or arg.lower() not in VALID_SESSION_MODES:
-            _send_command_reply(group, chat_id, "Usage : /session <ny|24h>")
-            return
-        updated = update_settings({"session_mode": arg.lower()})
-        label = "24h/24 (continu)" if updated["session_mode"] == "24h" else "NY (13h-22h UTC)"
-        _send_command_reply(group, chat_id, f"✅ Session mise à jour : *{label}*.\n\n{format_leader_profile_message(updated)}")
-    elif cmd == "/timeframe":
-        if not arg or arg.upper() not in VALID_TIMEFRAMES:
-            _send_command_reply(group, chat_id, "Usage : /timeframe <M1|M5>")
-            return
-        updated = update_settings({"timeframe": arg.upper()})
-        _send_command_reply(
-            group, chat_id,
-            f"✅ Timeframe mis à jour : *{updated['timeframe']}*.\n\n{format_leader_profile_message(updated)}",
-        )
-    elif cmd == "/signaux":
-        if not arg or arg.lower() not in ("on", "off"):
-            _send_command_reply(group, chat_id, "Usage : /signaux <on|off>")
-            return
-        updated = update_settings({"signals_enabled": arg.lower() == "on"})
-        state = "🟢 ACTIVÉS" if updated["signals_enabled"] else "🔴 DÉSACTIVÉS"
-        _send_command_reply(group, chat_id, f"Signaux : {state}\n\n{format_leader_profile_message(updated)}")
-    else:
-        _send_command_reply(group, chat_id, "Commande inconnue. Tape /help pour la liste.")
-
-
-def _handle_profile_callback(callback: Dict, group: str):
-    """Gère les taps sur les boutons inline du menu /profils (callback_data
-    'prof:<id>'), séparé du flux 'act:<signal_id>:<action>' des signaux.
-    group est connu à l'avance (déduit de l'URL du webhook) : ça marche
-    aussi bien dans les groupes qu'en DM avec l'un des 2 bots."""
-    data = callback.get("data", "")
-    try:
-        profile_id = int(data.split(":", 1)[1])
-    except (IndexError, ValueError):
-        return
-
-    message = callback.get("message") or {}
-    chat = message.get("chat") or {}
-    chat_id = chat.get("id")
-
-    sender_id = (callback.get("from") or {}).get("id")
-    if not _is_owner(sender_id):
-        try:
-            _telegram_answer_callback(group, callback["id"], text=_OWNER_ONLY_REPLY, show_alert=True)
-        except Exception:
-            log.warning("Échec answerCallbackQuery (profil, accès refusé):\n" + traceback.format_exc())
-        return
-
-    try:
-        activate_profile(profile_id)
-        confirm_text = "✅ Profil activé."
-    except ValueError as e:
-        confirm_text = f"❌ {e}"
-
-    try:
-        _telegram_answer_callback(group, callback["id"], text=confirm_text)
-    except Exception:
-        log.warning("Échec answerCallbackQuery (profil):\n" + traceback.format_exc())
-
-    if chat_id and message.get("message_id"):
-        try:
-            _telegram_edit_reply_markup(group, chat_id, message["message_id"], _profiles_inline_keyboard())
-        except Exception:
-            log.warning("Échec editMessageReplyMarkup (profil):\n" + traceback.format_exc())
-
-
-def _handle_menu_callback(callback: Dict, group: str):
-    """Gère les taps du menu /menu : navigation ('menu:<champ>' ou 'menu:home')
-    et application d'une valeur prédéfinie ('set:<champ>:<valeur>'). Les
-    valeurs libres restent possibles via la commande texte correspondante
-    (rappelée dans chaque sous-menu) — les deux méthodes cohabitent."""
-    data = callback.get("data", "")
-    message = callback.get("message") or {}
-    chat = message.get("chat") or {}
-    chat_id = chat.get("id")
-
-    sender_id = (callback.get("from") or {}).get("id")
-    if not _is_owner(sender_id):
-        try:
-            _telegram_answer_callback(group, callback["id"], text=_OWNER_ONLY_REPLY, show_alert=True)
-        except Exception:
-            log.warning("Échec answerCallbackQuery (menu, accès refusé):\n" + traceback.format_exc())
-        return
-
-    if not chat_id:
-        return
-
-    if data == "menu:home":
-        try:
-            _telegram_answer_callback(group, callback["id"])
-        except Exception:
-            pass
-        _send_command_reply(group, chat_id, "⚙️ *Réglages* — choisis ce que tu veux modifier :",
-                             reply_markup=_main_menu_keyboard())
-        return
-
-    if data == "menu:prix":
-        try:
-            _telegram_answer_callback(group, callback["id"])
-        except Exception:
-            pass
-        try:
-            text = format_live_prices_message()
-        except Exception:
-            log.error("Échec de génération du message /prix (menu):\n" + traceback.format_exc())
-            text = "⚠️ Prix indisponibles pour le moment — réessaie dans quelques instants."
-        _send_command_reply(group, chat_id, text, reply_markup=_prix_inline_keyboard())
-        return
-
-    if data == "menu:profils":
-        try:
-            _telegram_answer_callback(group, callback["id"])
-        except Exception:
-            pass
-        _send_command_reply(group, chat_id, "👤 *Profils sauvegardés* — tape pour activer :",
-                             reply_markup=_profiles_inline_keyboard())
-        return
-
-    if data.startswith("menu:"):
-        field = data.split(":", 1)[1]
-        if field not in _MENU_FIELD_LABELS:
-            return
-        label, _settings_key, usage = _MENU_FIELD_LABELS[field]
-        try:
-            _telegram_answer_callback(group, callback["id"])
-        except Exception:
-            pass
-        _send_command_reply(
-            group, chat_id,
-            f"{label} — choisis une valeur, ou tape `{usage}` pour une valeur libre :",
-            reply_markup=_preset_submenu_keyboard(field),
-        )
-        return
-
-    if data.startswith("set:"):
-        try:
-            _, field, raw_value = data.split(":", 2)
-        except ValueError:
-            return
-        if field not in _MENU_FIELD_LABELS:
-            return
-        _, settings_key, _usage = _MENU_FIELD_LABELS[field]
-        try:
-            updated = update_settings({settings_key: raw_value})
-            confirm_text = "✅ Mis à jour."
-        except ValueError as e:
-            confirm_text = f"❌ {e}"
-            updated = None
-        try:
-            _telegram_answer_callback(group, callback["id"], text=confirm_text)
-        except Exception:
-            log.warning("Échec answerCallbackQuery (menu, set):\n" + traceback.format_exc())
-        if updated is not None:
-            view = format_settings_message(updated) if settings_key in ("capital", "risk_percent") \
-                else format_leader_profile_message(updated)
-            _send_command_reply(group, chat_id, f"{confirm_text}\n\n{view}",
-                                 reply_markup=_main_menu_keyboard())
-        return
-
-
-# ============================================================================
-# 9. SIGNAL PIPELINE
-# ============================================================================
-
-def _classic_market_weekend_closed(asset: AssetConfig) -> bool:
-    """Marchés futures 'classiques' (Gold/Silver — contract_type='classic') :
-    fermés du vendredi ~21h UTC (clôture US) au dimanche ~21h UTC
-    (réouverture Asie/Sydney). Ne s'applique jamais aux actifs crypto
-    (contract_type='crypto', ouverts 24/7). Approximation volontairement
-    simple (pas de calcul DST minute-précis) : le filet de sécurité contre
-    une donnée figée reste validate_price_data (MAX_CANDLE_AGE_SECONDS) —
-    l'imprécision ici ne peut donc jamais causer un signal sur donnée
-    périmée, elle évite seulement des tentatives de scan inutiles (et le
-    bruit de logs associé) pendant que le marché est fermé. S'applique
-    QUELLE QUE SOIT la valeur de settings['session_mode'] : un marché
-    réellement fermé le reste, que le mode soit 'ny' ou '24h'."""
-    if asset.contract_type != "classic":
-        return False
-    now = datetime.now(timezone.utc)
-    weekday = now.weekday()  # lundi=0 ... dimanche=6
-    if weekday == 5:  # samedi : fermé toute la journée
-        return True
-    if weekday == 6 and now.hour < 21:  # dimanche avant ~21h UTC : pas encore rouvert
-        return True
-    if weekday == 4 and now.hour >= 21:  # vendredi après ~21h UTC : déjà fermé
-        return True
-    return False
-
-
-def is_session_open(asset_symbol: str) -> bool:
-    asset = ASSETS[asset_symbol]
-    if _classic_market_weekend_closed(asset):
-        return False
-    settings = get_settings()
-    if settings.get("session_mode") == "24h":
-        return True
-    if asset.session_continuous:
-        return True
-    hour_utc = datetime.now(timezone.utc).hour
-    if asset.session_start_utc <= asset.session_end_utc:
-        return asset.session_start_utc <= hour_utc < asset.session_end_utc
-    return hour_utc >= asset.session_start_utc or hour_utc < asset.session_end_utc
-
-
-def _fire_auto_trade_event(signal_id: int, status: str, current_price: Optional[float] = None):
-    """Enregistre et notifie un changement de statut détecté automatiquement
-    par le moteur de suivi (par opposition aux boutons Telegram, source
-    'telegram'). Best-effort : une erreur ici ne doit jamais interrompre le
-    scan des autres actifs."""
-    try:
-        record_trade_action(signal_id, action=status, new_status=status, source="auto")
-        notify_trade_event(signal_id, status, current_price=current_price)
-    except Exception:
-        log.error(f"Échec notification auto trade #{signal_id} ({status}):\n{traceback.format_exc()}")
-
-
-_AUTO_STATUS_RANK = {"pending": 0, "taken": 0, "be": 1, "secured": 2, "tp1_hit": 3, "tp2_hit": 4}
-# Remarque : "secured" et "tp2_hit" restent dans ce mapping pour la lecture
-# d'anciens signaux en base (historique), mais ne sont plus jamais atteints
-# par la progression active ci-dessous (voir `progression` dans
-# _check_signal_progress) — grille simplifiée BE@RR2 / TP unique@RR4.
-# Alias de TERMINAL_STATUSES (source unique de vérité) pour rester synchronisé.
-_AUTO_STATUS_TERMINAL = set(TERMINAL_STATUSES)
-
-
-def _check_signal_progress(row: sqlite3.Row, high: float, low: float, close: Optional[float] = None,
-                            be_rr: Optional[float] = None):
-    """MODIFICATION 4/5 : be_rr vient de get_settings()["be_rr"] (persisté)
-    si non fourni par l'appelant — plus de constante BE_TRIGGER_RR codée en
-    dur. monitor_open_signals() le passe déjà, résolu une seule fois par
-    scan à partir du même get_settings() que le reste de process_asset()."""
-    if be_rr is None:
-        be_rr = get_settings()["be_rr"]
-    status = row["status"]
-    if status in _AUTO_STATUS_TERMINAL:
-        return
-    direction = row["direction"]
-    entry, sl = row["entry_price"], row["stop_loss"]
-    tp1, tp2 = row["tp1"], row["tp2"]
-    risk = abs(entry - sl)
-    if risk <= 0:
-        return
-    signal_id = row["id"]
-    symbol = row["symbol"]
-
-    def level(rr: float) -> float:
-        return entry + rr * risk if direction == "BUY" else entry - rr * risk
-
-    def reached(price_level: float) -> bool:
-        return (direction == "BUY" and high >= price_level) or (direction == "SELL" and low <= price_level)
-
-    def sl_reached() -> bool:
-        return (direction == "BUY" and low <= sl) or (direction == "SELL" and high >= sl)
-
-    # --- Ambiguïté intrabar : avec des données OHLC (pas de tick-by-tick),
-    # on ne peut PAS savoir avec certitude si le SL ou un TP a été touché en
-    # premier quand les deux se trouvent dans le range [low, high] de la même
-    # bougie. On le journalise explicitement plutôt que de prétendre le savoir.
-    sl_hit_now = sl_reached()
-    any_tp_in_same_bar = (tp1 is not None and reached(tp1)) or (tp2 is not None and reached(tp2))
-    if sl_hit_now and any_tp_in_same_bar:
-        log.warning(
-            f"[{symbol}] AMBIGUOUS INTRABAR ORDER — signal #{signal_id} : SL ET au moins un TP sont "
-            f"dans le range de la même bougie (high={high}, low={low}, SL={sl}, TP1={tp1}, TP2={tp2}). "
-            f"Impossible de déterminer l'ordre réel intrabar avec des données OHLC seules -> "
-            f"règle déterministe appliquée : SL prioritaire (pire cas)."
-        )
-
-    # SL prioritaire (pire cas d'abord) — règle déterministe et documentée
-    # pour toute bougie ambiguë (voir log ci-dessus). Une fois TP1 déjà
-    # touché, le signal reste néanmoins sous surveillance (PAS fermé par
-    # TP1) : si le SL initial est retouché ensuite, ce n'est plus une perte
-    # totale (TP1 a déjà sécurisé une partie du gain) -> statut dédié
-    # 'tp1_sl_hit' (résultat = +RR_TP1) plutôt que 'invalidated' (-1R).
-    if sl_hit_now:
-        _fire_auto_trade_event(signal_id, "tp1_sl_hit" if status == "tp1_hit" else "invalidated")
-        return
-
-    current_rank = _AUTO_STATUS_RANK.get(status, 0)
-    # Grille simplifiée : plus d'étape "secured" ni de "tp2_hit" dans la
-    # progression active — BE à be_rr, puis TP unique (tp1_hit) au niveau
-    # déjà figé sur CE signal (tp1, calculé au moment du signal avec le
-    # tp_rr d'alors), qui est désormais l'état final du trade (voir
-    # TERMINAL_STATUSES/WIN_STATUSES).
-    progression = [("be", level(be_rr)), ("tp1_hit", tp1)]
-
-    for name, price_level in progression:
-        if _AUTO_STATUS_RANK[name] <= current_rank or price_level is None:
-            continue
-        if reached(price_level):
-            _fire_auto_trade_event(signal_id, name, current_price=close if name == "be" else None)
-            current_rank = _AUTO_STATUS_RANK[name]
-
-
-def monitor_open_signals(symbol: str, candles: List[Dict], be_rr: Optional[float] = None):
-    """Moteur de suivi automatique : à chaque scan, compare la dernière
-    bougie de `symbol` aux niveaux de tous ses signaux encore ouverts et
-    déclenche BE / Sécurisation / TP1 / TP2 / SL dès qu'ils sont atteints —
-    avec notification Telegram (groupes + DM), sans action manuelle requise.
-    Résolution = fréquence du scan (~30s) : un mouvement extrême intrabar
-    peut être détecté un peu après coup mais n'est jamais raté.
-
-    MODIFICATION 4/5 : be_rr vient de get_settings()["be_rr"] (persisté) si
-    non fourni — plus de constante BE_TRIGGER_RR codée en dur. process_asset()
-    le passe déjà, résolu une seule fois par scan (même `settings` que pour
-    max_open_positions/tp_rr) pour éviter toute relecture incohérente en
-    cours de scan si une commande Telegram modifie be_rr entre-temps."""
-    if not candles:
-        return
-    if be_rr is None:
-        be_rr = get_settings()["be_rr"]
-    last = candles[-1]
-    high, low, close = last["high"], last["low"], last["close"]
-    with get_conn() as conn:
-        rows = conn.execute(
-            f"SELECT * FROM signals WHERE symbol=? AND status NOT IN "
-            f"({','.join('?' for _ in TERMINAL_STATUSES)})",
-            (symbol, *TERMINAL_STATUSES),
-        ).fetchall()
-    for row in rows:
-        try:
-            _check_signal_progress(row, high, low, close, be_rr=be_rr)
-        except Exception:
-            log.error(f"Échec suivi auto du signal #{row['id']} ({symbol}):\n{traceback.format_exc()}")
-
-
-def process_asset(symbol: str):
-    asset = ASSETS[symbol]
-    if not is_session_open(symbol):
-        return
-    if not can_publish_today(symbol):
-        return
-
-    settings = get_settings()
-    if not settings.get("signals_enabled", True):
-        return  # signaux désactivés par le leader (état DÉSACTIVÉ) -> aucun scan de publication
-    if count_open_positions() >= settings["max_open_positions"]:
-        return
-
-    # --- SOURCE DE PRIX : MT5 (broker réel) -> Yahoo futures GC=F/SI=F ------
-    # (fallback) -> aucune donnée / donnée périmée = NO SIGNAL. Jamais de
-    # remplacement silencieux par une source approximative (ex. PAXG-USD).
-    try:
-        candles, price_source = fetch_candles(symbol, limit=200)
-    except Exception as e:
-        chain_desc = " -> ".join(
-            s for s in (asset.data_source, asset.fallback_data_source, asset.fallback_data_source_2) if s
-        )
-        log.warning(f"[{symbol}] NO SIGNAL — toute la chaîne de sources a échoué ({chain_desc}) : {e}")
-        return
-
-    reject_reason = validate_price_data(symbol, candles)
-    if reject_reason:
-        log.warning(f"[{symbol}] NO SIGNAL — donnée de prix rejetée : {reject_reason}")
-        return
-
-    source_label = _price_source_label(symbol, price_source)
-    last_close = candles[-1]["close"]
-    log.info(f"[{symbol}] scan OK — {len(candles)} bougies, dernier prix = {last_close} "
-             f"— PRICE_SOURCE={source_label}")
-    if price_source == asset.fallback_data_source:
-        log.warning(f"[{symbol}] WARNING: FALLBACK FUTURES PRICE (PRICE_SOURCE={source_label}) "
-                    f"— MT5 indisponible, ce n'est PAS le prix exact du broker.")
-
-    monitor_open_signals(symbol, candles, be_rr=settings["be_rr"])
-
-    swing_points = find_swing_points(candles)
-    sweep = detect_liquidity_sweep(candles, swing_points)
-    if not sweep:
-        log.info(f"[{symbol}] pas de sweep de liquidité détecté sur cette bougie.")
-        return
-    log.info(f"[{symbol}] LIQUIDITY SWEEP DETECTED — {sweep.direction} @ {sweep.sweep_wick_price} "
-             f"(niveau balayé : {sweep.swept_point.price}).")
-
-    bos = confirm_bos(candles, sweep, swing_points)
-    if not bos or not bos.confirmed:
-        if wick_only_break_pending(candles, sweep, swing_points):
-            log.info(f"[{symbol}] WICK BREAK REJECTED - NO STRUCTURE SHIFT")
-        else:
-            log.info(f"[{symbol}] WAITING FOR BODY CLOSE SHIFT")
-        return
-    log.info(f"[{symbol}] CHoCH CONFIRMED BY BODY CLOSE (Sweep + CHoCH, pas un simple BOS) — "
-             f"{bos.direction} @ niveau {bos.break_level}.")
-
-    direction = "BUY" if bos.direction == "bullish" else "SELL"
-    entry_price = candles[bos.break_index]["close"]
-
-    fvg = detect_fvg(candles, bos.break_index, bos.direction)
-    if fvg:
-        log.info(f"[{symbol}] FVG DETECTED — zone {fvg.bottom}-{fvg.top} ({fvg.direction}).")
-    entry_type = "fvg_return" if fvg else "direct"
-
-    levels = compute_levels(entry_price, direction, sweep.sweep_wick_price, candles, swing_points,
-                             spread_commission_buffer=asset.typical_spread, tp_rr=settings["tp_rr"])
-
-    setup_key = f"{symbol}:{direction}:{round(sweep.swept_point.price, 5)}"
-    if has_active_setup(setup_key):
-        return
-
-    # Anti-doublon temporel : même si le setup précédent est déjà clôturé,
-    # on n'autorise pas un nouveau signal sur le même actif avant
-    # SIGNAL_COOLDOWN_SECONDS (défaut 15 min) — évite qu'un même niveau
-    # re-balayé à quelques minutes d'intervalle ne spamme le groupe Telegram.
-    age = seconds_since_last_signal(symbol)
-    if age is not None and age < SIGNAL_COOLDOWN_SECONDS:
-        log.info(f"[{symbol}] signal ignoré : dernier signal il y a {age:.0f}s "
-                 f"(cooldown = {SIGNAL_COOLDOWN_SECONDS:.0f}s).")
-        return
-
-    # Lot recalculé à CHAQUE signal à partir du risque choisi (mode $ ou %),
-    # de l'entrée et du Stop Loss de CE signal précis.
-    risk_amount = get_effective_risk_amount(symbol, settings)
-    lot = compute_lot_size_v2(risk_amount, entry_price, levels.stop_loss, asset.lot_value_per_point)
-
-    # --- GARDE-FOU FINAL (MODIFICATION 5/5) -------------------------------
-    # Dernier verrou avant publication : si balance/risque/entry/SL/lot sont
-    # invalides pour QUELQUE RAISON que ce soit (bug amont, donnée corrompue,
-    # settings incohérents malgré la validation de update_settings...), le
-    # signal n'est JAMAIS publié et AUCUNE valeur n'est inventée en repli.
-    def _is_bad_number(x) -> bool:
-        return x is None or x != x or x in (float("inf"), float("-inf"))  # x != x -> NaN
-
-    reject = None
-    if _is_bad_number(settings.get("capital")) or settings["capital"] <= 0:
-        reject = f"capital invalide ({settings.get('capital')})"
-    elif _is_bad_number(settings.get("risk_percent")) or settings["risk_percent"] <= 0:
-        reject = f"risk_percent invalide ({settings.get('risk_percent')})"
-    elif _is_bad_number(risk_amount) or risk_amount <= 0:
-        reject = f"risk_amount invalide ({risk_amount})"
-    elif _is_bad_number(entry_price) or entry_price <= 0:
-        reject = f"entry invalide ({entry_price})"
-    elif _is_bad_number(levels.stop_loss) or levels.stop_loss <= 0:
-        reject = f"SL invalide ({levels.stop_loss})"
-    elif abs(entry_price - levels.stop_loss) <= 0:
-        reject = "distance Entry/SL nulle"
-    elif _is_bad_number(lot) or lot <= 0:
-        reject = f"lot impossible à calculer (lot={lot})"
-
-    if reject:
-        log.error(f"[{symbol}] SIGNAL BLOQUÉ — {reject} — aucune valeur inventée, signal NON publié "
-                   f"(entry={entry_price}, SL={levels.stop_loss}, risk_amount={risk_amount}, lot={lot}).")
-        return
-
-    log.info(f"[{symbol}] SIGNAL VALIDATED — {direction} {entry_type} "
-             f"entry={entry_price} SL={levels.stop_loss} lot={lot} PRICE_SOURCE={source_label}")
-
-    # Plus de score 0-100 : tout setup Sweep + CHoCH confirmé par la clôture
-    # du corps de bougie est publié tel quel (score=0 conservé en base pour
-    # compatibilité de schéma uniquement, non affiché, non utilisé pour filtrer).
-    signal_id = insert_signal(
-        symbol, setup_key, direction, entry_type, get_stars(entry_type), 0,
-        entry_price, levels.stop_loss, levels.tp1, levels.tp2, levels.rr_tp1, levels.rr_tp2,
-        asset.telegram_group, levels.tp2_source, risk_amount,
-    )
-    increment_daily_counter(symbol)
-
-    message = format_signal_message(
-        symbol, asset.display_name, direction, ENTRY_TYPES[entry_type]["label"],
-        get_stars(entry_type), entry_price, levels.stop_loss, levels.tp1,
-        levels.tp2, levels.rr_tp1, levels.rr_tp2 or 0, lot=lot, settings=settings,
-    )
-    leader_message = format_leader_signal_dm(
-        symbol, asset.display_name, direction, ENTRY_TYPES[entry_type]["label"],
-        get_stars(entry_type), entry_price, levels.stop_loss, levels.tp1,
-        levels.tp2, levels.rr_tp1, levels.rr_tp2 or 0,
-        lot=lot, risk_amount=risk_amount, settings=settings,
-    )
-    image_path = generate_signal_chart(
-        symbol, asset.display_name, direction, candles, sweep, bos,
-        entry_price, levels.stop_loss, levels.tp1,
-        signal_id=signal_id, rr_tp1=levels.rr_tp1,
-    )
-    try:
-        broadcast_signal(message, leader_text=leader_message, image_path=image_path, signal_id=signal_id,
-                          symbol=symbol, entry_price=entry_price, stop_loss=levels.stop_loss)
-        log.info(f"[{symbol}] signal #{signal_id} (direction={direction}, {entry_type}, lot={lot}, "
-                 f"risque={risk_amount:.2f}$) envoyé en DM leader (SIGNAL_BROADCAST_GROUPS vide -> aucun groupe averti).")
-    except Exception:
-        log.error(f"[{symbol}] échec d'envoi Telegram pour le signal #{signal_id}:\n{traceback.format_exc()}")
-
-
-def scan_loop():
-    log.info("AlphaBot SMC PRO (fusion) — démarrage de la boucle de scan.")
-    while True:
-        for symbol in ASSETS:
-            try:
-                process_asset(symbol)
-            except Exception:
-                log.error(f"[{symbol}] erreur inattendue:\n{traceback.format_exc()}")
-        # Heartbeat watchdog : preuve que la boucle de scan tourne toujours.
-        # Écrit en DB (visible via /health et /api/watchdog, survit à un
-        # redémarrage) ET en mémoire (lu par watchdog_loop sans I/O disque).
-        global _LAST_SCAN_MONOTONIC
-        _LAST_SCAN_MONOTONIC = time.monotonic()
-        try:
-            record_heartbeat(mark_scan=True)
-        except Exception:
-            log.error("watchdog: échec d'écriture du heartbeat en base:\n" + traceback.format_exc())
-        time.sleep(SCAN_INTERVAL_SECONDS)
-
-
-# ============================================================================
-# 9bis. WATCHDOG — surveillance du thread principal + auto-redémarrage
-# ============================================================================
-# Le heartbeat en mémoire (horloge monotone, insensible aux changements
-# d'heure système) est mis à jour par scan_loop() à chaque itération.
-_LAST_SCAN_MONOTONIC = time.monotonic()
-_WATCHDOG_LAST_RESTART_MONOTONIC = 0.0
-
-
-def watchdog_loop():
-    """Tourne dans un thread daemon dédié. Vérifie périodiquement que la
-    boucle de scan (thread principal) donne toujours signe de vie. Si elle
-    reste silencieuse plus de WATCHDOG_MAX_SILENCE_SECONDS (bloquée, deadlock,
-    exception non catchée qui aurait échappé à scan_loop, etc.), le watchdog :
-      1. logge l'incident en CRITICAL,
-      2. enregistre l'événement en SQLite (table watchdog_heartbeat),
-      3. force l'arrêt du process via os._exit(1).
-
-    Sur Render (Web/Background service) comme sur un VPS avec un superviseur
-    de process (systemd, supervisord, pm2, ou un simple `while true; do python
-    main.py; done`), un process qui se termine est automatiquement relancé —
-    c'est le mécanisme de redémarrage utilisé ici, volontairement simple et
-    donc fiable (pas de gestion de threads zombies à l'intérieur du même
-    process, qui serait beaucoup plus fragile)."""
-    log.info("Watchdog : thread de surveillance démarré "
-              f"(silence max toléré = {WATCHDOG_MAX_SILENCE_SECONDS}s).")
-    global _WATCHDOG_LAST_RESTART_MONOTONIC
-    while True:
-        try:
-            time.sleep(WATCHDOG_CHECK_INTERVAL_SECONDS)
-            silence = time.monotonic() - _LAST_SCAN_MONOTONIC
-
-            # Heartbeat "je suis vivant" pour le watchdog lui-même (utile si on
-            # veut un jour distinguer "scan bloqué" de "process entier mort").
-            try:
-                record_heartbeat(mark_scan=False)
-            except Exception:
-                pass
-
-            if silence <= WATCHDOG_MAX_SILENCE_SECONDS:
-                continue
-
-            since_last_restart = time.monotonic() - _WATCHDOG_LAST_RESTART_MONOTONIC
-            if since_last_restart < WATCHDOG_RESTART_COOLDOWN_SECONDS:
-                # Anti rage-restart : on vient déjà de forcer un redémarrage,
-                # on laisse le temps au nouveau process de démarrer proprement.
-                continue
-
-            reason = f"scan silencieux depuis {silence:.0f}s (seuil={WATCHDOG_MAX_SILENCE_SECONDS}s)"
-            log.critical(f"WATCHDOG : boucle de scan considérée bloquée ({reason}). "
-                         f"Redémarrage forcé du process.")
-            try:
-                record_watchdog_restart(reason)
-            except Exception:
-                log.error("watchdog: échec d'écriture du redémarrage en base:\n" + traceback.format_exc())
-
-            _WATCHDOG_LAST_RESTART_MONOTONIC = time.monotonic()
-            # os._exit() coupe le process immédiatement (pas de cleanup Python
-            # ni d'exceptions relancées) : c'est volontaire, on ne peut pas se
-            # fier à un état potentiellement bloqué/incohérent pour faire un
-            # arrêt "propre". Render / systemd / le superviseur du VPS relance
-            # alors un process neuf.
-            os._exit(1)
-        except Exception:
-            # Le watchdog lui-même ne doit JAMAIS s'arrêter silencieusement.
-            log.error("Erreur inattendue dans watchdog_loop (le watchdog continue):\n"
-                       + traceback.format_exc())
-
-
-# ============================================================================
-# 9ter. EXPORT (CSV/PDF) ET SAUVEGARDE AUTOMATIQUE
-# ============================================================================
-
-import csv
-import io
-import shutil
-import glob
-
-
-def _cleanup_old_files(directory: str, pattern: str, keep_last: int):
-    """Ne garde que les `keep_last` fichiers les plus récents correspondant à
-    `pattern` dans `directory` (nettoyage best-effort, jamais bloquant)."""
-    try:
-        files = sorted(glob.glob(os.path.join(directory, pattern)), key=os.path.getmtime, reverse=True)
-        for old_file in files[keep_last:]:
-            try:
-                os.remove(old_file)
-            except OSError:
-                pass
-    except Exception:
-        log.warning(f"Nettoyage de '{directory}' échoué (best-effort):\n{traceback.format_exc()}")
-
-
-def export_trades_csv(symbol: Optional[str] = None, limit: int = 1000) -> str:
-    """Exporte l'historique des trades (le plus récent en premier) au format
-    CSV. Retourne le chemin du fichier généré dans EXPORT_DIR."""
-    rows = get_trade_history(limit=limit, symbol=symbol)
-    ts = time.strftime("%Y%m%d_%H%M%S", time.gmtime())
-    suffix = f"_{symbol}" if symbol else ""
-    filename = f"trades{suffix}_{ts}.csv"
-    path = os.path.join(EXPORT_DIR, filename)
-
-    fieldnames = [
-        "id", "symbol", "direction", "entry_type", "stars", "score", "entry_price",
-        "stop_loss", "tp1", "tp2", "rr_tp1", "rr_tp2", "status", "result_r",
-        "created_at_utc", "closed_at_utc",
-    ]
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        for row in rows:
-            writer.writerow({
-                "id": row["id"], "symbol": row["symbol"], "direction": row["direction"],
-                "entry_type": row["entry_type"], "stars": row["stars"], "score": row["score"],
-                "entry_price": row["entry_price"], "stop_loss": row["stop_loss"],
-                "tp1": row["tp1"], "tp2": row["tp2"], "rr_tp1": row["rr_tp1"], "rr_tp2": row["rr_tp2"],
-                "status": row["status"], "result_r": _r_result(row),
-                "created_at_utc": time.strftime("%Y-%m-%d %H:%M", time.gmtime(row["created_at"])),
-                "closed_at_utc": (
-                    time.strftime("%Y-%m-%d %H:%M", time.gmtime(row["closed_at"])) if row["closed_at"] else ""
-                ),
-            })
-
-    _cleanup_old_files(EXPORT_DIR, "trades*.csv", EXPORT_KEEP_LAST)
-    log.info(f"Export CSV généré : {path} ({len(rows)} trades)")
-    return path
-
-
-def export_trades_pdf(symbol: Optional[str] = None, limit: int = 1000) -> str:
-    """Génère un rapport PDF (via matplotlib, sans dépendance supplémentaire) :
-    résumé de performance + tableau des derniers trades. Retourne le chemin
-    du fichier PDF généré dans EXPORT_DIR."""
-    from matplotlib.backends.backend_pdf import PdfPages
-
-    rows = get_trade_history(limit=limit, symbol=symbol)
-    stats = get_all_time_stats() if not symbol else get_period_stats(0, time.time() + 1)
-    ts = time.strftime("%Y%m%d_%H%M%S", time.gmtime())
-    suffix = f"_{symbol}" if symbol else ""
-    filename = f"rapport{suffix}_{ts}.pdf"
-    path = os.path.join(EXPORT_DIR, filename)
-
-    with PdfPages(path) as pdf:
-        # Page 1 : résumé de performance
-        fig, ax = plt.subplots(figsize=(8.27, 11.69))  # A4 portrait
-        ax.axis("off")
-        title = f"AlphaBot SMC PRO — Rapport de performance{(' ' + symbol) if symbol else ''}"
-        ax.text(0.5, 0.97, title, ha="center", va="top", fontsize=16, fontweight="bold")
-        ax.text(0.5, 0.93, f"Généré le {time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime())}",
-                ha="center", va="top", fontsize=9, color="gray")
-
-        summary_lines = [
-            f"Total signaux : {stats['total_signals']}",
-            f"Gagnants : {stats['wins']}   Perdants : {stats['losses']}   BE : {stats['be']}",
-            f"Winrate : {stats['win_rate']:.1f}%",
-            f"Résultat cumulé : {stats['total_r']:+.2f}R",
-            f"Drawdown max : {stats['max_drawdown_r']:.2f}R",
-        ]
-        y = 0.85
-        for line in summary_lines:
-            ax.text(0.08, y, line, fontsize=12, va="top")
-            y -= 0.05
-        pdf.savefig(fig)
-        plt.close(fig)
-
-        # Page(s) suivantes : tableau des trades (par lots de 35 lignes/page)
-        table_cols = ["ID", "Symbole", "Dir.", "Score", "Statut", "R", "Ouvert (UTC)"]
-        page_rows = []
-        for row in rows:
-            r = _r_result(row)
-            page_rows.append([
-                str(row["id"]), row["symbol"], row["direction"], f"{row['score']}", row["status"],
-                f"{r:+.2f}" if r is not None else "-",
-                time.strftime("%Y-%m-%d %H:%M", time.gmtime(row["created_at"])),
-            ])
-
-        chunk_size = 35
-        for i in range(0, len(page_rows), chunk_size) or [0]:
-            chunk = page_rows[i:i + chunk_size]
-            fig, ax = plt.subplots(figsize=(8.27, 11.69))
-            ax.axis("off")
-            if chunk:
-                table = ax.table(cellText=chunk, colLabels=table_cols, loc="upper center", cellLoc="center")
-                table.auto_set_font_size(False)
-                table.set_fontsize(7)
-                table.scale(1, 1.3)
-            else:
-                ax.text(0.5, 0.5, "Aucun trade sur la période.", ha="center", va="center")
-            pdf.savefig(fig)
-            plt.close(fig)
-
-    _cleanup_old_files(EXPORT_DIR, "rapport*.pdf", EXPORT_KEEP_LAST)
-    log.info(f"Export PDF généré : {path} ({len(rows)} trades)")
-    return path
-
-
-def backup_database() -> Optional[str]:
-    """Sauvegarde la base SQLite via l'API native de backup (cohérente même
-    si une écriture concurrente est en cours, contrairement à une simple
-    copie de fichier), avec rotation locale et copie optionnelle sur
-    Telegram. Best-effort : ne lève jamais d'exception vers l'appelant."""
-    ts = time.strftime("%Y%m%d_%H%M%S", time.gmtime())
-    filename = f"backup_{ts}.db"
-    path = os.path.join(BACKUP_DIR, filename)
-    try:
-        src = sqlite3.connect(DB_PATH)
-        dst = sqlite3.connect(path)
-        with dst:
-            src.backup(dst)
-        src.close()
-        dst.close()
-    except Exception:
-        log.error(f"Échec de la sauvegarde de la base:\n{traceback.format_exc()}")
-        return None
-
-    _cleanup_old_files(BACKUP_DIR, "backup_*.db", BACKUP_KEEP_LAST)
-    log.info(f"Sauvegarde de la base créée : {path}")
-
-    if BACKUP_SEND_TO_TELEGRAM:
-        # Plus de groupe Telegram : la sauvegarde part sur TG_CHAT_REPORTS si
-        # configuré, sinon en DM au leader (TELEGRAM_OWNER_ID).
-        try:
-            reports_chat_id = os.environ.get("TG_CHAT_REPORTS")
-            if reports_chat_id:
-                token = _bot_token("reports")
-                chat_id = reports_chat_id
-            elif TELEGRAM_OWNER_ID:
-                token = _bot_token("signal_group")
-                chat_id = str(TELEGRAM_OWNER_ID)
-            else:
-                token = chat_id = None
-            if token and chat_id:
-                with open(path, "rb") as f:
-                    requests.post(
-                        TELEGRAM_API.format(token=token, method="sendDocument"),
-                        data={"chat_id": chat_id, "caption": f"💾 Sauvegarde DB — {ts}"},
-                        files={"document": (filename, f)},
-                        timeout=30,
-                    )
-        except RuntimeError:
-            pass  # bot non configuré -> ignoré silencieusement (best-effort)
-        except Exception:
-            log.warning(f"Échec d'envoi de la sauvegarde sur Telegram (best-effort):\n{traceback.format_exc()}")
-
-    return path
-
-
-def backup_scheduler_loop():
-    """Thread dédié : sauvegarde la base toutes les BACKUP_INTERVAL_HOURS
-    heures. Une première sauvegarde est prise peu après le démarrage."""
-    time.sleep(60)  # laisse le temps au reste du service de démarrer proprement
-    while True:
-        try:
-            backup_database()
-        except Exception:
-            log.error(f"Erreur inattendue dans backup_scheduler_loop (continue):\n{traceback.format_exc()}")
-        time.sleep(max(60, BACKUP_INTERVAL_HOURS * 3600))
-
-
-# --- Cache TTL (endpoints de lecture les plus sollicités du dashboard) ------
-# Le dashboard interroge /api/overview, /api/stats* etc. toutes les 30s
-# (setInterval côté JS) alors que ces requêtes recalculent des agrégats sur
-# toute la table `signals`. Un petit cache en mémoire, à durée de vie courte,
-# évite de refaire ce travail à chaque appel sans jamais renvoyer une donnée
-# vieille de plus de quelques secondes. Verrou car app.run/Waitress sert
-# plusieurs requêtes en parallèle sur des threads différents.
-_dashboard_cache: Dict[str, tuple] = {}  # clé -> (expire_at, valeur)
-_dashboard_cache_lock = threading.Lock()
-DASHBOARD_CACHE_TTL_SECONDS = float(os.environ.get("DASHBOARD_CACHE_TTL_SECONDS", "10"))
-
-
-def _ttl_cached(key_prefix: str):
-    """Décorateur : met en cache le résultat JSON-sérialisable de la fonction
-    décorée pendant DASHBOARD_CACHE_TTL_SECONDS, par clé = key_prefix + args."""
-    def decorator(fn):
-        def wrapper(*args, **kwargs):
-            cache_key = key_prefix + str(args) + str(sorted(kwargs.items()))
-            now = time.time()
-            with _dashboard_cache_lock:
-                cached = _dashboard_cache.get(cache_key)
-                if cached and cached[0] > now:
-                    return cached[1]
-            value = fn(*args, **kwargs)
-            with _dashboard_cache_lock:
-                _dashboard_cache[cache_key] = (now + DASHBOARD_CACHE_TTL_SECONDS, value)
-            return value
-        wrapper.__name__ = fn.__name__
-        return wrapper
-    return decorator
-
-
-def invalidate_dashboard_cache():
-    """À appeler après toute écriture qui change les stats (nouveau signal,
-    changement de statut) pour ne jamais servir une valeur cachée obsolète
-    plus de quelques secondes de toute façon, mais utile pour une invalidation
-    immédiate après une action explicite de l'utilisateur (dashboard/Telegram)."""
-    with _dashboard_cache_lock:
-        _dashboard_cache.clear()
-
-
-# ============================================================================
-# 10. DASHBOARD FLASK
-# ============================================================================
-
-app = Flask(__name__)
-
-
-@app.route("/health")
-def health():
-    hb = get_heartbeat_status()
-    status = "ok" if hb["healthy"] else "degraded"
-    return jsonify({
-        "status": status,
-        "scan_healthy": hb["healthy"],
-        "seconds_since_last_scan": hb["seconds_since_scan"],
-        "restart_count": hb["restart_count"],
-    }), (200 if hb["healthy"] else 503)
-
-
-@app.route("/api/watchdog")
-def watchdog_status():
-    hb = get_heartbeat_status()
-    return jsonify({
-        "heartbeat": hb,
-    })
-
-
-@app.route("/api/export/csv")
-def export_csv_endpoint():
-    from flask import send_file
-    symbol = request.args.get("symbol") or None
-    limit = int(request.args.get("limit", 1000))
-    try:
-        path = export_trades_csv(symbol=symbol, limit=limit)
-        return send_file(path, as_attachment=True, download_name=os.path.basename(path))
-    except Exception:
-        log.error(f"Échec export CSV via API:\n{traceback.format_exc()}")
-        return jsonify({"error": "export_failed"}), 500
-
-
-@app.route("/api/export/pdf")
-def export_pdf_endpoint():
-    from flask import send_file
-    symbol = request.args.get("symbol") or None
-    limit = int(request.args.get("limit", 1000))
-    try:
-        path = export_trades_pdf(symbol=symbol, limit=limit)
-        return send_file(path, as_attachment=True, download_name=os.path.basename(path))
-    except Exception:
-        log.error(f"Échec export PDF via API:\n{traceback.format_exc()}")
-        return jsonify({"error": "export_failed"}), 500
-
-
-@app.route("/api/backup", methods=["POST"])
-def backup_endpoint():
-    path = backup_database()
-    if not path:
-        return jsonify({"ok": False, "error": "backup_failed"}), 500
-    return jsonify({"ok": True, "file": os.path.basename(path)})
-
-
-@app.route("/api/mt5/push", methods=["POST"])
-def mt5_bridge_push_endpoint():
-    """Reçoit les bougies M5 poussées par mt5_price_bridge.py (tourne sur un
-    PC/VPS Windows avec MT5 ouvert). Body attendu :
-    {"secret": "...", "symbol": "XAUUSD", "candles": [{"time","open","high","low","close"}, ...]}
-    Sans MT5_BRIDGE_SECRET défini côté serveur, la route est désactivée
-    (retourne 503) pour ne jamais accepter de prix non authentifiés."""
-    if not MT5_BRIDGE_SECRET:
-        return jsonify({"ok": False, "error": "mt5_bridge_disabled_no_secret_configured"}), 503
-    data = request.get_json(silent=True) or {}
-    if data.get("secret") != MT5_BRIDGE_SECRET:
-        return jsonify({"ok": False, "error": "invalid_secret"}), 403
-    symbol = data.get("symbol")
-    candles = data.get("candles")
-    if symbol not in ASSETS or not isinstance(candles, list) or not candles:
-        return jsonify({"ok": False, "error": "invalid_payload"}), 400
-    try:
-        cleaned = [{
-            "time": float(c["time"]), "open": float(c["open"]), "high": float(c["high"]),
-            "low": float(c["low"]), "close": float(c["close"]),
-        } for c in candles]
-    except (KeyError, TypeError, ValueError):
-        return jsonify({"ok": False, "error": "invalid_candle_format"}), 400
-    _mt5_bridge_push(symbol, cleaned)
-    return jsonify({"ok": True, "symbol": symbol, "candles_received": len(cleaned)})
-
-
-@app.route("/api/lot-size", methods=["POST"])
-def lot_size():
-    data = request.get_json(force=True)
-    settings = get_settings()
-    symbol = data.get("symbol")
-    risk_percent = float(data.get("risk_percent") or get_effective_risk_percent(symbol, settings))
-    lot = compute_lot_size(
-        capital=float(data.get("capital", settings["capital"])),
-        risk_percent=risk_percent,
-        entry=float(data["entry"]), stop_loss=float(data["stop_loss"]),
-        pip_value_per_lot=float(data.get("pip_value_per_lot", 10.0)),
-        pip_size=float(data.get("pip_size", 0.01)),
-    )
-    return jsonify({"lot_size": lot, "risk_percent_used": risk_percent})
-
-
-@app.route("/api/profile", methods=["GET", "POST"])
-def profile():
-    """Conservé pour compatibilité ascendante — délègue maintenant au
-    profil actif du nouveau système (table `profiles`, voir /api/profiles)."""
-    if request.method == "POST":
-        data = request.get_json(force=True)
-        name = data.get("name")
-        match = next((p for p in list_profiles() if p["name"] == name), None)
-        if not match:
-            return jsonify({"error": "profil inconnu"}), 400
-        activate_profile(match["id"])
-    settings = get_settings()
-    active = next((p for p in list_profiles() if p["id"] == settings.get("active_profile_id")), None)
-    return jsonify({"active_profile": active["name"] if active else None, "settings": active})
-
-
-@app.route("/api/profiles", methods=["GET", "POST"])
-def profiles_endpoint():
-    """Liste tous les profils sauvegardés, ou en crée un nouveau.
-    Body POST attendu : {name, capital, leverage, risk_percent, max_open_positions}."""
-    if request.method == "POST":
-        data = request.get_json(force=True) or {}
-        try:
-            p = create_profile(
-                name=data.get("name"),
-                capital=float(data.get("capital", 0)),
-                leverage=float(data.get("leverage", 0)),
-                risk_percent=float(data.get("risk_percent", 0)),
-                max_open_positions=int(data.get("max_open_positions", 0)),
-            )
-        except (ValueError, TypeError) as e:
-            return jsonify({"error": str(e)}), 400
-        return jsonify(p), 201
-    return jsonify(list_profiles())
-
-
-@app.route("/api/profiles/<int:profile_id>", methods=["GET", "PUT", "DELETE"])
-def profile_detail(profile_id):
-    if request.method == "GET":
-        p = get_profile(profile_id)
-        if not p:
-            return jsonify({"error": "profil introuvable"}), 404
-        return jsonify(p)
-    if request.method == "PUT":
-        data = request.get_json(force=True) or {}
-        try:
-            p = update_profile(profile_id, data)
-        except ValueError as e:
-            return jsonify({"error": str(e)}), 400
-        return jsonify(p)
-    try:
-        delete_profile(profile_id)
-    except ValueError as e:
-        return jsonify({"error": str(e)}), 400
-    return jsonify({"ok": True})
-
-
-@app.route("/api/profiles/<int:profile_id>/activate", methods=["POST"])
-def profile_activate(profile_id):
-    """Sélectionne ce profil comme actif ET applique immédiatement ses
-    valeurs (capital, levier, risque %, positions max) — sans redémarrage."""
-    try:
-        settings = activate_profile(profile_id)
-    except ValueError as e:
-        return jsonify({"error": str(e)}), 400
-    return jsonify({"ok": True, "active_profile_id": profile_id, "settings": settings})
-
-
-@app.route("/api/settings", methods=["GET", "POST"])
-def settings_endpoint():
-    """Point central de configuration du dashboard : capital, levier, risque
-    par trade, mode risque, martingale, recovery, positions max, score min."""
-    if request.method == "POST":
-        data = request.get_json(force=True) or {}
-        try:
-            updated = update_settings(data)
-        except ValueError as e:
-            return jsonify({"error": str(e)}), 400
-        return jsonify(updated)
-    return jsonify(get_settings())
-
-
-_cached_get_stats = _ttl_cached("stats")(get_stats)
-_cached_get_dashboard_overview = _ttl_cached("overview")(get_dashboard_overview)
-_cached_get_stats_by_asset = _ttl_cached("by_asset")(get_stats_by_asset)
-_cached_get_monthly_performance = _ttl_cached("monthly")(get_monthly_performance)
-
-
-@app.route("/api/stats")
-def stats():
-    return jsonify(_cached_get_stats())
-
-
-@app.route("/api/overview")
-def overview():
-    return jsonify(_cached_get_dashboard_overview())
-
-
-@app.route("/api/stats/by-asset")
-def stats_by_asset():
-    return jsonify(_cached_get_stats_by_asset())
-
-
-@app.route("/api/stats/monthly")
-def stats_monthly():
-    n = request.args.get("months", default=6, type=int)
-    return jsonify(_cached_get_monthly_performance(n))
-
-
-@app.route("/api/history")
-def history():
-    limit = request.args.get("limit", default=100, type=int)
-    symbol = request.args.get("symbol")
-    status = request.args.get("status")
-    return jsonify(get_trade_history(limit=limit, symbol=symbol, status=status))
-
-
-@app.route("/api/reports/daily")
-def report_daily():
-    now = datetime.now(timezone.utc)
-    start_ts, end_ts = _day_bounds(now)
-    return jsonify(get_period_stats(start_ts, end_ts))
-
-
-@app.route("/api/reports/weekly")
-def report_weekly():
-    now = datetime.now(timezone.utc)
-    start_ts, end_ts, period_key = _week_bounds(now)
-    stats_data = get_period_stats(start_ts, end_ts)
-    stats_data["period_key"] = period_key
-    return jsonify(stats_data)
-
-
-@app.route("/api/reports/monthly")
-def report_monthly():
-    now = datetime.now(timezone.utc)
-    start_ts, end_ts = _month_bounds(now)
-    stats_data = get_period_stats(start_ts, end_ts)
-    stats_data["period_key"] = now.strftime("%Y-%m")
-    return jsonify(stats_data)
-
-
-@app.route("/api/trade/<int:signal_id>/status", methods=["POST"])
-def set_trade_status(signal_id):
-    data = request.get_json(force=True)
-    status = data.get("status")
-    valid = {"taken", "ignored", "closed", "be", "secured", "tp1_hit", "tp2_hit", "invalidated"}
-    if status not in valid:
-        return jsonify({"error": f"status invalide, attendu un de {valid}"}), 400
-    record_trade_action(signal_id, action=status, new_status=status, source="dashboard")
-    try:
-        notify_trade_event(signal_id, status)
-    except Exception:
-        log.warning(f"Échec notification Telegram pour le signal #{signal_id}:\n{traceback.format_exc()}")
-    return jsonify({"ok": True, "signal_id": signal_id, "status": status})
-
-
-@app.route("/api/trade/<int:signal_id>")
-def get_trade(signal_id):
-    row = get_signal(signal_id)
-    if not row:
-        return jsonify({"error": "introuvable"}), 404
-    return jsonify(dict(row))
-
-
-@app.route("/api/trade/<int:signal_id>/actions")
-def get_trade_actions_endpoint(signal_id):
-    rows = get_trade_actions(signal_id)
-    return jsonify([dict(r) for r in rows])
-
-
-_WEBHOOK_BOT_KEYS = ("signal_group",)  # une seule clé valide pour <bot_key> dans l'URL
-
-
-@app.route("/telegram/webhook/<bot_key>", methods=["POST"])
-def telegram_webhook(bot_key):
-    """Reçoit les updates Telegram : commandes texte (/settings, /capital...),
-    boutons inline des signaux (✅❌🟡🔒🔴) et du menu /profils. bot_key (dans
-    l'URL) identifie le bot — donc le token — qui a reçu le message, y
-    compris en DM. Voir section DÉPLOIEMENT en bas de fichier pour l'URL de
-    webhook (.../telegram/webhook/signal_group)."""
-    if bot_key not in _WEBHOOK_BOT_KEYS:
-        return jsonify({"error": "bot inconnu"}), 404
-
-    if TELEGRAM_WEBHOOK_SECRET:
-        header = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
-        if header != TELEGRAM_WEBHOOK_SECRET:
-            return jsonify({"error": "secret invalide"}), 403
-
-    update = request.get_json(force=True, silent=True) or {}
-
-    message = update.get("message")
-    if message and isinstance(message.get("text"), str):
-        try:
-            _handle_telegram_command(message, bot_key)
-        except Exception:
-            log.error("Erreur traitement commande Telegram:\n" + traceback.format_exc())
-        return jsonify({"ok": True})
-
-    callback = update.get("callback_query")
-    if not callback:
-        return jsonify({"ok": True})  # autre type d'update -> ignoré
-
-    if callback.get("data", "").startswith("prof:"):
-        try:
-            _handle_profile_callback(callback, bot_key)
-        except Exception:
-            log.error("Erreur callback profil Telegram:\n" + traceback.format_exc())
-        return jsonify({"ok": True})
-
-    if callback.get("data", "").startswith(("menu:", "set:")):
-        try:
-            _handle_menu_callback(callback, bot_key)
-        except Exception:
-            log.error("Erreur callback menu Telegram:\n" + traceback.format_exc())
-        return jsonify({"ok": True})
-
-    try:
-        data = callback.get("data", "")
-        parts = data.split(":")
-        if len(parts) != 3 or parts[0] != "act":
-            return jsonify({"ok": True})
-
-        _, signal_id_str, action_key = parts
-        signal_id = int(signal_id_str)
-        action_def = TRADE_ACTIONS.get(action_key)
-        row = get_signal(signal_id)
-
-        if not action_def or not row:
-            return jsonify({"ok": True})
-
-        # bot_key = le bot qui a reçu ce clic (il n'y en a qu'un seul,
-        # "signal_group" — plus de multi-bot FREE/VIP).
-        group = bot_key
-        sender_id = (callback.get("from") or {}).get("id")
-        if not _is_owner(sender_id):
-            try:
-                _telegram_answer_callback(group, callback["id"], text=_OWNER_ONLY_REPLY, show_alert=True)
-            except Exception:
-                log.warning("Échec answerCallbackQuery Telegram (accès refusé):\n" + traceback.format_exc())
-            return jsonify({"ok": True})
-
-        actor_info = callback.get("from") or {}
-        actor = actor_info.get("username") or str(actor_info.get("id", "")) or None
-        record_trade_action(signal_id, action=action_key, new_status=action_def["status"],
-                             source="telegram", actor=actor)
-        try:
-            notify_trade_event(signal_id, action_def["status"])
-        except Exception:
-            log.warning(f"Échec notification TP/SL/BE pour le signal #{signal_id}:\n{traceback.format_exc()}")
-
-        confirm_text = f"{action_def['emoji']} {action_def['label']} enregistré pour le signal #{signal_id}."
-        try:
-            _telegram_answer_callback(group, callback["id"], text=confirm_text)
-        except Exception:
-            log.warning("Échec answerCallbackQuery Telegram:\n" + traceback.format_exc())
-
-        message = callback.get("message") or {}
-        chat = message.get("chat") or {}
-        if chat.get("id") and message.get("message_id"):
-            try:
-                _telegram_edit_reply_markup(group, chat["id"], message["message_id"], None)
-            except Exception:
-                log.warning("Échec editMessageReplyMarkup Telegram:\n" + traceback.format_exc())
-
-        return jsonify({"ok": True, "signal_id": signal_id, "action": action_key,
-                         "status": action_def["status"]})
-    except Exception:
-        log.error("Erreur traitement webhook Telegram:\n" + traceback.format_exc())
-        # 200 volontaire : éviter que Telegram ne retente indéfiniment un update cassé.
-        return jsonify({"ok": False}), 200
-
-
-DASHBOARD_HTML = """
-<!doctype html>
-<html lang="fr">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>AlphaBot SMC PRO — Dashboard</title>
-<style>
-  :root { --bg:#0f1420; --card:#171d2b; --border:#262e42; --text:#e8ecf4; --muted:#8b93a7;
-          --green:#22c55e; --red:#ef4444; --blue:#3b82f6; --amber:#f59e0b; }
-  * { box-sizing: border-box; }
-  body { margin:0; font-family: -apple-system, Segoe UI, Roboto, sans-serif; background:var(--bg); color:var(--text); }
-  header { padding:20px 28px; border-bottom:1px solid var(--border); display:flex; justify-content:space-between; align-items:center; }
-  header h1 { font-size:18px; margin:0; }
-  header span { color:var(--muted); font-size:13px; }
-  main { max-width:1180px; margin:0 auto; padding:24px 20px 60px; }
-  .cards { display:grid; grid-template-columns: repeat(auto-fit, minmax(170px,1fr)); gap:14px; margin-bottom:26px; }
-  .card { background:var(--card); border:1px solid var(--border); border-radius:12px; padding:16px; }
-  .card .label { color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.04em; }
-  .card .value { font-size:22px; font-weight:700; margin-top:6px; }
-  .pos { color:var(--green); } .neg { color:var(--red); }
-  section { background:var(--card); border:1px solid var(--border); border-radius:12px; padding:20px; margin-bottom:20px; }
-  section h2 { margin:0 0 16px; font-size:15px; }
-  .grid-form { display:grid; grid-template-columns: repeat(auto-fit, minmax(200px,1fr)); gap:14px; }
-  label { display:block; font-size:12px; color:var(--muted); margin-bottom:5px; }
-  input[type=number], select { width:100%; background:#0f1420; border:1px solid var(--border); color:var(--text);
-        padding:9px 10px; border-radius:8px; font-size:14px; }
-  .toggle-row { display:flex; align-items:center; justify-content:space-between; background:#0f1420;
-        border:1px solid var(--border); border-radius:8px; padding:10px 12px; }
-  .switch { position:relative; width:42px; height:24px; }
-  .switch input { opacity:0; width:0; height:0; }
-  .slider { position:absolute; cursor:pointer; inset:0; background:#333c50; border-radius:24px; transition:.2s; }
-  .slider:before { content:""; position:absolute; height:18px; width:18px; left:3px; bottom:3px; background:white; border-radius:50%; transition:.2s; }
-  input:checked + .slider { background:var(--blue); }
-  input:checked + .slider:before { transform: translateX(18px); }
-  button { background:var(--blue); color:white; border:none; padding:10px 18px; border-radius:8px; font-size:14px;
-        cursor:pointer; font-weight:600; }
-  button:hover { opacity:.9; }
-  #saveMsg { margin-left:12px; font-size:13px; color:var(--green); }
-  table { width:100%; border-collapse:collapse; font-size:13px; }
-  th, td { text-align:left; padding:9px 10px; border-bottom:1px solid var(--border); }
-  th { color:var(--muted); font-weight:600; font-size:12px; text-transform:uppercase; }
-  .badge { padding:2px 8px; border-radius:20px; font-size:11px; font-weight:600; }
-  .b-buy { background:rgba(34,197,94,.15); color:var(--green); }
-  .b-sell { background:rgba(239,68,68,.15); color:var(--red); }
-  .b-status { background:rgba(59,130,246,.15); color:var(--blue); }
-  .filters { display:flex; gap:10px; margin-bottom:14px; flex-wrap:wrap; }
-  .filters select { width:auto; min-width:140px; }
-  .tabs { display:flex; gap:8px; margin-bottom:16px; }
-  .tab-btn { background:#0f1420; border:1px solid var(--border); color:var(--muted); padding:8px 14px;
-        border-radius:8px; cursor:pointer; font-size:13px; }
-  .tab-btn.active { background:var(--blue); color:white; border-color:var(--blue); }
-</style>
-</head>
-<body>
-<header>
-  <h1>⚡ AlphaBot SMC PRO — Dashboard</h1>
-  <span id="lastUpdate">chargement…</span>
-</header>
-<main>
-  <div class="cards" id="overviewCards"></div>
-
-  <section>
-    <h2>👤 Profils (Scalping, Conservative, personnalisés…)</h2>
-    <table id="profilesTable">
-      <thead><tr><th>Nom</th><th>Capital</th><th>Levier</th><th>Risque %</th><th>Pos. max</th><th>Statut</th><th></th></tr></thead>
-      <tbody></tbody>
-    </table>
-    <div class="grid-form" style="margin-top:16px;">
-      <div><label>Nom du profil</label><input type="text" id="p_name" placeholder="ex: Mon setup New York"></div>
-      <div><label>Capital ($)</label><input type="number" step="0.01" id="p_capital" value="1000"></div>
-      <div><label>Levier (x)</label><input type="number" step="1" id="p_leverage" value="100"></div>
-      <div><label>Risque par trade (%)</label><input type="number" step="0.1" id="p_risk_percent" value="1"></div>
-      <div><label>Positions ouvertes max</label><input type="number" step="1" id="p_max_open_positions" value="3"></div>
-    </div>
-    <div style="margin-top:14px;">
-      <button onclick="createOrUpdateProfile()">💾 Enregistrer le profil</button>
-      <button style="background:#333c50; margin-left:8px;" onclick="resetProfileForm()">Annuler l'édition</button>
-      <span id="profileMsg"></span>
-    </div>
-  </section>
-
-  <section>
-    <h2>Réglages (appliqués immédiatement, aucune modification du code nécessaire)</h2>
-    <div class="grid-form">
-      <div><label>Capital du compte ($)</label><input type="number" step="0.01" id="s_capital"></div>
-      <div><label>Levier (x)</label><input type="number" step="1" id="s_leverage"></div>
-      <div><label>Risque par trade (%)</label><input type="number" step="0.1" id="s_risk_percent"></div>
-      <div><label>Positions ouvertes max</label><input type="number" step="1" id="s_max_open_positions"></div>
-      <div><label>Risque par trade ($)</label><input type="number" step="0.5" min="0" id="s_risk_dollar_amount"></div>
-      <div><label>Unité de risque</label>
-        <select id="s_risk_unit"><option value="dollar">$ fixe</option><option value="percent">% du capital</option></select>
-      </div>
-      <div><label>Multiplicateur martingale</label><input type="number" step="0.1" id="s_martingale_multiplier"></div>
-      <div><label>Multiplicateur max recovery</label><input type="number" step="0.1" id="s_recovery_max_multiplier"></div>
-      <div><label>Session de trading</label>
-        <select id="s_session_mode">
-          <option value="ny">NY fixe (13h-22h UTC)</option>
-          <option value="24h">24h/24 (continu)</option>
-        </select>
-      </div>
-      <div><label>Timeframe du scan</label>
-        <select id="s_timeframe">
-          <option value="M5">M5</option>
-          <option value="M1">M1 (scalping)</option>
-        </select>
-      </div>
-    </div>
-    <div class="grid-form" style="margin-top:14px;">
-      <div class="toggle-row"><span>Martingale</span>
-        <label class="switch"><input type="checkbox" id="s_martingale_enabled"><span class="slider"></span></label>
-      </div>
-      <div class="toggle-row"><span>Recovery</span>
-        <label class="switch"><input type="checkbox" id="s_recovery_enabled"><span class="slider"></span></label>
-      </div>
-    </div>
-    <div style="margin-top:16px;">
-      <button onclick="saveSettings()">💾 Enregistrer les réglages</button>
-      <span id="saveMsg"></span>
-    </div>
-  </section>
-
-  <section>
-    <h2>Performance par actif</h2>
-    <table id="byAssetTable">
-      <thead><tr><th>Actif</th><th>Total</th><th>Gagnants</th><th>Perdants</th><th>Winrate</th><th>R cumulé</th></tr></thead>
-      <tbody></tbody>
-    </table>
-  </section>
-
-  <section>
-    <h2>Performances mensuelles (6 derniers mois)</h2>
-    <table id="monthlyTable">
-      <thead><tr><th>Mois</th><th>Signaux</th><th>Gagnants</th><th>Perdants</th><th>Winrate</th><th>R</th></tr></thead>
-      <tbody></tbody>
-    </table>
-  </section>
-
-  <section>
-    <h2>Historique des trades</h2>
-    <div class="filters">
-      <select id="f_symbol"><option value="">Tous les actifs</option></select>
-      <select id="f_status">
-        <option value="">Tous les statuts</option>
-        <option value="pending">pending</option><option value="taken">taken</option>
-        <option value="be">be</option><option value="secured">secured</option>
-        <option value="tp1_hit">tp1_hit</option><option value="tp2_hit">tp2_hit</option>
-        <option value="invalidated">invalidated</option><option value="closed">closed</option>
-        <option value="ignored">ignored</option>
-      </select>
-      <button onclick="loadHistory()">Filtrer</button>
-      <button onclick="exportHistory('csv')">⬇️ Export CSV</button>
-      <button onclick="exportHistory('pdf')">⬇️ Export PDF</button>
-      <button onclick="triggerBackup()">💾 Sauvegarder maintenant</button>
-    </div>
-    <table id="historyTable">
-      <thead><tr><th>Date</th><th>Actif</th><th>Sens</th><th>Type</th><th>Score</th><th>Entrée</th><th>SL</th><th>TP (RR)</th><th>Statut</th></tr></thead>
-      <tbody></tbody>
-    </table>
-  </section>
-</main>
-
-<script>
-const ASSETS = {{ assets_json | safe }};
-
-let editingProfileId = null;
-
-async function loadProfiles() {
-  const r = await fetch('/api/profiles'); const profiles = await r.json();
-  const tbody = document.querySelector('#profilesTable tbody');
-  tbody.innerHTML = profiles.map(p => `
-    <tr>
-      <td>${p.name}</td><td>$${p.capital}</td><td>${p.leverage}x</td>
-      <td>${p.risk_percent}%</td><td>${p.max_open_positions}</td>
-      <td>${p.active ? '<span class="badge b-buy">✓ actif</span>' : ''}</td>
-      <td>
-        ${p.active ? '' : `<button style="padding:5px 10px;font-size:12px;" onclick="activateProfile(${p.id})">Activer</button>`}
-        <button style="padding:5px 10px;font-size:12px;background:#333c50;margin-left:4px;" onclick="editProfile(${p.id}, '${p.name.replace(/'/g,"\\'")}', ${p.capital}, ${p.leverage}, ${p.risk_percent}, ${p.max_open_positions})">✎</button>
-        ${p.active ? '' : `<button style="padding:5px 10px;font-size:12px;background:var(--red);margin-left:4px;" onclick="deleteProfile(${p.id})">🗑</button>`}
-      </td>
-    </tr>`).join('');
-}
-
-async function activateProfile(id) {
-  const r = await fetch(`/api/profiles/${id}/activate`, {method:'POST'});
-  if (r.ok) { loadProfiles(); loadOverview(); }
-}
-
-function editProfile(id, name, capital, leverage, risk_percent, max_open_positions) {
-  editingProfileId = id;
-  document.getElementById('p_name').value = name;
-  document.getElementById('p_capital').value = capital;
-  document.getElementById('p_leverage').value = leverage;
-  document.getElementById('p_risk_percent').value = risk_percent;
-  document.getElementById('p_max_open_positions').value = max_open_positions;
-}
-
-function resetProfileForm() {
-  editingProfileId = null;
-  document.getElementById('p_name').value = '';
-  document.getElementById('p_capital').value = 1000;
-  document.getElementById('p_leverage').value = 100;
-  document.getElementById('p_risk_percent').value = 1;
-  document.getElementById('p_max_open_positions').value = 3;
-}
-
-async function createOrUpdateProfile() {
-  const payload = {
-    name: document.getElementById('p_name').value,
-    capital: parseFloat(document.getElementById('p_capital').value),
-    leverage: parseFloat(document.getElementById('p_leverage').value),
-    risk_percent: parseFloat(document.getElementById('p_risk_percent').value),
-    max_open_positions: parseInt(document.getElementById('p_max_open_positions').value),
-  };
-  const url = editingProfileId ? `/api/profiles/${editingProfileId}` : '/api/profiles';
-  const method = editingProfileId ? 'PUT' : 'POST';
-  const r = await fetch(url, {method, headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
-  const msg = document.getElementById('profileMsg');
-  if (r.ok) {
-    msg.style.color = 'var(--green)'; msg.textContent = '✓ Profil enregistré';
-    resetProfileForm(); loadProfiles(); loadOverview();
-  } else {
-    const e = await r.json(); msg.style.color = 'var(--red)'; msg.textContent = '✗ ' + e.error;
-  }
-  setTimeout(() => msg.textContent = '', 3000);
-}
-
-async function deleteProfile(id) {
-  if (!confirm('Supprimer ce profil ?')) return;
-  const r = await fetch(`/api/profiles/${id}`, {method:'DELETE'});
-  if (r.ok) loadProfiles();
-  else { const e = await r.json(); alert(e.error); }
-}
-
-async function loadOverview() {
-  const r = await fetch('/api/overview'); const d = await r.json();
-  const pnlClass = d.profit_net_total >= 0 ? 'pos' : 'neg';
-  document.getElementById('overviewCards').innerHTML = `
-    <div class="card"><div class="label">Capital actuel</div><div class="value">$${d.capital_actuel}</div></div>
-    <div class="card"><div class="label">Profit / Perte net</div><div class="value ${pnlClass}">$${d.profit_net_total}</div></div>
-    <div class="card"><div class="label">Drawdown max</div><div class="value neg">$${d.drawdown_max}</div></div>
-    <div class="card"><div class="label">Winrate</div><div class="value">${d.winrate}%</div></div>
-    <div class="card"><div class="label">Signaux totaux</div><div class="value">${d.total_signals}</div></div>
-    <div class="card"><div class="label">Positions ouvertes</div><div class="value">${d.open_positions} / ${d.settings.max_open_positions}</div></div>
-  `;
-  const s = d.settings;
-  document.getElementById('s_capital').value = s.capital;
-  document.getElementById('s_leverage').value = s.leverage;
-  document.getElementById('s_risk_percent').value = s.risk_percent;
-  document.getElementById('s_max_open_positions').value = s.max_open_positions;
-  document.getElementById('s_risk_dollar_amount').value = s.risk_dollar_amount;
-  document.getElementById('s_risk_unit').value = s.risk_unit;
-  document.getElementById('s_martingale_multiplier').value = s.martingale_multiplier;
-  document.getElementById('s_recovery_max_multiplier').value = s.recovery_max_multiplier;
-  document.getElementById('s_martingale_enabled').checked = s.martingale_enabled;
-  document.getElementById('s_recovery_enabled').checked = s.recovery_enabled;
-  document.getElementById('s_session_mode').value = s.session_mode || 'ny';
-  document.getElementById('s_timeframe').value = s.timeframe || 'M5';
-  document.getElementById('lastUpdate').textContent = 'mis à jour ' + new Date().toLocaleTimeString();
-}
-
-async function saveSettings() {
-  const payload = {
-    capital: parseFloat(document.getElementById('s_capital').value),
-    leverage: parseFloat(document.getElementById('s_leverage').value),
-    risk_percent: parseFloat(document.getElementById('s_risk_percent').value),
-    max_open_positions: parseInt(document.getElementById('s_max_open_positions').value),
-    risk_dollar_amount: parseFloat(document.getElementById('s_risk_dollar_amount').value),
-    risk_unit: document.getElementById('s_risk_unit').value,
-    martingale_multiplier: parseFloat(document.getElementById('s_martingale_multiplier').value),
-    recovery_max_multiplier: parseFloat(document.getElementById('s_recovery_max_multiplier').value),
-    martingale_enabled: document.getElementById('s_martingale_enabled').checked,
-    recovery_enabled: document.getElementById('s_recovery_enabled').checked,
-    session_mode: document.getElementById('s_session_mode').value,
-    timeframe: document.getElementById('s_timeframe').value,
-  };
-  const r = await fetch('/api/settings', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
-  const msg = document.getElementById('saveMsg');
-  if (r.ok) { msg.style.color = 'var(--green)'; msg.textContent = '✓ Enregistré'; loadOverview(); }
-  else { const e = await r.json(); msg.style.color = 'var(--red)'; msg.textContent = '✗ ' + e.error; }
-  setTimeout(() => msg.textContent = '', 3000);
-}
-
-async function loadByAsset() {
-  const r = await fetch('/api/stats/by-asset'); const d = await r.json();
-  const tbody = document.querySelector('#byAssetTable tbody');
-  tbody.innerHTML = Object.entries(d).map(([sym, s]) => `
-    <tr><td>${s.display_name || sym}</td><td>${s.total}</td><td>${s.wins}</td><td>${s.losses}</td>
-    <td>${s.win_rate}%</td><td class="${s.total_r>=0?'pos':'neg'}">${s.total_r}</td></tr>`).join('');
-}
-
-async function loadMonthly() {
-  const r = await fetch('/api/stats/monthly?months=6'); const d = await r.json();
-  const tbody = document.querySelector('#monthlyTable tbody');
-  tbody.innerHTML = d.map(m => `
-    <tr><td>${m.period_key}</td><td>${m.total_signals}</td><td>${m.wins}</td><td>${m.losses}</td>
-    <td>${m.win_rate}%</td><td class="${m.total_r>=0?'pos':'neg'}">${m.total_r}</td></tr>`).join('');
-}
-
-async function loadHistory() {
-  const symbol = document.getElementById('f_symbol').value;
-  const status = document.getElementById('f_status').value;
-  const params = new URLSearchParams({limit: 150});
-  if (symbol) params.set('symbol', symbol);
-  if (status) params.set('status', status);
-  const r = await fetch('/api/history?' + params.toString()); const d = await r.json();
-  const tbody = document.querySelector('#historyTable tbody');
-  tbody.innerHTML = d.map(t => {
-    const date = new Date(t.created_at * 1000).toLocaleString();
-    const dirBadge = t.direction === 'BUY' ? '<span class="badge b-buy">ACHAT</span>' : '<span class="badge b-sell">VENTE</span>';
-    return `<tr><td>${date}</td><td>${t.symbol}</td><td>${dirBadge}</td><td>${t.entry_type}</td>
-      <td>${t.score}</td><td>${t.entry_price.toFixed(5)}</td><td>${t.stop_loss.toFixed(5)}</td>
-      <td>${t.tp1.toFixed(5)} (RR${t.rr_tp1})</td><td><span class="badge b-status">${t.status}</span></td></tr>`;
-  }).join('');
-}
-
-function exportHistory(fmt) {
-  const symbol = document.getElementById('f_symbol').value;
-  const params = new URLSearchParams({limit: 1000});
-  if (symbol) params.set('symbol', symbol);
-  window.open(`/api/export/${fmt}?` + params.toString(), '_blank');
-}
-
-async function triggerBackup() {
-  const r = await fetch('/api/backup', {method: 'POST'});
-  const d = await r.json();
-  alert(d.ok ? `Sauvegarde créée : ${d.file}` : 'Échec de la sauvegarde.');
-}
-
-function initFilters() {
-  const sel = document.getElementById('f_symbol');
-  ASSETS.forEach(a => { const o = document.createElement('option'); o.value = a.symbol; o.textContent = a.display_name; sel.appendChild(o); });
-}
-
-initFilters();
-loadOverview();
-loadProfiles();
-loadByAsset();
-loadMonthly();
-loadHistory();
-setInterval(loadOverview, 30000);
-</script>
-</body>
-</html>
-"""
-
-
-@app.route("/")
-def index():
-    assets_json = json.dumps([
-        {"symbol": sym, "display_name": a.display_name} for sym, a in ASSETS.items()
-    ])
-    return render_template_string(DASHBOARD_HTML, assets_json=assets_json)
-
-
-# ============================================================================
-# 11. POINT D'ENTRÉE — lance le dashboard Flask dans un thread + la boucle de
-#     scan dans le thread principal, pour ne déployer qu'UN seul process.
-# ============================================================================
-
-if __name__ == "__main__":
-    enforce_group_asset_whitelist()
-    init_db()
-
-    if not TELEGRAM_OWNER_ID:
-        log.warning(
-            "TELEGRAM_OWNER_ID n'est pas défini : TOUTES les commandes réservées au "
-            "leader (/capital /risque /levier /profils /signaux, boutons sous les "
-            "signaux) et le DM privé (send_leader_dm) seront REFUSÉS/NON ENVOYÉS "
-            "tant que cette variable n'est pas définie (comportement fail-closed). "
-            "Définis-la (ton ID Telegram numérique, via @userinfobot) avant la prod."
-        )
-
-    port = int(os.environ.get("PORT", 5000))
-
-    def _run_wsgi_server():
-        # Waitress est un serveur WSGI de production (multi-thread, pas de
-        # limitation de débogage) — on évite le serveur de développement de
-        # Flask, non recommandé en production même derrière un thread daemon.
-        try:
-            from waitress import serve
-            serve(app, host="0.0.0.0", port=port, threads=8)
-        except ImportError:
-            log.warning("waitress n'est pas installé — retombe sur le serveur de dev Flask "
-                        "(ajoute 'waitress' à requirements.txt pour la production).")
-            app.run(host="0.0.0.0", port=port, use_reloader=False)
-
-    flask_thread = threading.Thread(target=_run_wsgi_server, daemon=True)
-    flask_thread.start()
-    log.info(f"Dashboard Flask (Waitress) démarré sur le port {port} (thread daemon).")
-
-    report_thread = threading.Thread(target=report_scheduler_loop, daemon=True)
-    report_thread.start()
-    log.info("Thread du planificateur de rapports démarré.")
-
-    watchdog_thread = threading.Thread(target=watchdog_loop, daemon=True)
-    watchdog_thread.start()
-    log.info("Thread watchdog démarré.")
-
-    backup_thread = threading.Thread(target=backup_scheduler_loop, daemon=True)
-    backup_thread.start()
-    log.info(f"Thread de sauvegarde automatique démarré (toutes les {BACKUP_INTERVAL_HOURS}h).")
-
-    # Message "bot en ligne" sur Telegram — en thread séparé (non bloquant),
-    # pour ne jamais retarder le démarrage de la boucle de scan si Telegram
-    # est lent/indisponible au moment du déploiement.
-    startup_notify_thread = threading.Thread(target=send_startup_notification, daemon=True)
-    startup_notify_thread.start()
-
-
-# ============================================================================
-# MODULE AJOUTÉ (autonome) — gold_price_feed.py
-# ----------------------------------------------------------------------------
-# Flux de prix XAU/USD indépendant basé sur GoldAPI.io (GoldPriceService /
-# GoldAPIFeed / CandleBuilder ci-dessous). NON câblé dans process_asset() ni
-# dans fetch_candles() : le pipeline XAUUSD existant (mt5_bridge -> fallback
-# yfinance, plus haut dans ce fichier) continue de tourner sans changement.
-# Ce module est ajouté tel quel, prêt à être branché plus tard si besoin.
-# ============================================================================
-"""
-gold_price_feed.py
-===================
-Module de prix INDÉPENDANT pour XAU/USD, basé sur GoldAPI.io.
-
-Principes durs (non négociables, ne jamais contourner) :
-  - JAMAIS de prix inventé/simulé, jamais de fallback silencieux. Si le flux
-    est absent, périmé (timestamp trop vieux) ou anormal (saut de prix trop
-    important vs dernière cotation), l'état passe à "stale"/"unavailable" et
-    plus AUCUN tick/bougie n'est produit à partir de données inventées : le
-    consommateur (moteur de signal) doit alors arrêter d'émettre des
-    signaux (voir GoldPriceService.should_produce_signals()).
-  - JAMAIS Yahoo Finance comme source, même en secours.
-  - Une bougie M5 ne mélange JAMAIS des ticks venant de deux sources
-    différentes : un changement de source ferme explicitement la bougie en
-    cours (is_complete=True) et une nouvelle bougie démarre avec la
-    nouvelle source.
-  - Chaque cotation loggue explicitement sa source exacte (goldapi.io ici).
-
-Architecture :
-  PriceFeed (ABC)         -> interface générique. Permet de brancher plus
-                             tard un flux MT5/cTrader sans toucher au reste
-                             du système (CandleBuilder, moteur de signal...).
-  GoldAPIFeed(PriceFeed)  -> implémentation GoldAPI.io pour XAU/USD (payant
-                             au-delà de 100 requêtes/mois sur le tier gratuit).
-  GoldApiComFeed(PriceFeed) -> implémentation Gold-API.com pour XAU/USD (ou
-                             tout autre symbole supporté) — endpoint de prix
-                             temps réel GRATUIT et SANS LIMITE DE REQUÊTES,
-                             sans clé API. RECOMMANDÉ par défaut pour un scan
-                             en continu (voir docstring de la classe pour les
-                             limites : pas de bid/ask séparés, endpoints
-                             historique/OHLC payants -> M5 reconstruit
-                             localement via CandleBuilder comme pour GoldAPIFeed.
-  Tick                    -> une cotation VALIDÉE (prix, bid, ask, ts, source).
-  Candle                  -> bougie M5 OHLC construite à partir de Ticks.
-  CandleBuilder           -> agrège des Ticks d'UNE SEULE source à la fois.
-  GoldPriceService        -> service de haut niveau : polling + état exposé
-                             au consommateur.
-"""
-
-import abc
-import logging
-import time
-from dataclasses import dataclass
-from datetime import datetime, timezone
-from enum import Enum
-from typing import List, Optional
-
-import requests
-
-log_gold_feed = logging.getLogger("gold_price_feed")
-
-M5_SECONDS = 300
-
-
-# ============================================================================
-# États et structures de données
-# ============================================================================
-
-class FeedState(str, Enum):
-    LIVE = "live"                  # dernière cotation valide et fraîche
-    STALE = "stale"                # dernière cotation trop ancienne / saut anormal rejeté
-    UNAVAILABLE = "unavailable"    # API injoignable / réponse invalide / jamais interrogée
+TickListener = Callable[[str, "Tick"], Awaitable[None]]
 
 
 @dataclass(frozen=True)
 class Tick:
-    """Une cotation VALIDÉE (a passé tous les contrôles), avec sa source exacte."""
     symbol: str
-    price: float
-    bid: float
-    ask: float
-    quote_time_utc: datetime       # timestamp de cotation fourni par la source (UTC)
-    received_time_utc: datetime    # heure UTC de réception côté client
-    source: str                    # ex. "goldapi.io" — jamais vide, jamais deviné
+    quote: float
+    epoch: int
+    pip_size: Optional[float] = None
+
+
+class TickCache:
+    def __init__(self, client: DerivClient):
+        self.client = client
+        self._latest: dict[str, Tick] = {}
+        self._listeners: list[TickListener] = []
+        self.client.on("tick", self._on_tick_message)
+
+    def add_listener(self, listener: TickListener) -> None:
+        self._listeners.append(listener)
+
+    async def subscribe(self, symbols: list[str]) -> None:
+        for symbol in symbols:
+            await self.client.subscribe({"ticks": symbol, "subscribe": 1})
+            log_ticks.info("Abonné aux ticks de %s", symbol)
+
+    def latest(self, symbol: str) -> Optional[Tick]:
+        return self._latest.get(symbol)
+
+    async def _on_tick_message(self, msg: dict) -> None:
+        raw = msg.get("tick")
+        if not raw:
+            return
+        tick = Tick(symbol=raw["symbol"], quote=float(raw["quote"]),
+                    epoch=int(raw["epoch"]), pip_size=raw.get("pip_size"))
+        self._latest[tick.symbol] = tick
+        log_ticks.debug("%s\nLTP = %s", tick.symbol, tick.quote)
+
+        for listener in self._listeners:
+            await listener(tick.symbol, tick)
+
+
+# =============================================================================
+# 5. BOUGIES (construites depuis les ticks, jamais de bougie en cours utilisée)
+# =============================================================================
+
+log_candles = logging.getLogger("deriv.candles")
+
+CloseListener = Callable[[str, str, "Candle"], Awaitable[None]]
 
 
 @dataclass
 class Candle:
-    """Bougie M5 OHLC, construite exclusivement à partir de Ticks d'UNE
-    SEULE source. `is_complete` est False tant que la bougie est en cours
-    (bucket M5 non terminé), True dès qu'elle a été clôturée par l'arrivée
-    d'un tick appartenant au bucket suivant (ou par changement de source)."""
+    epoch: int
     open: float
     high: float
     low: float
     close: float
-    timestamp: datetime            # début de la bougie M5 (UTC, aligné sur le bucket)
-    is_complete: bool = False
-    tick_count: int = 0
-    source: Optional[str] = None   # source UNIQUE de tous les ticks agrégés dans cette bougie
 
+    def update(self, price: float) -> None:
+        self.high = max(self.high, price)
+        self.low = min(self.low, price)
+        self.close = price
+
+
+class CandleStore:
+    def __init__(self, client: DerivClient, tick_cache: TickCache, max_buffer: int = 1000):
+        self.client = client
+        self.tick_cache = tick_cache
+        self.max_buffer = max_buffer
+
+        self._closed: dict[str, dict[str, deque]] = defaultdict(dict)
+        self._forming: dict[str, dict[str, Optional[Candle]]] = defaultdict(dict)
+        self._close_listeners: list[CloseListener] = []
+        self._timeframes_by_symbol: dict[str, dict[str, int]] = {}
+
+        self.tick_cache.add_listener(self._on_tick)
+
+    def add_close_listener(self, listener: CloseListener) -> None:
+        self._close_listeners.append(listener)
+
+    def get_closed_candles(self, symbol: str, timeframe: str, n: Optional[int] = None) -> list[Candle]:
+        buf = self._closed.get(symbol, {}).get(timeframe, deque())
+        data = list(buf)
+        return data[-n:] if n else data
+
+    def get_forming_candle(self, symbol: str, timeframe: str) -> Optional[Candle]:
+        return self._forming.get(symbol, {}).get(timeframe)
+
+    async def load_history(self, symbol: str, timeframes: dict[str, int], count: int) -> None:
+        for tf_name, granularity in timeframes.items():
+            response = await self.client.request({
+                "ticks_history": symbol, "style": "candles", "granularity": granularity,
+                "count": count, "end": "latest", "subscribe": 0,
+            })
+
+            if response.get("error"):
+                log_candles.error("Historique indisponible pour %s/%s : %s",
+                                   symbol, tf_name, response["error"])
+                self._closed[symbol][tf_name] = deque(maxlen=self.max_buffer)
+                continue
+
+            raw_candles = response.get("candles", [])
+            candles = [
+                Candle(epoch=int(c["epoch"]), open=float(c["open"]),
+                       high=float(c["high"]), low=float(c["low"]), close=float(c["close"]))
+                for c in raw_candles
+            ]
+            # La dernière bougie renvoyée est la bougie encore ouverte côté serveur :
+            # jamais gardée comme "clôturée". On la garde comme bougie "en cours" (avec
+            # son OHLC serveur) pour que les ticks la complètent, au lieu de repartir
+            # d'une bougie vide qui serait partielle à sa clôture.
+            forming = candles.pop() if candles else None
+
+            self._closed[symbol][tf_name] = deque(candles, maxlen=self.max_buffer)
+            self._forming[symbol][tf_name] = forming
+            log_candles.info("Historique chargé : %s/%s -> %d bougies clôturées.",
+                              symbol, tf_name, len(candles))
+
+    async def _on_tick(self, symbol: str, tick: Tick) -> None:
+        timeframes = self._forming.get(symbol)
+        if timeframes is None:
+            return
+
+        for tf_name, forming in list(timeframes.items()):
+            granularity = self._granularity_for(symbol, tf_name)
+            if granularity is None:
+                continue
+            bucket_epoch = tick.epoch - (tick.epoch % granularity)
+
+            if forming is None:
+                self._forming[symbol][tf_name] = Candle(
+                    epoch=bucket_epoch, open=tick.quote, high=tick.quote,
+                    low=tick.quote, close=tick.quote)
+                continue
+
+            if bucket_epoch < forming.epoch:
+                log_candles.debug("Tick hors-ordre ignoré pour %s/%s", symbol, tf_name)
+                continue
+
+            if bucket_epoch == forming.epoch:
+                forming.update(tick.quote)
+                continue
+
+            closed_candle = forming
+            self._closed[symbol].setdefault(
+                tf_name, deque(maxlen=self.max_buffer)).append(closed_candle)
+            self._forming[symbol][tf_name] = Candle(
+                epoch=bucket_epoch, open=tick.quote, high=tick.quote,
+                low=tick.quote, close=tick.quote)
+
+            for listener in self._close_listeners:
+                await listener(symbol, tf_name, closed_candle)
+
+    def register_timeframes(self, symbol: str, timeframes: dict[str, int]) -> None:
+        self._timeframes_by_symbol[symbol] = timeframes
+        forming = self._forming.setdefault(symbol, {})
+        for tf in timeframes:
+            forming.setdefault(tf, None)
 
-# ============================================================================
-# Interface abstraite — pour brancher MT5/cTrader plus tard sans rien casser
-# ============================================================================
+    def _granularity_for(self, symbol: str, tf_name: str) -> Optional[int]:
+        return self._timeframes_by_symbol.get(symbol, {}).get(tf_name)
 
-class PriceFeed(abc.ABC):
-    """Interface générique d'un flux de prix. Toute nouvelle source (GoldAPI,
-    pont MT5, cTrader, etc.) doit l'implémenter pour rester interchangeable
-    avec le reste du système (CandleBuilder, GoldPriceService, moteur de
-    signal). Aucune implémentation ne doit jamais retourner un prix
-    inventé/interpolé — `get_latest_tick()` retourne None si aucune cotation
-    fraîche et valide n'est disponible."""
 
-    @property
-    @abc.abstractmethod
-    def source_name(self) -> str:
-        """Nom exact de la source, utilisé pour le logging et pour empêcher
-        le mélange de sources dans une même bougie M5."""
-        ...
+# =============================================================================
+# 6. LOGIQUE PURE (sans I/O, entièrement testable)
+# =============================================================================
 
-    @abc.abstractmethod
-    def get_latest_tick(self) -> Optional[Tick]:
-        """Retourne la dernière cotation VALIDÉE, ou None si indisponible/
-        périmée/anormale. Ne doit JAMAIS retourner un prix simulé."""
-        ...
-
-    @property
-    @abc.abstractmethod
-    def state(self) -> FeedState:
-        ...
-
-
-# ============================================================================
-# Implémentation GoldAPI.io
-# ============================================================================
-
-class GoldAPIFeed(PriceFeed):
-    """Client GoldAPI.io pour XAU/USD.
-
-    Validation stricte AVANT toute utilisation du prix :
-      1. Réponse API valide (champs attendus présents).
-      2. Prix numérique (price/bid/ask) et strictement positif.
-      3. Timestamp de cotation non périmé (< max_quote_age_seconds).
-      4. Pas de saut de prix anormal vs dernière cotation valide
-         (< max_price_jump_pct).
-    Si un de ces contrôles échoue, get_latest_tick() retourne None et
-    l'état passe à STALE (périmé/saut anormal) ou UNAVAILABLE (API/JSON
-    invalide) — jamais de prix de repli inventé.
-    """
-
-    API_URL = "https://www.goldapi.io/api/XAU/USD"
-
-    def __init__(self, api_key: str, max_quote_age_seconds: float = 30.0,
-                 max_price_jump_pct: float = 1.5, timeout_seconds: float = 5.0):
-        if not api_key:
-            raise ValueError("GoldAPIFeed nécessite une clé API GoldAPI.io (api_key).")
-        self._api_key = api_key
-        self._max_age = max_quote_age_seconds
-        self._max_jump_pct = max_price_jump_pct
-        self._timeout = timeout_seconds
-        self._last_valid_tick: Optional[Tick] = None
-        self._state: FeedState = FeedState.UNAVAILABLE
-
-    @property
-    def source_name(self) -> str:
-        return "goldapi.io"
-
-    @property
-    def state(self) -> FeedState:
-        return self._state
-
-    @property
-    def last_valid_tick(self) -> Optional[Tick]:
-        return self._last_valid_tick
-
-    def _fetch_raw(self) -> Optional[dict]:
-        headers = {"x-access-token": self._api_key, "Content-Type": "application/json"}
-        try:
-            resp = requests.get(self.API_URL, headers=headers, timeout=self._timeout)
-        except requests.RequestException as e:
-            log_gold_feed.error(f"[goldapi.io] Erreur réseau lors de la requête : {e}")
-            return None
-        if resp.status_code != 200:
-            log_gold_feed.error(f"[goldapi.io] Réponse HTTP {resp.status_code} inattendue : {resp.text[:200]!r}")
-            return None
-        try:
-            return resp.json()
-        except ValueError:
-            log_gold_feed.error(f"[goldapi.io] Réponse non-JSON reçue : {resp.text[:200]!r}")
-            return None
-
-    def _validate_and_build_tick(self, data: Optional[dict]) -> Optional[Tick]:
-        # --- 1. Réponse API valide (champs attendus présents) ---
-        required_fields = ("price", "bid", "ask", "timestamp")
-        if not data or any(field_name not in data for field_name in required_fields):
-            log_gold_feed.error(f"[goldapi.io] Réponse invalide, champ(s) manquant(s) : {data}")
-            self._state = FeedState.UNAVAILABLE
-            return None
-
-        # --- 2. Prix numérique et strictement positif ---
-        try:
-            price = float(data["price"])
-            bid = float(data["bid"])
-            ask = float(data["ask"])
-        except (TypeError, ValueError):
-            log_gold_feed.error(f"[goldapi.io] Champ(s) de prix non numérique(s) : {data}")
-            self._state = FeedState.UNAVAILABLE
-            return None
-        if price <= 0 or bid <= 0 or ask <= 0:
-            log_gold_feed.error(f"[goldapi.io] Prix non-positif rejeté : price={price} bid={bid} ask={ask}")
-            self._state = FeedState.UNAVAILABLE
-            return None
-
-        # --- 3. Timestamp de cotation non périmé ---
-        try:
-            quote_time = datetime.fromtimestamp(int(data["timestamp"]), tz=timezone.utc)
-        except (TypeError, ValueError, OSError, OverflowError):
-            log_gold_feed.error(f"[goldapi.io] Timestamp invalide reçu : {data.get('timestamp')!r}")
-            self._state = FeedState.UNAVAILABLE
-            return None
-
-        now = datetime.now(timezone.utc)
-        age_seconds = (now - quote_time).total_seconds()
-        if age_seconds > self._max_age:
-            log_gold_feed.warning(
-                f"[goldapi.io] Cotation PÉRIMÉE rejetée : âge={age_seconds:.1f}s "
-                f"> seuil={self._max_age:.1f}s (quote_time={quote_time.isoformat()}) "
-                f"-> état STALE, aucun prix simulé ne sera utilisé."
-            )
-            self._state = FeedState.STALE
-            return None
-        if age_seconds < -5.0:  # tolérance de 5s pour dérive d'horloge
-            log_gold_feed.warning(f"[goldapi.io] Timestamp dans le futur ({age_seconds:.1f}s) — cotation rejetée.")
-            self._state = FeedState.STALE
-            return None
-
-        # --- 4. Pas de saut de prix anormal vs dernière cotation valide ---
-        if self._last_valid_tick is not None and self._last_valid_tick.price > 0:
-            jump_pct = abs(price - self._last_valid_tick.price) / self._last_valid_tick.price * 100.0
-            if jump_pct > self._max_jump_pct:
-                log_gold_feed.warning(
-                    f"[goldapi.io] SAUT DE PRIX ANORMAL rejeté : "
-                    f"{self._last_valid_tick.price} -> {price} ({jump_pct:.3f}% "
-                    f"> seuil={self._max_jump_pct:.3f}%) -> état STALE, prix ignoré."
-                )
-                self._state = FeedState.STALE
-                return None
-
-        tick = Tick(
-            symbol="XAUUSD", price=price, bid=bid, ask=ask,
-            quote_time_utc=quote_time, received_time_utc=now, source=self.source_name,
-        )
-        log_gold_feed.info(
-            f"[goldapi.io] Cotation validée -> price={price} bid={bid} ask={ask} "
-            f"quote_time={quote_time.isoformat()} source={self.source_name}"
-        )
-        return tick
-
-    def get_latest_tick(self) -> Optional[Tick]:
-        raw = self._fetch_raw()
-        tick = self._validate_and_build_tick(raw)
-        if tick is None:
-            return None
-        self._last_valid_tick = tick
-        self._state = FeedState.LIVE
-        return tick
-
-
-# ============================================================================
-# Implémentation Gold-API.com (gratuite, sans clé API, sans limite de requêtes
-# sur l'endpoint de prix temps réel) — RECOMMANDÉE par défaut face à GoldAPI.io
-# ci-dessus, dont le tier gratuit est limité à 100 requêtes/mois.
-# Contrat d'API vérifié via https://gold-api.com/docs et
-# https://gold-api.com/llms.txt (documentation officielle) le 03/09/2026.
-# ============================================================================
-
-class GoldApiComFeed(PriceFeed):
-    """Client Gold-API.com pour XAU/USD (ou tout autre symbole supporté par
-    ce provider : XAG, XPT, XPD, HG, BTC, ETH).
-
-    Endpoint utilisé : GET https://api.gold-api.com/price/{symbol}
-      -> {"price": 4165.20, "symbol": "XAU", "currency": "USD",
-          "updatedAt": "2026-07-03T16:08:54Z", ...}
-    Gratuit, sans authentification, SANS limite de requêtes (contrairement à
-    GoldAPI.io). La documentation officielle demande de ne pas dépasser une
-    requête toutes les ~30s (le prix côté serveur n'est de toute façon pas
-    mis à jour plus souvent) — c'est cohérent avec poll_interval_seconds de
-    GoldPriceService (5s par défaut est plus prudent de rester >= 20-30s ici).
-
-    ⚠️ Différences importantes avec GoldAPIFeed (GoldAPI.io) :
-      1. Pas de bid/ask séparés dans la réponse -> on ne fabrique JAMAIS un
-         spread inventé. bid = ask = price ici, explicitement (voir
-         `Tick.bid`/`Tick.ask`). Le buffer de spread réel utilisé pour le SL
-         (AssetConfig.typical_spread, plus haut dans ce fichier) reste géré
-         séparément et n'est pas affecté par ce choix.
-      2. Les endpoints /history et /ohlc de Gold-API.com (agrégats
-         historiques) EXIGENT une clé API et sont limités à 10 requêtes/heure
-         sur le tier gratuit -> INUTILISABLES pour un scan en continu toutes
-         les quelques secondes. Comme pour GoldAPIFeed, la construction des
-         bougies M5 passe donc exclusivement par le polling répété de
-         /price/{symbol} + agrégation locale via CandleBuilder — jamais par
-         un appel direct à un endpoint d'historique.
-
-    Mêmes contrôles stricts qu'GoldAPIFeed avant toute utilisation du prix
-    (champs présents, prix numérique positif, timestamp non périmé, pas de
-    saut anormal) : si un contrôle échoue, get_latest_tick() retourne None et
-    l'état passe à STALE/UNAVAILABLE — jamais de prix de repli inventé.
-    """
-
-    API_BASE_URL = "https://api.gold-api.com"
-
-    def __init__(self, symbol: str = "XAU", max_quote_age_seconds: float = 60.0,
-                 max_price_jump_pct: float = 1.5, timeout_seconds: float = 5.0):
-        self._symbol = symbol
-        self._max_age = max_quote_age_seconds
-        self._max_jump_pct = max_price_jump_pct
-        self._timeout = timeout_seconds
-        self._last_valid_tick: Optional[Tick] = None
-        self._state: FeedState = FeedState.UNAVAILABLE
-
-    @property
-    def source_name(self) -> str:
-        return "gold-api.com"
-
-    @property
-    def state(self) -> FeedState:
-        return self._state
-
-    @property
-    def last_valid_tick(self) -> Optional[Tick]:
-        return self._last_valid_tick
-
-    def _fetch_raw(self) -> Optional[dict]:
-        url = f"{self.API_BASE_URL}/price/{self._symbol}"
-        try:
-            resp = requests.get(url, timeout=self._timeout)
-        except requests.RequestException as e:
-            log_gold_feed.error(f"[gold-api.com] Erreur réseau lors de la requête : {e}")
-            return None
-        if resp.status_code != 200:
-            log_gold_feed.error(f"[gold-api.com] Réponse HTTP {resp.status_code} inattendue : {resp.text[:200]!r}")
-            return None
-        try:
-            return resp.json()
-        except ValueError:
-            log_gold_feed.error(f"[gold-api.com] Réponse non-JSON reçue : {resp.text[:200]!r}")
-            return None
-
-    def _validate_and_build_tick(self, data: Optional[dict]) -> Optional[Tick]:
-        # --- 1. Réponse API valide (champs attendus présents) ---
-        required_fields = ("price", "updatedAt")
-        if not data or any(field_name not in data for field_name in required_fields):
-            log_gold_feed.error(f"[gold-api.com] Réponse invalide, champ(s) manquant(s) : {data}")
-            self._state = FeedState.UNAVAILABLE
-            return None
-
-        # --- 2. Prix numérique et strictement positif ---
-        try:
-            price = float(data["price"])
-        except (TypeError, ValueError):
-            log_gold_feed.error(f"[gold-api.com] Champ 'price' non numérique : {data}")
-            self._state = FeedState.UNAVAILABLE
-            return None
-        if price <= 0:
-            log_gold_feed.error(f"[gold-api.com] Prix non-positif rejeté : price={price}")
-            self._state = FeedState.UNAVAILABLE
-            return None
-
-        # --- 3. Timestamp de cotation non périmé ---
-        # Format ISO 8601 avec suffixe "Z" (ex. "2026-07-03T16:08:54Z") ->
-        # converti en "+00:00" pour que fromisoformat() l'accepte.
-        raw_ts = str(data["updatedAt"])
-        try:
-            quote_time = datetime.fromisoformat(raw_ts.replace("Z", "+00:00"))
-            if quote_time.tzinfo is None:
-                quote_time = quote_time.replace(tzinfo=timezone.utc)
-        except (TypeError, ValueError):
-            log_gold_feed.error(f"[gold-api.com] Timestamp invalide reçu : {raw_ts!r}")
-            self._state = FeedState.UNAVAILABLE
-            return None
-
-        now = datetime.now(timezone.utc)
-        age_seconds = (now - quote_time).total_seconds()
-        if age_seconds > self._max_age:
-            log_gold_feed.warning(
-                f"[gold-api.com] Cotation PÉRIMÉE rejetée : âge={age_seconds:.1f}s "
-                f"> seuil={self._max_age:.1f}s (quote_time={quote_time.isoformat()}) "
-                f"-> état STALE, aucun prix simulé ne sera utilisé."
-            )
-            self._state = FeedState.STALE
-            return None
-        if age_seconds < -5.0:  # tolérance de 5s pour dérive d'horloge
-            log_gold_feed.warning(f"[gold-api.com] Timestamp dans le futur ({age_seconds:.1f}s) — cotation rejetée.")
-            self._state = FeedState.STALE
-            return None
-
-        # --- 4. Pas de saut de prix anormal vs dernière cotation valide ---
-        if self._last_valid_tick is not None and self._last_valid_tick.price > 0:
-            jump_pct = abs(price - self._last_valid_tick.price) / self._last_valid_tick.price * 100.0
-            if jump_pct > self._max_jump_pct:
-                log_gold_feed.warning(
-                    f"[gold-api.com] SAUT DE PRIX ANORMAL rejeté : "
-                    f"{self._last_valid_tick.price} -> {price} ({jump_pct:.3f}% "
-                    f"> seuil={self._max_jump_pct:.3f}%) -> état STALE, prix ignoré."
-                )
-                self._state = FeedState.STALE
-                return None
-
-        # Gold-API.com ne renvoie pas de bid/ask séparés (juste un prix
-        # unique) -> bid = ask = price, assumé explicitement (pas de spread
-        # inventé). Voir docstring de la classe.
-        tick = Tick(
-            symbol=f"{self._symbol}USD", price=price, bid=price, ask=price,
-            quote_time_utc=quote_time, received_time_utc=now, source=self.source_name,
-        )
-        log_gold_feed.info(
-            f"[gold-api.com] Cotation validée -> price={price} "
-            f"quote_time={quote_time.isoformat()} source={self.source_name}"
-        )
-        return tick
-
-    def get_latest_tick(self) -> Optional[Tick]:
-        raw = self._fetch_raw()
-        tick = self._validate_and_build_tick(raw)
-        if tick is None:
-            return None
-        self._last_valid_tick = tick
-        self._state = FeedState.LIVE
-        return tick
-
-
-# ============================================================================
-# MODIFICATION : Implémentation XAUS.com (gratuite, sans clé API, sans limite
-# stricte de requêtes pour un usage raisonnable — cf. https://xaus.com/api/,
-# section "Rate limits & fair use" : "No API key required... no hard rate
-# limit"). Ajoutée en 2e position de la chaîne (juste après gold-api.com) pour
-# diversifier les sources amont : un incident sur l'un des deux ne fait plus
-# tomber XAUUSD en dessous de goldapi.io (limité, lui, à 100 requêtes/mois).
-# Contrat d'API vérifié via https://xaus.com/api/ (page /api/, section
-# "Response") le 04/09/2026.
-# ============================================================================
-
-class XausComFeed(PriceFeed):
-    """Client XAUS.com pour XAU/USD.
-
-    Endpoint utilisé : GET https://xaus.com/api/v1/spot?compact=1
-      -> {"spot_usd_oz": 4007.20, "updated_at": "2026-07-02T09:00:00.000Z",
-          "price_as_of": "...", "data_state": {"status": "fresh", ...},
-          "stale": false, ...}
-    `?compact=1` retire la table des ~160 devises FX, inutile ici (on ne lit
-    que le prix USD/oz) -- réponse ~75% plus légère.
-
-    Comme Gold-API.com : pas de bid/ask séparés -> bid = ask = price,
-    assumé explicitement, jamais de spread inventé.
-
-    `price_as_of` (heure réelle de la cotation) est utilisé de préférence à
-    `updated_at` (heure de génération de la réponse, qui peut être plus
-    récente qu'une cotation servie `stale` pendant une panne amont) -- notre
-    propre contrôle de fraîcheur (max_quote_age_seconds) rejette de toute
-    façon une cotation trop vieille, qu'elle soit signalée `stale` par
-    XAUS.com ou non : pas besoin de traiter ce cas séparément.
-
-    Mêmes contrôles stricts que les autres PriceFeed de ce fichier (champs
-    présents, prix positif, timestamp non périmé, pas de saut anormal) :
-    si un contrôle échoue, get_latest_tick() retourne None -- jamais de prix
-    de repli inventé."""
-
-    API_URL = "https://xaus.com/api/v1/spot?compact=1"
-
-    def __init__(self, max_quote_age_seconds: float = 60.0,
-                 max_price_jump_pct: float = 1.5, timeout_seconds: float = 5.0):
-        self._max_age = max_quote_age_seconds
-        self._max_jump_pct = max_price_jump_pct
-        self._timeout = timeout_seconds
-        self._last_valid_tick: Optional[Tick] = None
-        self._state: FeedState = FeedState.UNAVAILABLE
-
-    @property
-    def source_name(self) -> str:
-        return "xaus.com"
-
-    @property
-    def state(self) -> FeedState:
-        return self._state
-
-    @property
-    def last_valid_tick(self) -> Optional[Tick]:
-        return self._last_valid_tick
-
-    def _fetch_raw(self) -> Optional[dict]:
-        try:
-            resp = requests.get(self.API_URL, timeout=self._timeout)
-        except requests.RequestException as e:
-            log_gold_feed.error(f"[xaus.com] Erreur réseau lors de la requête : {e}")
-            return None
-        if resp.status_code != 200:
-            # 503 = source amont indisponible sans prix en cache (cf. docs
-            # XAUS.com) -> traité comme un échec normal de ce maillon.
-            log_gold_feed.error(f"[xaus.com] Réponse HTTP {resp.status_code} inattendue : {resp.text[:200]!r}")
-            return None
-        try:
-            return resp.json()
-        except ValueError:
-            log_gold_feed.error(f"[xaus.com] Réponse non-JSON reçue : {resp.text[:200]!r}")
-            return None
-
-    def _validate_and_build_tick(self, data: Optional[dict]) -> Optional[Tick]:
-        # --- 1. Réponse API valide (champs attendus présents) ---
-        required_fields = ("spot_usd_oz", "updated_at")
-        if not data or any(field_name not in data for field_name in required_fields):
-            log_gold_feed.error(f"[xaus.com] Réponse invalide, champ(s) manquant(s) : {data}")
-            self._state = FeedState.UNAVAILABLE
-            return None
-
-        # --- 2. Prix numérique et strictement positif ---
-        try:
-            price = float(data["spot_usd_oz"])
-        except (TypeError, ValueError):
-            log_gold_feed.error(f"[xaus.com] Champ 'spot_usd_oz' non numérique : {data}")
-            self._state = FeedState.UNAVAILABLE
-            return None
-        if price <= 0:
-            log_gold_feed.error(f"[xaus.com] Prix non-positif rejeté : price={price}")
-            self._state = FeedState.UNAVAILABLE
-            return None
-
-        # --- 3. Timestamp de cotation non périmé ---
-        # price_as_of = heure réelle de la cotation (préférée) ; à défaut,
-        # updated_at = heure de génération de la réponse.
-        raw_ts = str(data.get("price_as_of") or data["updated_at"])
-        try:
-            quote_time = datetime.fromisoformat(raw_ts.replace("Z", "+00:00"))
-            if quote_time.tzinfo is None:
-                quote_time = quote_time.replace(tzinfo=timezone.utc)
-        except (TypeError, ValueError):
-            log_gold_feed.error(f"[xaus.com] Timestamp invalide reçu : {raw_ts!r}")
-            self._state = FeedState.UNAVAILABLE
-            return None
-
-        now = datetime.now(timezone.utc)
-        age_seconds = (now - quote_time).total_seconds()
-        if age_seconds > self._max_age:
-            log_gold_feed.warning(
-                f"[xaus.com] Cotation PÉRIMÉE rejetée : âge={age_seconds:.1f}s "
-                f"> seuil={self._max_age:.1f}s (quote_time={quote_time.isoformat()}) "
-                f"-> état STALE, aucun prix simulé ne sera utilisé."
-            )
-            self._state = FeedState.STALE
-            return None
-        if age_seconds < -5.0:  # tolérance de 5s pour dérive d'horloge
-            log_gold_feed.warning(f"[xaus.com] Timestamp dans le futur ({age_seconds:.1f}s) — cotation rejetée.")
-            self._state = FeedState.STALE
-            return None
-
-        # --- 4. Pas de saut de prix anormal vs dernière cotation valide ---
-        if self._last_valid_tick is not None and self._last_valid_tick.price > 0:
-            jump_pct = abs(price - self._last_valid_tick.price) / self._last_valid_tick.price * 100.0
-            if jump_pct > self._max_jump_pct:
-                log_gold_feed.warning(
-                    f"[xaus.com] SAUT DE PRIX ANORMAL rejeté : "
-                    f"{self._last_valid_tick.price} -> {price} ({jump_pct:.3f}% "
-                    f"> seuil={self._max_jump_pct:.3f}%) -> état STALE, prix ignoré."
-                )
-                self._state = FeedState.STALE
-                return None
-
-        # XAUS.com ne renvoie pas de bid/ask séparés (juste un prix médian
-        # indicatif) -> bid = ask = price, assumé explicitement.
-        tick = Tick(
-            symbol="XAUUSD", price=price, bid=price, ask=price,
-            quote_time_utc=quote_time, received_time_utc=now, source=self.source_name,
-        )
-        log_gold_feed.info(
-            f"[xaus.com] Cotation validée -> price={price} "
-            f"quote_time={quote_time.isoformat()} source={self.source_name}"
-        )
-        return tick
-
-    def get_latest_tick(self) -> Optional[Tick]:
-        raw = self._fetch_raw()
-        tick = self._validate_and_build_tick(raw)
-        if tick is None:
-            return None
-        self._last_valid_tick = tick
-        self._state = FeedState.LIVE
-        return tick
-
-
-# ============================================================================
-# MODIFICATION : Implémentation goldprice.dev (gratuit, sans clé pour la
-# requête spot anonyme — cf. https://goldprice.dev/docs/quickstart :
-# "No API key is required for this request."). Ajoutée en 3e position de la
-# chaîne (après gold-api.com et xaus.com, avant goldapi.io) pour donner un
-# 3e maillon indépendant AVANT de retomber sur goldapi.io, dont le tier
-# gratuit est limité à 100 requêtes/mois.
-#
-# ⚠️ CORRECTIF vs les chiffres avancés initialement pour goldprice.dev :
-# vérification faite le 04/09/2026 directement sur la documentation
-# officielle (https://goldprice.dev/docs/quickstart,
-# https://goldprice.dev/docs/api-reference, https://goldprice.dev/pricing) :
-#   - Il s'agit d'un produit très récent (lancement public le 01/05/2026),
-#     donc absent de mes données d'entraînement -- vérifié en direct plutôt
-#     que supposé.
-#   - Le tier "Free" (avec clé) annonce 30 requêtes/minute et un quota de
-#     1000 appels/MOIS (pas "100/heure sans clé" comme avancé) : le quota
-#     mensuel est strict et se coupe (429 quota_exceeded) une fois atteint,
-#     sans facturation surprise, mais aussi sans accès de secours ce mois-là.
-#   - La requête anonyme (sans clé) documentée pour le spot XAU/USD est bien
-#     sans clé, mais soumise à une limite partagée par IP dont la valeur
-#     exacte n'est PAS publiée (seulement "shared IP limits") -- donc pas de
-#     chiffre fiable à annoncer ici.
-#   - `price`, `bid`, `ask`, `computed_at` sont des champs OPTIONNELS dans la
-#     réponse (omis quand indisponibles) -- seuls `symbol`, `quote_currency`,
-#     `unit`, `contract_type` et `is_stale` sont garantis. Le code ci-dessous
-#     traite un `price` absent comme un échec de ce maillon (jamais de prix
-#     inventé), exactement comme pour les autres PriceFeed de ce fichier.
-#   - Usage "Free" annoncé pour un usage interne (dashboards/backtests/outils
-#     perso) -- cohérent avec un usage privé DM leader comme ici, mais PAS
-#     couvert pour un usage commercial (ça, c'est réservé aux tiers Pro+ avec
-#     attribution visible).
-# Étant en 3e position de la chaîne (donc rarement sollicité si gold-api.com
-# et xaus.com répondent), le volume réel consommé sur le quota mensuel de
-# 1000 appels devrait rester marginal -- mais à surveiller si les deux
-# premiers maillons deviennent instables sur une période prolongée.
-# ============================================================================
-
-class GoldPriceDevFeed(PriceFeed):
-    """Client goldprice.dev pour XAU/USD (requête spot anonyme, sans clé).
-
-    Endpoint utilisé : GET https://api.goldprice.dev/v1/prices?symbol=XAU-USD-SPOT
-      -> {"symbols": [{"symbol": "XAU", "quote_currency": "USD",
-                        "unit": "troy_ounce", "contract_type": "spot",
-                        "price": "4826.40", "bid": "4825.00", "ask": "4827.00",
-                        "is_stale": false,
-                        "computed_at": "2026-04-27T01:00:00+00:00"}]}
-
-    `price`, `bid`, `ask` et `computed_at` sont documentés comme OPTIONNELS
-    (omis si indisponibles côté goldprice.dev) -- un `price` absent est donc
-    traité comme un échec normal de ce maillon, jamais comme un prix à 0 ou
-    inventé. `is_stale`, lui, est toujours présent : une réponse is_stale=true
-    est rejetée directement, sans même regarder l'âge de `computed_at`.
-
-    Mêmes contrôles stricts que les autres PriceFeed de ce fichier (champs
-    présents, prix positif, timestamp non périmé, pas de saut anormal) :
-    si un contrôle échoue, get_latest_tick() retourne None -- jamais de prix
-    de repli inventé."""
-
-    API_URL = "https://api.goldprice.dev/v1/prices"
-
-    def __init__(self, max_quote_age_seconds: float = 60.0,
-                 max_price_jump_pct: float = 1.5, timeout_seconds: float = 5.0):
-        self._max_age = max_quote_age_seconds
-        self._max_jump_pct = max_price_jump_pct
-        self._timeout = timeout_seconds
-        self._last_valid_tick: Optional[Tick] = None
-        self._state: FeedState = FeedState.UNAVAILABLE
-
-    @property
-    def source_name(self) -> str:
-        return "goldprice.dev"
-
-    @property
-    def state(self) -> FeedState:
-        return self._state
-
-    @property
-    def last_valid_tick(self) -> Optional[Tick]:
-        return self._last_valid_tick
-
-    def _fetch_raw(self) -> Optional[dict]:
-        try:
-            resp = requests.get(
-                self.API_URL, params={"symbol": "XAU-USD-SPOT"}, timeout=self._timeout
-            )
-        except requests.RequestException as e:
-            log_gold_feed.error(f"[goldprice.dev] Erreur réseau lors de la requête : {e}")
-            return None
-        if resp.status_code == 429:
-            # Limite IP anonyme ou quota mensuel atteint (429 rate_limited /
-            # rate_limit_exceeded / quota_exceeded) -- échec normal de ce
-            # maillon, jamais de prix inventé en repli.
-            log_gold_feed.warning(f"[goldprice.dev] 429 (limite atteinte) : {resp.text[:200]!r}")
-            return None
-        if resp.status_code != 200:
-            log_gold_feed.error(f"[goldprice.dev] Réponse HTTP {resp.status_code} inattendue : {resp.text[:200]!r}")
-            return None
-        try:
-            return resp.json()
-        except ValueError:
-            log_gold_feed.error(f"[goldprice.dev] Réponse non-JSON reçue : {resp.text[:200]!r}")
-            return None
-
-    def _validate_and_build_tick(self, raw: Optional[dict]) -> Optional[Tick]:
-        # --- 1. Enveloppe "symbols" présente et non vide ---
-        if not raw or not isinstance(raw.get("symbols"), list) or not raw["symbols"]:
-            log_gold_feed.error(f"[goldprice.dev] Réponse invalide, champ 'symbols' manquant/vide : {raw}")
-            self._state = FeedState.UNAVAILABLE
-            return None
-        data = raw["symbols"][0]
-
-        # --- 2. is_stale toujours présent -- rejet immédiat si vrai ---
-        if data.get("is_stale", True):
-            log_gold_feed.warning(f"[goldprice.dev] Cotation signalée is_stale=true -> rejetée : {data}")
-            self._state = FeedState.STALE
-            return None
-
-        # --- 3. price/bid/ask/computed_at sont OPTIONNELS -- absence = échec ---
-        required_optional_fields = ("price", "computed_at")
-        if any(field_name not in data for field_name in required_optional_fields):
-            log_gold_feed.error(
-                f"[goldprice.dev] Champ(s) optionnel(s) requis absent(s) "
-                f"(price/computed_at indisponibles côté source) : {data}"
-            )
-            self._state = FeedState.UNAVAILABLE
-            return None
-
-        # --- 4. Prix numérique et strictement positif (decimal-as-string) ---
-        try:
-            price = float(data["price"])
-            bid = float(data["bid"]) if "bid" in data else price
-            ask = float(data["ask"]) if "ask" in data else price
-        except (TypeError, ValueError):
-            log_gold_feed.error(f"[goldprice.dev] Champ(s) de prix non numérique(s) : {data}")
-            self._state = FeedState.UNAVAILABLE
-            return None
-        if price <= 0:
-            log_gold_feed.error(f"[goldprice.dev] Prix non-positif rejeté : price={price}")
-            self._state = FeedState.UNAVAILABLE
-            return None
-
-        # --- 5. Timestamp de cotation non périmé ---
-        raw_ts = str(data["computed_at"])
-        try:
-            quote_time = datetime.fromisoformat(raw_ts.replace("Z", "+00:00"))
-            if quote_time.tzinfo is None:
-                quote_time = quote_time.replace(tzinfo=timezone.utc)
-        except (TypeError, ValueError):
-            log_gold_feed.error(f"[goldprice.dev] Timestamp invalide reçu : {raw_ts!r}")
-            self._state = FeedState.UNAVAILABLE
-            return None
-
-        now = datetime.now(timezone.utc)
-        age_seconds = (now - quote_time).total_seconds()
-        if age_seconds > self._max_age:
-            log_gold_feed.warning(
-                f"[goldprice.dev] Cotation PÉRIMÉE rejetée : âge={age_seconds:.1f}s "
-                f"> seuil={self._max_age:.1f}s (quote_time={quote_time.isoformat()}) "
-                f"-> état STALE, aucun prix simulé ne sera utilisé."
-            )
-            self._state = FeedState.STALE
-            return None
-        if age_seconds < -5.0:  # tolérance de 5s pour dérive d'horloge
-            log_gold_feed.warning(f"[goldprice.dev] Timestamp dans le futur ({age_seconds:.1f}s) — cotation rejetée.")
-            self._state = FeedState.STALE
-            return None
-
-        # --- 6. Pas de saut de prix anormal vs dernière cotation valide ---
-        if self._last_valid_tick is not None and self._last_valid_tick.price > 0:
-            jump_pct = abs(price - self._last_valid_tick.price) / self._last_valid_tick.price * 100.0
-            if jump_pct > self._max_jump_pct:
-                log_gold_feed.warning(
-                    f"[goldprice.dev] SAUT DE PRIX ANORMAL rejeté : "
-                    f"{self._last_valid_tick.price} -> {price} ({jump_pct:.3f}% "
-                    f"> seuil={self._max_jump_pct:.3f}%) -> état STALE, prix ignoré."
-                )
-                self._state = FeedState.STALE
-                return None
-
-        tick = Tick(
-            symbol="XAUUSD", price=price, bid=bid, ask=ask,
-            quote_time_utc=quote_time, received_time_utc=now, source=self.source_name,
-        )
-        log_gold_feed.info(
-            f"[goldprice.dev] Cotation validée -> price={price} bid={bid} ask={ask} "
-            f"quote_time={quote_time.isoformat()} source={self.source_name}"
-        )
-        return tick
-
-    def get_latest_tick(self) -> Optional[Tick]:
-        raw = self._fetch_raw()
-        tick = self._validate_and_build_tick(raw)
-        if tick is None:
-            return None
-        self._last_valid_tick = tick
-        self._state = FeedState.LIVE
-        return tick
-
-
-# ============================================================================
-# Construction des bougies M5 — jamais de mélange de sources dans une bougie
-# ============================================================================
-
-def _candle_bucket_start(ts: datetime) -> datetime:
-    """Aligne un timestamp UTC sur le début de son bucket M5 (:00, :05, :10...)."""
-    epoch = int(ts.timestamp())
-    bucket_epoch = epoch - (epoch % M5_SECONDS)
-    return datetime.fromtimestamp(bucket_epoch, tz=timezone.utc)
-
-
-class CandleBuilder:
-    """Construit des bougies M5 OHLC à partir d'une séquence de Ticks.
-
-    Règle stricte : une bougie n'agrège JAMAIS des ticks de deux sources
-    différentes. Si la source change en cours de bougie (ex. bascule de
-    provider), la bougie en cours est immédiatement clôturée
-    (is_complete=True) et une nouvelle bougie démarre avec la nouvelle
-    source — sans aucun mélange de données.
-    """
-
-    def __init__(self):
-        self._current: Optional[Candle] = None
-        self._completed: List[Candle] = []
-
-    def add_tick(self, tick: Tick) -> Optional[Candle]:
-        """Ajoute un tick VALIDÉ (voir PriceFeed.get_latest_tick). Retourne
-        la bougie qui vient d'être clôturée si cet ajout en a fermé une
-        (nouveau bucket M5 ou changement de source), sinon None."""
-        bucket_start = _candle_bucket_start(tick.quote_time_utc)
-
-        if self._current is None:
-            self._current = Candle(
-                open=tick.price, high=tick.price, low=tick.price, close=tick.price,
-                timestamp=bucket_start, is_complete=False, tick_count=1, source=tick.source,
-            )
-            return None
-
-        same_bucket = self._current.timestamp == bucket_start
-        same_source = self._current.source == tick.source
-
-        if same_bucket and same_source:
-            c = self._current
-            c.high = max(c.high, tick.price)
-            c.low = min(c.low, tick.price)
-            c.close = tick.price
-            c.tick_count += 1
-            return None
-
-        # Nouveau bucket M5, OU changement de source -> clôture explicite de
-        # la bougie courante, jamais de mélange.
-        if not same_source:
-            log_gold_feed.warning(
-                f"[CandleBuilder] Changement de source de prix détecté "
-                f"({self._current.source} -> {tick.source}) — bougie en cours "
-                f"clôturée immédiatement pour ne jamais mélanger deux sources."
-            )
-        self._current.is_complete = True
-        closed = self._current
-        self._completed.append(closed)
-
-        self._current = Candle(
-            open=tick.price, high=tick.price, low=tick.price, close=tick.price,
-            timestamp=bucket_start, is_complete=False, tick_count=1, source=tick.source,
-        )
-        return closed
-
-    def get_candles(self, include_incomplete: bool = True) -> List[Candle]:
-        """Retourne les bougies clôturées, plus la bougie en cours si
-        `include_incomplete` (toujours avec is_complete=False sur celle-ci,
-        pour que le consommateur sache explicitement qu'elle n'est pas
-        terminée)."""
-        candles = list(self._completed)
-        if include_incomplete and self._current is not None:
-            candles.append(self._current)
-        return candles
-
-    def seed_completed(self, candles: List[Candle]) -> bool:
-        """Pré-charge un historique de bougies déjà clôturées (ex. bootstrap
-        depuis une source tierce au démarrage), UNIQUEMENT si aucune bougie
-        n'a encore été accumulée par des ticks live -- ne remplace jamais des
-        données live déjà en mémoire. Les bougies injectées ici ne sont
-        jamais mélangées à un tick live : le premier tick reçu après un seed
-        clôturera naturellement la dernière bougie seedée si elle tombe dans
-        le même bucket M5 (comportement normal du changement de source).
-        Retourne True si le seed a été appliqué, False s'il a été ignoré
-        (des bougies live existaient déjà)."""
-        if self._completed or self._current is not None:
-            return False
-        self._completed = list(candles)
-        return True
-
-
-# ============================================================================
-# Service de haut niveau : polling + état exposé au consommateur
-# ============================================================================
-
-class GoldPriceService:
-    """Interroge un PriceFeed à intervalle régulier, construit les bougies
-    M5 via CandleBuilder, et expose un état clair au consommateur (moteur de
-    signal). Ne fournit JAMAIS de prix de secours simulé : si le feed passe
-    en STALE/UNAVAILABLE, `should_produce_signals()` renvoie False et le
-    moteur de signal DOIT arrêter d'émettre des signaux tant que ce n'est
-    pas redevenu True — get_m5_candles() continue de refléter fidèlement les
-    seules données réellement reçues (pas de comblement artificiel des
-    bougies manquantes)."""
-
-    def __init__(self, feed: PriceFeed, poll_interval_seconds: float = 5.0):
-        self._feed = feed
-        self._builder = CandleBuilder()
-        self._poll_interval = poll_interval_seconds
-        self._last_tick: Optional[Tick] = None
-
-    @property
-    def state(self) -> FeedState:
-        return self._feed.state
-
-    @property
-    def last_tick(self) -> Optional[Tick]:
-        return self._last_tick
-
-    def should_produce_signals(self) -> bool:
-        """Le moteur de signal ne doit consommer les bougies que si cette
-        méthode renvoie True. False -> flux périmé/indisponible -> pas de
-        nouveau signal, quel que soit l'état technique des bougies déjà en
-        mémoire."""
-        return self._feed.state == FeedState.LIVE
-
-    def poll_once(self) -> Optional[Tick]:
-        tick = self._feed.get_latest_tick()
-        if tick is None:
-            log_gold_feed.warning(
-                f"[GoldPriceService] Aucune cotation valide cette itération "
-                f"(état={self._feed.state.value}) — AUCUN prix simulé ne sera utilisé, "
-                f"production de signaux suspendue tant que l'état n'est pas LIVE."
-            )
-            return None
-        self._last_tick = tick
-        self._builder.add_tick(tick)
-        return tick
-
-    def run_forever(self):
-        """Boucle de polling bloquante — à lancer dans un thread dédié."""
-        while True:
-            try:
-                self.poll_once()
-            except Exception:
-                log_gold_feed.exception("[GoldPriceService] Erreur inattendue dans la boucle de polling.")
-            time.sleep(self._poll_interval)
-
-    def get_m5_candles(self, include_incomplete: bool = True) -> List[Candle]:
-        return self._builder.get_candles(include_incomplete=include_incomplete)
-
-    def bootstrap_from_historical(self, raw_candles: List[Dict]) -> int:
-        """Pré-charge l'historique M5 à partir d'une liste de dicts
-        {"time","open","high","low","close"} (ex. yfinance GC=F, gratuit et
-        sans clé) -- pour ne PAS attendre l'accumulation de MIN_CANDLES_REQUIRED
-        ticks live (~2h30 à chaque redémarrage) avant que should_produce_signals()
-        puisse être exploité par fetch_candles(). Ces bougies sont étiquetées
-        source="bootstrap_yfinance" pour rester traçables et ne jamais être
-        confondues avec un flux temps réel gold-api.com/goldapi.io dans les logs.
-        Ignoré silencieusement si des bougies live sont déjà accumulées (voir
-        CandleBuilder.seed_completed). Retourne le nombre de bougies injectées."""
-        seeded = [
-            Candle(
-                open=c["open"], high=c["high"], low=c["low"], close=c["close"],
-                timestamp=datetime.fromtimestamp(c["time"], tz=timezone.utc),
-                is_complete=True, tick_count=0, source="bootstrap_yfinance",
-            )
-            for c in raw_candles
-        ]
-        applied = self._builder.seed_completed(seeded)
-        return len(seeded) if applied else 0
-
-
-# ============================================================================
-# BRANCHEMENT RÉEL SUR LE PIPELINE LIVE XAUUSD
-# ----------------------------------------------------------------------------
-# Ce bloc câble RÉELLEMENT GoldApiComFeed (gratuit, sans clé, source
-# principale) -> GoldAPIFeed (goldapi.io, secours n°1, actif seulement si
-# GOLDAPI_IO_API_KEY est définie) en chaîne de prix temps réel pour XAUUSD.
-# GoldPriceService/CandleBuilder ci-dessus sont UTILISÉS TELS QUELS, sans
-# aucune modification, pour agréger cette chaîne en bougies M5.
-#
-# twelvedata n'est PAS mis dans cette chaîne de ticks : il reste le fallback
-# déjà existant de fetch_candles() (asset.fallback_data_source, voir
-# ASSETS["XAUUSD"] plus haut), car il renvoie directement jusqu'à 200
-# bougies M5 historiques réelles en un seul appel — alors qu'un flux
-# tick-par-tick devrait ré-accumuler ~2h30 d'historique (30 bougies M5 x
-# 5 min, MIN_CANDLES_REQUIRED) avant de pouvoir produire un signal à chaque
-# redémarrage. Résultat, ordre de repli EXACT :
-#
-#     GoldApiComFeed -> XausComFeed -> GoldAPIFeed -> twelvedata -> XAUUSD indisponible (NO SIGNAL)
-#
-# gold-api.com et xaus.com sont tous les deux gratuits/sans clé/sans limite
-# stricte -> goldapi.io (100 req/mois) et twelvedata (800 req/jour) ne sont
-# donc sollicités qu'en dernier recours, une fois les deux premiers en panne.
-# ============================================================================
-
-class FallbackChainFeed(PriceFeed):
-    """Chaîne de secours entre plusieurs PriceFeed, essayés dans l'ordre.
-
-    À chaque poll (`get_latest_tick`) : tente le 1er feed de la liste, avec
-    un petit nombre de tentatives + backoff court en cas d'échec réseau
-    transitoire (timeout, 5xx...). Si toutes les tentatives échouent, passe
-    au feed suivant, etc. Ne fabrique JAMAIS de prix : si TOUS les feeds
-    échouent, retourne None et l'état passe à UNAVAILABLE — c'est alors au
-    consommateur (fetch_candles(), plus haut dans ce fichier) de basculer
-    sur son propre fallback (yfinance), hors de cette chaîne.
-
-    Chaque tentative loggue explicitement OK / ERROR / FALLBACK avec le nom
-    exact de la source (gold-api.com / goldapi.io), pour un diagnostic clair
-    en prod.
-
-    ⚠️ CORRECTIF (04/09/2026, suite à un écart constaté en prod ~4484 signal
-    vs ~4431 broker/MT5) : chaque PriceFeed individuel a SON PROPRE garde-fou
-    anti-saut de prix (`max_price_jump_pct`), mais celui-ci compare toujours
-    le nouveau prix au dernier prix accepté PAR CE MÊME FEED. Or, quand la
-    chaîne bascule d'une source à une autre (ex. gold-api.com -> xaus.com),
-    le nouveau feed n'a souvent aucun historique récent -> son propre garde-
-    fou ne peut rien comparer, et un prix aberrant peut passer sans jamais
-    être comparé au dernier prix RÉELLEMENT utilisé par le bot, toutes
-    sources confondues. C'est un trou de conception : le garde-fou doit être
-    global à la chaîne, pas isolé par source. `_last_accepted_tick` /
-    `chain_max_jump_pct` ci-dessous ferment ce trou : tout tick, quelle que
-    soit sa source, est comparé au dernier tick RETENU par la chaîne elle-
-    même avant d'être transmis plus haut. Seuil délibérément plus serré que
-    celui de chaque feed pris isolément (0.5% par défaut, vs 1.5% par feed) :
-    à un intervalle de poll de ~20s, un mouvement XAUUSD de 0.5% est déjà
-    un événement rare (hors news majeure) -> un écart plus grand est traité
-    comme suspect par défaut plutôt que comme un vrai mouvement de marché."""
-
-    def __init__(self, feeds: List[PriceFeed], retries_per_feed: int = 2,
-                 backoff_seconds: float = 1.0, chain_max_jump_pct: float = 0.5,
-                 chain_max_quote_age_seconds: float = 90.0):
-        if not feeds:
-            raise ValueError("FallbackChainFeed nécessite au moins un PriceFeed.")
-        self._feeds = feeds
-        self._retries = max(1, retries_per_feed)
-        self._backoff = backoff_seconds
-        self._chain_max_jump_pct = chain_max_jump_pct
-        self._chain_max_age = chain_max_quote_age_seconds
-        self._state: FeedState = FeedState.UNAVAILABLE
-        self._active_source: Optional[str] = None
-        # Dernier tick RETENU par la chaîne (toutes sources confondues) —
-        # baseline globale pour le garde-fou anti-saut, indépendante du
-        # feed qui a produit ce tick.
-        self._last_accepted_tick: Optional[Tick] = None
-
-    @property
-    def source_name(self) -> str:
-        # Reflète la source réellement utilisée lors du dernier succès ;
-        # sinon celle du feed principal (valeur par défaut avant 1er poll).
-        return self._active_source or self._feeds[0].source_name
-
-    @property
-    def state(self) -> FeedState:
-        return self._state
-
-    def _passes_chain_level_check(self, tick: Tick, feed_source_name: str) -> bool:
-        """Deuxième garde-fou, GLOBAL à la chaîne (voir docstring de classe).
-        Ne fait JAMAIS confiance au seul garde-fou interne du feed source."""
-        baseline = self._last_accepted_tick
-        if baseline is None:
-            return True  # premier tick jamais accepté -> rien à comparer
-        age_since_baseline = (tick.received_time_utc - baseline.received_time_utc).total_seconds()
-        if age_since_baseline > self._chain_max_age:
-            # Trop de temps depuis le dernier tick accepté (ex. la chaîne
-            # vient de sortir d'une longue panne totale) -> la baseline
-            # n'est plus pertinente pour juger d'un "saut" ; on l'accepte
-            # sans comparaison plutôt que de bloquer un redémarrage légitime.
-            return True
-        if baseline.price <= 0:
-            return True
-        jump_pct = abs(tick.price - baseline.price) / baseline.price * 100.0
-        if jump_pct > self._chain_max_jump_pct:
-            log_gold_feed.error(
-                f"[FallbackChainFeed] SAUT DE PRIX INTER-SOURCES rejeté : "
-                f"'{baseline.source}'={baseline.price} -> '{feed_source_name}'={tick.price} "
-                f"({jump_pct:.3f}% en {age_since_baseline:.1f}s > seuil chaîne="
-                f"{self._chain_max_jump_pct:.3f}%) -> tick ignoré, AUCUN prix "
-                f"simulé ne sera utilisé. Vérifier '{feed_source_name}' vs le broker réel."
-            )
-            return False
-        return True
-
-    def get_latest_tick(self) -> Optional[Tick]:
-        for position, feed in enumerate(self._feeds):
-            for attempt in range(1, self._retries + 1):
-                tick = feed.get_latest_tick()
-                if tick is not None:
-                    if not self._passes_chain_level_check(tick, feed.source_name):
-                        # Rejeté par le garde-fou GLOBAL malgré un feed qui se
-                        # déclare lui-même LIVE -> traité comme un échec de ce
-                        # maillon pour cette itération, jamais comme un prix
-                        # utilisable. On continue vers le maillon suivant.
-                        self._state = FeedState.STALE
-                        break
-                    if position == 0:
-                        log_gold_feed.info(f"[FallbackChainFeed] '{feed.source_name}' -> OK.")
-                    else:
-                        log_gold_feed.warning(
-                            f"[FallbackChainFeed] '{feed.source_name}' -> FALLBACK actif "
-                            f"(source(s) précédente(s) en échec cette itération)."
-                        )
-                    self._active_source = feed.source_name
-                    self._state = FeedState.LIVE
-                    self._last_accepted_tick = tick
-                    return tick
-                log_gold_feed.error(
-                    f"[FallbackChainFeed] '{feed.source_name}' -> ERROR "
-                    f"(état={feed.state.value}, tentative {attempt}/{self._retries})."
-                )
-                if attempt < self._retries:
-                    time.sleep(self._backoff)
-        log_gold_feed.error(
-            "[FallbackChainFeed] Toutes les sources de la chaîne ont échoué (ou ont été "
-            "rejetées par le garde-fou inter-sources) cette itération -> UNAVAILABLE. "
-            "Aucun prix simulé/inventé ne sera utilisé."
-        )
-        self._state = FeedState.UNAVAILABLE
-        self._active_source = None
+def iso(epoch: Optional[int]) -> Optional[str]:
+    if epoch is None:
         return None
+    return datetime.fromtimestamp(epoch, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
-# Clé optionnelle goldapi.io pour activer le 2e maillon de la chaîne (le
-# tier gratuit est limité à 100 requêtes/mois — laisser vide si non utilisé,
-# la chaîne fonctionne avec gold-api.com seul).
-GOLDAPI_IO_API_KEY = os.environ.get("GOLDAPI_IO_API_KEY", "")
-# gold-api.com demande de ne pas dépasser ~1 requête/30s (voir docstring de
-# GoldApiComFeed plus haut) -> 20s par défaut, override possible via l'env.
-GOLD_PRICE_SERVICE_POLL_SECONDS = float(os.environ.get("GOLD_PRICE_SERVICE_POLL_SECONDS", "20"))
-# Garde-fou anti-saut GLOBAL à la chaîne (voir docstring FallbackChainFeed,
-# correctif du 04/09/2026) -- volontairement plus serré que le seuil interne
-# de chaque feed (1.5%), car il compare des ticks qui peuvent venir de
-# sources différentes d'un poll à l'autre.
-GOLD_CHAIN_MAX_JUMP_PCT = float(os.environ.get("GOLD_CHAIN_MAX_JUMP_PCT", "0.5"))
-GOLD_CHAIN_MAX_QUOTE_AGE_SECONDS = float(os.environ.get("GOLD_CHAIN_MAX_QUOTE_AGE_SECONDS", "90"))
-
-# Instance réelle, créée au démarrage (voir bloc "if __name__" juste plus
-# bas) et consommée par _fetch_gold_price_service() ci-dessous.
-xauusd_price_service: Optional["GoldPriceService"] = None
+def fmt_price(x: Optional[float]) -> str:
+    if x is None:
+        return "-"
+    return f"{x:.4f}".rstrip("0").rstrip(".")
 
 
-def _build_xauusd_price_service() -> "GoldPriceService":
-    # MODIFICATION : xaus.com (2e position) puis goldprice.dev (3e position)
-    # -- toutes deux gratuites et sans clé pour la requête spot utilisée ici
-    # (voir XausComFeed et GoldPriceDevFeed plus haut) -- pour ne dépendre de
-    # goldapi.io (100 requêtes/mois) qu'en tout dernier recours, une fois les
-    # trois sources sans-clé épuisées. Le fallback ultime hors chaîne reste
-    # twelvedata, via asset.fallback_data_source dans fetch_candles().
-    feeds: List[PriceFeed] = [GoldApiComFeed(symbol="XAU"), XausComFeed(), GoldPriceDevFeed()]
-    if GOLDAPI_IO_API_KEY:
-        feeds.append(GoldAPIFeed(api_key=GOLDAPI_IO_API_KEY))
-        log_gold_feed.info(
-            "[GoldPriceService] Chaîne = gold-api.com -> xaus.com -> goldprice.dev -> "
-            "goldapi.io (clé détectée)."
-        )
-    else:
-        log_gold_feed.info(
-            "[GoldPriceService] GOLDAPI_IO_API_KEY absente -> chaîne = gold-api.com -> "
-            "xaus.com -> goldprice.dev (goldapi.io non activé ; twelvedata reste le "
-            "secours final via fetch_candles())."
-        )
-    chain = FallbackChainFeed(
-        feeds, retries_per_feed=2, backoff_seconds=1.0,
-        chain_max_jump_pct=GOLD_CHAIN_MAX_JUMP_PCT,
-        chain_max_quote_age_seconds=GOLD_CHAIN_MAX_QUOTE_AGE_SECONDS,
-    )
-    return GoldPriceService(feed=chain, poll_interval_seconds=GOLD_PRICE_SERVICE_POLL_SECONDS)
+def fmt_r(k: float) -> str:
+    return f"{k:g}"
 
 
-def _fetch_gold_price_service(symbol: str, limit: int) -> List[Dict]:
-    """Pont entre GoldPriceService (ticks -> bougies M5 en mémoire) et le
-    pipeline existant (fetch_candles()/process_asset()), qui attend une
-    liste de dicts {"time","open","high","low","close"}. Lève une exception
-    (jamais de prix inventé) si le service n'est pas encore prêt, périmé, ou
-    si l'historique M5 accumulé est encore insuffisant -> fetch_candles()
-    bascule alors automatiquement sur asset.fallback_data_source (yfinance),
-    exactement comme pour n'importe quelle autre source qui échoue."""
-    if symbol != "XAUUSD":
-        raise ValueError(f"gold_price_service ne gère que XAUUSD pour le moment (reçu : {symbol}).")
-    if xauusd_price_service is None:
-        raise RuntimeError("GoldPriceService pas encore initialisé (démarrage en cours ?).")
-    if not xauusd_price_service.should_produce_signals():
-        raise RuntimeError(
-            f"GoldPriceService état={xauusd_price_service.state.value} — flux XAU périmé/indisponible."
-        )
-    raw_candles = xauusd_price_service.get_m5_candles(include_incomplete=True)
-    if len(raw_candles) < MIN_CANDLES_REQUIRED:
-        raise RuntimeError(
-            f"GoldPriceService : seulement {len(raw_candles)} bougie(s) M5 accumulée(s) "
-            f"(minimum {MIN_CANDLES_REQUIRED}) — historique encore en cours de constitution."
-        )
-    return [
-        {"time": c.timestamp.timestamp(), "open": c.open, "high": c.high, "low": c.low, "close": c.close}
-        for c in raw_candles[-limit:]
-    ]
+# ---- 6.1 CRT ----------------------------------------------------------------
 
+def detect_crt(c1: Candle, c2: Candle) -> Optional[str]:
+    """c1 = bougie 1 (range), c2 = bougie 2 (sweep) : les deux CLÔTURÉES.
 
-if __name__ == "__main__":
-    xauusd_price_service = _build_xauusd_price_service()
-    # MODIFICATION (04/09/2026) : bootstrap de l'historique M5 via yfinance
-    # (GC=F, gratuit, sans clé) AVANT de démarrer le polling live -- pour que
-    # gold_price_service soit immédiatement exploitable au démarrage/redémarrage
-    # au lieu d'exiger ~2h30 d'accumulation de ticks live (MIN_CANDLES_REQUIRED).
-    # N'affecte QUE le bootstrap initial : dès que le flux live (gold-api.com
-    # etc.) tourne, chaque nouveau tick clôture naturellement la dernière
-    # bougie bootstrap et prend le relais avec des données 100% live -- jamais
-    # de mélange entre les deux sources dans une même bougie (voir
-    # CandleBuilder.add_tick). Best-effort : si yfinance échoue (Yahoo bloque
-    # parfois les IP cloud), le service démarre simplement vide comme avant,
-    # sans jamais bloquer le démarrage du bot.
-    try:
-        historical = _fetch_yfinance("XAUUSD", limit=MIN_CANDLES_REQUIRED + 10, interval="5m")
-        n = xauusd_price_service.bootstrap_from_historical(historical)
-        log_gold_feed.info(
-            f"[GoldPriceService] Bootstrap historique yfinance (GC=F) : {n} bougie(s) "
-            f"M5 pré-chargée(s) -- signal exploitable immédiatement (pas d'attente "
-            f"de {MIN_CANDLES_REQUIRED} bougies live)."
-        )
-    except Exception as e:
-        log_gold_feed.warning(
-            f"[GoldPriceService] Bootstrap yfinance impossible ({e}) -- démarrage "
-            f"à vide, accumulation live habituelle (~2h30) via gold-api.com."
-        )
-    threading.Thread(target=xauusd_price_service.run_forever, daemon=True).start()
-    log_gold_feed.info(
-        f"[GoldPriceService] Thread de polling XAUUSD démarré "
-        f"(intervalle={GOLD_PRICE_SERVICE_POLL_SECONDS:.0f}s)."
-    )
+    SELL : HIGH_2 > HIGH_1 puis CLOSE_2 < HIGH_1
+    BUY  : LOW_2  < LOW_1  puis CLOSE_2 > LOW_1
 
-
-# ============================================================================
-# MODULE AJOUTÉ (autonome) — xau_signal_engine.py
-# ----------------------------------------------------------------------------
-# Moteur de détection Sweep -> BOS(corps) -> FVG pour XAUUSD (XAUSignalEngine),
-# INDÉPENDANT du moteur SMC déjà utilisé par process_asset() plus haut dans ce
-# fichier (detect_liquidity_sweep / confirm_bos / detect_fvg, partagé par
-# XAUUSD, XAGUSD et BTCUSD). NON câblé au pipeline existant.
-# Pour éviter tout conflit de nom avec les classes déjà définies plus haut
-# (utilisées par tous les actifs), les symboles suivants ont été renommés :
-#   SwingPoint       -> SwingPointXAU
-#   FVGZone          -> FVGZoneXAU
-#   find_swing_points -> find_swing_points_xau
-#   log (logger)     -> log_xau_engine
-# ============================================================================
-"""
-xau_signal_engine.py
-=====================
-Moteur de détection de signal XAUUSD, INDÉPENDANT, consommant les bougies M5
-produites par `gold_price_feed.py` (Candle : open/high/low/close/timestamp/
-is_complete). Aucun système de score : le signal est un booléen — produit
-uniquement si TOUTES les conditions techniques de la séquence sont réunies.
-
-Séquence stricte, dans cet ordre, sans exception :
-  1. Sweep de liquidité : une mèche dépasse un niveau de liquidité identifié
-     (swing high/low récent).
-  2. BOS (Break of Structure) confirmé UNIQUEMENT par la clôture du CORPS de
-     la bougie au-delà du niveau de structure interne opposé. Une mèche
-     seule ne valide JAMAIS un BOS.
-  3. Détection d'un FVG (Fair Value Gap / imbalance) laissé par la bougie de
-     cassure :
-       - Pas de FVG exploitable -> entrée directe, signal émis immédiatement.
-       - FVG exploitable -> on attend que le prix revienne dans l'imbalance
-         avant d'émettre le signal (entrée sur retour).
-
-BUY et SELL sont détectés de façon totalement indépendante et simultanée :
-un setup SELL en cours de formation ne bloque JAMAIS la détection d'un
-setup BUY sur un swing différent, et réciproquement — chaque direction a son
-propre état interne.
-
-Sortie : SignalCandidate structuré (direction, niveau de sweep, niveau BOS,
-zone FVG éventuelle, bougie associée). PAS de SL/TP, PAS de Telegram ici —
-moteur de détection technique pur, à brancher ensuite sur le module de
-risque (SL/TP/lot) et de diffusion.
-"""
-
-import logging
-from dataclasses import dataclass
-from datetime import datetime
-from enum import Enum
-from typing import Dict, List, Optional
-
-try:
-    from typing import Literal
-    Direction = Literal["BUY", "SELL"]
-except ImportError:  # pragma: no cover - py<3.8 fallback
-    Direction = str
-
-log_xau_engine = logging.getLogger("xau_signal_engine")
-
-
-# ============================================================================
-# Structures de données
-# ============================================================================
-
-@dataclass(frozen=True)
-class SwingPointXAU:
-    index: int
-    price: float
-    kind: str               # "high" | "low"
-    timestamp: datetime
-
-
-@dataclass(frozen=True)
-class FVGZoneXAU:
-    top: float
-    bottom: float
-    direction: str           # "BUY" (imbalance haussière) | "SELL" (baissière)
-    candle_index: int        # index de la bougie de cassure qui a laissé le FVG
-
-
-@dataclass(frozen=True)
-class SignalCandidate:
-    """Signal structuré — sortie UNIQUE de ce moteur. Pas de SL/TP/Lot/
-    Telegram : à consommer par un module de risque séparé."""
-    direction: str                    # "BUY" | "SELL"
-    sweep_level: float
-    sweep_candle_index: int
-    bos_level: float
-    bos_candle_index: int
-    fvg_zone: Optional[FVGZoneXAU]
-    entry_type: str                   # "direct" | "fvg_return"
-    signal_candle_index: int
-    timestamp: datetime
-
-
-class SetupStage(str, Enum):
-    """Étapes de la séquence stricte, suivies indépendamment par direction."""
-    SWEPT = "swept"
-    BOS_CONFIRMED = "bos_confirmed"
-    AWAITING_FVG_RETURN = "awaiting_fvg_return"
-    DONE = "done"
-
-
-@dataclass
-class PendingSetup:
-    """État interne d'un setup en cours de formation, pour UNE direction
-    (BUY ou SELL). Les deux directions ont chacune leur propre instance,
-    totalement indépendante l'une de l'autre."""
-    direction: str
-    stage: SetupStage
-    sweep_level: float
-    sweep_candle_index: int
-    bos_level: Optional[float] = None
-    bos_candle_index: Optional[int] = None
-    fvg_zone: Optional[FVGZoneXAU] = None
-
-
-# ============================================================================
-# Détection des swing points (fractals confirmés)
-# ============================================================================
-
-def find_swing_points_xau(candles: List, lookback: int = 2) -> List[SwingPointXAU]:
-    """Détecte les swing highs/lows confirmés (fractals) : un swing high à
-    l'index i nécessite `lookback` bougies de part et d'autre avec un high
-    strictement inférieur (symétrique pour un swing low). Ces swings servent
-    à la fois de niveaux de liquidité (pour le sweep) et de niveaux de
-    structure interne (pour la confirmation du BOS)."""
-    swings: List[SwingPointXAU] = []
-    n = len(candles)
-    for i in range(lookback, n - lookback):
-        h = candles[i].high
-        if all(candles[j].high < h for j in range(i - lookback, i)) and \
-           all(candles[j].high < h for j in range(i + 1, i + lookback + 1)):
-            swings.append(SwingPointXAU(i, h, "high", candles[i].timestamp))
-        l = candles[i].low
-        if all(candles[j].low > l for j in range(i - lookback, i)) and \
-           all(candles[j].low > l for j in range(i + 1, i + lookback + 1)):
-            swings.append(SwingPointXAU(i, l, "low", candles[i].timestamp))
-    return swings
-
-
-# ============================================================================
-# Détection du FVG (Fair Value Gap / imbalance) laissé par la bougie de cassure
-# ============================================================================
-
-def detect_fvg_from_breakout(candles: List, breakout_index: int, direction: str) -> Optional[FVGZoneXAU]:
-    """Motif ICT/SMC classique à 3 bougies : le FVG associé à la bougie de
-    cassure (breakout_index) est le vide entre la bougie PRÉCÉDENTE et la
-    bougie SUIVANTE la cassure.
-      - Haussier (BUY) : low(bougie suivante) > high(bougie précédente).
-      - Baissier (SELL) : high(bougie suivante) < low(bougie précédente).
-    Retourne None si aucune des deux bougies voisines n'existe encore, ou si
-    aucun vide n'est laissé (pas de FVG exploitable)."""
-    if breakout_index - 1 < 0 or breakout_index + 1 >= len(candles):
+    Si c2 balaie les DEUX côtés (outside bar) et clôture dans le range, le
+    sens est ambigu : aucun signal (None)."""
+    sell = c2.high > c1.high and c2.close < c1.high
+    buy = c2.low < c1.low and c2.close > c1.low
+    if sell and buy:
         return None
-    prev_c = candles[breakout_index - 1]
-    next_c = candles[breakout_index + 1]
-
-    if direction == "BUY":
-        if next_c.low > prev_c.high:
-            return FVGZoneXAU(top=next_c.low, bottom=prev_c.high, direction="BUY",
-                            candle_index=breakout_index)
-    else:
-        if next_c.high < prev_c.low:
-            return FVGZoneXAU(top=prev_c.low, bottom=next_c.high, direction="SELL",
-                            candle_index=breakout_index)
+    if sell:
+        return "sell"
+    if buy:
+        return "buy"
     return None
 
 
-def _fvg_size(fvg: FVGZoneXAU) -> float:
-    return max(fvg.top - fvg.bottom, 0.0)
+# ---- 6.2 FVG (imbalance) -----------------------------------------------------
+
+def detect_fvg(c1: Candle, c2: Candle, c3: Candle, direction: str) -> Optional[tuple[float, float]]:
+    """Retourne (bas, haut) de la FVG dans le sens du trade, sinon None.
+
+    SELL : FVG baissière  -> HIGH_3 < LOW_1   ; zone [HIGH_3, LOW_1]
+    BUY  : FVG haussière  -> LOW_3  > HIGH_1  ; zone [HIGH_1, LOW_3]"""
+    if direction == "sell" and c3.high < c1.low:
+        return (c3.high, c1.low)
+    if direction == "buy" and c3.low > c1.high:
+        return (c1.high, c3.low)
+    return None
 
 
-# ============================================================================
-# Moteur principal
-# ============================================================================
+def m5_confirmation(candles: list[Candle], direction: str, lookback: int = 2) -> bool:
+    """Mode d'entrée directe : la dernière bougie d'entrée clôturée va dans le
+    sens du trade ET sort du micro-range des `lookback` bougies précédentes."""
+    if len(candles) < lookback + 1:
+        return False
+    last = candles[-1]
+    window = candles[-(lookback + 1):-1]
+    if direction == "buy":
+        return last.close > last.open and last.close > max(c.high for c in window)
+    return last.close < last.open and last.close < min(c.low for c in window)
 
-class XAUSignalEngine:
-    """Moteur de détection Sweep -> BOS(corps) -> FVG pour XAUUSD.
 
-    Consomme une liste de bougies M5 COMPLÈTES (is_complete=True — les
-    bougies incomplètes du module de prix ne doivent jamais être utilisées
-    pour valider un sweep, un BOS ou un FVG, seulement pour un affichage
-    temps réel éventuel côté consommateur).
+# ---- 6.3 Filtre de tendance (optionnel) --------------------------------------
 
-    BUY et SELL possèdent chacun leur propre état interne (`PendingSetup`) :
-    aucune direction ne bloque jamais l'autre.
-    """
+def ema(values: list[float], period: int) -> Optional[float]:
+    if period <= 0 or len(values) < period:
+        return None
+    k = 2.0 / (period + 1)
+    value = sum(values[:period]) / period
+    for v in values[period:]:
+        value = v * k + value * (1 - k)
+    return value
 
-    def __init__(self, swing_lookback: int = 2, min_fvg_size: float = 0.0):
-        self._swing_lookback = swing_lookback
-        self._min_fvg_size = min_fvg_size
-        self._pending: Dict[str, Optional[PendingSetup]] = {"BUY": None, "SELL": None}
 
-    def reset(self):
-        self._pending = {"BUY": None, "SELL": None}
+def trend_from_ema(candles: list[Candle], fast: int, slow: int) -> Optional[str]:
+    closes = [c.close for c in candles]
+    ef, es = ema(closes, fast), ema(closes, slow)
+    if ef is None or es is None or ef == es:
+        return None
+    return "buy" if ef > es else "sell"
 
-    def process(self, candles: List) -> List[SignalCandidate]:
-        """Traite l'historique de bougies M5 disponible et retourne les
-        NOUVEAUX signaux détectés lors de cet appel. À rappeler à chaque
-        nouvelle bougie M5 complète reçue du module de prix (voir
-        GoldPriceService.get_m5_candles(include_incomplete=False))."""
-        complete = [c for c in candles if getattr(c, "is_complete", True)]
-        min_len = self._swing_lookback * 2 + 3
-        if len(complete) < min_len:
-            return []
 
-        swings = find_swing_points_xau(complete, self._swing_lookback)
+def detect_swings(candles: list[Candle], length: int) -> tuple[list[float], list[float]]:
+    """Swings confirmés (fractales strictes sur `length` bougies de chaque côté)."""
+    highs: list[float] = []
+    lows: list[float] = []
+    for i in range(length, len(candles) - length):
+        neighbours = candles[i - length:i] + candles[i + 1:i + length + 1]
+        if all(candles[i].high > n.high for n in neighbours):
+            highs.append(candles[i].high)
+        if all(candles[i].low < n.low for n in neighbours):
+            lows.append(candles[i].low)
+    return highs, lows
 
-        signals: List[SignalCandidate] = []
-        signals += self._process_direction("BUY", complete, swings)
-        signals += self._process_direction("SELL", complete, swings)
-        return signals
 
-    # ------------------------------------------------------------------
-    # Logique interne — une direction à la fois, état totalement séparé
-    # ------------------------------------------------------------------
+def trend_from_structure(candles: list[Candle], length: int) -> Optional[str]:
+    highs, lows = detect_swings(candles, length)
+    if len(highs) < 2 or len(lows) < 2:
+        return None
+    if highs[-1] > highs[-2] and lows[-1] > lows[-2]:
+        return "buy"
+    if highs[-1] < highs[-2] and lows[-1] < lows[-2]:
+        return "sell"
+    return None
 
-    def _process_direction(self, direction: str, candles: List,
-                            swings: List[SwingPointXAU]) -> List[SignalCandidate]:
-        signals: List[SignalCandidate] = []
-        n = len(candles)
-        last_index = n - 1
 
-        sweep_kind = "low" if direction == "BUY" else "high"        # liquidité balayée
-        structure_kind = "high" if direction == "BUY" else "low"    # structure opposée pour le BOS
+def trend_allows(cfg: StrategyConfig, direction: str, candles: list[Candle]) -> tuple[bool, str]:
+    """Le filtre ne fabrique JAMAIS un signal : il autorise ou bloque un signal CRT."""
+    mode = str(cfg.trend_filter).upper()
+    if mode == "OFF":
+        return True, "OFF"
+    if mode == "EMA":
+        trend = trend_from_ema(candles, cfg.ema_fast, cfg.ema_slow)
+    else:
+        trend = trend_from_structure(candles, cfg.structure_swing_length)
+    if trend is None:
+        return False, f"{mode}: tendance indéterminée"
+    return trend == direction, f"{mode}: {trend}"
 
-        pending = self._pending[direction]
 
-        # --- Étape 1 : sweep de liquidité (aucun setup en cours pour cette direction) ---
-        if pending is None:
-            candidate_swings = [s for s in swings if s.kind == sweep_kind and s.index < last_index]
-            if not candidate_swings:
-                return signals
-            level = candidate_swings[-1]  # niveau de liquidité le plus récent
-            c = candles[last_index]
-            swept = (c.low < level.price) if direction == "BUY" else (c.high > level.price)
-            if not swept:
-                return signals
-            pending = PendingSetup(direction=direction, stage=SetupStage.SWEPT,
-                                    sweep_level=level.price, sweep_candle_index=last_index)
-            log_xau_engine.info(f"[{direction}] Sweep de liquidité détecté @ {level.price} "
-                      f"(bougie #{last_index}, ts={c.timestamp}).")
-            self._pending[direction] = pending
+# =============================================================================
+# 7. TRADE PAPER + STATISTIQUES
+# =============================================================================
 
-        # --- Étape 2 : BOS confirmé UNIQUEMENT par clôture du corps ---
-        if pending.stage == SetupStage.SWEPT:
-            structure_swings = [s for s in swings if s.kind == structure_kind
-                                 and s.index > pending.sweep_candle_index]
-            if structure_swings:
-                struct_level = structure_swings[0].price
-                for i in range(pending.sweep_candle_index + 1, n):
-                    body_close = candles[i].close
-                    body_open = candles[i].open
-                    if direction == "BUY":
-                        confirmed = body_close > struct_level and body_close > body_open
-                    else:
-                        confirmed = body_close < struct_level and body_close < body_open
-                    # Une mèche seule (high/low) au-delà du niveau ne valide
-                    # JAMAIS le BOS : seule la clôture du CORPS compte.
-                    if confirmed:
-                        pending.stage = SetupStage.BOS_CONFIRMED
-                        pending.bos_level = struct_level
-                        pending.bos_candle_index = i
-                        log_xau_engine.info(f"[{direction}] BOS confirmé par clôture du corps @ {body_close} "
-                                  f"au-delà du niveau opposé {struct_level} (bougie #{i}).")
-                        break
-            if pending.stage != SetupStage.BOS_CONFIRMED:
-                self._pending[direction] = pending
-                return signals
+@dataclass
+class PaperTrade:
+    id: str
+    market_key: str
+    label: str
+    symbol: str
+    direction: str                 # "buy" | "sell"
+    crt_tf: str
+    entry_tf: str
+    mode: str                      # "FVG" | "DIRECT"
+    trend_filter: str
 
-        # --- Étape 3 : détection FVG -> entrée directe ou attente de retour ---
-        if pending.stage == SetupStage.BOS_CONFIRMED:
-            fvg = detect_fvg_from_breakout(candles, pending.bos_candle_index, direction)
-            exploitable = fvg is not None and _fvg_size(fvg) >= self._min_fvg_size
-            if not exploitable:
-                signal = SignalCandidate(
-                    direction=direction, sweep_level=pending.sweep_level,
-                    sweep_candle_index=pending.sweep_candle_index, bos_level=pending.bos_level,
-                    bos_candle_index=pending.bos_candle_index, fvg_zone=None,
-                    entry_type="direct", signal_candle_index=pending.bos_candle_index,
-                    timestamp=candles[pending.bos_candle_index].timestamp,
-                )
-                signals.append(signal)
-                log_xau_engine.info(f"[{direction}] Signal DIRECT (pas de FVG exploitable) "
-                          f"@ bougie #{pending.bos_candle_index}.")
-                pending.stage = SetupStage.DONE
+    c1_epoch: int
+    c1_high: float
+    c1_low: float
+    sweep_epoch: int
+    sweep_high: float
+    sweep_low: float
+    fvg_low: Optional[float]
+    fvg_high: Optional[float]
+
+    entry_epoch: int
+    entry: float
+    sl: float
+    tp: float
+    risk: float
+    rr_target: float
+    be_rr: float = 0.0
+
+    sl_current: float = 0.0
+    be_active: bool = False
+    rr_hits: dict = field(default_factory=dict)   # "1" -> epoch
+    max_r: float = 0.0
+    status: str = "OPEN"           # OPEN | WIN | LOSS | BE
+    close_epoch: Optional[int] = None
+    close_price: Optional[float] = None
+    r_result: Optional[float] = None
+
+    def __post_init__(self) -> None:
+        if not self.sl_current:
+            self.sl_current = self.sl
+
+    @property
+    def sign(self) -> int:
+        return 1 if self.direction == "buy" else -1
+
+    @property
+    def milestones(self) -> list[float]:
+        """RR1, RR2, ... jusqu'à la cible (la cible = TP)."""
+        marks = {float(k) for k in range(1, int(self.rr_target) + 1)}
+        marks.add(float(self.rr_target))
+        return sorted(marks)
+
+    def r_at(self, price: float) -> float:
+        return self.sign * (price - self.entry) / self.risk
+
+    def on_price(self, price: float, epoch: int) -> list[tuple[str, Any]]:
+        """Fait avancer le suivi virtuel. Retourne les événements produits :
+        ("RR", k) | ("BE_ACTIVATED", rr) | ("CLOSE", "WIN"|"LOSS"|"BE")."""
+        events: list[tuple[str, Any]] = []
+        if self.status != "OPEN":
+            return events
+
+        r_now = self.r_at(price)
+        self.max_r = max(self.max_r, r_now)
+
+        # 1) stop (SL initial, ou entrée si break-even actif)
+        if self.sign * (price - self.sl_current) <= 0:
+            self.status = "BE" if self.be_active else "LOSS"
+            self.r_result = 0.0 if self.be_active else -1.0
+            self.close_epoch, self.close_price = epoch, self.sl_current
+            events.append(("CLOSE", self.status))
+            return events
+
+        # 2) break-even
+        if self.be_rr and not self.be_active and r_now >= self.be_rr:
+            self.be_active = True
+            self.sl_current = self.entry
+            events.append(("BE_ACTIVATED", self.be_rr))
+
+        # 3) jalons RR (plusieurs peuvent tomber sur le même tick si gap)
+        for k in self.milestones:
+            key = fmt_r(k)
+            if key not in self.rr_hits and r_now >= k:
+                self.rr_hits[key] = epoch
+                events.append(("RR", k))
+
+        # 4) TP = dernier jalon
+        if r_now >= self.rr_target:
+            self.status = "WIN"
+            self.r_result = float(self.rr_target)
+            self.close_epoch, self.close_price = epoch, self.tp
+            events.append(("CLOSE", "WIN"))
+        return events
+
+    def to_record(self) -> dict:
+        hits = self.rr_hits
+        return {
+            "id": self.id,
+            "market": self.label,
+            "market_key": self.market_key,
+            "symbol": self.symbol,
+            "direction": self.direction,
+            "crt_timeframe": self.crt_tf,
+            "entry_timeframe": self.entry_tf,
+            "mode": self.mode,
+            "trend_filter": self.trend_filter,
+            "candle_1_time": iso(self.c1_epoch),
+            "candle_1_high": self.c1_high,
+            "candle_1_low": self.c1_low,
+            "sweep_time": iso(self.sweep_epoch),
+            "sweep_high": self.sweep_high,
+            "sweep_low": self.sweep_low,
+            "fvg_high": self.fvg_high,
+            "fvg_low": self.fvg_low,
+            "entry_time": iso(self.entry_epoch),
+            "entry": self.entry,
+            "sl": self.sl,
+            "tp": self.tp,
+            "risk": self.risk,
+            "rr_target": self.rr_target,
+            "rr1_time": iso(hits.get("1")),
+            "rr2_time": iso(hits.get("2")),
+            "rr3_time": iso(hits.get("3")),
+            "max_rr": round(self.max_r, 2),
+            "close_time": iso(self.close_epoch),
+            "close_price": self.close_price,
+            "result": self.status,
+            "r_result": self.r_result,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "PaperTrade":
+        return cls(**data)
+
+
+def compute_stats(records: list[dict]) -> dict[str, dict]:
+    """Statistiques PAR MARCHÉ (+ ligne ALL) à partir des trades clôturés."""
+    buckets: dict[str, list[dict]] = defaultdict(list)
+    for rec in records:
+        buckets[rec["market"]].append(rec)
+        buckets["ALL"].append(rec)
+
+    out: dict[str, dict] = {}
+    for name, recs in buckets.items():
+        wins = sum(1 for r in recs if r["result"] == "WIN")
+        losses = sum(1 for r in recs if r["result"] == "LOSS")
+        be = sum(1 for r in recs if r["result"] == "BE")
+        total_r = sum(float(r.get("r_result") or 0.0) for r in recs)
+        n = len(recs)
+        out[name] = {
+            "trades": n, "wins": wins, "losses": losses, "be": be,
+            "winrate": (100.0 * wins / n) if n else 0.0,
+            "total_r": total_r,
+            "avg_r": (total_r / n) if n else 0.0,
+        }
+    return out
+
+
+def format_stats(stats: dict[str, dict]) -> str:
+    if not stats:
+        return "Aucun trade clôturé pour le moment."
+    lines = [f"{'MARCHÉ':<24}{'TRADES':>7}{'WIN':>5}{'LOSS':>6}{'BE':>4}{'WR%':>7}{'TOTAL R':>9}{'AVG R':>8}"]
+    for name in sorted(stats, key=lambda n: (n == "ALL", n)):
+        s = stats[name]
+        lines.append(f"{name:<24}{s['trades']:>7}{s['wins']:>5}{s['losses']:>6}{s['be']:>4}"
+                     f"{s['winrate']:>7.1f}{s['total_r']:>9.2f}{s['avg_r']:>8.2f}")
+    return "\n".join(lines)
+
+
+def format_daily_report(date_label: str, market_keys: list[str],
+                        signals_today: list[dict], closed_today: list[dict]) -> str:
+    """Rapport façon Telegram (voir doc de specs) à partir de :
+    - signals_today : lignes de signals.jsonl filtrées sur la date (TOUS les signaux, même encore ouverts)
+    - closed_today  : lignes de trades.jsonl filtrées sur la date d'ENTRÉE (résultat connu uniquement
+                      pour ceux déjà clôturés ; un trade encore ouvert compte dans "Total" mais pas
+                      dans WIN/LOSS/winrate tant qu'il n'est pas clôturé)."""
+    total = len(signals_today)
+    buy = sum(1 for s in signals_today if s["direction"] == "BUY")
+    sell = sum(1 for s in signals_today if s["direction"] == "SELL")
+
+    wins = sum(1 for c in closed_today if c["result"] == "WIN")
+    losses = sum(1 for c in closed_today if c["result"] == "LOSS")
+    be = sum(1 for c in closed_today if c["result"] == "BE")
+    decided = wins + losses          # le BE n'entre ni au numérateur ni au dénominateur du winrate
+    winrate = (100.0 * wins / decided) if decided else 0.0
+    avg_r = (sum(float(c.get("r_result") or 0.0) for c in closed_today) / len(closed_today)) if closed_today else 0.0
+
+    rr1 = sum(1 for c in closed_today if c.get("rr1_time"))
+    rr2 = sum(1 for c in closed_today if c.get("rr2_time"))
+    rr3 = sum(1 for c in closed_today if c.get("rr3_time"))
+
+    lines = [
+        "📊 RAPPORT JOURNALIER", f"📅 {date_label}", "",
+        "MARCHÉS", *market_keys, "",
+        "━━━━━━━━━━━━━━", "",
+        "SIGNALS", f"Total : {total}", "",
+        f"BUY : {buy}", f"SELL : {sell}", "",
+        f"WIN : {wins}", f"LOSS : {losses}" + (f" | BE : {be}" if be else ""), "",
+        f"Winrate : {winrate:.1f}%", "",
+        f"RR moyen : {avg_r:.1f}", "",
+        f"RR1 atteint : {rr1}", f"RR2 atteint : {rr2}", f"RR3 atteint : {rr3}",
+        "", "━━━━━━━━━━━━━━",
+    ]
+    for key in market_keys:
+        m_signals = [s for s in signals_today if s["market_key"] == key]
+        m_closed = [c for c in closed_today if c.get("market_key") == key]
+        m_wins = sum(1 for c in m_closed if c["result"] == "WIN")
+        m_losses = sum(1 for c in m_closed if c["result"] == "LOSS")
+        lines += ["", key, f"Signaux : {len(m_signals)}", f"WIN : {m_wins}", f"LOSS : {m_losses}"]
+    return "\n".join(lines)
+
+
+def _next_report_time(now: datetime, hour: int, minute: int) -> datetime:
+    """Prochaine occurrence de hour:minute strictement après `now` (heure locale, naïve)."""
+    target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if target <= now:
+        target += timedelta(days=1)
+    return target
+
+
+# =============================================================================
+# 8. NOTIFICATIONS + JOURNAL (fichiers)
+# =============================================================================
+
+log_sig = logging.getLogger("signals")
+
+
+class Notifier:
+    """Point d'accroche des messages. V1 : console + data/signals.log.
+    `photo_path`, si fourni, est le chemin d'une image PNG à joindre (voir
+    render_signal_chart) ; la classe de base se contente de le noter dans le
+    journal local. Voir TelegramNotifier pour l'envoi réel sur Telegram."""
+
+    def __init__(self, path: Optional[Path] = None):
+        self.path = path
+        if path is not None:
+            path.parent.mkdir(parents=True, exist_ok=True)
+
+    def send(self, text: str, photo_path: Optional[Path] = None) -> None:
+        log_sig.info("\n%s", text)
+        if self.path is not None:
+            suffix = f" [image: {photo_path}]" if photo_path else ""
+            with open(self.path, "a", encoding="utf-8") as f:
+                f.write(f"[{datetime.now(timezone.utc):%Y-%m-%d %H:%M:%S} UTC]{suffix}\n{text}\n\n")
+
+
+class TelegramNotifier(Notifier):
+    """Envoie chaque message sur Telegram (texte seul, ou texte + photo).
+
+    Nécessite TELEGRAM_BOT_TOKEN et TELEGRAM_CHAT_ID dans l'environnement
+    (.env). Pour obtenir chat_id : parler au bot puis ouvrir
+    https://api.telegram.org/bot<token>/getUpdates et lire "chat":{"id":...}.
+
+    Un échec réseau est journalisé mais ne fait jamais planter le moteur —
+    le paper trading continue même si Telegram est indisponible."""
+
+    API_BASE = "https://api.telegram.org"
+    MAX_TEXT = 4096
+    MAX_CAPTION = 1024
+
+    def __init__(self, bot_token: str, chat_id: str, path: Optional[Path] = None, timeout: float = 15.0):
+        super().__init__(path)
+        self.bot_token = bot_token
+        self.chat_id = chat_id
+        self.timeout = timeout
+
+    def send(self, text: str, photo_path: Optional[Path] = None) -> None:
+        super().send(text, photo_path)   # trace locale conservée dans tous les cas
+        if requests is None:
+            log_sig.warning("Telegram demandé mais le paquet 'requests' est absent : pip install requests")
+            return
+        try:
+            if photo_path is not None and Path(photo_path).exists():
+                self._send_photo(text, Path(photo_path))
             else:
-                pending.fvg_zone = fvg
-                pending.stage = SetupStage.AWAITING_FVG_RETURN
-                log_xau_engine.info(f"[{direction}] FVG exploitable détecté [{fvg.bottom}, {fvg.top}] "
-                          f"— attente du retour dans l'imbalance avant signal.")
+                self._send_message(text)
+        except Exception as exc:  # pragma: no cover - dépend du réseau
+            log_sig.warning("Envoi Telegram échoué : %s", exc)
 
-        # --- Étape 4 : attente du retour effectif dans l'imbalance (FVG) ---
-        if pending.stage == SetupStage.AWAITING_FVG_RETURN:
-            fvg = pending.fvg_zone
-            for i in range(pending.bos_candle_index + 1, n):
-                c = candles[i]
-                # Retour dans l'imbalance = chevauchement du range de la
-                # bougie avec la zone FVG, quelle que soit la direction.
-                overlaps = c.low <= fvg.top and c.high >= fvg.bottom
-                if overlaps:
-                    signal = SignalCandidate(
-                        direction=direction, sweep_level=pending.sweep_level,
-                        sweep_candle_index=pending.sweep_candle_index, bos_level=pending.bos_level,
-                        bos_candle_index=pending.bos_candle_index, fvg_zone=fvg,
-                        entry_type="fvg_return", signal_candle_index=i,
-                        timestamp=c.timestamp,
-                    )
-                    signals.append(signal)
-                    log_xau_engine.info(f"[{direction}] Signal RETOUR IMBALANCE (FVG) @ bougie #{i}.")
-                    pending.stage = SetupStage.DONE
-                    break
+    def _send_message(self, text: str) -> None:
+        resp = requests.post(f"{self.API_BASE}/bot{self.bot_token}/sendMessage",
+                              data={"chat_id": self.chat_id, "text": text[: self.MAX_TEXT]},
+                              timeout=self.timeout)
+        if not resp.ok:
+            log_sig.warning("Telegram sendMessage %s : %s", resp.status_code, resp.text[:200])
 
-        # Setup terminé -> on libère l'état pour permettre la détection du
-        # prochain setup sur cette même direction, indépendamment de l'autre.
-        if pending.stage == SetupStage.DONE:
-            self._pending[direction] = None
+    def _send_photo(self, caption: str, photo_path: Path) -> None:
+        with open(photo_path, "rb") as f:
+            resp = requests.post(f"{self.API_BASE}/bot{self.bot_token}/sendPhoto",
+                                  data={"chat_id": self.chat_id, "caption": caption[: self.MAX_CAPTION]},
+                                  files={"photo": f}, timeout=self.timeout)
+        if not resp.ok:
+            log_sig.warning("Telegram sendPhoto %s : %s", resp.status_code, resp.text[:200])
+
+
+class Journal:
+    """trades.jsonl : un trade clôturé par ligne (données pour backtest/stats).
+    open_trades.json : trades paper encore ouverts (survivent à un redémarrage)."""
+
+    def __init__(self, data_dir: Path):
+        data_dir.mkdir(parents=True, exist_ok=True)
+        self.trades_path = data_dir / "trades.jsonl"
+        self.open_path = data_dir / "open_trades.json"
+        self.signals_path = data_dir / "signals.jsonl"
+        self._open: dict[str, list[dict]] = {}
+
+    def append_signal(self, trade: PaperTrade) -> None:
+        """Une ligne par ENTRÉE (contrairement à trades.jsonl qui n'a une ligne
+        qu'à la CLÔTURE) : permet au rapport journalier de compter tous les
+        signaux du jour, même ceux encore ouverts au moment du rapport."""
+        rec = {
+            "id": trade.id, "date": iso(trade.entry_epoch)[:10], "time": iso(trade.entry_epoch),
+            "market": trade.label, "market_key": trade.market_key, "direction": trade.direction.upper(),
+        }
+        with open(self.signals_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+    def read_signals(self) -> list[dict]:
+        if not self.signals_path.exists():
+            return []
+        out = []
+        with open(self.signals_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    out.append(json.loads(line))
+        return out
+
+    def append_closed(self, trade: PaperTrade) -> None:
+        with open(self.trades_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(trade.to_record(), ensure_ascii=False) + "\n")
+
+    def read_closed(self) -> list[dict]:
+        if not self.trades_path.exists():
+            return []
+        out = []
+        with open(self.trades_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    out.append(json.loads(line))
+        return out
+
+    def save_open(self, market_key: str, trades: list[PaperTrade]) -> None:
+        self._open[market_key] = [asdict(t) for t in trades]
+        tmp = self.open_path.with_suffix(".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(self._open, f, ensure_ascii=False)
+        os.replace(tmp, self.open_path)
+
+    def load_open(self) -> dict[str, list[dict]]:
+        if not self.open_path.exists():
+            return {}
+        with open(self.open_path, "r", encoding="utf-8") as f:
+            self._open = json.load(f)
+        return {k: list(v) for k, v in self._open.items()}
+
+
+# =============================================================================
+# 8.5. IMAGE DE SIGNAL (matplotlib, optionnel)
+# =============================================================================
+
+log_chart = logging.getLogger("chart")
+
+
+def _draw_candles(ax, candles: list[Candle]) -> None:
+    """Bougies simples (mèche + corps) sur un axe indexé (pas un axe temporel)."""
+    for i, c in enumerate(candles):
+        up = c.close >= c.open
+        color = "#2e7d32" if up else "#c62828"
+        ax.vlines(i, c.low, c.high, color=color, linewidth=1)
+        lo, hi = (c.open, c.close) if up else (c.close, c.open)
+        height = max(hi - lo, (c.high - c.low) * 0.03 or 0.0001)
+        ax.add_patch(Rectangle((i - 0.3, lo), 0.6, height, facecolor=color, edgecolor=color))
+    if candles:
+        step = max(1, len(candles) // 6)
+        ticks = list(range(0, len(candles), step))
+        ax.set_xticks(ticks)
+        ax.set_xticklabels(
+            [datetime.fromtimestamp(candles[i].epoch, tz=timezone.utc).strftime("%H:%M") for i in ticks],
+            fontsize=7)
+    ax.set_xlim(-1, max(len(candles), 1))
+    ax.grid(axis="y", color="#eeeeee", linewidth=0.6)
+
+
+def render_signal_chart(trade: "PaperTrade", crt_candles: list[Candle], entry_candles: list[Candle],
+                        cfg: StrategyConfig, out_path: Path, crt_context: int = 10) -> Optional[Path]:
+    """Génère le PNG annoté d'un signal : volet CRT_TF (range + sweep) en haut,
+    volet ENTRY_TF (FVG + entrée + SL/TP/RR) en bas, plus la configuration du
+    moment (point 9 de la spec). Best-effort : retourne None et journalise un
+    avertissement en cas de souci (matplotlib absent, données incomplètes...),
+    sans jamais interrompre le moteur."""
+    if plt is None:
+        log_chart.warning("matplotlib indisponible : image non générée pour %s.", trade.id)
+        return None
+
+    fig = None
+    try:
+        crt_view = [c for c in crt_candles if c.epoch <= trade.sweep_epoch][-crt_context:] or crt_candles[-crt_context:]
+        window = [c for c in entry_candles if trade.sweep_epoch <= c.epoch <= trade.entry_epoch]
+        tail = [c for c in entry_candles if c.epoch > trade.entry_epoch][:2]
+        entry_view = (window + tail) or entry_candles[-10:]
+        if not crt_view:
+            crt_view = [Candle(trade.c1_epoch, trade.c1_high, trade.c1_high, trade.c1_low, trade.c1_low)]
+        if not entry_view:
+            entry_view = [Candle(trade.entry_epoch, trade.entry, trade.entry, trade.entry, trade.entry)]
+
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(9, 8), gridspec_kw={"height_ratios": [1, 1.4]})
+        fig.suptitle(f"{trade.label} — {trade.direction.upper()} — CRT {trade.crt_tf} → {trade.entry_tf}",
+                    fontsize=12, fontweight="bold")
+
+        _draw_candles(ax1, crt_view)
+        ax1.axhline(trade.c1_high, color="#607d8b", ls="--", lw=1)
+        ax1.axhline(trade.c1_low, color="#607d8b", ls="--", lw=1)
+        ax1.text(0, trade.c1_high, " HIGH CRT", fontsize=7, va="bottom", color="#607d8b")
+        ax1.text(0, trade.c1_low, " LOW CRT", fontsize=7, va="top", color="#607d8b")
+        ax1.set_title(f"CRT {trade.crt_tf} — range + sweep", fontsize=9, loc="left")
+
+        _draw_candles(ax2, entry_view)
+        if trade.fvg_low is not None and trade.fvg_high is not None:
+            ax2.axhspan(trade.fvg_low, trade.fvg_high, color="#fbc02d", alpha=0.25)
+            ax2.text(0, trade.fvg_high, " FVG", fontsize=7, va="bottom", color="#a17e00")
+        entry_color = "#2e7d32" if trade.direction == "buy" else "#c62828"
+        ax2.axhline(trade.entry, color=entry_color, lw=1.6)
+        ax2.axhline(trade.sl, color="#c62828", ls="--", lw=1.2)
+        ax2.axhline(trade.tp, color="#2e7d32", ls="--", lw=1.2)
+        last_x = len(entry_view) - 1
+        ax2.text(last_x, trade.entry, f" ENTRY {fmt_price(trade.entry)}", fontsize=7,
+                 color=entry_color, ha="right", va="bottom")
+        ax2.text(last_x, trade.sl, f" SL {fmt_price(trade.sl)}", fontsize=7, color="#c62828", ha="right", va="bottom")
+        ax2.text(last_x, trade.tp, f" TP {fmt_price(trade.tp)}", fontsize=7, color="#2e7d32", ha="right", va="top")
+        for k in trade.milestones:
+            level = trade.entry + trade.sign * k * trade.risk
+            ax2.axhline(level, color="#9e9e9e", ls=":", lw=0.8)
+            ax2.text(0, level, f" RR{fmt_r(k)}", fontsize=6, color="#757575", va="bottom")
+        ax2.set_title(f"{trade.entry_tf} — FVG / retest / entrée — RR cible 1:{fmt_r(trade.rr_target)}",
+                     fontsize=9, loc="left")
+
+        config_lines = [
+            f"CRT: {cfg.crt_tf}", f"ENTRY: {cfg.entry_tf}",
+            f"FVG: {'ON' if cfg.fvg_enabled else 'OFF'}",
+            f"TREND: {str(cfg.trend_filter).upper()}",
+            f"RR: {fmt_r(cfg.rr)}", f"BE: {cfg.break_even}",
+        ]
+        fig.text(0.995, 0.5, "\n".join(config_lines), fontsize=7, family="monospace",
+                ha="right", va="center", bbox=dict(boxstyle="round", fc="#f5f5f5", ec="#bdbdbd"))
+
+        fig.tight_layout(rect=(0, 0, 0.9, 0.96))
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(out_path, dpi=150)
+        return out_path
+    except Exception as exc:  # pragma: no cover - rendu best-effort, ne doit jamais interrompre le moteur
+        log_chart.warning("Génération d'image échouée pour %s : %s", trade.id, exc)
+        return None
+    finally:
+        if fig is not None:
+            plt.close(fig)
+
+
+# =============================================================================
+# 9. MOTEUR PAR MARCHÉ
+# =============================================================================
+
+log_engine = logging.getLogger("engine")
+
+CandleProvider = Callable[[str], list]   # timeframe -> bougies clôturées
+
+
+@dataclass
+class Setup:
+    """Un CRT confirmé en attente d'entrée."""
+    direction: str
+    crt_tf: str
+    c1_epoch: int
+    c1_high: float
+    c1_low: float
+    sweep_epoch: int
+    sweep_high: float
+    sweep_low: float
+    confirm_epoch: int            # instant de clôture de la bougie de sweep
+    expires_epoch: int
+    trend_state: str = "OFF"
+    fvg_low: Optional[float] = None
+    fvg_high: Optional[float] = None
+    fvg_ready_epoch: int = 0      # instant de clôture de la 3e bougie de la FVG
+
+
+class MarketEngine:
+    """Machine à états d'UN marché, indépendante des autres :
+
+        (rien) -> CRT confirmé -> [FVG détectée] -> retest -> trade paper -> RR1/RR2/RR3
+
+    Entrées d'événements : on_candle_close(tf, candle) et on_price(price, epoch)."""
+
+    def __init__(self, key: str, label: str, symbol: str, cfg: StrategyConfig,
+                 get_candles: CandleProvider, notifier: Notifier, journal: Journal,
+                 now_fn: Callable[[], float] = _time.time, chart_dir: Optional[Path] = None,
+                 max_positions: Optional[int] = None):
+        self.key, self.label, self.symbol = key, label, symbol
+        self.cfg = cfg
+        self.get_candles = get_candles
+        self.notifier = notifier
+        self.journal = journal
+        self.now_fn = now_fn
+        self.chart_dir = chart_dir   # None = pas d'image générée (défaut des tests)
+        # max_positions : réglage global (cfg.max_positions) sauf override par marché
+        # (voir AppConfig.max_positions_by_market / config.json).
+        self.max_positions = cfg.max_positions if max_positions is None else max_positions
+
+        self.setup: Optional[Setup] = None
+        self.open_trades: list[PaperTrade] = []
+        self._trade_seq = 0
+
+    # ---- événements ---------------------------------------------------------
+
+    def on_candle_close(self, tf: str, candle: Candle) -> None:
+        if tf == self.cfg.crt_tf:
+            self._on_crt_close(candle)
+        if tf == self.cfg.entry_tf:
+            self._on_entry_close(candle)
+
+    def on_price(self, price: float, epoch: int) -> None:
+        self._track_trades(price, epoch)
+
+        s = self.setup
+        if s is None or s.fvg_low is None or s.fvg_high is None:
+            return
+        if epoch < s.fvg_ready_epoch:
+            return
+
+        if epoch >= s.expires_epoch:
+            log_engine.info("%s | setup %s expiré sans entrée.", self.label, s.direction.upper())
+            self.setup = None
+            return
+
+        if self._sl_breached(s, price):
+            log_engine.info("%s | setup %s annulé : le prix a atteint le niveau du sweep avant l'entrée.",
+                            self.label, s.direction.upper())
+            self.setup = None
+            return
+
+        touched = price >= s.fvg_low if s.direction == "sell" else price <= s.fvg_high
+        if touched:
+            self._open_trade(price, epoch, mode="FVG")
+
+    # ---- CRT ----------------------------------------------------------------
+
+    def _on_crt_close(self, candle: Candle) -> None:
+        cfg = self.cfg
+        gran = TF_SECONDS[cfg.crt_tf]
+        candles = self.get_candles(cfg.crt_tf)
+        if len(candles) < 2:
+            return
+        if candles[-1].epoch != candle.epoch:
+            log_engine.warning("%s | CRT %s ignoré : historique incohérent.", self.label, cfg.crt_tf)
+            return
+
+        c1, c2 = candles[-2], candles[-1]
+        if c2.epoch - c1.epoch != gran:
+            log_engine.info("%s | CRT ignoré : bougies %s non consécutives.", self.label, cfg.crt_tf)
+            return
+
+        direction = detect_crt(c1, c2)
+        if direction is None:
+            log_engine.debug("%s | %s clôturée : pas de CRT.", self.label, cfg.crt_tf)
+            return
+
+        confirm_epoch = c2.epoch + gran
+        expiry = cfg.setup_expiry_crt_candles * gran
+        if self.now_fn() - confirm_epoch > expiry:
+            log_engine.info("%s | CRT %s périmé (données anciennes), ignoré.", self.label, direction.upper())
+            return
+
+        trend_candles = self.get_candles(cfg.effective_trend_tf) if str(cfg.trend_filter).upper() != "OFF" else []
+        allowed, trend_state = trend_allows(cfg, direction, trend_candles)
+        if not allowed:
+            log_engine.info("%s | CRT %s bloqué par le filtre de tendance (%s).",
+                            self.label, direction.upper(), trend_state)
+            return
+
+        if self.setup is not None:
+            log_engine.info("%s | ancien setup %s remplacé par le nouveau CRT.",
+                            self.label, self.setup.direction.upper())
+
+        self.setup = Setup(
+            direction=direction, crt_tf=cfg.crt_tf,
+            c1_epoch=c1.epoch, c1_high=c1.high, c1_low=c1.low,
+            sweep_epoch=c2.epoch, sweep_high=c2.high, sweep_low=c2.low,
+            confirm_epoch=confirm_epoch, expires_epoch=confirm_epoch + expiry,
+            trend_state=trend_state,
+        )
+        log_engine.info("%s | CRT %s CONFIRMÉ sur %s (range %s–%s, sweep %s) | tendance: %s",
+                        self.label, direction.upper(), cfg.crt_tf,
+                        fmt_price(c1.low), fmt_price(c1.high),
+                        fmt_price(c2.high if direction == "sell" else c2.low), trend_state)
+
+        # ---- V1 : timeframe unique (crt_tf == entry_tf, ex. M5) ------------
+        # CRT validé -> ENTRÉE DIRECTE immédiate, au prix disponible à l'instant
+        # de la confirmation (clôture de la bougie de sweep). On n'attend ni
+        # une nouvelle bougie, ni un retest FVG (FVG désactivée dans ce mode).
+        if cfg.crt_tf == cfg.entry_tf and cfg.direct_entry and not cfg.fvg_enabled:
+            self._open_trade(c2.close, confirm_epoch, mode="DIRECT")
+
+    # ---- FVG / entrée directe -------------------------------------------------
+
+    def _on_entry_close(self, candle: Candle) -> None:
+        s = self.setup
+        if s is None:
+            return
+        cfg = self.cfg
+        gran = TF_SECONDS[cfg.entry_tf]
+
+        if candle.epoch < s.confirm_epoch:
+            return                      # bougie appartenant encore à la bougie de sweep
+        if candle.epoch >= s.expires_epoch:
+            log_engine.info("%s | setup %s expiré sans entrée.", self.label, s.direction.upper())
+            self.setup = None
+            return
+
+        candles = self.get_candles(cfg.entry_tf)
+        if not candles or candles[-1].epoch != candle.epoch:
+            return
+
+        # 1) FVG : les 3 bougies doivent s'ouvrir APRÈS la clôture de la bougie de sweep
+        #    (une bougie M5 appartenant encore au sweep ne peut pas faire partie de la FVG)
+        if cfg.fvg_enabled and s.fvg_low is None and len(candles) >= 3:
+            c1, c2, c3 = candles[-3], candles[-2], candles[-1]
+            consecutive = (c3.epoch - c1.epoch) == 2 * gran and c1.epoch >= s.confirm_epoch
+            zone = detect_fvg(c1, c2, c3, s.direction) if consecutive else None
+            if zone is not None:
+                s.fvg_low, s.fvg_high = zone
+                s.fvg_ready_epoch = candle.epoch + gran
+                log_engine.info("%s | FVG %s détectée [%s – %s] : attente du retest.",
+                                self.label, "baissière" if s.direction == "sell" else "haussière",
+                                fmt_price(s.fvg_low), fmt_price(s.fvg_high))
+                return
+
+        # 2) Entrée directe (mode secours)
+        if not cfg.direct_entry or s.fvg_low is not None:
+            return
+        bars_since = (candle.epoch - s.confirm_epoch) // gran + 1
+        if cfg.fvg_enabled and bars_since < cfg.direct_fallback_bars:
+            return
+        if self._sl_breached(s, candle.close):
+            log_engine.info("%s | setup %s annulé : le prix a atteint le niveau du sweep.",
+                            self.label, s.direction.upper())
+            self.setup = None
+            return
+        if m5_confirmation(candles, s.direction):
+            self._open_trade(candle.close, candle.epoch + gran, mode="DIRECT")
+
+    # ---- ouverture / suivi du trade -------------------------------------------
+
+    @staticmethod
+    def _sl_breached(s: Setup, price: float) -> bool:
+        return price >= s.sweep_high if s.direction == "sell" else price <= s.sweep_low
+
+    def _open_trade(self, price: float, epoch: int, mode: str) -> None:
+        s = self.setup
+        cfg = self.cfg
+        if s is None:
+            return
+        self.setup = None                     # un setup = au plus un trade
+
+        if len(self.open_trades) >= self.max_positions:
+            log_engine.info("%s | entrée %s ignorée : max_positions (%d) atteint.",
+                            self.label, s.direction.upper(), self.max_positions)
+            return
+
+        if s.direction == "sell":
+            sl = s.sweep_high + cfg.sl_buffer
+            risk = sl - price
+            tp = price - risk * cfg.rr
         else:
-            self._pending[direction] = pending
+            sl = s.sweep_low - cfg.sl_buffer
+            risk = price - sl
+            tp = price + risk * cfg.rr
 
-        return signals
+        if risk <= 0:
+            log_engine.warning("%s | entrée %s ignorée : risque <= 0 (prix %s, SL %s).",
+                               self.label, s.direction.upper(), fmt_price(price), fmt_price(sl))
+            return
+
+        self._trade_seq += 1
+        trade = PaperTrade(
+            id=f"{self.key}-{epoch}-{self._trade_seq}",
+            market_key=self.key, label=self.label, symbol=self.symbol,
+            direction=s.direction, crt_tf=cfg.crt_tf, entry_tf=cfg.entry_tf,
+            mode=mode, trend_filter=str(cfg.trend_filter).upper(),
+            c1_epoch=s.c1_epoch, c1_high=s.c1_high, c1_low=s.c1_low,
+            sweep_epoch=s.sweep_epoch, sweep_high=s.sweep_high, sweep_low=s.sweep_low,
+            fvg_low=s.fvg_low, fvg_high=s.fvg_high,
+            entry_epoch=epoch, entry=price, sl=sl, tp=tp, risk=risk,
+            rr_target=cfg.rr, be_rr=cfg.be_rr,
+        )
+        self.open_trades.append(trade)
+        self.journal.save_open(self.key, self.open_trades)
+        self.journal.append_signal(trade)
+        photo_path = self._render_chart(trade) if self.chart_dir is not None else None
+        self.notifier.send(self._entry_message(trade), photo_path=photo_path)
+
+    def _render_chart(self, trade: "PaperTrade") -> Optional[Path]:
+        try:
+            crt_candles = self.get_candles(trade.crt_tf)
+            entry_candles = self.get_candles(trade.entry_tf)
+            out_path = self.chart_dir / f"{trade.id}.png"
+            return render_signal_chart(trade, crt_candles, entry_candles, self.cfg, out_path)
+        except Exception as exc:  # ne doit jamais empêcher l'envoi du signal texte
+            log_engine.warning("%s | génération d'image échouée pour %s : %s", self.label, trade.id, exc)
+            return None
+
+    def _track_trades(self, price: float, epoch: int) -> None:
+        if not self.open_trades:
+            return
+        changed = False
+        for trade in list(self.open_trades):
+            for kind, value in trade.on_price(price, epoch):
+                changed = True
+                if kind == "RR":
+                    if value != trade.rr_target:     # le dernier jalon est annoncé par CLOSE
+                        self.notifier.send(self._header(trade) + f"\n\nRR {fmt_r(value)} atteint ✅")
+                elif kind == "BE_ACTIVATED":
+                    self.notifier.send(self._header(trade) + f"\n\nBreak-even activé (SL → entrée) à RR {fmt_r(value)}")
+                elif kind == "CLOSE":
+                    self.open_trades.remove(trade)
+                    self.journal.append_closed(trade)
+                    self.notifier.send(self._close_message(trade))
+        if changed:
+            self.journal.save_open(self.key, self.open_trades)
+
+    # ---- restauration ----------------------------------------------------------
+
+    def restore_trades(self, trades: list[PaperTrade]) -> None:
+        self.open_trades = list(trades)
+        if trades:
+            log_engine.info("%s | %d trade(s) paper restauré(s) après redémarrage.", self.label, len(trades))
+
+    # ---- messages ---------------------------------------------------------------
+
+    @staticmethod
+    def _icon(trade: PaperTrade) -> str:
+        return "🟢" if trade.direction == "buy" else "🔴"
+
+    def _header(self, t: PaperTrade) -> str:
+        return (f"{self._icon(t)} CRT {t.direction.upper()}\n\n"
+                f"📊 Market: {t.label}\n⏱️ TF: {t.entry_tf}")
+
+    def _entry_message(self, t: PaperTrade) -> str:
+        fvg = f"\n🟨 FVG: {fmt_price(t.fvg_low)} – {fmt_price(t.fvg_high)}" if t.fvg_low is not None else ""
+        mode_line = "⚡ Entrée directe" if t.mode == "DIRECT" else "🔁 Entrée sur retest FVG"
+        return (self._header(t) +
+                f"\n\n🎯 Entry: {fmt_price(t.entry)}\n🛑 SL: {fmt_price(t.sl)}\n💰 TP: {fmt_price(t.tp)}"
+                f"\n📐 RR: 1:{fmt_r(t.rr_target)}" + fvg +
+                f"\n\n{mode_line}"
+                f"\n(paper trading — aucun ordre réel)")
+
+    def _close_message(self, t: PaperTrade) -> str:
+        if t.status == "WIN":
+            return (f"🎯 {t.label} {t.direction.upper()}\n\n"
+                    f"TP RR{fmt_r(t.rr_target)} atteint ✅\nTrade WIN (+{fmt_r(t.rr_target)}R)")
+        if t.status == "BE":
+            return f"⚪ {t.label} {t.direction.upper()}\n\nRetour à l'entrée après break-even\nTrade BE (0R)"
+        return (f"❌ {t.label} {t.direction.upper()}\n\nStop loss touché ({fmt_price(t.sl)})\n"
+                f"Trade LOSS (-1R) | max atteint: {t.max_r:.2f}R")
+
+
+# =============================================================================
+# 10. ORCHESTRATION
+# =============================================================================
+
+log_main = logging.getLogger("main")
+
+
+def needed_timeframes(cfg: StrategyConfig) -> dict[str, int]:
+    tfs = {cfg.entry_tf, cfg.crt_tf}
+    if str(cfg.trend_filter).upper() != "OFF":
+        tfs.add(cfg.effective_trend_tf)
+    return {tf: TF_SECONDS[tf] for tf in sorted(tfs, key=lambda t: TF_SECONDS[t])}
+
+
+def wire_engines(cfg: StrategyConfig, markets: dict, candle_store: "CandleStore", tick_cache: "TickCache",
+                 notifier: Notifier, journal: Journal,
+                 now_fn: Callable[[], float] = _time.time,
+                 chart_dir: Optional[Path] = None,
+                 max_positions_by_market: Optional[dict[str, int]] = None) -> dict[str, MarketEngine]:
+    """Crée un MarketEngine par marché, restaure les trades ouverts et branche
+    les écouteurs (bougies clôturées + ticks). Retourne {symbole: moteur}.
+
+    max_positions_by_market permet un max_positions différent par marché
+    (clé = market.key, ex. "V75") ; un marché absent garde cfg.max_positions."""
+    saved_open = journal.load_open()
+    overrides = max_positions_by_market or {}
+    engines: dict[str, MarketEngine] = {}
+
+    for market in markets.values():
+        engine = MarketEngine(
+            key=market.key, label=market.label, symbol=market.symbol, cfg=cfg,
+            get_candles=lambda tf, sym=market.symbol: candle_store.get_closed_candles(sym, tf),
+            notifier=notifier, journal=journal, now_fn=now_fn, chart_dir=chart_dir,
+            max_positions=overrides.get(market.key),
+        )
+        engine.restore_trades([PaperTrade.from_dict(d) for d in saved_open.get(market.key, [])])
+        engines[market.symbol] = engine
+
+    async def on_candle_closed(symbol: str, timeframe: str, candle: Candle) -> None:
+        engine = engines.get(symbol)
+        if engine is not None:
+            engine.on_candle_close(timeframe, candle)
+
+    async def on_tick(symbol: str, tick: Tick) -> None:
+        engine = engines.get(symbol)
+        if engine is not None:
+            engine.on_price(tick.quote, tick.epoch)
+
+    candle_store.add_close_listener(on_candle_closed)
+    tick_cache.add_listener(on_tick)      # enregistré APRÈS CandleStore : bougie d'abord, prix ensuite
+    return engines
+
+
+def telegram_credentials() -> tuple[str, str, str]:
+    """(token, chat_id, admin_id) : variables d'environnement (.env) si définies et
+    non vides, sinon valeurs DEFAULT_TELEGRAM_* intégrées."""
+    return (os.getenv("TELEGRAM_BOT_TOKEN") or DEFAULT_TELEGRAM_BOT_TOKEN,
+            os.getenv("TELEGRAM_CHAT_ID") or DEFAULT_TELEGRAM_CHAT_ID,
+            os.getenv("TELEGRAM_ADMIN_ID") or DEFAULT_TELEGRAM_ADMIN_ID)
+
+
+def build_notifier(app: AppConfig) -> Notifier:
+    """TelegramNotifier si telegram.enabled=true dans config.json (token et chat
+    via telegram_credentials : .env sinon valeurs par défaut intégrées) ; sinon
+    repli sur le Notifier fichier (data/signals.log), comme en V1."""
+    log_path = app.data_dir / "signals.log"
+    if not app.telegram_enabled:
+        return Notifier(log_path)
+    token, chat_id, _admin_id = telegram_credentials()
+    if not token or not chat_id:
+        log_main.warning("telegram.enabled=true mais token/chat_id Telegram vides : "
+                         "repli sur data/signals.log.")
+        return Notifier(log_path)
+    if requests is None:
+        log_main.warning("telegram.enabled=true mais le paquet 'requests' est absent "
+                         "(pip install requests) : repli sur data/signals.log.")
+        return Notifier(log_path)
+    return TelegramNotifier(token, chat_id, log_path)
+
+
+async def daily_report_task(app: AppConfig, journal: Journal, notifier: Notifier) -> None:
+    """Boucle infinie : dort jusqu'à app.report_hour:report_minute (heure locale
+    du serveur) puis envoie le rapport journalier, chaque jour."""
+    while True:
+        now = datetime.now()
+        target = _next_report_time(now, app.report_hour, app.report_minute)
+        await asyncio.sleep((target - now).total_seconds())
+
+        cutoff_date = target.strftime("%Y-%m-%d")
+        date_label = target.strftime("%d/%m/%Y")
+        signals_today = [s for s in journal.read_signals() if s["date"] == cutoff_date]
+        closed_today = [c for c in journal.read_closed() if (c.get("entry_time") or "")[:10] == cutoff_date]
+        notifier.send(format_daily_report(date_label, app.markets, signals_today, closed_today))
+        log_main.info("Rapport journalier envoyé (%s).", cutoff_date)
+
+
+async def run(app: AppConfig) -> None:
+    cfg = app.strategy
+    conn = ConnectionSettings(history_candle_count=app.history_candle_count)
+    journal = Journal(app.data_dir)
+    notifier = build_notifier(app)
+
+    chart_dir: Optional[Path] = app.data_dir / "charts" if app.chart_enabled else None
+    if chart_dir is not None and plt is None:
+        log_main.warning("chart_enabled=true mais matplotlib est absent (pip install matplotlib) : "
+                         "images de signal désactivées.")
+        chart_dir = None
+
+    single_tf_direct = cfg.crt_tf == cfg.entry_tf and cfg.direct_entry and not cfg.fvg_enabled
+    log_main.info("Démarrage moteur CRT V1 — signaux + paper trading, AUCUN ordre réel.")
+    log_main.info("Mode=%s | CRT=%s | entrée=%s | RR=%g | FVG=%s | direct=%s | tendance=%s | BE=%s | "
+                  "SL buffer=%g | max pos/marché=%d | override par marché=%s",
+                  "TIMEFRAME UNIQUE (entrée immédiate)" if single_tf_direct else "CRT->FVG/retest",
+                  cfg.crt_tf, cfg.entry_tf, cfg.rr, "ON" if cfg.fvg_enabled else "OFF",
+                  "ON" if cfg.direct_entry else "OFF", str(cfg.trend_filter).upper(),
+                  cfg.break_even, cfg.sl_buffer, cfg.max_positions,
+                  app.max_positions_by_market or "aucun")
+    log_main.info("Telegram=%s | images=%s | rapport quotidien=%02d:%02d",
+                  "ON" if isinstance(notifier, TelegramNotifier) else "OFF",
+                  "ON" if chart_dir else "OFF", app.report_hour, app.report_minute)
+
+    client = DerivClient(conn)
+    tick_cache = TickCache(client)
+    candle_store = CandleStore(client, tick_cache)
+    client_task = asyncio.create_task(client.run_forever())
+
+    definitions = [m for m in ALL_MARKETS if m["key"] in app.markets]
+    markets = await discover_symbols(client, definitions)
+    if not markets:
+        log_main.error("Aucun marché résolu via active_symbols. Arrêt.")
+        client_task.cancel()
+        return
+
+    timeframes = needed_timeframes(cfg)
+    for market in markets.values():
+        candle_store.register_timeframes(market.symbol, timeframes)
+        await candle_store.load_history(market.symbol, timeframes, conn.history_candle_count)
+
+    wire_engines(cfg, markets, candle_store, tick_cache, notifier, journal, chart_dir=chart_dir,
+                max_positions_by_market=app.max_positions_by_market)
+    await tick_cache.subscribe([m.symbol for m in markets.values()])
+
+    report_task = asyncio.create_task(daily_report_task(app, journal, notifier))
+
+    log_main.info("Moteur actif sur %d marché(s) : %s",
+                  len(markets), ", ".join(m.label for m in markets.values()))
+    await asyncio.gather(client_task, report_task)
+
+
+def print_stats(app: AppConfig) -> None:
+    records = Journal(app.data_dir).read_closed()
+    print(format_stats(compute_stats(records)))
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="AlphaBot — moteur CRT V1 (paper trading)")
+    parser.add_argument("--stats", action="store_true", help="affiche les statistiques par marché et quitte")
+    parser.add_argument("--test", action="store_true", help="lance les tests intégrés (sans réseau) et quitte")
+    parser.add_argument("--init-config", action="store_true",
+                        help="écrit le modèle de config dans --config s'il n'existe pas, et quitte")
+    parser.add_argument("--config", type=Path, default=CONFIG_PATH, help="chemin de config.json")
+    args = parser.parse_args()
+
+    if args.test:
+        sys.exit(run_tests())
+
+    if args.init_config:
+        if write_example_config(args.config):
+            print(f"Config d'exemple écrite : {args.config}")
+            return
+        print(f"{args.config} existe déjà : non écrasé.", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        app = load_app_config(args.config)
+    except (ValueError, json.JSONDecodeError) as exc:
+        print(f"Configuration invalide : {exc}", file=sys.stderr)
+        sys.exit(2)
+
+    if args.stats:
+        print_stats(app)
+        return
+
+    if websockets is None:
+        print("Le paquet 'websockets' est requis : pip install -r requirements.txt", file=sys.stderr)
+        sys.exit(2)
+
+    configure_logging()
+    try:
+        asyncio.run(run(app))
+    except KeyboardInterrupt:
+        log_main.info("Arrêt demandé par l'utilisateur.")
+
+
+# =============================================================================
+# 11. TESTS INTÉGRÉS — python3 main.py --test (logique pure, aucun accès réseau)
+# =============================================================================
+
+T0 = 1_700_000_000 - (1_700_000_000 % 3600)     # aligné sur l'heure
+M30, M5 = 1800, 300
+
+
+class FakeNotifier(Notifier):
+    def __init__(self):
+        super().__init__(None)
+        self.messages: list[str] = []
+        self.photos: list = []
+
+    def send(self, text: str, photo_path=None) -> None:
+        self.messages.append(text)
+        self.photos.append(photo_path)
+
+
+class Harness:
+    """Fabrique un MarketEngine avec des bougies pilotées à la main."""
+
+    def __init__(self, tmp: Path, **cfg_kwargs):
+        self.cfg = StrategyConfig(**cfg_kwargs)
+        self.cfg.validate()
+        self.candles: dict[str, list[Candle]] = {"M30": [], "M5": [], "H1": [], "M1": [], "M15": []}
+        self.notifier = FakeNotifier()
+        self.journal = Journal(tmp)
+        self.now = 0.0
+        self.engine = MarketEngine(
+            "TEST", "TEST Index", "R_TEST", self.cfg,
+            get_candles=lambda tf: self.candles[tf],
+            notifier=self.notifier, journal=self.journal, now_fn=lambda: self.now)
+
+    def close(self, tf: str, candle: Candle) -> None:
+        self.candles[tf].append(candle)
+        self.engine.on_candle_close(tf, candle)
+
+    def prices(self, epoch0: int, *prices: float) -> None:
+        for i, p in enumerate(prices):
+            self.engine.on_price(p, epoch0 + i)
+
+
+def sell_crt(h: Harness) -> int:
+    """Bougie 1 puis bougie de sweep SELL. Retourne l'instant de confirmation."""
+    c1 = Candle(T0, 100, 110, 90, 105)
+    c2 = Candle(T0 + M30, 105, 115, 100, 104)          # high 115 > 110, close 104 < 110
+    h.close("M30", c1)
+    h.now = T0 + 2 * M30 + 5
+    h.close("M30", c2)
+    return T0 + 2 * M30
+
+
+def bearish_fvg(h: Harness, confirm: int) -> None:
+    """3 bougies M5 post-confirmation -> FVG baissière [98, 100]."""
+    h.close("M5", Candle(confirm, 104, 104.5, 100, 101))
+    h.close("M5", Candle(confirm + M5, 101, 101, 96, 97))
+    h.close("M5", Candle(confirm + 2 * M5, 97, 98, 95, 96))
+
+
+class TestCRT(unittest.TestCase):
+    def test_sell(self):
+        self.assertEqual(detect_crt(Candle(0, 100, 110, 90, 105), Candle(1, 105, 115, 100, 104)), "sell")
+
+    def test_buy(self):
+        self.assertEqual(detect_crt(Candle(0, 100, 110, 90, 105), Candle(1, 95, 100, 85, 96)), "buy")
+
+    def test_close_outside_range_is_not_crt(self):
+        # sweep du high mais clôture AU-DESSUS du high de la bougie 1 : simple cassure
+        self.assertIsNone(detect_crt(Candle(0, 100, 110, 90, 105), Candle(1, 105, 118, 104, 116)))
+
+    def test_no_sweep(self):
+        self.assertIsNone(detect_crt(Candle(0, 100, 110, 90, 105), Candle(1, 100, 108, 92, 101)))
+
+    def test_outside_bar_is_ambiguous(self):
+        self.assertIsNone(detect_crt(Candle(0, 100, 110, 90, 105), Candle(1, 100, 115, 85, 100)))
+
+
+class TestFVG(unittest.TestCase):
+    def test_bearish(self):
+        z = detect_fvg(Candle(0, 0, 104, 100, 0), Candle(1, 0, 0, 0, 0), Candle(2, 0, 98, 95, 0), "sell")
+        self.assertEqual(z, (98, 100))
+
+    def test_bullish(self):
+        z = detect_fvg(Candle(0, 0, 100, 96, 0), Candle(1, 0, 0, 0, 0), Candle(2, 0, 106, 102, 0), "buy")
+        self.assertEqual(z, (100, 102))
+
+    def test_overlap_is_no_fvg(self):
+        self.assertIsNone(detect_fvg(Candle(0, 0, 104, 100, 0), Candle(1, 0, 0, 0, 0), Candle(2, 0, 101, 95, 0), "sell"))
+
+    def test_wrong_direction(self):
+        self.assertIsNone(detect_fvg(Candle(0, 0, 104, 100, 0), Candle(1, 0, 0, 0, 0), Candle(2, 0, 98, 95, 0), "buy"))
+
+
+class TestTrend(unittest.TestCase):
+    def rising(self, n=260):
+        out = []
+        for i in range(n):
+            p = 100 + i * 0.5
+            out.append(Candle(T0 + i * M30, p, p + 1, p - 1, p + 0.5))
+        return out
+
+    def test_ema_value(self):
+        self.assertAlmostEqual(ema([1, 2, 3, 4, 5], 5), 3.0)
+        self.assertIsNone(ema([1, 2], 5))
+
+    def test_ema_trend(self):
+        up = self.rising()
+        self.assertEqual(trend_from_ema(up, 50, 200), "buy")
+        down = [Candle(c.epoch, -c.open, -c.low, -c.high, -c.close) for c in up]
+        self.assertEqual(trend_from_ema(down, 50, 200), "sell")
+        self.assertIsNone(trend_from_ema(up[:100], 50, 200))     # pas assez de données
+
+    def test_structure(self):
+        zig = []
+        # zigzag haussier : creux/sommets de plus en plus hauts
+        for i, base in enumerate([10, 14, 11, 16, 12, 18, 13, 20, 14, 22, 15, 24]):
+            zig.append(Candle(i, base, base + 1, base - 1, base))
+        self.assertEqual(trend_from_structure(zig, 1), "buy")
+
+    def test_filter_blocks_and_allows(self):
+        cfg = StrategyConfig(trend_filter="EMA")
+        up = self.rising()
+        self.assertTrue(trend_allows(cfg, "buy", up)[0])
+        self.assertFalse(trend_allows(cfg, "sell", up)[0])
+        self.assertFalse(trend_allows(cfg, "buy", up[:50])[0])   # indéterminé -> bloqué
+        self.assertTrue(trend_allows(StrategyConfig(), "sell", [])[0])
+
+
+class TestPaperTrade(unittest.TestCase):
+    def make(self, direction="sell", **kw):
+        entry, sl = (99.0, 115.0) if direction == "sell" else (101.0, 85.0)
+        risk = 16.0
+        tp = entry - 3 * risk if direction == "sell" else entry + 3 * risk
+        return PaperTrade(
+            id="x", market_key="T", label="T", symbol="T", direction=direction,
+            crt_tf="M30", entry_tf="M5", mode="FVG", trend_filter="OFF",
+            c1_epoch=0, c1_high=110, c1_low=90, sweep_epoch=1, sweep_high=115, sweep_low=85,
+            fvg_low=98, fvg_high=100, entry_epoch=2, entry=entry, sl=sl, tp=tp, risk=risk,
+            rr_target=3.0, **kw)
+
+    def test_sell_levels(self):
+        t = self.make("sell")
+        self.assertEqual(t.tp, 51.0)
+        ev = t.on_price(83.0, 10)               # exactement RR1
+        self.assertEqual(ev, [("RR", 1.0)])
+        self.assertEqual(t.status, "OPEN")
+
+    def test_gap_hits_several_milestones(self):
+        t = self.make("buy")
+        ev = t.on_price(200.0, 10)              # bien au-delà de RR3
+        kinds = [e[0] for e in ev]
+        self.assertEqual(kinds, ["RR", "RR", "RR", "CLOSE"])
+        self.assertEqual(t.status, "WIN")
+        self.assertEqual(t.r_result, 3.0)
+
+    def test_loss(self):
+        t = self.make("sell")
+        t.on_price(90, 5)
+        ev = t.on_price(115.0, 6)
+        self.assertEqual(ev, [("CLOSE", "LOSS")])
+        self.assertEqual(t.r_result, -1.0)
+
+    def test_break_even_off_keeps_full_loss(self):
+        t = self.make("sell", be_rr=0.0)
+        t.on_price(83.0, 5)                     # RR1 atteint
+        t.on_price(115.0, 6)
+        self.assertEqual(t.status, "LOSS")
+
+    def test_break_even_on(self):
+        t = self.make("sell", be_rr=1.0)
+        ev = t.on_price(83.0, 5)
+        self.assertIn(("BE_ACTIVATED", 1.0), ev)
+        self.assertEqual(t.sl_current, 99.0)
+        ev = t.on_price(99.0, 6)
+        self.assertEqual(ev, [("CLOSE", "BE")])
+        self.assertEqual(t.r_result, 0.0)
+
+    def test_closed_trade_ignores_prices(self):
+        t = self.make("sell")
+        t.on_price(200, 1)
+        self.assertEqual(t.on_price(10, 2), [])
+
+
+class TestEngine(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_full_sell_flow_to_rr3(self):
+        h = Harness(self.tmp)
+        confirm = sell_crt(h)
+        self.assertIsNotNone(h.engine.setup)
+        self.assertEqual(h.engine.setup.direction, "sell")
+
+        bearish_fvg(h, confirm)
+        s = h.engine.setup
+        self.assertEqual((s.fvg_low, s.fvg_high), (98, 100))
+
+        e = confirm + 3 * M5
+        h.prices(e, 96.5, 97.5)                 # sous la FVG : pas d'entrée
+        self.assertEqual(h.engine.open_trades, [])
+        h.prices(e + 10, 99.0)                  # retest : entrée
+        self.assertEqual(len(h.engine.open_trades), 1)
+
+        t = h.engine.open_trades[0]
+        self.assertEqual((t.entry, t.sl, t.risk, t.tp), (99.0, 115.0, 16.0, 51.0))
+        self.assertEqual(t.mode, "FVG")
+        self.assertIsNone(h.engine.setup)
+
+        h.prices(e + 20, 90, 83, 67, 51)
+        self.assertEqual(t.status, "WIN")
+        self.assertEqual(sorted(t.rr_hits), ["1", "2", "3"])
+        self.assertEqual(h.engine.open_trades, [])
+
+        text = "\n".join(h.notifier.messages)
+        for expected in ("SELL", "RR 1 atteint", "RR 2 atteint", "TP RR3 atteint", "Trade WIN"):
+            self.assertIn(expected, text)
+
+        rec = h.journal.read_closed()[0]
+        self.assertEqual(rec["result"], "WIN")
+        self.assertEqual(rec["r_result"], 3.0)
+        self.assertEqual(rec["sweep_high"], 115)
+        self.assertIsNotNone(rec["rr1_time"]); self.assertIsNotNone(rec["rr3_time"])
+
+        stats = compute_stats(h.journal.read_closed())
+        self.assertEqual(stats["ALL"]["total_r"], 3.0)
+        self.assertEqual(stats["TEST Index"]["wins"], 1)
+
+    def test_full_sell_flow_with_m15_crt(self):
+        """Même scénario que test_full_sell_flow_to_rr3, mais avec crt_tf=M15
+        (nouveau réglage pour obtenir des signaux plus rapidement en test)."""
+        h = Harness(self.tmp, crt_tf="M15")
+        M15 = 900
+        c1 = Candle(T0, 100, 110, 90, 105)
+        c2 = Candle(T0 + M15, 105, 115, 100, 104)       # sweep du high, clôture dans le range
+        h.close("M15", c1)
+        h.now = T0 + 2 * M15 + 5
+        h.close("M15", c2)
+        confirm = T0 + 2 * M15
+        self.assertEqual(h.engine.setup.direction, "sell")
+
+        bearish_fvg(h, confirm)
+        s = h.engine.setup
+        self.assertEqual((s.fvg_low, s.fvg_high), (98, 100))
+
+        e = confirm + 3 * M5
+        h.prices(e + 10, 99.0)                          # retest : entrée
+        self.assertEqual(len(h.engine.open_trades), 1)
+
+        t = h.engine.open_trades[0]
+        self.assertEqual(t.crt_tf, "M15")
+        self.assertEqual((t.entry, t.sl, t.risk, t.tp), (99.0, 115.0, 16.0, 51.0))
+
+    def test_full_buy_flow_loss(self):
+        h = Harness(self.tmp)
+        h.close("M30", Candle(T0, 100, 110, 90, 105))
+        h.now = T0 + 2 * M30 + 5
+        h.close("M30", Candle(T0 + M30, 95, 100, 85, 96))       # low 85 < 90, close 96 > 90
+        confirm = T0 + 2 * M30
+        self.assertEqual(h.engine.setup.direction, "buy")
+        h.close("M5", Candle(confirm, 96, 100, 95, 99))         # high 100
+        h.close("M5", Candle(confirm + M5, 99, 104, 99, 103))
+        h.close("M5", Candle(confirm + 2 * M5, 103, 106, 102, 105))   # low 102 > 100 -> FVG [100,102]
+        s = h.engine.setup
+        self.assertEqual((s.fvg_low, s.fvg_high), (100, 102))
+
+        e = confirm + 3 * M5
+        h.prices(e, 104, 103)
+        h.prices(e + 5, 102)                                    # retest
+        t = h.engine.open_trades[0]
+        self.assertEqual((t.entry, t.sl, t.risk, t.tp), (102.0, 85.0, 17.0, 153.0))
+        h.prices(e + 10, 95, 85)
+        self.assertEqual(t.status, "LOSS")
+        self.assertEqual(h.journal.read_closed()[0]["r_result"], -1.0)
+
+    def test_setup_cancelled_if_sweep_level_hit_before_entry(self):
+        h = Harness(self.tmp)
+        confirm = sell_crt(h)
+        bearish_fvg(h, confirm)
+        h.prices(confirm + 3 * M5, 116.0)                       # au-dessus du high du sweep
+        self.assertIsNone(h.engine.setup)
+        self.assertEqual(h.engine.open_trades, [])
+
+    def test_no_entry_before_fvg_exists(self):
+        h = Harness(self.tmp)
+        sell_crt(h)
+        h.prices(T0 + 3 * M30, 99, 100, 105)                    # aucune FVG -> aucune entrée
+        self.assertEqual(h.engine.open_trades, [])
+        self.assertIsNotNone(h.engine.setup)
+
+    def test_fvg_before_confirmation_is_ignored(self):
+        h = Harness(self.tmp)
+        confirm = sell_crt(h)
+        # FVG complète formée PENDANT la bougie de sweep (avant la confirmation) : ignorée
+        h.close("M5", Candle(confirm - 3 * M5, 104, 104.5, 100, 101))
+        h.close("M5", Candle(confirm - 2 * M5, 101, 101, 96, 97))
+        h.close("M5", Candle(confirm - 1 * M5, 97, 98, 95, 96))
+        self.assertIsNone(h.engine.setup.fvg_low)
+
+    def test_fvg_starting_inside_sweep_candle_is_ignored(self):
+        h = Harness(self.tmp)
+        confirm = sell_crt(h)
+        # 1re bougie de la FVG = dernière M5 DU sweep, les 2 autres après : ignorée
+        h.close("M5", Candle(confirm - M5, 104, 104.5, 100, 101))
+        h.close("M5", Candle(confirm, 101, 101, 96, 97))
+        h.close("M5", Candle(confirm + M5, 97, 98, 95, 96))
+        self.assertIsNone(h.engine.setup.fvg_low)
+
+    def test_no_entry_after_setup_expiry_even_on_tick(self):
+        h = Harness(self.tmp, setup_expiry_crt_candles=1)
+        confirm = sell_crt(h)
+        bearish_fvg(h, confirm)
+        h.prices(confirm + M30 + 1, 99.0)                       # retest, mais trop tard
+        self.assertEqual(h.engine.open_trades, [])
+        self.assertIsNone(h.engine.setup)
+
+    def test_non_consecutive_fvg_candles_ignored(self):
+        h = Harness(self.tmp)
+        confirm = sell_crt(h)
+        h.close("M5", Candle(confirm, 104, 104.5, 100, 101))
+        h.close("M5", Candle(confirm + M5, 101, 101, 96, 97))
+        h.close("M5", Candle(confirm + 3 * M5, 97, 98, 95, 96))  # trou d'une bougie
+        self.assertIsNone(h.engine.setup.fvg_low)
+
+    def test_direct_entry_when_fvg_off(self):
+        h = Harness(self.tmp, fvg_enabled=False, direct_entry=True)
+        confirm = sell_crt(h)
+        h.close("M5", Candle(confirm, 104, 104, 101, 102))
+        h.close("M5", Candle(confirm + M5, 102, 103, 100, 101))
+        h.close("M5", Candle(confirm + 2 * M5, 101, 101, 97, 98))   # baissière et casse le micro-range
+        self.assertEqual(len(h.engine.open_trades), 1)
+        t = h.engine.open_trades[0]
+        self.assertEqual(t.mode, "DIRECT")
+        self.assertEqual(t.entry, 98)
+        self.assertEqual(t.sl, 115)
+        self.assertEqual(t.tp, 98 - 3 * 17)
+
+    def test_direct_entry_off_by_default(self):
+        h = Harness(self.tmp)
+        confirm = sell_crt(h)
+        h.close("M5", Candle(confirm, 104, 104, 101, 102))
+        h.close("M5", Candle(confirm + M5, 102, 103, 100, 101))
+        h.close("M5", Candle(confirm + 2 * M5, 101, 101, 97, 98))
+        self.assertEqual(h.engine.open_trades, [])
+
+    def test_direct_fallback_waits_when_fvg_on(self):
+        h = Harness(self.tmp, fvg_enabled=True, direct_entry=True, direct_fallback_bars=5)
+        confirm = sell_crt(h)
+        # pas de FVG (bougies qui se chevauchent) mais confirmation directe dès la 3e bougie
+        h.close("M5", Candle(confirm, 104, 104, 101, 102))
+        h.close("M5", Candle(confirm + M5, 102, 103, 100, 101))
+        h.close("M5", Candle(confirm + 2 * M5, 101, 102, 99.5, 99.8))
+        self.assertEqual(h.engine.open_trades, [])               # trop tôt (< 5 bougies)
+        h.close("M5", Candle(confirm + 3 * M5, 99.8, 100.5, 99.5, 99.9))
+        h.close("M5", Candle(confirm + 4 * M5, 99.9, 100, 98, 98.5))
+        self.assertEqual(len(h.engine.open_trades), 1)
+
+    def test_trend_filter_blocks_counter_trend_crt(self):
+        h = Harness(self.tmp, trend_filter="EMA")
+        base = []
+        for i in range(258):
+            p = 100 + i * 0.5
+            base.append(Candle(T0 - (260 - i) * M30, p, p + 1, p - 1, p + 0.5))
+        h.candles["M30"] = base
+        p = 100 + 258 * 0.5
+        c1 = Candle(T0, p, p + 3, p - 2, p + 1)
+        c2 = Candle(T0 + M30, p + 1, p + 5, p, p + 0.5)          # sweep du high, clôture dedans
+        h.close("M30", c1)
+        h.now = T0 + 2 * M30 + 5
+        h.close("M30", c2)
+        self.assertIsNone(h.engine.setup)                        # SELL contre tendance haussière
+
+        h2 = Harness(self.tmp / "b", trend_filter="OFF")
+        sell_crt(h2)
+        self.assertIsNotNone(h2.engine.setup)
+
+    def test_non_consecutive_crt_candles_ignored(self):
+        h = Harness(self.tmp)
+        h.close("M30", Candle(T0, 100, 110, 90, 105))
+        h.now = T0 + 3 * M30 + 5
+        h.close("M30", Candle(T0 + 2 * M30, 105, 115, 100, 104))  # une bougie manque
+        self.assertIsNone(h.engine.setup)
+
+    def test_stale_crt_ignored(self):
+        h = Harness(self.tmp)
+        h.close("M30", Candle(T0, 100, 110, 90, 105))
+        h.now = T0 + 10 * M30                                     # données anciennes
+        h.close("M30", Candle(T0 + M30, 105, 115, 100, 104))
+        self.assertIsNone(h.engine.setup)
+
+    def test_setup_expires(self):
+        h = Harness(self.tmp, setup_expiry_crt_candles=1)
+        confirm = sell_crt(h)
+        h.close("M5", Candle(confirm + 6 * M5, 104, 105, 103, 104))   # = confirm + 1 bougie CRT
+        self.assertIsNone(h.engine.setup)
+
+    def test_new_crt_replaces_old_setup(self):
+        h = Harness(self.tmp)
+        sell_crt(h)
+        old = h.engine.setup
+        h.now = T0 + 3 * M30 + 5
+        h.close("M30", Candle(T0 + 2 * M30, 104, 104.5, 84, 102))  # sweep du low de c2 (100), clôture dedans : BUY
+        self.assertEqual(h.engine.setup.direction, "buy")
+        self.assertIsNot(h.engine.setup, old)
+
+    def test_max_positions_per_market(self):
+        h = Harness(self.tmp, max_positions=1)
+        confirm = sell_crt(h)
+        bearish_fvg(h, confirm)
+        h.prices(confirm + 3 * M5, 99.0)
+        self.assertEqual(len(h.engine.open_trades), 1)
+        # second CRT pendant que le trade est ouvert
+        h.now = T0 + 3 * M30 + 5
+        h.close("M30", Candle(T0 + 2 * M30, 104, 118, 100, 110))   # sweep du high de c2 (115), clôture dedans
+        self.assertIsNotNone(h.engine.setup)
+        confirm2 = T0 + 3 * M30
+        h.close("M5", Candle(confirm2, 110, 110.5, 106, 107))
+        h.close("M5", Candle(confirm2 + M5, 107, 107, 102, 103))
+        h.close("M5", Candle(confirm2 + 2 * M5, 103, 104, 101, 102))  # FVG [104, 106]
+        self.assertIsNotNone(h.engine.setup.fvg_low)
+        h.prices(confirm2 + 3 * M5, 105.0)
+        self.assertEqual(len(h.engine.open_trades), 1)            # pas de 2e trade
+
+    def test_sl_buffer_and_rr(self):
+        h = Harness(self.tmp, sl_buffer=1.0, rr=2.0)
+        confirm = sell_crt(h)
+        bearish_fvg(h, confirm)
+        h.prices(confirm + 3 * M5, 99.0)
+        t = h.engine.open_trades[0]
+        self.assertEqual(t.sl, 116.0)
+        self.assertEqual(t.risk, 17.0)
+        self.assertEqual(t.tp, 99 - 2 * 17)
+
+    def test_open_trades_survive_restart(self):
+        h = Harness(self.tmp)
+        confirm = sell_crt(h)
+        bearish_fvg(h, confirm)
+        h.prices(confirm + 3 * M5, 99.0)
+        saved = Journal(self.tmp).load_open()
+        trades = [PaperTrade.from_dict(d) for d in saved["TEST"]]
+        self.assertEqual(len(trades), 1)
+        self.assertEqual(trades[0].entry, 99.0)
+        h2 = Harness(self.tmp)
+        h2.engine.restore_trades(trades)
+        h2.prices(confirm + 10 * M5, 51)
+        self.assertEqual(trades[0].status, "WIN")
+
+
+class FakeClient:
+    """Client Deriv factice : historique + active_symbols, sans réseau."""
+
+    def __init__(self, history: dict[int, list[dict]], active_symbols: list[dict] | None = None):
+        self.handlers: dict[str, list] = {}
+        self.history = history
+        self.active_symbols = active_symbols or []
+
+    def on(self, msg_type, handler):
+        self.handlers.setdefault(msg_type, []).append(handler)
+
+    async def request(self, payload, timeout=15.0):
+        if "active_symbols" in payload:
+            return {"active_symbols": self.active_symbols}
+        return {"candles": self.history[payload["granularity"]]}
+
+    async def subscribe(self, payload):
+        pass
+
+
+def raw(epoch, o, h, l, c):
+    return {"epoch": epoch, "open": o, "high": h, "low": l, "close": c}
+
+
+class TestPipelineFromTicks(unittest.TestCase):
+    """Ticks -> bougies -> CRT -> FVG -> retest -> paper trade -> WIN, via le vrai
+    câblage (CandleStore + TickCache + wire_engines)."""
+
+    def test_end_to_end(self):
+        import asyncio
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            # historique : c1 complète ; c2 = bougie M30 EN COURS (high 112 pour l'instant)
+            c2_epoch = T0 + M30
+            hist = {
+                1800: [raw(T0, 100, 110, 90, 105), raw(c2_epoch, 105, 112, 100, 108)],
+                300: [raw(T0 + 1200, 106, 107, 104, 105), raw(T0 + 3300, 108, 109, 107, 108)],  # M5 en cours
+            }
+            client = FakeClient(hist)
+            tick_cache = TickCache(client)
+            store = CandleStore(client, tick_cache)
+            symbol = "R_TEST"
+            tfs = {"M5": 300, "M30": 1800}
+            store.register_timeframes(symbol, tfs)
+            asyncio.run(store.load_history(symbol, tfs, 500))
+
+            # la bougie en cours n'est PAS dans les clôturées, mais reste complétable
+            self.assertEqual([c.epoch for c in store.get_closed_candles(symbol, "M30")], [T0])
+            self.assertEqual(store.get_forming_candle(symbol, "M30").high, 112)
+
+            notifier = FakeNotifier()
+            journal = Journal(tmp)
+            market = MarketSymbol("TEST", "TEST Index", "TEST", symbol, "synthetic_index", True)
+            engines = wire_engines(StrategyConfig(), {"TEST": market}, store, tick_cache,
+                                     notifier, journal, now_fn=lambda: T0 + 2 * M30 + 5)
+            engine = engines[symbol]
+
+            def tick(epoch, quote):
+                asyncio.run(tick_cache._on_tick_message(
+                    {"tick": {"symbol": symbol, "quote": quote, "epoch": epoch}}))
+
+            confirm = T0 + 2 * M30
+            # fin de la bougie c2 : sweep du high (115) puis clôture dedans (104)
+            tick(T0 + 3330, 115)
+            tick(T0 + 3500, 104)
+            self.assertIsNone(engine.setup)                     # c2 pas encore clôturée
+            tick(confirm + 5, 101)                               # 1er tick du nouveau bucket -> clôture c2
+            self.assertIsNotNone(engine.setup)
+            self.assertEqual(engine.setup.direction, "sell")
+            self.assertEqual(engine.setup.sweep_high, 115)      # high complet, pas une bougie partielle
+
+            # M5 post-confirmation : a (h104.5 l100), b (l96), c (h98 l95) -> FVG [98, 100]
+            for dt, q in ((10, 104.5), (100, 100), (250, 101)):
+                tick(confirm + dt, q)
+            for dt, q in ((M5 + 5, 101), (M5 + 100, 96), (M5 + 250, 97)):
+                tick(confirm + dt, q)
+            for dt, q in ((2 * M5 + 5, 97), (2 * M5 + 50, 98), (2 * M5 + 100, 95), (2 * M5 + 250, 96)):
+                tick(confirm + dt, q)
+            self.assertIsNone(engine.setup.fvg_low)             # c pas encore clôturée
+            tick(confirm + 3 * M5 + 5, 96.5)                     # clôture c -> FVG détectée
+            self.assertEqual((engine.setup.fvg_low, engine.setup.fvg_high), (98, 100))
+
+            tick(confirm + 3 * M5 + 30, 97.5)
+            self.assertEqual(engine.open_trades, [])
+            tick(confirm + 3 * M5 + 60, 99.0)                    # retest
+            self.assertEqual(len(engine.open_trades), 1)
+            for i, q in enumerate((83, 67, 51)):
+                tick(confirm + 3 * M5 + 100 + i, q)
+            self.assertEqual(journal.read_closed()[0]["result"], "WIN")
+            self.assertEqual(journal.read_closed()[0]["sweep_high"], 115)
+
+    def test_discover_symbols_prefers_regular_index_and_skips_boom(self):
+        import asyncio
+        active = [
+            {"symbol": "1HZ75V", "display_name": "Volatility 75 (1s) Index", "market": "synthetic_index"},
+            {"symbol": "R_75", "display_name": "Volatility 75 Index", "market": "synthetic_index"},
+            {"symbol": "R_25", "display_name": "Volatility 25 Index", "market": "synthetic_index"},
+            {"symbol": "BOOM500", "display_name": "Boom 500 Index", "market": "synthetic_index"},
+            {"symbol": "CRASH500", "display_name": "Crash 500 Index", "market": "synthetic_index"},
+            {"symbol": "frxXAUUSD", "display_name": "Gold/USD", "market": "commodities"},
+            {"symbol": "cryBTCUSD", "display_name": "BTC/USD", "market": "cryptocurrency"},
+        ]
+        found = asyncio.run(discover_symbols(FakeClient({}, active), ALL_MARKETS))
+        self.assertEqual({k: v.symbol for k, v in found.items()},
+                         {"V75": "R_75", "V25": "R_25", "GOLD": "frxXAUUSD", "BTC": "cryBTCUSD"})
+
+
+class TestConfig(unittest.TestCase):
+    def test_defaults_are_the_v1_test_setup(self):
+        c = StrategyConfig()
+        self.assertEqual((c.crt_tf, c.entry_tf, c.rr, c.fvg_enabled, c.direct_entry, c.trend_filter, c.be_rr, c.sl_buffer),
+                         ("M30", "M5", 3.0, True, False, "OFF", 0.0, 0.0))
+
+    def test_invalid_values(self):
+        for bad in ({"crt_tf": "M10"}, {"entry_tf": "H1"}, {"rr": 0}, {"trend_filter": "MACD"},
+                    {"break_even": "3"}, {"fvg_enabled": False, "direct_entry": False},
+                    {"ema_fast": 200, "ema_slow": 50}, {"typo_param": 1}):
+            with self.assertRaises(ValueError, msg=str(bad)):
+                StrategyConfig.from_dict(bad)
+
+    def test_m15_crt_tf_is_accepted(self):
+        c = StrategyConfig.from_dict({"crt_tf": "M15"})
+        self.assertEqual(c.crt_tf, "M15")
+        self.assertEqual(TF_SECONDS["M15"], 900)
+
+    def test_break_even_parsing(self):
+        self.assertEqual(StrategyConfig(break_even="1.5").be_rr, 1.5)
+        self.assertEqual(StrategyConfig(break_even="RR2").be_rr, 2.0)
+        self.assertEqual(StrategyConfig(break_even="OFF").be_rr, 0.0)
+
+    def test_only_allowed_markets(self):
+        self.assertEqual(ALL_MARKET_KEYS, ["V75", "V25", "GOLD", "BTC"])
+        self.assertFalse(any("boom" in a or "crash" in a for d in ALL_MARKETS for a in d["aliases"]))
+
+    def test_load_config_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "config.json"
+            p.write_text(json.dumps({"strategy": {"crt_tf": "H1", "rr": 2}, "markets": ["GOLD"]}))
+            app = load_app_config(p)
+            self.assertEqual((app.strategy.crt_tf, app.strategy.rr, app.markets), ("H1", 2, ["GOLD"]))
+            p.write_text(json.dumps({"markets": ["BOOM500"]}))
+            with self.assertRaises(ValueError):
+                load_app_config(p)
+
+    def test_telegram_and_report_defaults(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "config.json"
+            p.write_text(json.dumps({}))
+            app = load_app_config(p)
+            self.assertFalse(app.telegram_enabled)
+            self.assertTrue(app.chart_enabled)
+            self.assertEqual((app.report_hour, app.report_minute), (21, 0))
+
+    def test_telegram_and_report_custom_values(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "config.json"
+            p.write_text(json.dumps({
+                "telegram": {"enabled": True}, "chart_enabled": False,
+                "report": {"hour": 22, "minute": 30},
+            }))
+            app = load_app_config(p)
+            self.assertTrue(app.telegram_enabled)
+            self.assertFalse(app.chart_enabled)
+            self.assertEqual((app.report_hour, app.report_minute), (22, 30))
+
+    def test_bad_report_time_rejected(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "config.json"
+            p.write_text(json.dumps({"report": {"hour": 25, "minute": 0}}))
+            with self.assertRaises(ValueError):
+                load_app_config(p)
+
+
+class TestStore(unittest.TestCase):
+    def test_needed_timeframes(self):
+        self.assertEqual(list(needed_timeframes(StrategyConfig())), ["M5", "M30"])
+        self.assertEqual(list(needed_timeframes(StrategyConfig(crt_tf="H1", trend_filter="EMA"))), ["M5", "H1"])
+        self.assertEqual(list(needed_timeframes(StrategyConfig(trend_filter="EMA", trend_tf="H1"))), ["M5", "M30", "H1"])
+        self.assertEqual(list(needed_timeframes(StrategyConfig(crt_tf="M15"))), ["M5", "M15"])
+
+
+def make_trade(direction="sell", fvg=True, **kw):
+    """Même fabrique que TestPaperTrade.make, réutilisable pour le rendu de graphique."""
+    entry, sl = (99.0, 115.0) if direction == "sell" else (101.0, 85.0)
+    risk = 16.0
+    tp = entry - 3 * risk if direction == "sell" else entry + 3 * risk
+    return PaperTrade(
+        id="chart-test", market_key="T", label="TEST Index", symbol="R_TEST", direction=direction,
+        crt_tf="M15", entry_tf="M5", mode="FVG", trend_filter="OFF",
+        c1_epoch=T0, c1_high=110, c1_low=90, sweep_epoch=T0 + 900, sweep_high=115, sweep_low=85,
+        fvg_low=98 if fvg else None, fvg_high=100 if fvg else None,
+        entry_epoch=T0 + 2700, entry=entry, sl=sl, tp=tp, risk=risk, rr_target=3.0, **kw)
+
+
+def make_candles(start: int, step: int, n: int) -> list:
+    out = []
+    p = 100.0
+    for i in range(n):
+        o, c = p, p + (1 if i % 2 == 0 else -1)
+        out.append(Candle(start + i * step, o, max(o, c) + 1, min(o, c) - 1, c))
+        p = c
+    return out
+
+
+class TestChart(unittest.TestCase):
+    def test_renders_png_for_sell_with_fvg(self):
+        trade = make_trade("sell", fvg=True)
+        crt_candles = make_candles(T0 - 10 * 900, 900, 12)
+        entry_candles = make_candles(T0 + 900, 300, 15)
+        with tempfile.TemporaryDirectory() as d:
+            out = Path(d) / "chart.png"
+            result = render_signal_chart(trade, crt_candles, entry_candles, StrategyConfig(crt_tf="M15"), out)
+            self.assertEqual(result, out)
+            self.assertTrue(out.exists())
+            self.assertGreater(out.stat().st_size, 0)
+
+    def test_renders_png_for_buy_without_fvg(self):
+        """mode DIRECT (pas de FVG) : ne doit pas planter faute de fvg_low/high."""
+        trade = make_trade("buy", fvg=False)
+        crt_candles = make_candles(T0 - 10 * 900, 900, 12)
+        entry_candles = make_candles(T0 + 900, 300, 15)
+        with tempfile.TemporaryDirectory() as d:
+            out = Path(d) / "chart.png"
+            result = render_signal_chart(trade, crt_candles, entry_candles, StrategyConfig(crt_tf="M15"), out)
+            self.assertTrue(out.exists())
+
+    def test_handles_empty_candle_lists_gracefully(self):
+        trade = make_trade("sell", fvg=True)
+        with tempfile.TemporaryDirectory() as d:
+            out = Path(d) / "chart.png"
+            result = render_signal_chart(trade, [], [], StrategyConfig(crt_tf="M15"), out)
+            self.assertTrue(out.exists())
+
+
+class FakeResponse:
+    def __init__(self, ok=True, status_code=200, text=""):
+        self.ok, self.status_code, self.text = ok, status_code, text
+
+
+class FakeRequests:
+    """Remplace le module 'requests' : capture les appels sans toucher au réseau."""
+    def __init__(self):
+        self.calls: list[dict] = []
+
+    def post(self, url, data=None, files=None, timeout=None):
+        self.calls.append({"url": url, "data": data, "files": files})
+        return FakeResponse()
+
+
+class TestTelegramNotifier(unittest.TestCase):
+    def setUp(self):
+        self.fake = FakeRequests()
+        self._orig = requests
+        globals()["requests"] = self.fake
+
+    def tearDown(self):
+        globals()["requests"] = self._orig
+
+    def test_send_text_only_calls_sendmessage(self):
+        n = TelegramNotifier("TOKEN", "12345")
+        n.send("hello")
+        self.assertEqual(len(self.fake.calls), 1)
+        call = self.fake.calls[0]
+        self.assertIn("sendMessage", call["url"])
+        self.assertEqual(call["data"]["chat_id"], "12345")
+        self.assertEqual(call["data"]["text"], "hello")
+
+    def test_send_with_photo_calls_sendphoto(self):
+        with tempfile.TemporaryDirectory() as d:
+            photo = Path(d) / "x.png"
+            photo.write_bytes(b"\x89PNG\r\n")
+            n = TelegramNotifier("TOKEN", "12345")
+            n.send("caption text", photo_path=photo)
+            self.assertEqual(len(self.fake.calls), 1)
+            call = self.fake.calls[0]
+            self.assertIn("sendPhoto", call["url"])
+            self.assertEqual(call["data"]["caption"], "caption text")
+            self.assertIsNotNone(call["files"])
+
+    def test_missing_photo_file_falls_back_to_text(self):
+        n = TelegramNotifier("TOKEN", "12345")
+        n.send("hello", photo_path=Path("/no/such/file.png"))
+        self.assertIn("sendMessage", self.fake.calls[0]["url"])
+
+    def test_network_error_does_not_raise(self):
+        def boom(*a, **kw):
+            raise ConnectionError("no network")
+        self.fake.post = boom
+        n = TelegramNotifier("TOKEN", "12345")
+        n.send("hello")   # ne doit pas lever d'exception
+
+    def test_requests_missing_logs_and_returns(self):
+        globals()["requests"] = None
+        n = TelegramNotifier("TOKEN", "12345")
+        n.send("hello")   # ne doit pas lever d'exception
+
+
+class TestJournalSignals(unittest.TestCase):
+    def test_append_and_read_signals(self):
+        with tempfile.TemporaryDirectory() as d:
+            journal = Journal(Path(d))
+            trade = make_trade("sell")
+            journal.append_signal(trade)
+            rows = journal.read_signals()
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["direction"], "SELL")
+            self.assertEqual(rows[0]["market_key"], "T")
+            self.assertEqual(rows[0]["date"], iso(trade.entry_epoch)[:10])
+
+    def test_open_trade_writes_a_signal_row(self):
+        """_open_trade doit journaliser un signal en plus d'ouvrir le trade paper."""
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            h = Harness(tmp)
+            confirm = sell_crt(h)
+            bearish_fvg(h, confirm)
+            h.prices(confirm + 3 * M5 + 10, 99.0)
+            rows = h.journal.read_signals()
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["market_key"], "TEST")
+
+
+class TestDailyReport(unittest.TestCase):
+    def test_next_report_time_same_day(self):
+        now = datetime(2026, 9, 19, 14, 0, 0)
+        target = _next_report_time(now, 21, 0)
+        self.assertEqual(target, datetime(2026, 9, 19, 21, 0, 0))
+
+    def test_next_report_time_rolls_to_tomorrow(self):
+        now = datetime(2026, 9, 19, 21, 30, 0)
+        target = _next_report_time(now, 21, 0)
+        self.assertEqual(target, datetime(2026, 9, 20, 21, 0, 0))
+
+    def test_format_daily_report_counts(self):
+        signals = [
+            {"market_key": "V75", "direction": "BUY"},
+            {"market_key": "V75", "direction": "SELL"},
+            {"market_key": "GOLD", "direction": "SELL"},
+        ]
+        closed = [
+            {"market_key": "V75", "result": "WIN", "r_result": 3.0, "rr1_time": "t", "rr2_time": "t", "rr3_time": "t"},
+            {"market_key": "V75", "result": "LOSS", "r_result": -1.0, "rr1_time": None, "rr2_time": None, "rr3_time": None},
+            {"market_key": "GOLD", "result": "WIN", "r_result": 3.0, "rr1_time": "t", "rr2_time": "t", "rr3_time": "t"},
+        ]
+        text = format_daily_report("19/09/2026", ["V75", "GOLD"], signals, closed)
+        self.assertIn("Total : 3", text)
+        self.assertIn("BUY : 1", text)
+        self.assertIn("SELL : 2", text)
+        self.assertIn("WIN : 2", text)
+        self.assertIn("LOSS : 1", text)
+        self.assertIn("Winrate : 66.7%", text)
+        self.assertIn("RR1 atteint : 2", text)
+        self.assertIn("V75", text)
+        self.assertIn("GOLD", text)
+
+    def test_format_daily_report_with_no_data(self):
+        text = format_daily_report("19/09/2026", ["V75"], [], [])
+        self.assertIn("Total : 0", text)
+        self.assertIn("Winrate : 0.0%", text)
+
+
+class TestV1SingleTimeframeDirectEntry(unittest.TestCase):
+    """Nouveau mode V1 : crt_tf == entry_tf (ex. M5 partout), FVG désactivée,
+    entrée directe immédiate au prix de clôture de la bougie de sweep, sans
+    attendre une nouvelle bougie ni un retest."""
+
+    def make_h(self, tmp, **kw):
+        return Harness(tmp, crt_tf="M5", entry_tf="M5", fvg_enabled=False, direct_entry=True, **kw)
+
+    def test_sell_enters_immediately_on_confirmation(self):
+        with tempfile.TemporaryDirectory() as d:
+            h = self.make_h(Path(d))
+            c1 = Candle(T0, 100, 110, 90, 105)
+            c2 = Candle(T0 + M5, 105, 115, 100, 104)   # sweep du high (115>110), clôture 104<110
+            h.close("M5", c1)
+            h.now = T0 + 2 * M5 + 1
+            h.close("M5", c2)
+            # entrée immédiate, dès la clôture de c2, sans bougie supplémentaire ni tick
+            self.assertEqual(len(h.engine.open_trades), 1)
+            t = h.engine.open_trades[0]
+            self.assertEqual(t.direction, "sell")
+            self.assertEqual(t.mode, "DIRECT")
+            self.assertEqual(t.entry, 104)              # prix disponible à la confirmation = close(c2)
+            self.assertEqual(t.sl, 115)                 # SL = plus haut du sweep
+            self.assertEqual(t.risk, 11)
+            self.assertEqual(t.tp, 104 - 3 * 11)         # RR = 3 (config par défaut)
+            self.assertIsNone(h.engine.setup)            # pas de setup en attente
+
+    def test_buy_enters_immediately_on_confirmation(self):
+        with tempfile.TemporaryDirectory() as d:
+            h = self.make_h(Path(d))
+            c1 = Candle(T0, 100, 110, 90, 105)
+            c2 = Candle(T0 + M5, 95, 100, 85, 96)      # sweep du low (85<90), clôture 96>90
+            h.close("M5", c1)
+            h.now = T0 + 2 * M5 + 1
+            h.close("M5", c2)
+            self.assertEqual(len(h.engine.open_trades), 1)
+            t = h.engine.open_trades[0]
+            self.assertEqual(t.direction, "buy")
+            self.assertEqual(t.entry, 96)
+            self.assertEqual(t.sl, 85)
+            self.assertEqual(t.tp, 96 + 3 * 11)
+
+    def test_scanner_continues_after_win_and_after_loss(self):
+        """Après un WIN puis un LOSS, le scanner continue et un nouveau signal
+        peut être pris immédiatement — jamais de pause."""
+        with tempfile.TemporaryDirectory() as d:
+            h = self.make_h(Path(d), max_positions=5)
+            c1 = Candle(T0, 100, 110, 90, 105)
+            c2 = Candle(T0 + M5, 105, 115, 100, 104)
+            h.close("M5", c1); h.now = T0 + 2 * M5 + 1; h.close("M5", c2)
+            t1 = h.engine.open_trades[0]
+            h.prices(T0 + 2 * M5 + 10, t1.tp)          # TP atteint -> WIN
+            self.assertEqual(t1.status, "WIN")
+            self.assertEqual(h.engine.open_trades, [])
+
+            # nouveau CRT juste après : le scanner doit toujours répondre
+            c3 = Candle(T0 + 2 * M5, 104, 106, 84, 102)   # sweep du low de c2 (100) -> BUY
+            h.now = T0 + 3 * M5 + 1
+            h.close("M5", c3)
+            self.assertEqual(len(h.engine.open_trades), 1)
+            t2 = h.engine.open_trades[0]
+            self.assertEqual(t2.direction, "buy")
+            h.prices(T0 + 3 * M5 + 10, t2.sl)          # SL atteint -> LOSS
+            self.assertEqual(t2.status, "LOSS")
+
+            # encore un CRT ensuite : toujours actif
+            c4 = Candle(T0 + 3 * M5, 102, 118, 100, 103)  # sweep du high de c3 (106) -> SELL
+            h.now = T0 + 4 * M5 + 1
+            h.close("M5", c4)
+            self.assertEqual(len(h.engine.open_trades), 1)
+
+    def test_no_immediate_entry_when_fvg_enabled(self):
+        """Le mode entrée directe immédiate ne s'applique que si fvg_enabled=False :
+        avec FVG activée, même en timeframe unique, on repasse par l'ancien flux."""
+        with tempfile.TemporaryDirectory() as d:
+            h = Harness(Path(d), crt_tf="M5", entry_tf="M5", fvg_enabled=True, direct_entry=False)
+            c1 = Candle(T0, 100, 110, 90, 105)
+            c2 = Candle(T0 + M5, 105, 115, 100, 104)
+            h.close("M5", c1); h.now = T0 + 2 * M5 + 1; h.close("M5", c2)
+            self.assertEqual(h.engine.open_trades, [])
+            self.assertIsNotNone(h.engine.setup)
+
+
+class TestMaxPositionsByMarket(unittest.TestCase):
+    def test_override_replaces_global_value(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            cfg = StrategyConfig(crt_tf="M5", entry_tf="M5", fvg_enabled=False,
+                                 direct_entry=True, max_positions=1)
+            cfg.validate()
+            candles: dict[str, list] = {"M5": []}
+            notifier = FakeNotifier()
+            journal = Journal(tmp)
+            engine = MarketEngine("V75", "Volatility 75", "R_75", cfg,
+                                    get_candles=lambda tf: candles[tf],
+                                    notifier=notifier, journal=journal,
+                                    now_fn=lambda: T0 + 10 * M5, max_positions=3)
+            self.assertEqual(engine.max_positions, 3)   # override, pas cfg.max_positions (1)
+
+    def test_no_override_keeps_global_value(self):
+        cfg = StrategyConfig(max_positions=2)
+        engine = MarketEngine("GOLD", "Gold", "frxXAUUSD", cfg,
+                                get_candles=lambda tf: [],
+                                notifier=FakeNotifier(), journal=None)
+        self.assertEqual(engine.max_positions, 2)
+
+    def test_config_file_parses_overrides(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "config.json"
+            p.write_text(json.dumps({"max_positions_by_market": {"V75": 3, "GOLD": 1}}))
+            app = load_app_config(p)
+            self.assertEqual(app.max_positions_by_market, {"V75": 3, "GOLD": 1})
+
+    def test_config_file_rejects_unknown_market(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "config.json"
+            p.write_text(json.dumps({"max_positions_by_market": {"BOOM500": 1}}))
+            with self.assertRaises(ValueError):
+                load_app_config(p)
+
+
+class TestReconnectSchedule(unittest.TestCase):
+    def test_delays_match_spec(self):
+        settings = ConnectionSettings()
+        self.assertEqual(settings.reconnect_delays, (5.0, 10.0, 20.0, 30.0, 60.0))
+
+    def test_run_forever_never_raises_and_uses_schedule(self):
+        """Le client ne doit jamais lever d'exception : erreurs réseau et
+        erreurs inattendues déclenchent toutes une reconnexion planifiée."""
+        import asyncio
+
+        class FlakyWS:
+            calls = 0
+
+            async def _run_once(self):
+                FlakyWS.calls += 1
+                if FlakyWS.calls == 1:
+                    raise ConnectionError("boom")
+                if FlakyWS.calls == 2:
+                    raise ValueError("erreur inattendue")
+                client._stop = True   # 3e tentative : on arrête proprement le test
+
+        client = DerivClient(ConnectionSettings())
+        client._run_once = FlakyWS()._run_once
+
+        sleeps = []
+        orig_sleep = asyncio.sleep
+        async def fake_sleep(sec):
+            sleeps.append(sec)
+        asyncio.sleep = fake_sleep
+        try:
+            asyncio.run(client.run_forever())
+        finally:
+            asyncio.sleep = orig_sleep
+        self.assertEqual(sleeps, [5.0, 10.0])   # palier progressif, jamais de crash
+
+
+class TestExampleConfig(unittest.TestCase):
+    """Le modèle intégré (ex config_example.json) doit rester valide."""
+
+    def test_example_config_loads_and_matches_defaults(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "config.json"
+            p.write_text(EXAMPLE_CONFIG_JSON, encoding="utf-8")
+            app = load_app_config(p)
+        self.assertEqual(app.markets, ALL_MARKET_KEYS)
+        self.assertEqual(app.strategy, StrategyConfig())
+
+    def test_write_example_config_never_overwrites(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "sub" / "config.json"
+            self.assertTrue(write_example_config(p))
+            self.assertEqual(p.read_text(encoding="utf-8"), EXAMPLE_CONFIG_JSON)
+            p.write_text("{}", encoding="utf-8")
+            self.assertFalse(write_example_config(p))
+            self.assertEqual(p.read_text(encoding="utf-8"), "{}")
+
+
+class TestTelegramCredentials(unittest.TestCase):
+    """Valeurs par défaut intégrées, remplacées par l'environnement (.env) quand il est défini."""
+
+    KEYS = ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "TELEGRAM_ADMIN_ID")
+
+    def _clean_env(self):
+        for k in self.KEYS:
+            os.environ.pop(k, None)
+
+    def test_defaults_when_env_absent(self):
+        with mock.patch.dict(os.environ):
+            self._clean_env()
+            self.assertEqual(telegram_credentials(),
+                             (DEFAULT_TELEGRAM_BOT_TOKEN, DEFAULT_TELEGRAM_CHAT_ID, DEFAULT_TELEGRAM_ADMIN_ID))
+
+    def test_env_overrides_defaults(self):
+        env = {"TELEGRAM_BOT_TOKEN": "T", "TELEGRAM_CHAT_ID": "-1", "TELEGRAM_ADMIN_ID": "2"}
+        with mock.patch.dict(os.environ, env):
+            self.assertEqual(telegram_credentials(), ("T", "-1", "2"))
+
+    def test_empty_env_value_falls_back_to_default(self):
+        with mock.patch.dict(os.environ, {"TELEGRAM_BOT_TOKEN": ""}):
+            self.assertEqual(telegram_credentials()[0], DEFAULT_TELEGRAM_BOT_TOKEN)
+
+    def test_build_notifier_uses_defaults_when_enabled(self):
+        orig = requests
+        globals()["requests"] = FakeRequests()          # aucun accès réseau
+        try:
+            with mock.patch.dict(os.environ), tempfile.TemporaryDirectory() as d:
+                self._clean_env()
+                app = AppConfig(strategy=StrategyConfig(), markets=[], data_dir=Path(d), telegram_enabled=True)
+                n = build_notifier(app)
+                self.assertIsInstance(n, TelegramNotifier)
+                self.assertEqual((n.bot_token, n.chat_id), (DEFAULT_TELEGRAM_BOT_TOKEN, DEFAULT_TELEGRAM_CHAT_ID))
+        finally:
+            globals()["requests"] = orig
+
+
+def run_tests(verbosity: int = 1) -> int:
+    """Lance les tests intégrés. Retourne 0 si tout passe, 1 sinon."""
+    suite = unittest.TestLoader().loadTestsFromModule(sys.modules[__name__])
+    result = unittest.TextTestRunner(verbosity=verbosity).run(suite)
+    return 0 if result.wasSuccessful() else 1
 
 
 if __name__ == "__main__":
-    scan_loop()  # boucle infinie dans le thread principal
-
-
-# ============================================================================
-# DÉPLOIEMENT SUR RENDER
-# ============================================================================
-# 1. Type de service : "Web Service" (pas "Background Worker") — car ce fichier
-#    expose aussi le dashboard Flask sur $PORT, ce que Render attend d'un Web
-#    Service pour le healthcheck HTTP. Render redémarre automatiquement tout
-#    process qui se termine (crash, os._exit du watchdog, etc.) : c'est ce
-#    mécanisme qui est utilisé par le watchdog intégré (section 9bis).
-# 2. Start command : python main.py
-# 3. Variables d'environnement à définir dans Render (Settings > Environment) :
-#      Groupe de signaux (public) : TELEGRAM_BOT_TOKEN_SIGNAL, TG_CHAT_SIGNAL
-#      TG_CHAT_REPORTS (optionnel — sinon les rapports partent sur le groupe de signaux)
-#      TELEGRAM_BOT_TOKEN_REPORTS (optionnel — sinon le bot "signal_group" est réutilisé)
-#      TELEGRAM_WEBHOOK_SECRET (optionnel mais recommandé — sécurise la route
-#        /telegram/webhook/signal_group)
-#      TELEGRAM_OWNER_ID (OBLIGATOIRE avant toute mise en prod réelle — ton ID
-#        Telegram numérique, récupérable via @userinfobot ou affiché par ton
-#        propre bot au démarrage d'une conversation, ex. "Votre ID : ...".
-#        C'est le SEUL destinataire du DM privé (solde, risque, levier, lot,
-#        paramètres, suivi détaillé) et le seul autorisé à changer les
-#        réglages (/capital /risque /levier /profils /signaux, boutons
-#        ✅❌🟡🔒🔴). Sans elle : fail-closed -> TOUTES ces commandes sont
-#        REFUSÉES à tout le monde (personne, pas même toi, ne peut les
-#        utiliser) et le DM privé n'est envoyé à personne.
-#        ⚠️ Même une fois définie, Telegram exige que TU envoies d'abord UN
-#        message (ex. /help) en privé à ton bot AVANT qu'il puisse te DM en
-#        retour — un bot ne peut jamais initier une conversation privée.
-#        Sans ce premier message de ta part, send_leader_dm() échoue
-#        silencieusement (loggé "Échec d'envoi du DM leader", 403 Forbidden).
-#      SIGNAL_COOLDOWN_MINUTES (optionnel, défaut 15 — délai mini entre 2 signaux sur le même actif)
-#      MAX_CANDLE_AGE_SECONDS (optionnel, défaut 900 — âge max toléré de la dernière bougie
-#        avant de considérer la donnée de prix périmée -> NO SIGNAL)
-#      MAX_LOT_DEFAULT (optionnel, défaut 50 — plafond du lot dynamique calculé automatiquement)
-#      DB_PATH (optionnel — chemin du fichier SQLite, ex. un disque persistant Render)
-#      EXPORT_DIR (optionnel, défaut "exports" — dossier des CSV/PDF générés)
-#      EXPORT_KEEP_LAST (optionnel, défaut 50 — nombre de fichiers conservés par type)
-#      BACKUP_DIR (optionnel, défaut "backups" — dossier des sauvegardes .db)
-#      BACKUP_INTERVAL_HOURS (optionnel, défaut 6 — fréquence de la sauvegarde automatique)
-#      BACKUP_KEEP_LAST (optionnel, défaut 20 — nombre de sauvegardes conservées)
-#      BACKUP_SEND_TO_TELEGRAM (optionnel, défaut "false" — "true" pour recevoir chaque
-#        sauvegarde en document Telegram sur le canal "reports", sinon "signal_group")
-#      LOG_LEVEL (optionnel, défaut "INFO" — DEBUG/INFO/WARNING/ERROR)
-#      LOG_MAX_BYTES (optionnel, défaut 5242880 — taille max avant rotation d'un fichier de log)
-#      LOG_BACKUP_COUNT (optionnel, défaut 5 — nombre de fichiers de log archivés conservés)
-#      DASHBOARD_CACHE_TTL_SECONDS (optionnel, défaut 10 — durée de cache des endpoints
-#        /api/stats, /api/overview, /api/stats/by-asset, /api/stats/monthly)
-#      PROMO_ENABLED (optionnel, défaut "true" — "false" pour désactiver la promo)
-#      PROMO_TEXT / PROMO_LINK (optionnels — personnalise le texte/lien affilié ajouté
-#        en pied des rapports journalier/hebdo/mensuel, au maximum 1x par jour civil UTC
-#        même si plusieurs rapports partent le même jour)
-#    ⚠️ Sur Render, EXPORT_DIR/BACKUP_DIR/DB_PATH/CHARTS_DIR gagnent à pointer vers un
-#    disque persistant (Settings > Disks) : sans disque, leur contenu est perdu à
-#    chaque redéploiement/redémarrage du service.
-# 4. Healthcheck path côté Render : /health
-#      -> renvoie 200 si le scan a tourné il y a moins de WATCHDOG_MAX_SILENCE_SECONDS,
-#         503 sinon (Render peut alors, en plus du watchdog interne, redémarrer le service).
-# 5. Boutons Telegram interactifs + commandes en DM — UN SEUL bot dans tout le
-#    projet (celui du groupe de signaux), donc une seule URL de webhook. À
-#    faire UNE FOIS, après le déploiement :
-#      curl -X POST "https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN_SIGNAL>/setWebhook" \
-#           -d "url=https://<ton-service>.onrender.com/telegram/webhook/signal_group" \
-#           -d "secret_token=<TELEGRAM_WEBHOOK_SECRET>"
-#    ⚠️ Si le bot avait déjà un webhook pointé vers une ancienne URL avant ce
-#    changement, relance l'appel ci-dessus après déploiement pour basculer
-#    vers la nouvelle URL — sinon Telegram continue d'appeler l'ancienne
-#    route (qui n'existe plus) et les updates ne partent nulle part.
-# 6. Commandes Telegram natives — il n'y a plus qu'UN SEUL contexte : le DM
-#    privé du leader (TELEGRAM_OWNER_ID). Il n'y a plus de groupe Telegram
-#    dans ce projet ; tout message reçu hors DM est ignoré :
-#      /stats /report [daily|weekly|monthly] /help
-#      /settings /profil /capital /risque /levier /session /timeframe
-#      /tprr /berr /bemode /signaux <on|off> /profils /status /menu
-#    Pour que le menu "/" apparaisse dans Telegram, exécute UNE FOIS
-#    (optionnel, juste pour l'UI) :
-#      curl -X POST "https://api.telegram.org/bot<TOKEN>/setMyCommands" \
-#           -H "Content-Type: application/json" \
-#           -d '{"commands": [
-#                 {"command": "profil", "description": "Profil leader (solde/risque/levier/lot)"},
-#                 {"command": "stats", "description": "Statistiques globales"},
-#                 {"command": "report", "description": "Rapport de performance"},
-#                 {"command": "settings", "description": "Voir les réglages actuels"},
-#                 {"command": "capital", "description": "Définir le capital ($)"},
-#                 {"command": "risque", "description": "Définir le risque par trade (%)"},
-#                 {"command": "balance", "description": "Voir/définir le solde ($)"},
-#                 {"command": "risk", "description": "Voir/définir le risque par trade (%)"},
-#                 {"command": "levier", "description": "Définir le levier (x)"},
-#                 {"command": "tprr", "description": "Définir le TP en multiple de RR"},
-#                 {"command": "berr", "description": "Définir le déclenchement du BE en multiple de RR"},
-#                 {"command": "bemode", "description": "Voir/définir le mode Break-Even"},
-#                 {"command": "signaux", "description": "Activer/désactiver les signaux"},
-#                 {"command": "profils", "description": "Lister/activer un profil"},
-#                 {"command": "status", "description": "État du bot"},
-#                 {"command": "help", "description": "Liste des commandes"}
-#               ]}'
+    main()
