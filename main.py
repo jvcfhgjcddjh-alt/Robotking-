@@ -799,6 +799,8 @@ def _post(method, data=None, files=None, _retry=True):
     except Exception as e:
         print(f"[telegram] erreur {method}: {e}")
         return None
+    if not res.get("ok") and "message is not modified" in str(res.get("description", "")):
+        return res   # bouton pressé sans changement de contenu : sans importance, on ne pollue pas les logs
     if not res.get("ok"):
         print(f"[telegram] {method} REFUSÉ vers {(data or {}).get('chat_id')} : "
               f"{res.get('error_code')} {res.get('description')}")
