@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 """AlphaBot BOS + CHoCH — Gold & BTC — version en un seul fichier.
 
@@ -145,6 +146,17 @@ TP_RR = _env_float("TP_RR", 4.0)          # RR de la TP finale (clôture complè
 RR_LEVELS = (1.0, 2.0, 3.0)                # paliers intermédiaires notifiés au groupe (hors TP finale)
 MAX_POSITIONS = _env_int("MAX_POSITIONS", 3)     # positions max en cours par actif
 
+# --- Type d'entrée : DIRECT (au marché) ou LIMIT (on attend le retour du prix) ---------------
+# ENTRY_MODE : MARKET = toujours direct (par défaut) | LIMIT = toujours limit | BOTH = le bot choisit et le précise.
+# En BOTH : si la clôture du signal est loin du niveau cassé (> LIMIT_EXT_ATR x ATR), le prix est "étendu" ->
+# ordre LIMIT sur le niveau cassé (retest) ; sinon -> entrée DIRECTE. Le message dit toujours lequel.
+ENTRY_MODE = os.getenv("ENTRY_MODE", "MARKET").strip().upper()   # par défaut : rien que des entrées DIRECTES
+if ENTRY_MODE not in ("MARKET", "LIMIT", "BOTH"):
+    ENTRY_MODE = "MARKET"
+LIMIT_EXT_ATR = _env_float("LIMIT_EXT_ATR", 0.6)
+LIMIT_CANCEL_RR = _env_float("LIMIT_CANCEL_RR", 2.0)         # ordre annulé si le prix part de +X R sans toucher la limit
+LIMIT_EXPIRY_CANDLES = _env_int("LIMIT_EXPIRY_CANDLES", 30)  # ordre annulé s'il n'est pas exécuté après N bougies
+
 # --- Risque & levier --------------------------------------------------------
 # Le lot est calculé uniquement à partir du risque $ et de la distance du SL (aucun solde requis).
 DEFAULT_RISK_USD = _env_float("DEFAULT_RISK_USD", 10.0)  # modifiable à tout moment via /risque
@@ -218,6 +230,11 @@ _ensure_column("trades", "timeframe", "TEXT")
 # Suivi de l'envoi du signal d'ouverture (1 = envoyé). Les anciens trades restent à 1 : pas de renvoi.
 _ensure_column("trades", "sent_admin", "INTEGER DEFAULT 1")
 _ensure_column("trades", "sent_group", "INTEGER DEFAULT 1")
+# Entrées LIMIT : type d'ordre, bougie du signal, bougie d'exécution, prix de marché au moment du signal.
+_ensure_column("trades", "order_type", "TEXT DEFAULT 'MARKET'")
+_ensure_column("trades", "placed_ts", "INTEGER")
+_ensure_column("trades", "filled_ts", "INTEGER")
+_ensure_column("trades", "ref_price", "REAL")
 
 
 # --- paramètres / méta -------------------------------------------------------
@@ -298,7 +315,7 @@ def signal_exists(key):
 
 
 def count_open(symbol):
-    return _q("SELECT COUNT(*) n FROM trades WHERE symbol=? AND status='OPEN'", (symbol,)).fetchone()["n"]
+    return _q("SELECT COUNT(*) n FROM trades WHERE symbol=? AND status IN ('OPEN','PENDING')", (symbol,)).fetchone()["n"]
 
 
 def add_trade(**t):
@@ -315,9 +332,9 @@ def update_trade(trade_id, **fields):
 
 def open_trades(symbol=None):
     if symbol:
-        rows = _q("SELECT * FROM trades WHERE status='OPEN' AND symbol=? ORDER BY id", (symbol,))
+        rows = _q("SELECT * FROM trades WHERE status IN ('OPEN','PENDING') AND symbol=? ORDER BY id", (symbol,))
     else:
-        rows = _q("SELECT * FROM trades WHERE status='OPEN' ORDER BY id")
+        rows = _q("SELECT * FROM trades WHERE status IN ('OPEN','PENDING') ORDER BY id")
     return [dict(r) for r in rows.fetchall()]
 
 
@@ -346,6 +363,7 @@ def query_stats(since_ts=None, symbol=None, timeframe=None):
     if timeframe:
         sql += " AND timeframe=?"; args.append(timeframe)
     rows = [dict(r) for r in _q(sql, tuple(args)).fetchall()]
+    rows = [r for r in rows if r["status"] != "CANCELLED"]   # ordres LIMIT jamais exécutés : hors statistiques
     closed = [r for r in rows if r["status"] == "CLOSED"]
     wins = [r for r in closed if (r["result_r"] or 0) > 0]
     losses = [r for r in closed if (r["result_r"] or 0) < 0]
@@ -587,12 +605,25 @@ def build_signal(c, ev):
         sl = entry - d * risk
     if risk > MAX_SL_ATR * a:
         return None
-    return {
+    sig = {
         "dir": d, "side": "BUY" if d == 1 else "SELL", "type": ev["type"],
+        "order": "MARKET", "ref_price": entry,
         "entry": entry, "sl": sl, "risk": risk,
         "tp": entry + d * risk * TP_RR,
         "t": ev["t"], "bos_level": ev["sl_level"],
     }
+    # Entrée LIMIT : retest du niveau cassé (la ligne du CHoCH), avec le même SL structurel.
+    lvl = ev["level"]
+    want_limit = ENTRY_MODE == "LIMIT" or (ENTRY_MODE == "BOTH" and abs(entry - lvl) > LIMIT_EXT_ATR * a)
+    if want_limit and ((d == 1 and sl < lvl < entry) or (d == -1 and entry < lvl < sl)):
+        risk_l = abs(lvl - sl)
+        if risk_l < MIN_SL_ATR * a:
+            risk_l = MIN_SL_ATR * a
+            sl = lvl - d * risk_l
+        # si le prix a déjà dépassé le seuil d'annulation, la limit n'a plus de sens : on reste en DIRECT
+        if (entry - lvl) * d < LIMIT_CANCEL_RR * risk_l:
+            sig.update(order="LIMIT", entry=lvl, sl=sl, risk=risk_l, tp=lvl + d * risk_l * TP_RR)
+    return sig
 
 
 # ============================================================================
@@ -665,6 +696,27 @@ def track_trade(trade, candles):
         last_ts = c["t"]
         adverse = c["l"] if side == 1 else c["h"]
         favorable = c["h"] if side == 1 else c["l"]
+        just_filled = False
+
+        # 0) ordre LIMIT en attente : exécuté, annulé (prix parti / expiré) ou toujours en attente
+        if trade["status"] == "PENDING":
+            touched = (adverse <= entry) if side == 1 else (adverse >= entry)
+            if touched:
+                trade.update(status="OPEN", filled_ts=c["t"])
+                events.append({"name": "FILLED", "trade": dict(trade)})
+                just_filled = True
+            else:
+                reason = None
+                if (favorable - entry) * side >= LIMIT_CANCEL_RR * risk:
+                    reason = "Le prix est reparti sans toucher ta limit : trop tard, on ne court pas après."
+                elif c["t"] - (trade.get("placed_ts") or 0) >= LIMIT_EXPIRY_CANDLES * TF_SEC:
+                    reason = f"Ordre expiré : pas exécuté après {LIMIT_EXPIRY_CANDLES} bougies."
+                if reason:
+                    trade.update(status="CANCELLED", closed_ts=c["t"], outcome="CANCELLED",
+                                 result_r=None, pnl_usd=None)
+                    events.append({"name": "CANCELLED", "reason": reason, "trade": dict(trade)})
+                    break
+                continue
 
         # 1) stop touché (initial ou déplacé à l'entrée) ?
         if (side == 1 and adverse <= trade["sl"]) or (side == -1 and adverse >= trade["sl"]):
@@ -674,6 +726,8 @@ def track_trade(trade, candles):
                          pnl_usd=r * trade["risk_usd"], outcome="BE" if at_be else "SL")
             events.append({"name": "BE" if at_be else "SL", "trade": dict(trade)})
             break
+        if just_filled:
+            continue   # bougie d'exécution : pas de progression comptée (l'ordre des mèches est inconnu)
 
         # 2) progression : paliers RR1/RR2/RR3 (notification groupe, BE combiné au palier BE_RR)
         r_fav = (favorable - entry) * side / risk
@@ -696,7 +750,7 @@ def track_trade(trade, candles):
             break
 
     trade["last_ts"] = last_ts
-    fields = {k: trade[k] for k in ("sl", "be_hit", "status", "last_ts", "closed_ts",
+    fields = {k: trade[k] for k in ("sl", "be_hit", "status", "last_ts", "closed_ts", "filled_ts",
                                     "result_r", "pnl_usd", "outcome",
                                     "rr1_hit", "rr2_hit", "rr3_hit")}
     update_trade(trade["id"], **fields)
@@ -766,7 +820,7 @@ def make_chart(symbol, candles, events, sig, decimals=2, n_show=70, extend=25):
     hi = max(max(c["h"] for c in view), sl, tp)
     pad = (hi - lo) * 0.05
     ax.set_ylim(lo - pad, hi + pad)
-    ax.set_title(f"{symbol} {TF_LABEL} - {sig['side']} ({'CHoCH + CHoCH' if sig['type'] == 'CHOCH2' else 'CHoCH'})",
+    ax.set_title(f"{symbol} {TF_LABEL} - {sig['side']}{' LIMIT' if sig.get('order') == 'LIMIT' else ''} ({'CHoCH + CHoCH' if sig['type'] == 'CHOCH2' else 'CHoCH'})",
                  color="white", fontsize=11)
     ax.tick_params(colors="#888888", labelsize=7)
     ax.set_xticks([])
@@ -843,6 +897,27 @@ def _delivered(chat_id, res):
     return bool(res and res.get("ok"))
 
 
+def check_group(send_test=False):
+    """Vérifie que le bot peut écrire dans CHAT_ID_GROUPE. Retourne (ok, message lisible)."""
+    if not TELEGRAM_TOKEN:
+        return False, "TELEGRAM_TOKEN absent."
+    if not CHAT_ID_GROUPE:
+        return False, "CHAT_ID_GROUPE n'est pas défini sur Render : aucun signal n'ira au groupe."
+    hint = ""
+    if not str(CHAT_ID_GROUPE).startswith("-"):
+        hint = ("\n👉 Un groupe/canal a un ID NÉGATIF (ex. -1001234567890). Un ID positif est celui d'une "
+                "personne, qui doit d'abord avoir démarré le bot.")
+    res = _post("sendMessage" if send_test else "getChat",
+                {"chat_id": CHAT_ID_GROUPE, "text": "✅ Test de connexion AlphaBot"} if send_test
+                else {"chat_id": CHAT_ID_GROUPE})
+    if res and res.get("ok"):
+        return True, f"Groupe joignable (CHAT_ID_GROUPE = {CHAT_ID_GROUPE})."
+    why = (res or {}).get("description", "pas de réponse de Telegram")
+    return False, (f"⚠️ Le bot ne peut pas écrire dans le groupe (CHAT_ID_GROUPE = {CHAT_ID_GROUPE}) : "
+                   f"{why}{hint}\n👉 Vérifie l'ID, et que le bot a bien été ajouté au groupe "
+                   f"(administrateur si c'est un canal).")
+
+
 def to_group(text, photo=None):
     return send(CHAT_ID_GROUPE, text, photo)
 
@@ -906,18 +981,49 @@ def _rr_price(sig, level):
     return sig["entry"] + side * level * sig["risk"]
 
 
+def _dist(sig, level, dec):
+    """Distance signée (en points) entre l'entrée et un niveau : SL négatif, TP positif pour un BUY (inverse pour un SELL)."""
+    side = 1 if sig["side"] == "BUY" else -1
+    d = (level - sig["entry"]) * side
+    return f"{d:+,.{dec}f}".replace(",", " ")
+
+
+def _limit_cancel_level(sig):
+    """Prix au-delà duquel l'ordre LIMIT est annulé (le prix est parti sans toucher la limit)."""
+    side = 1 if sig["side"] == "BUY" else -1
+    return sig["entry"] + side * LIMIT_CANCEL_RR * sig["risk"]
+
+
+def _exec_block(sig, dec):
+    """(texte d'exécution, libellé + valeur de l'entrée) — DIRECT ou LIMIT, toujours explicite."""
+    if sig.get("order") == "LIMIT":
+        ref = sig.get("ref_price")
+        now = f" (prix actuel ≈ {_fmt(ref, dec)})" if ref else ""
+        mins = LIMIT_EXPIRY_CANDLES * TF_SEC // 60
+        txt = (f"⏳ <b>{sig['side']} LIMIT</b> — <b>N'ENTRE PAS MAINTENANT</b>\n"
+               f"Place un ordre limit à {_fmt(sig['entry'], dec)}{now}, puis attends le retour du prix.\n"
+               f"❌ Annulé si le prix atteint {_fmt(_limit_cancel_level(sig), dec)} sans toucher la limit, "
+               f"ou après {mins} min : je te préviens.")
+        return txt, f"Entrée (limit) : <b>{_fmt(sig['entry'], dec)}</b>"
+    return (f"⚡ <b>{sig['side']} AU MARCHÉ</b> — entrée directe, pas d'ordre limit",
+            f"Entrée : <b>≈ {_fmt(sig['entry'], dec)}</b>")
+
+
 def group_signal(symbol, sig, position_n, dec, tf=None):
     icon = "🟢" if sig["side"] == "BUY" else "🔴"
     rr_lines = "\n".join(
         f"RR{int(lvl)} : {_fmt(_rr_price(sig, lvl), dec)}" for lvl in RR_LEVELS)
+    exec_txt, entry_line = _exec_block(sig, dec)
+    label = f"{sig['side']} LIMIT" if sig.get("order") == "LIMIT" else sig["side"]
     return (
         f"Nouveau signal\n"
-        f"{icon} <b>{sig['side']} {symbol}</b> · {tf or TF_LABEL}\n"
-        f"Type : {_kind_label(sig['type'])}\n\n"
-        f"Entrée : <b>{_fmt(sig['entry'], dec)}</b>\n"
-        f"SL : {_fmt(sig['sl'], dec)}\n"
+        f"{icon} <b>{label} {symbol}</b> · {tf or TF_LABEL}\n"
+        f"Type : {_kind_label(sig['type'])}\n"
+        f"Exécution : {exec_txt}\n\n"
+        f"{entry_line}\n"
+        f"SL : {_fmt(sig['sl'], dec)} ({_dist(sig, sig['sl'], dec)} pts)\n"
         f"{rr_lines}\n"
-        f"TP : {_fmt(sig['tp'], dec)}\n\n"
+        f"TP : {_fmt(sig['tp'], dec)} ({_dist(sig, sig['tp'], dec)} pts)\n\n"
         f"BE → RR{BE_RR:g}\n"
         f"TP final → RR{TP_RR:g}"
         + (f"\n\nPosition {position_n}/{MAX_POSITIONS} sur {symbol}" if position_n else "")
@@ -926,11 +1032,17 @@ def group_signal(symbol, sig, position_n, dec, tf=None):
 
 def admin_signal(symbol, sig, risk_usd, leverage, lot_info, margin, dec):
     """Message complet envoyé uniquement en privé/admin : signal + risque + levier + lot."""
+    exec_txt, entry_line = _exec_block(sig, dec)
+    label = f"{sig['side']} LIMIT" if sig.get("order") == "LIMIT" else sig["side"]
+    base = "TA limit" if sig.get("order") == "LIMIT" else "TON prix d'entrée réel"
     txt = (
-        f"💰 <b>{symbol} {sig['side']}</b> (privé)\n"
-        f"Entrée : {_fmt(sig['entry'], dec)}\n"
+        f"💰 <b>{symbol} {label}</b> (privé)\n"
+        f"Exécution : {exec_txt}\n"
+        f"{entry_line.replace('<b>', '').replace('</b>', '')}\n"
         f"SL : {_fmt(sig['sl'], dec)} (distance {_fmt(sig['risk'], dec)} pts)\n"
-        f"TP : {_fmt(sig['tp'], dec)} (RR{TP_RR:g})\n\n"
+        f"TP : {_fmt(sig['tp'], dec)} (RR{TP_RR:g})\n"
+        f"📐 Si ton prix broker diffère : SL {_dist(sig, sig['sl'], dec)} / TP {_dist(sig, sig['tp'], dec)} "
+        f"pts depuis {base}.\n\n"
         f"Risque : {risk_usd:g} $\n"
         f"Levier : {leverage:g}x\n"
         f"👉 <b>Lot calculé : {lot_info['lot']:g}</b>\n"
@@ -967,6 +1079,12 @@ def group_event(ev, dec):
         if lvl >= 2:
             txt += "\n💡 Clôture partielle possible ici pour ceux qui le souhaitent."
         return txt
+    if name == "FILLED":
+        return (f"✅ <b>{t['side']} LIMIT exécuté</b> — {t['symbol']} @ {_fmt(t['entry'], dec)}\n"
+                f"Position ouverte · SL {_fmt(t['sl'], dec)} · TP {_fmt(t['tp'], dec)}")
+    if name == "CANCELLED":
+        return (f"❌ <b>Ordre LIMIT annulé</b> — {head}\n{ev['reason']}\n"
+                f"Retire ton ordre limit s'il est encore en attente.")
     if name == "BE_MOVED":
         return f"🔒 <b>RR{BE_RR:g} atteint</b> — {head}\nSL déplacé à l'entrée (BE)."
     if name == "TP":
@@ -979,6 +1097,10 @@ def group_event(ev, dec):
 
 def admin_event(ev):
     t = ev["trade"]
+    if ev["name"] == "FILLED":
+        return f"✅ {t['symbol']} {t['side']} LIMIT exécuté @ {t['entry']:g} — position ouverte."
+    if ev["name"] == "CANCELLED":
+        return f"❌ {t['symbol']} {t['side']} LIMIT annulé — {ev['reason']} Retire l'ordre."
     if ev["name"] in ("TP", "SL", "BE"):
         return f"📒 {t['symbol']} {t['side']} clôturé ({ev['name']}) : <b>{t['result_r']:+.2f} R</b>"
     return None
@@ -1109,11 +1231,17 @@ def handle_command(text):
                "/risque [montant] — montant à risquer par trade ($)\n"
                "/levier [valeur] — levier (indicatif, calcul de marge)\n"
                "/stats — statistiques (jour / semaine + taux par RR)\n"
+               "/statut — prix BTC / Gold et dernière bougie scannée\n"
+               "/testgroupe — envoie un message test au groupe (vérifie CHAT_ID_GROUPE)\n"
                "/trades — positions en cours (avec RR actuel)\n"
                "/timeframe [M1|M3|M5|M15|M30|H1] — change le timeframe à chaud\n"
                "/medias — stickers / images / GIF du groupe (TP, SL, BE, motivation)\n"
                "/menu — menu à boutons")
         return (txt, _menu_keyboard())
+    if cmd == "/testgroupe":
+        return (check_group(send_test=True)[1], None)
+    if cmd in ("/statut", "/status", "/prix"):
+        return ("📡 <b>Scan en cours</b> — " + TF_LABEL + "\n" + "\n".join(scan_status_lines()), None)
     if cmd == "/menu":
         return (_home_text(), _menu_keyboard())
     if cmd == "/risque":
@@ -1184,6 +1312,13 @@ def handle_command(text):
             dec = SYMBOLS[t["symbol"]]["decimals"]
             st = " (BE)" if t["be_hit"] else ""
             tp_str = _fmt(t["tp"], dec) if t["tp"] is not None else "—"
+            if t["status"] == "PENDING":
+                lines.append(f"{i}. ⏳ <b>{t['symbol']} {t['side']} LIMIT</b> — en attente\n"
+                             f"Limit : {_fmt(t['entry'], dec)}\n"
+                             f"SL : {_fmt(t['sl'], dec)}\n"
+                             f"TP : {tp_str}\n"
+                             f"Lot : {t['lot']:g}")
+                continue
             rr_now = current_rr(t)
             rr_str = f"{rr_now:+.1f}" if rr_now is not None else "—"
             lines.append(f"{i}. <b>{t['symbol']} {t['side']}</b>{st}\n"
@@ -1305,6 +1440,23 @@ SIGNAL_MAX_AGE = 2
 
 _fetch_state = {}  # symbole -> {"slot": ouverture de la bougie attendue, "tries": nb d'essais}
 _last_price = {}   # symbole -> dernier prix de clôture connu (pour le RR actuel affiché dans /trades)
+_last_candle = {}  # symbole -> ouverture (ts) de la dernière bougie clôturée reçue
+_last_check = {}   # symbole -> heure (time.time) du dernier appel réussi à la source de prix
+
+
+def scan_status_lines():
+    """Une ligne par actif : dernier prix, dernière bougie, positions ouvertes (pour /statut et les logs)."""
+    out = []
+    for sym, cfg in SYMBOLS.items():
+        p, t = _last_price.get(sym), _last_candle.get(sym)
+        if p is None or t is None:
+            out.append(f"⏳ {sym} : en attente des premières données")
+            continue
+        stale = time.time() - t > 3 * TF_SEC + 60
+        note = " — marché fermé ? (pas de nouvelle bougie)" if stale else ""
+        out.append(f"{'💤' if stale else '✅'} {sym} : {_fmt(p, cfg['decimals'])} · bougie {_ts_str(t)} · "
+                   f"{count_open(sym)} position(s){note}")
+    return out
 
 
 def set_timeframe(minutes):
@@ -1381,12 +1533,14 @@ def publish_signal(symbol, candles, events, sig):
     margin = calc_margin(symbol, lot_info["lot"], sig["entry"], leverage)
 
     trade_id = add_trade(
+        status="PENDING" if sig.get("order") == "LIMIT" else "OPEN",
+        order_type=sig.get("order", "MARKET"), placed_ts=sig["t"], ref_price=sig.get("ref_price"),
         sent_admin=0, sent_group=0,   # passent à 1 seulement quand Telegram a confirmé l'envoi
         signal_key=key, symbol=symbol, side=sig["side"], kind=sig["type"], timeframe=TF_LABEL,
         entry=sig["entry"], sl=sig["sl"], sl_initial=sig["sl"], tp=sig["tp"],
         risk_usd=lot_info["real_risk"],  # risque réel du lot pris (= risque demandé sauf lot minimum)
         lot=lot_info["lot"], leverage=leverage, opened_ts=now_ts(), last_ts=sig["t"])
-    print(f"[{symbol}] SIGNAL {sig['side']} {sig['type']} @ {sig['entry']:.{dec}f} "
+    print(f"[{symbol}] SIGNAL {sig['side']} {sig.get('order', 'MARKET')} {sig['type']} @ {sig['entry']:.{dec}f} "
           f"(bougie {_ts_str(sig['t'])})")
 
     try:
@@ -1437,7 +1591,7 @@ def retry_unsent_signals():
         tries, last = _retry_state.get(t["id"], [0, 0.0])
         if time.time() - last < 30:
             continue
-        if t["status"] != "OPEN" or tries >= 8:
+        if t["status"] not in ("OPEN", "PENDING") or tries >= 8:
             print(f"[retry] signal #{t['id']} abandonné (trade {t['status']}, {tries} essais)")
             update_trade(t["id"], sent_admin=1, sent_group=1)
             continue
@@ -1445,7 +1599,8 @@ def retry_unsent_signals():
         sym = t["symbol"]
         dec = SYMBOLS[sym]["decimals"]
         sig = {"side": t["side"], "type": t["kind"], "entry": t["entry"], "sl": t["sl_initial"],
-               "tp": t["tp"], "risk": abs(t["entry"] - t["sl_initial"])}
+               "tp": t["tp"], "risk": abs(t["entry"] - t["sl_initial"]),
+               "order": t.get("order_type") or "MARKET", "ref_price": t.get("ref_price")}
         lot_info = {"lot": t["lot"], "real_risk": t["risk_usd"], "raised_to_min": False}
         lev = t["leverage"] or get_leverage()
         margin = calc_margin(sym, t["lot"], t["entry"], lev)
@@ -1469,6 +1624,8 @@ def process_symbol(symbol):
         return
     last_t = candles[-1]["t"]
     _last_price[symbol] = candles[-1]["c"]
+    _last_candle[symbol] = last_t
+    _last_check[symbol] = time.time()
 
     if last_seen is None:  # premier lancement : on s'initialise sur la dernière bougie
         set_meta(meta_key, last_t)
@@ -1518,7 +1675,14 @@ def maybe_daily_report():
 def _trading_loop():
     """La boucle de scan (symboles + rapport quotidien), tourne en continu en arrière-plan."""
     try:
+        last_hb = 0.0
         while True:
+            if time.time() - last_hb >= 300:   # « je scanne bien » dans les logs, toutes les 5 min
+                last_hb = time.time()
+                try:
+                    print("[scan] " + " | ".join(scan_status_lines()))
+                except Exception:
+                    traceback.print_exc()
             try:
                 retry_unsent_signals()
             except Exception:
@@ -1583,10 +1747,13 @@ def main():
             print("⚠️  CHAT_ID_ADMIN absent : ni lot, ni commandes.")
 
     start_polling()
+    ok_grp, msg_grp = check_group()
+    print(f"[groupe] {msg_grp}")
+    if not ok_grp and TELEGRAM_TOKEN:
+        to_admin(msg_grp)   # tu es prévenu dès le démarrage, pas au moment d'un signal perdu
     to_admin(f"🤖 AlphaBot démarré — timeframe <b>{TF_LABEL}</b> ({_TF_SOURCE}). Change-le avec /timeframe.")
     _run(_env_int("PORT", 10000))
 
 
 if __name__ == "__main__":
     main()
-
