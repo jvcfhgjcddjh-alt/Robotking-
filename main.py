@@ -63,10 +63,12 @@ import os
 import re
 import sys
 import tempfile
+import threading
 import time as _time
 import unittest
 from collections import defaultdict, deque
 from dataclasses import asdict, dataclass, field, fields
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
@@ -140,6 +142,15 @@ ALL_MARKETS: list[dict[str, Any]] = [
      "aliases": ["btc/usd", "bitcoin", "btcusd", "btc"]},
 ]
 ALL_MARKET_KEYS = [m["key"] for m in ALL_MARKETS]
+
+# Codes symboles Deriv connus, utilisés UNIQUEMENT si active_symbols revient vide
+# (chaque code est vérifié par une vraie requête ticks_history avant d'être accepté).
+FALLBACK_SYMBOLS: dict[str, tuple[str, str]] = {
+    "V75": ("R_75", "synthetic_index"),
+    "V25": ("R_25", "synthetic_index"),
+    "GOLD": ("frxXAUUSD", "commodities"),
+    "BTC": ("cryBTCUSD", "cryptocurrency"),
+}
 
 
 @dataclass
@@ -578,14 +589,24 @@ async def discover_symbols(client: DerivClient, market_definitions: list[dict]) 
     """Interroge active_symbols et retourne {key: MarketSymbol} pour les
     marchés trouvés. Les marchés introuvables sont journalisés et omis :
     le bot continue avec les marchés disponibles."""
-    response = await client.request({"active_symbols": "brief", "product_type": "basic"})
+    raw_symbols: list[dict] = []
+    # Plusieurs variantes de la requête : certaines réponses reviennent vides selon le serveur / l'App ID.
+    for variant in ({"active_symbols": "brief", "product_type": "basic"},
+                    {"active_symbols": "brief"},
+                    {"active_symbols": "full"}):
+        response = await client.request(variant)
+        if response.get("error"):
+            log_symbols.error("active_symbols a échoué (%s) : %s", variant, response["error"])
+            continue
+        raw_symbols = response.get("active_symbols", []) or []
+        log_symbols.info("active_symbols %s : %d marchés reçus depuis Deriv.",
+                         variant.get("product_type", variant["active_symbols"]), len(raw_symbols))
+        if raw_symbols:
+            break
 
-    if response.get("error"):
-        log_symbols.error("active_symbols a échoué : %s", response["error"])
-        return {}
-
-    raw_symbols = response.get("active_symbols", [])
-    log_symbols.info("active_symbols : %d marchés actifs reçus depuis Deriv.", len(raw_symbols))
+    if not raw_symbols:
+        log_symbols.warning("active_symbols vide : bascule sur les codes symboles connus (vérifiés par ticks_history).")
+        return await _fallback_symbols(client, market_definitions)
 
     result: dict[str, MarketSymbol] = {}
 
@@ -623,6 +644,32 @@ async def discover_symbols(client: DerivClient, market_definitions: list[dict]) 
         else:
             log_symbols.warning("[MARCHÉ INDISPONIBLE] %s", label)
 
+    return result
+
+
+async def _fallback_symbols(client: DerivClient, market_definitions: list[dict]) -> dict[str, MarketSymbol]:
+    """Repli sans active_symbols : chaque code connu est validé par une vraie requête de bougies."""
+    result: dict[str, MarketSymbol] = {}
+    for market_def in market_definitions:
+        key, label = market_def["key"], market_def["label"]
+        known = FALLBACK_SYMBOLS.get(key)
+        if known is None:
+            log_symbols.warning("[MARCHÉ INDISPONIBLE] %s (pas de code de secours)", label)
+            continue
+        code, market = known
+        try:
+            resp = await client.request({"ticks_history": code, "end": "latest", "count": 2,
+                                         "style": "candles", "granularity": 300})
+        except Exception as exc:
+            log_symbols.warning("[MARCHÉ INDISPONIBLE] %s : %s", label, exc)
+            continue
+        if resp.get("error") or not resp.get("candles"):
+            log_symbols.warning("[MARCHÉ INDISPONIBLE] %s (%s) : %s", label, code,
+                                resp.get("error") or "aucune bougie reçue")
+            continue
+        result[key] = MarketSymbol(key=key, label=label, display_name=label,
+                                   symbol=code, market=market, available=True)
+        log_symbols.info("%s -> symbole de secours validé : %s", label, code)
     return result
 
 
@@ -1788,7 +1835,35 @@ async def daily_report_task(app: AppConfig, journal: Journal, notifier: Notifier
         log_main.info("Rapport journalier envoyé (%s).", cutoff_date)
 
 
+class _HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):  # noqa: N802
+        body = b"AlphaBot CRT OK"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    do_HEAD = do_GET  # noqa: N815
+
+    def log_message(self, *args):  # silence
+        pass
+
+
+def start_health_server() -> Optional[HTTPServer]:
+    """Render (Web Service) exige un port ouvert : si la variable PORT est définie,
+    on expose un mini serveur HTTP de santé (thread démon). Sans PORT (Worker, local) : rien."""
+    port = os.getenv("PORT", "").strip()
+    if not port.isdigit():
+        return None
+    server = HTTPServer(("0.0.0.0", int(port)), _HealthHandler)
+    threading.Thread(target=server.serve_forever, daemon=True, name="health").start()
+    logging.getLogger("main").info("Serveur de santé HTTP démarré sur le port %s.", port)
+    return server
+
+
 async def run(app: AppConfig) -> None:
+    start_health_server()
     cfg = app.strategy
     conn = ConnectionSettings(history_candle_count=app.history_candle_count)
     journal = Journal(app.data_dir)
@@ -2457,6 +2532,41 @@ class TestPipelineFromTicks(unittest.TestCase):
         found = asyncio.run(discover_symbols(FakeClient({}, active), ALL_MARKETS))
         self.assertEqual({k: v.symbol for k, v in found.items()},
                          {"V75": "R_75", "V25": "R_25", "GOLD": "frxXAUUSD", "BTC": "cryBTCUSD"})
+
+
+class _EmptySymbolsClient:
+    """active_symbols toujours vide ; ticks_history répond pour R_75 et frxXAUUSD seulement."""
+    OK = {"R_75", "frxXAUUSD"}
+
+    async def request(self, payload, timeout=15.0):
+        if "active_symbols" in payload:
+            return {"active_symbols": []}
+        if payload.get("ticks_history") in self.OK:
+            return {"candles": [{"epoch": 1, "open": 1, "high": 2, "low": 0.5, "close": 1.5}]}
+        return {"error": {"code": "MarketIsClosed", "message": "x"}}
+
+
+class TestSymbolFallbackAndHealth(unittest.TestCase):
+    def test_fallback_when_active_symbols_empty(self):
+        found = asyncio.run(discover_symbols(_EmptySymbolsClient(), ALL_MARKETS))
+        self.assertEqual({k: v.symbol for k, v in found.items()}, {"V75": "R_75", "GOLD": "frxXAUUSD"})
+
+    def test_health_server_only_with_port(self):
+        with mock.patch.dict(os.environ):
+            os.environ.pop("PORT", None)
+            self.assertIsNone(start_health_server())
+
+    def test_health_server_answers_200(self):
+        import socket
+        import urllib.request
+        sock = socket.socket(); sock.bind(("127.0.0.1", 0)); port = sock.getsockname()[1]; sock.close()
+        with mock.patch.dict(os.environ, {"PORT": str(port)}):
+            srv = start_health_server()
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=3) as r:
+                self.assertEqual(r.status, 200)
+        finally:
+            srv.shutdown()
 
 
 class TestConfig(unittest.TestCase):
