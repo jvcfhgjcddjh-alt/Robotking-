@@ -174,7 +174,7 @@ POI_MAX_AGE = _env_int("POI_MAX_AGE", 60)                  # âge max d'un POI (
 POI_MIN_ATR = _env_float("POI_MIN_ATR", 0.15)              # taille mini d'un POI, en ATR de son UT (écarte les micro-gaps)
 SWEEP_LOOKBACK = _env_int("SWEEP_LOOKBACK", 10)            # bougies d'entrée comparées pour détecter un balayage de liquidité
 SL_BUFFER_ATR = _env_float("SL_BUFFER_ATR", 0.2)   # buffer au-delà de la ligne du BOS (0.1 laissait le SL pile sur la mèche -> balayé par le bruit)
-MIN_SL_ATR = _env_float("MIN_SL_ATR", 0.6)         # SL minimum (en ATR) -- 0.3 donnait des SL de quelques points sur BTC en M1/M5, balayés par le spread/bruit
+MIN_SL_ATR = _env_float("MIN_SL_ATR", 0.8)         # SL minimum (en ATR) -- 0.3 donnait des SL de quelques points sur BTC en M1/M5, balayés par le spread/bruit
 MAX_SL_ATR = _env_float("MAX_SL_ATR", 6.0)         # au-delà : signal ignoré (BOS trop ancien)
 # Plancher ABSOLU du SL, en % du prix d'entrée : filet de sécurité indépendant de l'ATR (l'ATR d'une UT basse comme M1
 # peut lui-même être minuscule en marché calme -> MIN_SL_ATR seul ne suffit pas à empêcher un SL de quelques points).
@@ -1289,6 +1289,12 @@ def build_signal(c, ev, symbol=None):
     if (d == 1 and sl >= entry) or (d == -1 and sl <= entry):
         return _rej(f"SL structurel du mauvais côté de l'entrée (sl={sl:.2f}, entrée={entry:.2f})")
     risk = abs(entry - sl)
+    # Le contrôle "BOS trop ancien/éloigné" doit juger la distance STRUCTURELLE d'origine (avant tout plancher) :
+    # sinon, sur une UT basse (M1) où l'ATR est petit, le plancher en % ci-dessous dépasserait quasi toujours
+    # 6xATR et bloquerait TOUS les signaux, même valides (c'est le bug qui a fait disparaître les signaux).
+    if risk > MAX_SL_ATR * a:
+        return _rej(f"SL trop large : {risk:.2f} pts > {MAX_SL_ATR}xATR ({MAX_SL_ATR * a:.2f} pts) "
+                    f"-- niveau de référence trop ancien/éloigné")
     # Double plancher : ATR (MIN_SL_ATR) ET % du prix (min_sl_pct/MIN_SL_PCT) -- le plus grand des deux gagne.
     # Sans le plancher en %, un ATR minuscule (marché calme sur une UT basse comme M1) laissait passer des SL de
     # quelques points, balayés par le moindre bruit/spread : c'est ce plancher absolu qui l'empêche.
@@ -1297,9 +1303,6 @@ def build_signal(c, ev, symbol=None):
     if risk < min_risk:
         risk = min_risk
         sl = entry - d * risk
-    if risk > MAX_SL_ATR * a:
-        return _rej(f"SL trop large : {risk:.2f} pts > {MAX_SL_ATR}xATR ({MAX_SL_ATR * a:.2f} pts) "
-                    f"-- niveau de référence trop ancien/éloigné")
     sig = {
         "dir": d, "side": "BUY" if d == 1 else "SELL", "type": ev["type"],
         "order": "MARKET", "ref_price": entry,
