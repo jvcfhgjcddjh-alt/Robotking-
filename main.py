@@ -27,11 +27,14 @@ ni au groupe ni en privé Leader — uniquement des R et des taux de réussite p
 Réglages : section 1 (CONFIGURATION) ou fichier .env (voir README) — ex. TIMEFRAME=M15.
 Le timeframe se change aussi à chaud depuis Telegram (/timeframe) : le dernier choix est mémorisé, sauf si la
 variable TIMEFRAME est modifiée sur Render (elle reprend alors la main au démarrage suivant).
+RR (RR1-RR4), timeframe d'entrée (M1/M5/M15) et filtre HTF (ON/OFF) se règlent aussi à chaud depuis le menu
+Telegram « ⚙️ Paramètres signal » (/signal) : mémorisés en base, ils survivent aux redémarrages Render.
 Stickers / images / GIF du groupe (TP, SL, BE, motivation) : envoyer le média au bot en privé, puis choisir la
 catégorie (gestion via /medias). Optionnel : variables MEDIA_TP, MEDIA_SL, MEDIA_BE, MEDIA_MOTIV.
+Auto-tests du moteur H1 -> M15 -> M5 -> M1 (sans réseau ni base de prod) :  python main.py --selftest
 Sommaire : 1 Configuration · 2 Base de données · 3 Données de prix · 4 Signaux
            5 Risque · 6 Suivi des positions · 7 Graphique · 8 Telegram · 9 Boucle principale
-           10 Serveur web (Render)
+           10 Serveur web (Render) · 11 Auto-tests
 """
 import json
 import math
@@ -129,7 +132,7 @@ SYMBOLS = {
     "BTCUSD": {
         "source": "binance", "binance_symbol": "BTCUSDT",
         "value_per_point": 1.0,     # $ par point pour 1 lot (1 BTC) - à ajuster selon le broker
-        "min_lot": 0.001, "lot_step": 0.001, "decimals": 2,
+        "min_lot": 0.001, "lot_step": 0.001, "decimals": 0,
     },
 }
 
@@ -138,12 +141,25 @@ SWING_DEPTH = _env_int("SWING_DEPTH", 3)
 ATR_PERIOD = 14
 ENTRY_CHOCH1 = _env_bool("ENTRY_CHOCH1", True)    # CHoCH qui suit un BOS (retournement classique)
 ENTRY_CHOCH2 = _env_bool("ENTRY_CHOCH2", True)    # CHoCH + CHoCH (CHoCH qui suit directement un CHoCH)
+DEBUG_CHOCH = _env_bool("DEBUG_CHOCH", True)      # logge chaque CHoCH ignoré (et pourquoi) au lieu de rien dire
+HTF_FILTER = _env_bool("HTF_FILTER", True)   # ON : HTF = contexte, POI = zone de réaction, CHoCH = déclencheur (htf_poi_setup)
+HTF_MINUTES = _env_int("HTF_MINUTES", 60)    # unité de temps de référence pour la tendance ("liquidité externe")
+# Cascade du filtre HTF : H1 (biais + liquidité externe) -> M15 (confirmation du contexte) -> M5 (retracement, liquidité interne,
+# fin du mouvement) -> UT d'entrée (trigger final uniquement). Seules les UT > UT d'entrée portent des POI.
+HTF_CASCADE = tuple(sorted({HTF_MINUTES, 15, 5}, reverse=True))
+POI_MAX_AGE = _env_int("POI_MAX_AGE", 60)                  # âge max d'un POI (OB / FVG), en bougies de sa propre UT
+POI_MIN_ATR = _env_float("POI_MIN_ATR", 0.15)              # taille mini d'un POI, en ATR de son UT (écarte les micro-gaps)
+SWEEP_LOOKBACK = _env_int("SWEEP_LOOKBACK", 10)            # bougies d'entrée comparées pour détecter un balayage de liquidité
 SL_BUFFER_ATR = _env_float("SL_BUFFER_ATR", 0.1)   # buffer au-delà de la ligne du BOS
 MIN_SL_ATR = _env_float("MIN_SL_ATR", 0.3)         # SL minimum (en ATR)
 MAX_SL_ATR = _env_float("MAX_SL_ATR", 6.0)         # au-delà : signal ignoré (BOS trop ancien)
 BE_RR = _env_float("BE_RR", 2.0)          # RR auquel le SL est déplacé à l'entrée (BE)
 TP_RR = _env_float("TP_RR", 4.0)          # RR de la TP finale (clôture complète, pas de TP1/TP2)
 RR_LEVELS = (1.0, 2.0, 3.0)                # paliers intermédiaires notifiés au groupe (hors TP finale)
+# ⚙️ PARAMÈTRES SIGNAL (menu Telegram) : TP_RR, HTF_FILTER et le timeframe ci-dessus ne sont que les valeurs de
+# DÉPART ; le choix fait sur Telegram est mémorisé en base (table settings) et prime après chaque redémarrage.
+SIGNAL_RR_CHOICES = (1, 2, 3, 4)     # boutons « RR1 | RR2 | RR3 | RR4 »
+SIGNAL_TF_CHOICES = (1, 5, 15)       # boutons « M1 | M5 | M15 » (timeframe du déclenchement final)
 MAX_POSITIONS = _env_int("MAX_POSITIONS", 3)     # positions max en cours par actif
 
 # --- Type d'entrée : DIRECT (au marché) ou LIMIT (on attend le retour du prix) ---------------
@@ -173,6 +189,9 @@ def scan_interval():
     """Secondes entre deux vérifications : SCAN_INTERVAL si défini, sinon 5 s en M1 et 20 s au-delà."""
     return _SCAN_INTERVAL_ENV or (5 if TIMEFRAME_MIN == 1 else 20)
 CANDLES_LIMIT = 300
+if "--selftest" in sys.argv:   # auto-tests (section 11) : base SQLite jetable, jamais celle de production
+    import tempfile
+    os.environ["DB_PATH"] = os.path.join(tempfile.mkdtemp(), "selftest.db")
 DB_PATH = os.getenv("DB_PATH", "alphabot.db")
 DAILY_REPORT_HOUR_UTC = _env_int("DAILY_REPORT_HOUR_UTC", 21)
 
@@ -272,6 +291,44 @@ def get_leverage():
 
 def set_leverage(v):
     set_setting("leverage", round(float(v), 2))
+
+
+# --- paramètres signal : RR et filtre HTF (modifiables à chaud depuis Telegram) ---------------------
+def get_tp_rr():
+    """RR de la TP finale des NOUVEAUX signaux : dernier choix Telegram, sinon TP_RR (Render / défaut)."""
+    try:
+        v = float(get_setting("tp_rr", TP_RR))
+    except (TypeError, ValueError):
+        return TP_RR
+    return v if v > 0 else TP_RR
+
+
+def set_tp_rr(v):
+    set_setting("tp_rr", float(v))
+
+
+def get_htf_filter():
+    """Filtre HTF actif ? Dernier choix Telegram, sinon HTF_FILTER (Render / défaut)."""
+    v = get_setting("htf_filter")
+    return HTF_FILTER if v is None else str(v) == "1"
+
+
+def set_htf_filter(on):
+    set_setting("htf_filter", "1" if on else "0")
+
+
+def trade_tp_rr(trade):
+    """RR de la TP d'UN trade, relu depuis son entrée / SL initial / TP enregistrés au moment du signal.
+    Changer le RR sur Telegram n'affecte donc jamais un trade déjà ouvert. Repli : TP_RR (anciens trades sans TP)."""
+    try:
+        risk = abs(trade["entry"] - trade["sl_initial"])
+        if trade.get("tp") is not None and risk > 0:
+            rr = round(abs(trade["tp"] - trade["entry"]) / risk, 2)
+            if rr > 0:
+                return rr
+    except (KeyError, TypeError):
+        pass
+    return TP_RR
 
 
 # --- timeframe (modifiable à chaud) --------------------------------------------------------
@@ -408,20 +465,22 @@ BINANCE_BASES = ["https://api.binance.com", "https://data-api.binance.vision"]  
 BINANCE_INTERVALS = {1: "1m", 3: "3m", 5: "5m", 15: "15m", 30: "30m", 60: "1h"}
 
 
-def _only_closed(candles):
+def _only_closed(candles, tf_sec=None):
     now = time.time()
-    return sorted((c for c in candles if c["t"] + TF_SEC + CLOSE_GRACE_SEC <= now),
+    tf_sec = tf_sec or TF_SEC
+    return sorted((c for c in candles if c["t"] + tf_sec + CLOSE_GRACE_SEC <= now),
                   key=lambda c: c["t"])
 
 
 # --- BTC : API publique Binance (klines), sans clé --------------------------------------
-def _binance(symbol):
+def _binance(symbol, minutes=None):
     last_err = None
+    interval = BINANCE_INTERVALS[minutes or TIMEFRAME_MIN]
     for base in BINANCE_BASES:
         try:
             r = requests.get(
                 base + "/api/v3/klines",
-                params={"symbol": symbol, "interval": BINANCE_INTERVALS[TIMEFRAME_MIN],
+                params={"symbol": symbol, "interval": interval,
                         "limit": CANDLES_LIMIT},
                 timeout=15)
             r.raise_for_status()
@@ -480,10 +539,11 @@ def _deriv_request(payload):
     raise RuntimeError(f"Deriv indisponible : {last_err}")
 
 
-def _deriv(deriv_symbol):
+def _deriv(deriv_symbol, minutes=None):
     """Bougies du timeframe demandé, construites par Deriv (ticks_history, style candles)."""
+    sec = (minutes or TIMEFRAME_MIN) * 60
     msg = _deriv_request({
-        "ticks_history": deriv_symbol, "style": "candles", "granularity": TF_SEC,
+        "ticks_history": deriv_symbol, "style": "candles", "granularity": sec,
         "count": CANDLES_LIMIT, "end": "latest",
         "adjust_start_time": 1,   # marché fermé (week-end) : recule jusqu'aux dernières bougies dispo
     })
@@ -491,16 +551,19 @@ def _deriv(deriv_symbol):
              "l": float(k["low"]), "c": float(k["close"])} for k in msg["candles"]]
 
 
-def get_candles(symbol):
-    """Retourne la liste des bougies clôturées (plus ancienne -> plus récente)."""
+def get_candles(symbol, minutes=None):
+    """Retourne la liste des bougies clôturées (plus ancienne -> plus récente).
+
+    minutes=None -> timeframe actuellement sélectionné (M1/M5/...) ; sinon un autre timeframe fixe
+    (ex. HTF_MINUTES) sans toucher au suivi des positions ni aux signaux en cours."""
     cfg = SYMBOLS[symbol]
     if cfg["source"] == "deriv":
-        raw = _deriv(cfg["deriv_symbol"])
+        raw = _deriv(cfg["deriv_symbol"], minutes)
     elif cfg["source"] == "binance":
-        raw = _binance(cfg["binance_symbol"])
+        raw = _binance(cfg["binance_symbol"], minutes)
     else:
         raise ValueError(f"Source de prix inconnue pour {symbol} : {cfg['source']}")
-    return _only_closed(raw)
+    return _only_closed(raw, (minutes or TIMEFRAME_MIN) * 60)
 
 
 # ============================================================================
@@ -516,6 +579,13 @@ def get_candles(symbol):
 #     CHOCH1 : CHoCH qui suit un BOS (retournement classique)
 #     CHOCH2 : CHoCH qui suit directement un autre CHoCH (CHoCH + CHoCH)
 # - SL : sous la ligne du dernier BOS opposé (achat) / au-dessus (vente), + petit buffer ATR.
+# - Filtre HTF ON : cascade H1 -> M15 -> M5 -> entrée (M1 par défaut), chaque UT a UN rôle :
+#     H1  = biais principal + liquidité externe · M15 = confirmation du contexte (H1 et M15 doivent être alignés)
+#     M5  = retracement / liquidité interne / fin du mouvement (CHoCH M5 dans le sens du contexte)
+#     M1  = trigger final UNIQUEMENT : il ne détermine jamais le biais et ne peut pas s'opposer au contexte.
+#     Chaîne : contexte -> liquidité interne -> sweep / réaction -> fin du retracement -> CHoCH M5 -> POI (OB / FVG) mitigé -> CHoCH M1.
+#     Un CHoCH M1 contre le contexte = retracement interne, jamais un signal. Le biais ne change que si la structure H1 ET M15
+#     est réellement cassée (clôture au-delà d'un swing, règles d'`analyze`) : le contexte opposé devient alors le contexte valide.
 # ============================================================================
 
 def atr_series(c, period=ATR_PERIOD):
@@ -586,31 +656,370 @@ def analyze(c, depth=SWING_DEPTH):
     return events
 
 
-def build_signal(c, ev):
-    """Transforme un CHoCH en signal (entrée, SL, TP). None si invalide."""
-    if ev["kind"] != "CHOCH" or ev["sl_level"] is None:
+_htf_cache = {}       # symbole -> (epoch du dernier calcul, direction : 1 haussier / -1 baissier / 0 inconnu)
+HTF_CACHE_SEC = 300   # le H1 ne clôture qu'1x/heure : inutile de le retélécharger à chaque scan
+
+
+def htf_bias(symbol):
+    """Tendance actuelle sur l'unité de temps HTF_MINUTES (H1 par défaut) : 1 haussier, -1 baissier,
+    0 si indéterminé (pas assez de bougies / erreur réseau -> le filtre HTF laisse alors passer).
+
+    Sert à distinguer la liquidité externe (la direction HTF, celle qu'on a le droit de trader) de la
+    liquidité interne (un retracement à contre-sens sur l'unité de temps courte, qu'on ne trade pas)."""
+    now = time.time()
+    cached = _htf_cache.get(symbol)
+    if cached and now - cached[0] < HTF_CACHE_SEC:
+        return cached[1]
+    try:
+        raw = get_candles(symbol, minutes=HTF_MINUTES)
+    except Exception as e:
+        print(f"[{symbol}] htf_bias : lecture H{HTF_MINUTES // 60 or 1} impossible ({e}) — filtre neutre ce passage")
+        return cached[1] if cached else 0
+    trend = _last_dir(raw)
+    _htf_cache[symbol] = (now, trend)
+    return trend
+
+
+def _last_dir(raw):
+    """Direction de la dernière cassure de structure d'`analyze` (1 / -1) ; 0 si pas assez de bougies ou aucune cassure."""
+    if len(raw) <= 2 * SWING_DEPTH + 1:
+        return 0
+    evs = analyze(raw)
+    return evs[-1]["dir"] if evs else 0
+
+
+# --- Filtre HTF ON : HTF = CONTEXTE · POI = ZONE DE RÉACTION · CHoCH = DÉCLENCHEUR -------------------------
+# Rien de neuf côté structure : les POI sont tirés des cassures que `analyze` détecte déjà, sur H1 / M15 / M5.
+_ctx_cache = {}   # (symbole, UT en minutes) -> (epoch du calcul, bougies clôturées)
+
+
+def _ctx_candles(symbol, tf):
+    """Bougies clôturées d'une UT de contexte (H1 / M15 / M5), gardées en cache quelques secondes.
+    Liste vide si la lecture échoue et qu'aucun cache n'existe."""
+    now = time.time()
+    hit = _ctx_cache.get((symbol, tf))
+    if hit and now - hit[0] < min(HTF_CACHE_SEC, tf * 12):   # 1/5 de la durée d'une bougie, plafonné à HTF_CACHE_SEC
+        return hit[1]
+    try:
+        raw = get_candles(symbol, minutes=tf)
+    except Exception as e:
+        print(f"[{symbol}] contexte {_tf_lbl(tf)} : lecture impossible ({e})")
+        return hit[1] if hit else []
+    _ctx_cache[(symbol, tf)] = (now, raw)
+    return raw
+
+
+def find_pois(raw, tf, d):
+    """POI (OB / FVG) de sens d (1 = haussier / demande, -1 = baissier / offre) sur les bougies `raw` d'une UT.
+
+    Un POI naît d'une cassure de structure récente de `analyze` (dans le sens d) :
+      OB  = dernière bougie de couleur opposée à l'origine de l'impulsion (plus bas / plus haut de la jambe)
+      FVG = déséquilibre à 3 bougies à l'intérieur de cette impulsion
+    Valide tant qu'aucune clôture ultérieure ne le traverse. Plus récent d'abord."""
+    n = len(raw)
+    if n <= 2 * SWING_DEPTH + 1:
+        return []
+    atr, out = atr_series(raw), []
+
+    def _add(kind, lo, hi, f):   # f = bougie qui valide la zone
+        far = lo if d == 1 else hi   # bord lointain : une clôture au-delà = POI traversé, donc mort
+        if hi - lo < POI_MIN_ATR * atr[f] or any((x["c"] - far) * d < 0 for x in raw[f + 1:]):
+            return
+        out.append({"kind": kind, "tf": tf, "d": d, "lo": lo, "hi": hi, "f": f,
+                    "t_valid": raw[f]["t"] + tf * 60})   # utilisable dès la clôture de la bougie f (pas de lookahead)
+
+    for ev in analyze(raw):
+        i, s = ev["i"], ev["src"]
+        if ev["dir"] != d or i < n - POI_MAX_AGE:
+            continue
+        rng = range(s, i + 1)
+        o = min(rng, key=lambda k: raw[k]["l"]) if d == 1 else max(rng, key=lambda k: raw[k]["h"])   # origine
+        ob = next((k for k in range(o, s - 1, -1) if (raw[k]["c"] - raw[k]["o"]) * d < 0), None)
+        if ob is not None:
+            _add("OB", raw[ob]["l"], raw[ob]["h"], i)
+        for k in range(o + 1, i):   # bougies k-1, k, k+1 : le gap est entre la 1re et la 3e
+            lo, hi = (raw[k - 1]["h"], raw[k + 1]["l"]) if d == 1 else (raw[k + 1]["h"], raw[k - 1]["l"])
+            if hi > lo:
+                _add("FVG", lo, hi, k + 1)
+    uniq = {(p["kind"], p["lo"], p["hi"]): p for p in out}
+    return sorted(uniq.values(), key=lambda p: -p["f"])
+
+
+def poi_reaction(c, ev, poi):
+    """Sur les bougies d'entrée `c` : le point de retournement (extrême de la jambe qui précède le CHoCH `ev`)
+    a-t-il RÉELLEMENT mitigé le POI, puis réagi ? Retourne (mitigation: bool, réaction: str | None).
+
+    Mitigation réelle : la mèche du point de retournement entre dans la zone (le POI existait déjà à ce moment
+    et aucune clôture d'entrée ne l'a traversé). Réaction : bougie de rejet dans le sens du trade qui clôture
+    au-delà du milieu du POI, OU balayage de liquidité (mèche au-delà du dernier extrême, clôture de retour)."""
+    d, i = ev["dir"], ev["i"]
+    e = _turn_index(c, ev)
+    x, lo, hi = c[e], poi["lo"], poi["hi"]
+    far = lo if d == 1 else hi
+    if x["t"] < poi["t_valid"] or any((k["c"] - far) * d < 0 for k in c[:i + 1] if k["t"] >= poi["t_valid"]):
+        return False, None   # POI pas encore formé au retournement, ou déjà traversé par une clôture
+    if not (x["l"] <= hi and x["h"] >= lo):
+        return False, None   # le retournement s'est fait hors de la zone : pas de mitigation réelle
+    mid = (lo + hi) / 2
+    if any((c[j]["c"] - c[j]["o"]) * d > 0 and (c[j]["c"] - mid) * d > 0 for j in range(e, max(i, e + 1))):
+        return True, "rejet du POI"
+    if _sweep_at(c, e, d)[1]:
+        return True, "balayage de liquidité"
+    return True, None
+
+
+def _turn_index(c, ev):
+    """Index du point de retournement : extrême de la jambe (du swing cassé `src` jusqu'au CHoCH `ev`) — plus bas si le CHoCH
+    est haussier, plus haut s'il est baissier."""
+    d, rng = ev["dir"], range(ev["src"], ev["i"] + 1)
+    return min(rng, key=lambda k: c[k]["l"]) if d == 1 else max(rng, key=lambda k: c[k]["h"])
+
+
+def _sweep_at(c, e, d):
+    """Balayage de liquidité sur la bougie e : mèche au-delà du dernier extrême des SWEEP_LOOKBACK bougies précédentes, puis clôture
+    de retour. Retourne (niveau balayé | None, balayé: bool) — d = 1 : liquidité sous les plus bas, d = -1 : au-dessus des plus hauts."""
+    prior = c[max(0, e - SWEEP_LOOKBACK):e]
+    if not prior:
+        return None, False
+    x = c[e]
+    if d == 1:
+        lvl = min(k["l"] for k in prior)
+        return lvl, x["l"] < lvl < x["c"]
+    lvl = max(k["h"] for k in prior)
+    return lvl, x["h"] > lvl > x["c"]
+
+
+def _poi_log(symbol, msg):
+    if DEBUG_CHOCH:
+        print(f"[{symbol}]   {msg}")
+
+
+def _tf_lbl(tf):
+    return TF_LABELS.get(tf, f"M{tf}")
+
+
+def _poi_txt(p, dec):
+    return f"{_tf_lbl(p['tf'])} {p['kind']} {'bullish' if p['d'] == 1 else 'bearish'} {p['lo']:.{dec}f}-{p['hi']:.{dec}f}"
+
+
+def _dir_txt(d):
+    return {1: "haussier", -1: "baissier", 0: "indéterminé"}[d]
+
+
+def _ext_liquidity(symbol, d, dec):
+    """H1 = liquidité externe (LOG UNIQUEMENT, ne filtre rien) : extrême de la jambe H1 en cours dans le sens du contexte d
+    (plus haut si haussier, plus bas si baissier), c'est-à-dire la liquidité que le prix vise à l'extérieur du range interne."""
+    h1 = _ctx_candles(symbol, HTF_MINUTES)
+    evs = analyze(h1) if len(h1) > 2 * SWING_DEPTH + 1 else []
+    if not evs or evs[-1]["dir"] != d:
+        return "indéterminée"
+    leg = h1[evs[-1]["src"]:]
+    lvl = max(k["h"] for k in leg) if d == 1 else min(k["l"] for k in leg)
+    return (f"H{HTF_MINUTES // 60 or 1} {'haut' if d == 1 else 'bas'} {lvl:.{dec}f} "
+            f"(à {abs(lvl - h1[-1]['c']):.{dec}f} pts du prix)")
+
+
+def m5_retracement(symbol, d, dec):
+    """M5 = retracement, liquidité interne, fin du mouvement, pour un contexte H1/M15 de sens d (1 / -1).
+
+    Ne refait aucune détection : dernière cassure de `analyze` sur M5, `_turn_index` / `_sweep_at` / `find_pois` / `poi_reaction`.
+      EN COURS      : la structure M5 est encore à contre-sens du contexte -> retracement pas terminé
+      AUCUN         : M5 déjà dans le sens du contexte via un BOS -> pas de retracement à attendre (continuation)
+      TERMINÉ       : CHoCH M5 dans le sens du contexte, avec sweep de liquidité interne OU réaction sur un POI
+      NON CONFIRMÉ  : CHoCH M5 dans le sens du contexte, mais ni sweep ni réaction -> fin du retracement non prouvée
+      INDÉTERMINÉ   : pas assez de bougies M5 (ou lecture impossible)
+    Retourne {"state", "liq" (liquidité interne), "choch" (CHoCH M5)} — textes pour les logs."""
+    m5 = _ctx_candles(symbol, 5)
+    evs = analyze(m5) if len(m5) > 2 * SWING_DEPTH + 1 else []
+    if not evs:
+        return {"state": "INDÉTERMINÉ", "liq": "—", "choch": "—"}
+    last = evs[-1]
+    word = "haut" if d == -1 else "bas"   # extrême de la jambe de retracement : bas si contexte haussier, haut sinon
+    if last["dir"] != d:
+        leg = m5[last["src"]:]
+        lvl = min(k["l"] for k in leg) if d == 1 else max(k["h"] for k in leg)
+        return {"state": "EN COURS", "liq": f"M5 {word} {lvl:.{dec}f} (extrême du retracement en cours, pas de CHoCH M5 {_dir_txt(d)})",
+                "choch": f"non — dernière cassure M5 : {last['kind']} {_dir_txt(last['dir'])}"}
+    if last["kind"] != "CHOCH":
+        return {"state": "AUCUN", "liq": "— (M5 déjà dans le sens du contexte, pas de retracement)",
+                "choch": f"non requis — M5 en {last['kind']} {_dir_txt(d)}"}
+
+    op = ">" if d == 1 else "<"
+    choch = f"{last['type']} {_dir_txt(d)} · clôture {m5[last['i']]['c']:.{dec}f} {op} {last['level']:.{dec}f}"
+    e = _turn_index(m5, last)
+    lvl, swept = _sweep_at(m5, e, d)
+    proof = f"balayage de liquidité interne ({word} {lvl:.{dec}f})" if swept else None
+    if not proof:   # à défaut de sweep : le point de retournement M5 a mitigé un POI H1 / M15 / M5 et y a réagi
+        for tf in (t for t in HTF_CASCADE if t >= 5):
+            for p in find_pois(_ctx_candles(symbol, tf), tf, d):
+                mit, react = poi_reaction(m5, last, p)
+                if mit and react:
+                    proof = f"{react} sur {_poi_txt(p, dec)}"
+                    break
+            if proof:
+                break
+    liq = f"M5 {word} {lvl:.{dec}f} " + ("balayé" if swept else "non balayé") if lvl is not None else "M5 — (pas d'historique)"
+    if not proof:
+        return {"state": "NON CONFIRMÉ", "liq": liq, "choch": choch + " · aucun sweep ni réaction"}
+    return {"state": "TERMINÉ", "liq": liq, "choch": f"{choch} · {proof}"}
+
+
+def _mtf_block(symbol, tr, final):
+    """Synthèse de l'analyse multi-UT d'un CHoCH d'entrée : HTF bias / liquidité externe / liquidité interne / état du
+    retracement / CHoCH M5 / trigger / POI / état final. Toujours les mêmes lignes, « — » pour une étape non atteinte."""
+    rows = (("HTF bias", "htf"), ("liquidité ext.", "ext"), ("liquidité int.", "int"), ("retracement", "retr"),
+            ("CHoCH M5", "choch5"), (f"trigger {_tf_lbl(TIMEFRAME_MIN)}", "trigger"), ("POI", "poi"))
+    print(f"[{symbol}] ▸ analyse multi-UT")
+    for lbl, k in rows:
+        print(f"[{symbol}]   {lbl:<15}: {tr.get(k, '—')}")
+    print(f"[{symbol}]   {'état final':<15}: {final}")
+
+
+def htf_poi_setup(symbol, c, ev, trace=None):
+    """Filtre HTF ON. Cascade H1 -> M15 -> M5 -> entrée : chaque UT a un rôle, l'entrée (M1) n'est que le trigger.
+
+      1) H1 = biais principal (+ liquidité externe) ; M15 = confirmation : H1 et M15 doivent être alignés -> contexte.
+         Contexte indéterminé ou non confirmé -> aucun signal. Le M1 ne détermine jamais seul le biais.
+      2) CHoCH d'entrée contre le contexte = retracement interne (liquidité interne) : jamais un signal. Le contexte ne change
+         que si H1 ET M15 cassent réellement leur structure (clôture au-delà d'un swing, règles d'`analyze`).
+      3) M5 : le retracement doit être terminé (`m5_retracement`) : CHoCH M5 dans le sens du contexte après sweep / réaction,
+         ou M5 déjà dans le sens du contexte (continuation).
+      4) POI (OB / FVG) valide, mitigé pour de vrai, avec réaction / liquidité — inchangé (`find_pois` / `poi_reaction`).
+      5) Le CHoCH d'entrée (validé par `analyze` / `build_signal` : clôture, ATR, ENTRY_CHOCH1/2 — inchangé) est le trigger.
+    Les UT >= UT d'entrée sont sautées (entrée M5 : pas d'étape M5 ; entrée M15 : ni M15 ni M5).
+    Retourne (setup, poi, motif_de_refus) ; motif_de_refus vaut None quand le signal est accepté.
+    `trace` (dict) est rempli au fil des étapes pour `_mtf_block`."""
+    tr = trace if trace is not None else {}
+    d, dec = ev["dir"], SYMBOLS[symbol]["decimals"]
+    side, htf, tfl = ("BUY" if d == 1 else "SELL"), f"H{HTF_MINUTES // 60 or 1}", _tf_lbl(TIMEFRAME_MIN)
+    setup = "CONTINUATION"   # seul setup possible : un contexte aligné, jamais un trade à contre-sens
+    tr["trigger"] = (f"{ev['type']} {_dir_txt(d)} · clôture {c[ev['i']]['c']:.{dec}f} "
+                     f"{'>' if d == 1 else '<'} {ev['level']:.{dec}f}")
+
+    # 1) contexte : H1 (biais) confirmé par M15
+    bias = htf_bias(symbol)
+    use_m15 = TIMEFRAME_MIN < 15
+    m15 = _last_dir(_ctx_candles(symbol, 15)) if use_m15 else bias
+    ctx_txt = f"{htf} {_dir_txt(bias)}" + (f" · M15 {_dir_txt(m15)}" if use_m15 else "")
+    if bias:
+        tr["ext"] = _ext_liquidity(symbol, bias, dec)
+    if bias == 0:
+        tr["htf"] = f"{ctx_txt} → contexte INDÉTERMINÉ"
+        return setup, None, f"biais {htf} indéterminé -- {tfl} ne peut pas déterminer le biais seul"
+    if m15 != bias:
+        tr["htf"] = f"{ctx_txt} → contexte NON CONFIRMÉ"
+        return setup, None, (f"contexte non confirmé : {htf} {_dir_txt(bias)} / M15 {_dir_txt(m15)} "
+                             f"-- pas de trade tant que M15 n'est pas aligné avec {htf}")
+    tr["htf"] = f"{ctx_txt} → contexte {_dir_txt(bias).upper()}"
+
+    # 2) un CHoCH d'entrée à contre-sens du contexte est un retracement interne, pas une entrée
+    if d != bias:
+        return setup, None, (f"{side} contre le contexte {_dir_txt(bias)} ({ctx_txt}) : retracement interne, pas une entrée "
+                             f"-- le biais ne change que si {htf} et M15 cassent réellement leur structure")
+
+    # 3) M5 : liquidité interne -> sweep / réaction -> fin du retracement -> CHoCH M5
+    if TIMEFRAME_MIN < 5:
+        r = m5_retracement(symbol, d, dec)
+        tr.update({"int": r["liq"], "retr": r["state"], "choch5": r["choch"]})
+        if r["state"] == "INDÉTERMINÉ":
+            return setup, None, "structure M5 indéterminée -- retracement impossible à évaluer"
+        if r["state"] == "EN COURS":
+            return setup, None, (f"retracement M5 en cours (M5 encore {_dir_txt(-d)}) -- {tfl} seul ne suffit pas, "
+                                 f"attendre un CHoCH M5 {_dir_txt(d)}")
+        if r["state"] == "NON CONFIRMÉ":
+            return setup, None, "CHoCH M5 sans balayage de liquidité interne ni réaction sur POI -- fin du retracement non confirmée"
+    else:
+        tr.update({"int": "—", "retr": f"non applicable (UT d'entrée {tfl})", "choch5": "—"})
+
+    # 4) POI -> mitigation -> réaction (inchangé)
+    tfs = [tf for tf in HTF_CASCADE if tf > TIMEFRAME_MIN]
+    if not tfs:   # UT d'entrée >= H1 : aucune UT supérieure pour porter un POI -> le contexte aligné suffit (filtre d'origine)
+        tr["poi"] = "non applicable (aucune UT supérieure à l'entrée)"
+        return setup, None, None
+    _poi_log(symbol, f"{side} {ev['type']} : {ctx_txt} -> {setup}")
+
+    found = []   # H1 -> M15 -> M5 : la plus haute UT prime
+    for tf in tfs:
+        pois = find_pois(_ctx_candles(symbol, tf), tf, d)
+        if pois:
+            _poi_log(symbol, "POI détecté : " + " | ".join(_poi_txt(p, dec) for p in pois[:3])
+                     + (f" (+{len(pois) - 3})" if len(pois) > 3 else ""))
+        found += pois
+    if not found:
+        tr["poi"] = "aucun"
+        return setup, None, (f"aucun POI {'bullish' if d == 1 else 'bearish'} valide sur "
+                             f"{'/'.join(_tf_lbl(t) for t in tfs) or 'aucune UT'} -- un CHoCH seul ne suffit pas")
+
+    touched = []   # (POI, réaction) pour chaque POI réellement mitigé
+    for p in found:
+        mit, react = poi_reaction(c, ev, p)
+        if mit:
+            touched.append((p, react))
+    if not touched:
+        tr["poi"] = f"{len(found)} POI détecté(s), aucun mitigé"
+        return setup, None, "aucune mitigation réelle : le point de retournement n'a touché aucun POI"
+    poi, react = next(((p, r) for p, r in touched if r), touched[0])
+    _poi_log(symbol, f"mitigation {_poi_txt(poi, dec)} : le point de retournement est entré dans la zone")
+    if not react:
+        tr["poi"] = f"{_poi_txt(poi, dec)} mitigé, sans réaction"
+        return setup, None, f"POI {_poi_txt(poi, dec)} mitigé mais ni réaction ni balayage de liquidité"
+    tr["poi"] = f"{_poi_txt(poi, dec)} mitigé · {react}"
+    _poi_log(symbol, f"réaction : {react}")
+    _poi_log(symbol, f"CHoCH confirmé ({ev['type']}) : clôture {c[ev['i']]['c']:.{dec}f} au-delà de {ev['level']:.{dec}f}")
+    return setup, poi, None
+
+
+def build_signal(c, ev, symbol=None):
+    """Transforme un CHoCH en signal (entrée, SL, TP). None si invalide.
+
+    DEBUG_CHOCH=True (par défaut) : chaque CHoCH ignoré est loggé avec la raison, pour ne plus
+    jamais se demander en silence pourquoi tel retournement n'a pas donné de signal.
+    """
+    trace = {}   # rempli par htf_poi_setup : HTF bias / liquidités / retracement / CHoCH M5 / trigger / POI
+
+    def _rej(reason):
+        if symbol and DEBUG_CHOCH:
+            side = "BUY" if ev["dir"] == 1 else "SELL"
+            print(f"[{symbol}] CHoCH {side} {ev.get('type') or ev['kind']} ignoré : {reason}")
+            if trace:
+                _mtf_block(symbol, trace, f"⛔ REJETÉ -- {reason}")
         return None
+
+    if ev["kind"] != "CHOCH":
+        return None
+    if ev["sl_level"] is None:
+        return _rej("pas de niveau de repli valide (sl_level manquant)")
     if ev["type"] == "CHOCH1" and not ENTRY_CHOCH1:
-        return None
+        return _rej("ENTRY_CHOCH1 désactivé")
     if ev["type"] == "CHOCH2" and not ENTRY_CHOCH2:
-        return None
+        return _rej("ENTRY_CHOCH2 désactivé")
+    htf_on, tp_rr = get_htf_filter(), get_tp_rr()   # réglages Telegram, lus à chaque signal : effet immédiat
+    setup = poi = None
+    if htf_on and symbol:
+        # HTF = contexte · POI = zone de réaction · CHoCH = déclencheur : plus de blocage automatique contre le biais H1
+        setup, poi, why = htf_poi_setup(symbol, c, ev, trace)
+        if why:
+            return _rej(why)
     d, a = ev["dir"], ev["atr"]
     entry = c[ev["i"]]["c"]
     sl = ev["sl_level"] - d * SL_BUFFER_ATR * a
     if (d == 1 and sl >= entry) or (d == -1 and sl <= entry):
-        return None
+        return _rej(f"SL structurel du mauvais côté de l'entrée (sl={sl:.2f}, entrée={entry:.2f})")
     risk = abs(entry - sl)
     if risk < MIN_SL_ATR * a:
         risk = MIN_SL_ATR * a
         sl = entry - d * risk
     if risk > MAX_SL_ATR * a:
-        return None
+        return _rej(f"SL trop large : {risk:.2f} pts > {MAX_SL_ATR}xATR ({MAX_SL_ATR * a:.2f} pts) "
+                    f"-- niveau de référence trop ancien/éloigné")
     sig = {
         "dir": d, "side": "BUY" if d == 1 else "SELL", "type": ev["type"],
         "order": "MARKET", "ref_price": entry,
         "entry": entry, "sl": sl, "risk": risk,
-        "tp": entry + d * risk * TP_RR,
+        "tp": entry + d * risk * tp_rr,
         "t": ev["t"], "bos_level": ev["sl_level"],
+        "rr": tp_rr, "htf": htf_on, "tf": TF_LABEL,   # affichés sur le signal
+        "setup": setup, "poi": poi,                   # CONTINUATION (None si filtre HTF OFF)
     }
     # Entrée LIMIT : retest du niveau cassé (la ligne du CHoCH), avec le même SL structurel.
     lvl = ev["level"]
@@ -622,7 +1031,12 @@ def build_signal(c, ev):
             sl = lvl - d * risk_l
         # si le prix a déjà dépassé le seuil d'annulation, la limit n'a plus de sens : on reste en DIRECT
         if (entry - lvl) * d < LIMIT_CANCEL_RR * risk_l:
-            sig.update(order="LIMIT", entry=lvl, sl=sl, risk=risk_l, tp=lvl + d * risk_l * TP_RR)
+            sig.update(order="LIMIT", entry=lvl, sl=sl, risk=risk_l, tp=lvl + d * risk_l * tp_rr)
+    if setup:   # dernier maillon de la chaîne POI -> mitigation -> réaction -> CHoCH : accepté (les refus passent par _rej)
+        src = f" depuis {_poi_txt(poi, SYMBOLS[symbol]['decimals'])}" if poi else ""
+        print(f"[{symbol}] signal ACCEPTÉ : {sig['side']} {sig['type']} -- {setup}{src}")
+        if trace:
+            _mtf_block(symbol, trace, f"✅ ACCEPTÉ -- {sig['side']} {sig['type']} · {setup}{src}")
     return sig
 
 
@@ -688,6 +1102,7 @@ def track_trade(trade, candles):
     events = []
     side = 1 if trade["side"] == "BUY" else -1
     entry, risk = trade["entry"], abs(trade["entry"] - trade["sl_initial"])
+    tp_rr = trade_tp_rr(trade)   # RR de CE trade (fixé à l'ouverture), pas le réglage courant
     last_ts = trade["last_ts"]
 
     for c in candles:
@@ -732,20 +1147,24 @@ def track_trade(trade, candles):
         # 2) progression : paliers RR1/RR2/RR3 (notification groupe, BE combiné au palier BE_RR)
         r_fav = (favorable - entry) * side / risk
         for lvl in RR_LEVELS:
+            if lvl > tp_rr:
+                continue   # palier au-delà de la TP de ce trade : jamais atteint (trade clôturé avant)
             field = f"rr{int(lvl)}_hit"
             if not trade[field] and r_fav >= lvl:
                 trade[field] = 1
+                if lvl >= tp_rr:
+                    continue   # palier = TP finale : annoncé par l'événement TP, pas en double
                 be_now = not trade["be_hit"] and lvl >= BE_RR
                 if be_now:
                     trade["be_hit"], trade["sl"] = 1, entry
                 events.append({"name": f"RR{int(lvl)}", "be_moved": be_now, "trade": dict(trade)})
         # BE_RR peut ne pas être un palier RR1/2/3 rond (ex. BE_RR=2.5) : on le couvre séparément
-        if not trade["be_hit"] and BE_RR not in RR_LEVELS and r_fav >= BE_RR:
+        if not trade["be_hit"] and BE_RR not in RR_LEVELS and BE_RR < tp_rr and r_fav >= BE_RR:
             trade["be_hit"], trade["sl"] = 1, entry
             events.append({"name": "BE_MOVED", "trade": dict(trade)})
-        if r_fav >= TP_RR:
-            trade.update(status="CLOSED", closed_ts=c["t"], result_r=TP_RR,
-                         pnl_usd=TP_RR * trade["risk_usd"], outcome="TP")
+        if r_fav >= tp_rr:
+            trade.update(status="CLOSED", closed_ts=c["t"], result_r=tp_rr,
+                         pnl_usd=tp_rr * trade["risk_usd"], outcome="TP")
             events.append({"name": "TP", "trade": dict(trade)})
             break
 
@@ -830,6 +1249,274 @@ def make_chart(symbol, candles, events, sig, decimals=2, n_show=70, extend=25):
     fig.savefig(path, facecolor=fig.get_facecolor(), bbox_inches="tight")
     plt.close(fig)
     return path
+
+
+CHART_ON_EVENTS = {"SL", "BE", "TP", "RR1", "RR2", "RR3", "RR4"}  # événements accompagnés d'une image
+
+
+def make_event_chart(symbol, candles, events, trade, dec):
+    """Même rendu que le graphique d'entrée (bougies + niveaux), mais recentré sur la bougie la
+    plus récente : sert à montrer où le SL / RR / TP vient d'être touché, comme pour un signal."""
+    sig_like = {
+        "entry": trade["entry"], "sl": trade["sl"], "tp": trade["tp"],
+        "side": trade["side"], "type": trade["kind"], "order": trade.get("order_type", "MARKET"),
+        "t": candles[-1]["t"],
+    }
+    try:
+        return make_chart(symbol, candles, events, sig_like, dec)
+    except Exception as e:
+        print(f"[{symbol}] make_event_chart a échoué ({type(e).__name__}) : notification envoyée sans image")
+        return None
+
+
+# ============================================================================
+# 7bis. ANALYSE MANUELLE (menu Telegram « 📊 Analyse »)
+#
+# Lecture seule, à la demande (admin uniquement) : réutilise le moteur existant (analyze,
+# find_pois, htf_bias, _ext_liquidity, m5_retracement, _sweep_at) pour un instantané de la
+# structure H1/M15/M5/M1, sans jamais toucher au moteur de signal ni aux positions.
+# ============================================================================
+
+def make_analysis_chart(symbol, tf, candles, events, pois, price, dec, n_show=90, extend=20):
+    """Bougies réelles + structure BOS/CHoCH + zones OB/FVG proches du prix, sur l'UT `tf`."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from matplotlib.patches import Rectangle
+    except ImportError:
+        return None
+
+    os.makedirs(CHART_DIR, exist_ok=True)
+    files = sorted((os.path.join(CHART_DIR, f) for f in os.listdir(CHART_DIR)), key=os.path.getmtime)
+    for f in files[:-40]:
+        try:
+            os.remove(f)
+        except OSError:
+            pass
+
+    view = candles[-n_show:]
+    start = len(candles) - len(view)
+    fig, ax = plt.subplots(figsize=(9, 5), dpi=110)
+    fig.patch.set_facecolor("#0e1117")
+    ax.set_facecolor("#0e1117")
+
+    for k, c in enumerate(view):
+        up = c["c"] >= c["o"]
+        col = "#26a69a" if up else "#ef5350"
+        ax.plot([k, k], [c["l"], c["h"]], color=col, lw=0.8)
+        ax.add_patch(Rectangle((k - 0.3, min(c["o"], c["c"])), 0.6,
+                               max(abs(c["c"] - c["o"]), 1e-9), color=col))
+
+    for ev in events:
+        if start <= ev["i"] <= len(candles) - 1 and ev["src"] >= start and ev["kind"] != "INIT":
+            col = "#26a69a" if ev["dir"] == 1 else "#ef5350"
+            ax.plot([ev["src"] - start, ev["i"] - start], [ev["level"]] * 2, color=col, lw=0.9, ls="--")
+            ax.text((ev["src"] + ev["i"]) / 2 - start, ev["level"], ev["kind"].replace("CHOCH", "CHoCH"),
+                    color=col, fontsize=7, ha="center", va="bottom")
+
+    x0, x1 = len(view) - 1, len(view) - 1 + extend
+    for p in pois:
+        col = "#26a69a" if p["d"] == 1 else "#ef5350"
+        ax.add_patch(Rectangle((x0, p["lo"]), x1 - x0, p["hi"] - p["lo"], color=col, alpha=0.22))
+        ax.text(x1 + 0.5, (p["lo"] + p["hi"]) / 2, f"{_tf_lbl(p['tf'])} {p['kind']}", color=col, fontsize=7, va="center")
+
+    ax.axhline(price, color="#ffffff", lw=0.7, ls=":")
+    ax.text(x1 + 0.5, price, f"PRIX {price:.{dec}f}", color="#ffffff", fontsize=8, va="center")
+
+    ax.set_xlim(-1, x1 + 20)
+    lows = [c["l"] for c in view] + [p["lo"] for p in pois] + [price]
+    highs = [c["h"] for c in view] + [p["hi"] for p in pois] + [price]
+    lo, hi = min(lows), max(highs)
+    pad = (hi - lo) * 0.05 or 1
+    ax.set_ylim(lo - pad, hi + pad)
+    ax.set_title(f"{symbol} {_tf_lbl(tf)} — ANALYSE", color="white", fontsize=11)
+    ax.tick_params(colors="#888888", labelsize=7)
+    ax.set_xticks([])
+    for s in ax.spines.values():
+        s.set_color("#333333")
+    path = os.path.join(CHART_DIR, f"{symbol}_analyse_{int(time.time())}.png")
+    fig.savefig(path, facecolor=fig.get_facecolor(), bbox_inches="tight")
+    plt.close(fig)
+    return path
+
+
+def build_technical_analysis(symbol):
+    """Instantané technique H1/M15/M5/M1 : structure, liquidité, sweep, CHoCH, OB/FVG/POI, scénario.
+    Retourne (texte, chemin_image|None). N'appelle jamais build_signal : lecture seule."""
+    dec = SYMBOLS[symbol]["decimals"]
+    htf_lbl = f"H{HTF_MINUTES // 60 or 1}"
+    tfs = (HTF_MINUTES, 15, 5, 1)
+    data = {}
+    for tf in tfs:
+        raw = _ctx_candles(symbol, tf)
+        data[tf] = {"raw": raw, "events": analyze(raw)} if len(raw) > 2 * SWING_DEPTH + 1 else None
+
+    missing = [_tf_lbl(tf) for tf in tfs if not data.get(tf)]
+    if missing:
+        return (f"⚠️ Données insuffisantes pour analyser {symbol} pour le moment "
+                f"({', '.join(missing)} indisponible(s)). Réessaie dans quelques instants.", None)
+
+    price = data[1]["raw"][-1]["c"]
+    bias = htf_bias(symbol)
+
+    struct_lines = []
+    for tf in tfs:
+        evs = data[tf]["events"]
+        if not evs:
+            struct_lines.append(f"{_tf_lbl(tf)} : structure indéterminée (historique insuffisant)")
+            continue
+        last = evs[-1]
+        icon = "🟢" if last["dir"] == 1 else "🔴"
+        struct_lines.append(f"{_tf_lbl(tf)} : {icon} {_dir_txt(last['dir'])} "
+                             f"(dernier {last['kind'].replace('CHOCH', 'CHoCH')} à {last['level']:.{dec}f})")
+
+    ext_txt = _ext_liquidity(symbol, bias, dec) if bias != 0 else "indéterminée (biais H1 non confirmé)"
+    retr = m5_retracement(symbol, bias, dec) if bias != 0 else {"state": "INDÉTERMINÉ", "liq": "—", "choch": "—"}
+
+    sweep_lines = []
+    for tf in (15, 5, 1):
+        raw = data[tf]["raw"]
+        idx = len(raw) - 1
+        lvl_bull, swept_bull = _sweep_at(raw, idx, 1)     # liquidité sous les plus bas, prise puis rejetée -> haussier
+        lvl_bear, swept_bear = _sweep_at(raw, idx, -1)    # liquidité au-dessus des plus hauts, prise puis rejetée -> baissier
+        if swept_bull:
+            sweep_lines.append(f"{_tf_lbl(tf)} : balayage de liquidité côté bas ({lvl_bull:.{dec}f}) — signal haussier potentiel")
+        if swept_bear:
+            sweep_lines.append(f"{_tf_lbl(tf)} : balayage de liquidité côté haut ({lvl_bear:.{dec}f}) — signal baissier potentiel")
+    if not sweep_lines:
+        sweep_lines = ["Aucun balayage de liquidité sur la dernière bougie H15/M5/M1."]
+
+    all_bull, all_bear = [], []
+    for tf in (HTF_MINUTES, 15, 5):
+        raw = data[tf]["raw"]
+        all_bull += find_pois(raw, tf, 1)
+        all_bear += find_pois(raw, tf, -1)
+    key = lambda p: abs((p["lo"] + p["hi"]) / 2 - price)
+    all_bull.sort(key=key)
+    all_bear.sort(key=key)
+
+    poi_lines = ["Zones haussières (demande) :"] + ([f"  • {_poi_txt(p, dec)}" for p in all_bull[:3]] or ["  • aucune détectée"])
+    poi_lines += ["Zones baissières (offre) :"] + ([f"  • {_poi_txt(p, dec)}" for p in all_bear[:3]] or ["  • aucune détectée"])
+
+    zones_reaction = []
+    if all_bull:
+        zones_reaction.append(f"Support / POI le plus proche sous le prix : {_poi_txt(all_bull[0], dec)}")
+    if all_bear:
+        zones_reaction.append(f"Résistance / POI le plus proche au-dessus du prix : {_poi_txt(all_bear[0], dec)}")
+    zones_attente = [f"  • {_poi_txt(p, dec)} (haussière, plus loin)" for p in all_bull[1:3]]
+    zones_attente += [f"  • {_poi_txt(p, dec)} (baissière, plus loin)" for p in all_bear[1:3]]
+
+    if bias == 0:
+        scenario = "Biais H1 indéterminé : structure encore peu claire pour un scénario directionnel fiable — attendre une cassure nette."
+    else:
+        state_txt = {
+            "EN COURS": "le retracement M5 est toujours en cours (M5 encore à contre-sens du contexte) : pas d'entrée tant qu'un CHoCH M5 dans le sens du contexte n'apparaît pas",
+            "AUCUN": "M5 est déjà aligné avec le contexte (pas de retracement à attendre) : continuation possible",
+            "TERMINÉ": "le retracement M5 est terminé (CHoCH M5 confirmé par un balayage de liquidité ou une réaction sur POI) : le contexte peut reprendre",
+            "NON CONFIRMÉ": "un CHoCH M5 est apparu mais sans confirmation (ni sweep ni réaction sur POI) : prudence",
+            "INDÉTERMINÉ": "structure M5 insuffisante pour juger du retracement",
+        }.get(retr["state"], retr["state"])
+        scenario = (f"Contexte {htf_lbl} <b>{_dir_txt(bias).upper()}</b> (à confirmer par M15). {state_txt}. "
+                    f"Liquidité externe visée : {ext_txt}.")
+
+    text = (
+        f"📈 <b>ANALYSE TECHNIQUE — {symbol}</b>\n"
+        f"Prix actuel : <b>{price:.{dec}f}</b>\n\n"
+        f"<b>Structure multi-UT</b>\n" + "\n".join(struct_lines) + "\n\n"
+        f"<b>Liquidité</b>\n"
+        f"Externe ({htf_lbl}) : {ext_txt}\n"
+        f"Interne (M5) : {retr['liq']}\n\n"
+        f"<b>Sweep récents</b>\n" + "\n".join(sweep_lines) + "\n\n"
+        f"<b>CHoCH M5</b>\n{retr['choch']}\n\n"
+        f"<b>Zones OB / FVG / POI ({htf_lbl}/M15/M5)</b>\n" + "\n".join(poi_lines) + "\n\n"
+        + (f"<b>Zones stratégiques (réaction probable)</b>\n" + "\n".join(zones_reaction) + "\n\n" if zones_reaction else "")
+        + (f"<b>Zones d'attente</b>\n" + "\n".join(zones_attente) + "\n\n" if zones_attente else "")
+        + f"<b>Scénario technique actuel</b>\n{scenario}\n\n"
+        f"⚠️ Analyse informative — n'affecte ni le moteur de signal ni les positions en cours."
+    )
+
+    chart_tf = 15
+    chart_path = None
+    try:
+        chart_pois = (all_bull[:2] + all_bear[:2])
+        chart_path = make_analysis_chart(symbol, chart_tf, data[chart_tf]["raw"], data[chart_tf]["events"],
+                                          chart_pois, price, dec)
+    except Exception as e:
+        print(f"[{symbol}] make_analysis_chart a échoué ({type(e).__name__}) : analyse envoyée sans image")
+    return text, chart_path
+
+
+_ff_cache = {}   # calendrier ForexFactory (public, sans clé) : mis en cache 15 min
+
+
+def _forexfactory_events():
+    now = time.time()
+    if _ff_cache.get("data") is not None and now - _ff_cache.get("ts", 0) < 900:
+        return _ff_cache["data"]
+    events = []
+    for url in ("https://nfs.faireconomy.media/ff_calendar_thisweek.json",
+                "https://nfs.faireconomy.media/ff_calendar_nextweek.json"):
+        try:
+            r = requests.get(url, timeout=15)
+            if r.ok:
+                events += r.json()
+        except Exception as e:
+            print(f"[fondamental] lecture calendrier échouée ({url}) : {e}")
+    _ff_cache["data"], _ff_cache["ts"] = events, now
+    return events
+
+
+def build_fundamental_analysis(symbol):
+    """Résumé du calendrier économique public (ForexFactory, sans clé) pertinent pour l'actif.
+    Aucune génération de texte libre : uniquement des événements réels du calendrier, sans invention."""
+    try:
+        raw_events = _forexfactory_events()
+    except Exception as e:
+        return f"⚠️ Calendrier économique indisponible pour le moment ({type(e).__name__})."
+    if not raw_events:
+        return "⚠️ Calendrier économique indisponible pour le moment — réessaie plus tard."
+
+    relevant = {"USD"} | ({"CHF", "JPY"} if symbol == "XAUUSD" else set())
+    now = datetime.now(timezone.utc)
+    upcoming, recent = [], []
+    for e in raw_events:
+        cur = e.get("country") or e.get("currency")
+        if cur not in relevant or str(e.get("impact", "")).strip() not in ("High", "Medium"):
+            continue
+        try:
+            dt = datetime.fromisoformat(str(e.get("date", "")).replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        item = {"title": e.get("title", "?"), "cur": cur, "impact": e.get("impact", ""),
+                "dt": dt, "forecast": e.get("forecast", "")}
+        (upcoming if dt >= now else recent).append(item)
+    upcoming.sort(key=lambda x: x["dt"])
+    recent.sort(key=lambda x: x["dt"], reverse=True)
+    recent = [x for x in recent if (now - x["dt"]).days <= 2]
+
+    def _fmt_ev(x):
+        icon = "🔴" if x["impact"] == "High" else "🟠"
+        fc = f" (prév. {x['forecast']})" if x["forecast"] else ""
+        return f"{icon} {x['dt'].strftime('%a %d/%m %H:%M UTC')} — {x['cur']} {x['title']}{fc}"
+
+    lines_up = [_fmt_ev(x) for x in upcoming[:6]] or ["Aucun événement macro à fort impact recensé dans les prochains jours."]
+    lines_re = [_fmt_ev(x) for x in recent[:4]] or ["Aucun événement macro récent à fort impact (48h)."]
+    watch_note = (
+        "Le Gold réagit surtout aux taux réels, au dollar et à l'aversion au risque "
+        "(données Fed / inflation / emploi US, tensions géopolitiques, JPY/CHF en valeurs refuge)."
+        if symbol == "XAUUSD" else
+        "Le BTC réagit surtout à la liquidité globale et aux données macro USD (taux, inflation, emploi), "
+        "ainsi qu'au sentiment risk-on / risk-off des marchés."
+    )
+    return (
+        f"📰 <b>ANALYSE FONDAMENTALE — {symbol}</b>\n\n"
+        f"<b>À surveiller (prochains jours)</b>\n" + "\n".join(lines_up) + "\n\n"
+        f"<b>Événements récents (48h)</b>\n" + "\n".join(lines_re) + "\n\n"
+        f"<b>Contexte</b>\n{watch_note}\n\n"
+        f"⚠️ Résumé du calendrier économique public (ForexFactory) — analyse informative, "
+        f"n'affecte ni le moteur de signal ni les positions."
+    )
 
 
 # ============================================================================
@@ -1009,6 +1696,23 @@ def _exec_block(sig, dec):
             f"Entrée : <b>≈ {_fmt(sig['entry'], dec)}</b>")
 
 
+def _sig_rr(sig):
+    """RR de la TP du signal (fixé à la création ; recalculé depuis entrée / SL / TP pour un renvoi différé)."""
+    if sig.get("rr"):
+        return sig["rr"]
+    return round(abs(sig["tp"] - sig["entry"]) / sig["risk"], 2) if sig.get("risk") else TP_RR
+
+
+def _params_lines(sig, tf=None):
+    """Les 3 paramètres affichés sur un nouveau signal."""
+    htf = sig.get("htf")
+    if htf is None:
+        htf = get_htf_filter()
+    return (f"Timeframe : {tf or sig.get('tf') or TF_LABEL}\n"
+            f"RR : {_sig_rr(sig):g}\n"
+            f"Filtre HTF : {'ON' if htf else 'OFF'}")
+
+
 def group_signal(symbol, sig, position_n, dec, tf=None):
     icon = "🟢" if sig["side"] == "BUY" else "🔴"
     rr_lines = "\n".join(
@@ -1025,7 +1729,8 @@ def group_signal(symbol, sig, position_n, dec, tf=None):
         f"{rr_lines}\n"
         f"TP : {_fmt(sig['tp'], dec)} ({_dist(sig, sig['tp'], dec)} pts)\n\n"
         f"BE → RR{BE_RR:g}\n"
-        f"TP final → RR{TP_RR:g}"
+        f"TP final → RR{_sig_rr(sig):g}\n\n"
+        f"{_params_lines(sig, tf)}"
         + (f"\n\nPosition {position_n}/{MAX_POSITIONS} sur {symbol}" if position_n else "")
     )
 
@@ -1040,13 +1745,14 @@ def admin_signal(symbol, sig, risk_usd, leverage, lot_info, margin, dec):
         f"Exécution : {exec_txt}\n"
         f"{entry_line.replace('<b>', '').replace('</b>', '')}\n"
         f"SL : {_fmt(sig['sl'], dec)} (distance {_fmt(sig['risk'], dec)} pts)\n"
-        f"TP : {_fmt(sig['tp'], dec)} (RR{TP_RR:g})\n"
+        f"TP : {_fmt(sig['tp'], dec)} (RR{_sig_rr(sig):g})\n"
         f"📐 Si ton prix broker diffère : SL {_dist(sig, sig['sl'], dec)} / TP {_dist(sig, sig['tp'], dec)} "
         f"pts depuis {base}.\n\n"
         f"Risque : {risk_usd:g} $\n"
         f"Levier : {leverage:g}x\n"
         f"👉 <b>Lot calculé : {lot_info['lot']:g}</b>\n"
-        f"Marge indicative ≈ {margin:.2f} $"
+        f"Marge indicative ≈ {margin:.2f} $\n\n"
+        f"{_params_lines(sig)}"
     )
     if lot_info["raised_to_min"]:
         txt += f"\n⚠️ Lot minimum appliqué : risque réel ≈ {lot_info['real_risk']:.2f} $"
@@ -1088,7 +1794,7 @@ def group_event(ev, dec):
     if name == "BE_MOVED":
         return f"🔒 <b>RR{BE_RR:g} atteint</b> — {head}\nSL déplacé à l'entrée (BE)."
     if name == "TP":
-        return f"🎯 <b>RR{TP_RR:g} atteint — TP ✅</b> — {head}\nRésultat : <b>WIN ({t['result_r']:+.2f} R)</b>"
+        return f"🎯 <b>RR{trade_tp_rr(t):g} atteint — TP ✅</b> — {head}\nRésultat : <b>WIN ({t['result_r']:+.2f} R)</b>"
     if name == "BE":
         return f"➖ <b>Clôture à l'entrée (BE)</b> — {head}\nRésultat : <b>{t['result_r']:+.2f} R</b>"
     return (f"🔴 <b>SL touché ❌</b> — {head}\nRésultat : <b>LOSS ({t['result_r']:+.2f} R)</b>\n\n"
@@ -1169,6 +1875,63 @@ def _tf_text():
             f"bougie clôturée, sans rejouer l'historique.{note}")
 
 
+# --- ⚙️ PARAMÈTRES SIGNAL : RR / timeframe d'entrée / filtre HTF ------------------------------------
+def _signal_text():
+    return (f"⚙️ <b>PARAMÈTRES SIGNAL</b>\n\n"
+            f"🎯 RR actuel : RR{get_tp_rr():g}\n"
+            f"⏱ Timeframe : {TF_LABEL}\n"
+            f"🧠 Filtre HTF : {'🟢 ACTIVÉ' if get_htf_filter() else '🔴 DÉSACTIVÉ'}")
+
+
+def _signal_keyboard():
+    return {"inline_keyboard": [
+        [{"text": "🎯 RR", "callback_data": "sig:rr"}, {"text": "⏱ TIMEFRAME", "callback_data": "sig:tf"},
+         {"text": "🧠 FILTRE HTF", "callback_data": "sig:htf"}],
+        [{"text": "🔙 Menu", "callback_data": "menu:home"}]]}
+
+
+def _signal_back(rows):
+    return {"inline_keyboard": rows + [[{"text": "🔙 Paramètres", "callback_data": "sig:home"}]]}
+
+
+def _signal_rr_text():
+    return (f"🎯 RR actuel : <b>RR{get_tp_rr():g}</b>\n"
+            f"S'applique immédiatement aux NOUVEAUX signaux. Les trades déjà ouverts gardent leur TP / SL / RR.")
+
+
+def _signal_rr_keyboard():
+    cur = get_tp_rr()
+    return _signal_back([[{"text": ("✅ " if float(v) == cur else "") + f"RR{v}", "callback_data": f"srr:{v}"}
+                          for v in SIGNAL_RR_CHOICES]])
+
+
+def _signal_tf_text():
+    n = len(open_trades())
+    note = f"\n⚠️ {n} position(s) ouverte(s) : suivies avec les bougies du nouveau timeframe." if n else ""
+    return (f"⏱ Timeframe d'entrée : <b>{TF_LABEL}</b>\n"
+            f"Timeframe du déclenchement final du signal. Effet immédiat : le bot se recale sur la dernière "
+            f"bougie clôturée, sans rejouer l'historique.{note}")
+
+
+def _signal_tf_keyboard():
+    return _signal_back([[{"text": ("✅ " if m == TIMEFRAME_MIN else "") + TF_LABELS[m], "callback_data": f"stf:{m}"}
+                          for m in SIGNAL_TF_CHOICES]])
+
+
+def _signal_htf_text():
+    return (f"🧠 Filtre HTF : {'🟢 ACTIVÉ' if get_htf_filter() else '🔴 DÉSACTIVÉ'}\n"
+            f"ACTIVÉ : H{HTF_MINUTES // 60 or 1} = biais, M15 = confirmation du contexte, M5 = fin du retracement, "
+            f"POI (OB / FVG) mitigé = zone de réaction, CHoCH d'entrée = trigger final. "
+            f"Un CHoCH seul ne suffit pas et ne peut jamais aller contre le contexte H1 / M15 (c'est un retracement). "
+            f"DÉSACTIVÉ : logique de signal d'origine, sans ce filtre. Effet immédiat.")
+
+
+def _signal_htf_keyboard():
+    on = get_htf_filter()
+    return _signal_back([[{"text": ("✅ " if on else "") + "🟢 ACTIVÉ", "callback_data": "shtf:1"},
+                          {"text": ("✅ " if not on else "") + "🔴 DÉSACTIVÉ", "callback_data": "shtf:0"}]])
+
+
 def _media_keyboard(prefix, suffix="", verb=""):
     """Boutons des catégories, 2 par ligne ; callback_data = prefix:CAT[suffix]."""
     cats = list(MEDIA_CATS.items())
@@ -1197,11 +1960,40 @@ def _media_from_message(msg):
     return None
 
 
+_ANALYSE_SYMS = {"XAU": "XAUUSD", "BTC": "BTCUSD"}
+
+
+def _analyse_text():
+    return ("📊 <b>ANALYSE</b>\n\n"
+            "Choisis l'actif. Lecture seule : n'affecte jamais le moteur de signal ni les positions.")
+
+
+def _analyse_keyboard():
+    return _with_back({"inline_keyboard": [
+        [{"text": "🥇 XAUUSD", "callback_data": "ana:sym:XAU"}, {"text": "₿ BTCUSD", "callback_data": "ana:sym:BTC"}],
+    ]})
+
+
+def _analyse_symbol_text(symbol):
+    return f"📊 <b>{symbol}</b>\n\nChoisis le type d'analyse :"
+
+
+def _analyse_symbol_keyboard(symbol):
+    code = next(k for k, v in _ANALYSE_SYMS.items() if v == symbol)
+    return {"inline_keyboard": [
+        [{"text": "📈 TECHNIQUE", "callback_data": f"ana:tech:{code}"},
+         {"text": "📰 FONDAMENTAL", "callback_data": f"ana:fond:{code}"}],
+        [{"text": "🔙 Analyse", "callback_data": "ana:home"}, {"text": "🔙 Menu", "callback_data": "menu:home"}],
+    ]}
+
+
 def _menu_keyboard():
     return {"inline_keyboard": [
         [{"text": "💰 Risque", "callback_data": "menu:risque"}, {"text": "⚙️ Levier", "callback_data": "menu:levier"}],
         [{"text": "⏱ Timeframe", "callback_data": "menu:timeframe"}, {"text": "🎭 Médias", "callback_data": "menu:medias"}],
         [{"text": "📊 Stats", "callback_data": "menu:stats"}, {"text": "📈 Positions", "callback_data": "menu:trades"}],
+        [{"text": "📊 Analyse", "callback_data": "ana:home"}],
+        [{"text": "⚙️ Paramètres signal", "callback_data": "menu:signal"}],
         [{"text": "🔄 Actualiser", "callback_data": "menu:home"}],
     ]}
 
@@ -1235,15 +2027,21 @@ def handle_command(text):
                "/testgroupe — envoie un message test au groupe (vérifie CHAT_ID_GROUPE)\n"
                "/trades — positions en cours (avec RR actuel)\n"
                "/timeframe [M1|M3|M5|M15|M30|H1] — change le timeframe à chaud\n"
+               "/signal — paramètres du signal (RR, timeframe, filtre HTF)\n"
                "/medias — stickers / images / GIF du groupe (TP, SL, BE, motivation)\n"
+               "/analyse — analyse technique / fondamentale à la demande (BTCUSD, XAUUSD)\n"
                "/menu — menu à boutons")
         return (txt, _menu_keyboard())
+    if cmd in ("/analyse", "/analyze"):
+        return (_analyse_text(), _analyse_keyboard())
     if cmd == "/testgroupe":
         return (check_group(send_test=True)[1], None)
     if cmd in ("/statut", "/status", "/prix"):
         return ("📡 <b>Scan en cours</b> — " + TF_LABEL + "\n" + "\n".join(scan_status_lines()), None)
     if cmd == "/menu":
         return (_home_text(), _menu_keyboard())
+    if cmd in ("/signal", "/parametres", "/paramètres"):
+        return (_signal_text(), _signal_keyboard())
     if cmd == "/risque":
         if len(parts) > 1:
             try:
@@ -1333,7 +2131,7 @@ def handle_command(text):
 
 _MENU_ACTIONS = {
     "risque": "/risque", "levier": "/levier", "stats": "/stats", "trades": "/trades",
-    "timeframe": "/timeframe", "medias": "/medias",
+    "timeframe": "/timeframe", "medias": "/medias", "signal": "/signal",
 }
 
 
@@ -1367,6 +2165,32 @@ def _handle_update(u):
                 set_timeframe(tf)
                 _edit(cq, _tf_text(), _tf_keyboard())
                 ack = TF_LABEL
+        elif data.startswith("sig:"):
+            page = data[4:]
+            if page == "rr":
+                _edit(cq, _signal_rr_text(), _signal_rr_keyboard())
+            elif page == "tf":
+                _edit(cq, _signal_tf_text(), _signal_tf_keyboard())
+            elif page == "htf":
+                _edit(cq, _signal_htf_text(), _signal_htf_keyboard())
+            else:
+                _edit(cq, _signal_text(), _signal_keyboard())
+        elif data.startswith("srr:"):
+            rr = int(data[4:])
+            if rr in SIGNAL_RR_CHOICES:
+                set_tp_rr(rr)
+                _edit(cq, _signal_text(), _signal_keyboard())
+                ack = f"RR{rr}"
+        elif data.startswith("stf:"):
+            tf = int(data[4:])
+            if tf in SIGNAL_TF_CHOICES:
+                set_timeframe(tf)
+                _edit(cq, _signal_text(), _signal_keyboard())
+                ack = TF_LABEL
+        elif data.startswith("shtf:"):
+            set_htf_filter(data[5:] == "1")
+            _edit(cq, _signal_text(), _signal_keyboard())
+            ack = "Filtre HTF : " + ("ON" if get_htf_filter() else "OFF")
         elif data.startswith("mset:"):
             _, cat, mid = data.split(":")
             item = _pending_media.pop((cq["message"]["chat"]["id"], int(mid)), None)
@@ -1380,6 +2204,29 @@ def _handle_update(u):
                 clear_media(data[5:])
                 _edit(cq, _media_text(), _with_back(_media_keyboard("mclr", verb="🗑 ")))
                 ack = "Vidé"
+        elif data == "ana:home":
+            _edit(cq, _analyse_text(), _analyse_keyboard())
+        elif data.startswith("ana:sym:"):
+            sym = _ANALYSE_SYMS.get(data[8:])
+            if sym:
+                _edit(cq, _analyse_symbol_text(sym), _analyse_symbol_keyboard(sym))
+        elif data.startswith("ana:tech:"):
+            sym = _ANALYSE_SYMS.get(data[9:])
+            if sym:
+                _edit(cq, f"⏳ Analyse technique {sym} en cours…", None)
+                chat_id = cq["message"]["chat"]["id"]
+                txt, chart = build_technical_analysis(sym)
+                if chart:
+                    send(chat_id, f"📊 {sym} — zones actuelles (H{HTF_MINUTES // 60 or 1}/M15/M5/M1)", photo=chart)
+                send(chat_id, txt, reply_markup=_analyse_symbol_keyboard(sym))
+                ack = "Analyse envoyée"
+        elif data.startswith("ana:fond:"):
+            sym = _ANALYSE_SYMS.get(data[9:])
+            if sym:
+                _edit(cq, f"⏳ Analyse fondamentale {sym} en cours…", None)
+                txt = build_fundamental_analysis(sym)
+                send(cq["message"]["chat"]["id"], txt, reply_markup=_analyse_symbol_keyboard(sym))
+                ack = "Analyse envoyée"
         elif data == "menu:home":
             _edit(cq, _home_text(), _menu_keyboard())
         elif data.startswith("menu:") and data[5:] in _MENU_ACTIONS:
@@ -1600,7 +2447,7 @@ def retry_unsent_signals():
         dec = SYMBOLS[sym]["decimals"]
         sig = {"side": t["side"], "type": t["kind"], "entry": t["entry"], "sl": t["sl_initial"],
                "tp": t["tp"], "risk": abs(t["entry"] - t["sl_initial"]),
-               "order": t.get("order_type") or "MARKET", "ref_price": t.get("ref_price")}
+               "order": t.get("order_type") or "MARKET", "ref_price": t.get("ref_price"), "tf": t["timeframe"]}
         lot_info = {"lot": t["lot"], "real_risk": t["risk_usd"], "raised_to_min": False}
         lev = t["leverage"] or get_leverage()
         margin = calc_margin(sym, t["lot"], t["entry"], lev)
@@ -1638,21 +2485,23 @@ def process_symbol(symbol):
     retry_unsent_signals()
 
     # 1) suivi des positions ouvertes (BE / TP / SL)
+    events = analyze(candles)
     for trade in open_trades(symbol):
         for ev in track_trade(trade, candles):
-            to_group(group_event(ev, dec))
+            chart = make_event_chart(symbol, candles, events, ev["trade"], dec) \
+                if ev["name"] in CHART_ON_EVENTS else None
+            to_group(group_event(ev, dec), photo=chart)
             group_event_media(ev["name"])
             txt = admin_event(ev)
             if txt:
                 to_admin(txt)
 
     # 2) nouveaux signaux : CHoCH survenus sur les bougies clôturées depuis le dernier passage
-    events = analyze(candles)
     n = len(candles)
     for ev in events:
         if ev["t"] <= last_seen or ev["i"] < n - SIGNAL_MAX_AGE:
             continue
-        sig = build_signal(candles, ev)
+        sig = build_signal(candles, ev, symbol)
         if sig:
             publish_signal(symbol, candles, events, sig)
 
@@ -1755,5 +2604,416 @@ def main():
     _run(_env_int("PORT", 10000))
 
 
+
+
+# ============================================================================
+# 11. AUTO-TESTS  (python main.py --selftest)
+#
+# Tests du moteur H1 -> M15 -> M5 -> M1 (filtre HTF ON). Aucun réseau, aucune écriture en base de prod : `--selftest` utilise une
+# base SQLite jetable, et `get_candles` est remplacé par des bougies synthétiques. Un seul flux M1 est fabriqué par scénario
+# (tendance + ondulations + bruit) ; M5 / M15 / H1 en sont dérivés par agrégation, donc les 4 UT sont cohérentes entre elles.
+# Chaque CHoCH M1 est évalué avec `build_signal` comme `process_symbol` le fait en live, sur les bougies connues À CE MOMENT-LÀ
+# (pas de lookahead). L'état H1 / M15 / M5 qui sert à classer les CHoCH est recalculé ici avec `analyze`, indépendamment du
+# code de décision. Scénarios : retracement bullish sans SELL · retracement bearish sans BUY · continuation valide ·
+# invalidation HTF · chop. Optionnel : OLD_ENGINE=<ancien main.py> ajoute la non-régression contre l'ancien moteur.
+# ============================================================================
+
+import contextlib
+import importlib.util
+import io
+import unittest
+from collections import Counter
+
+_ST_OLD = os.environ.get("OLD_ENGINE")
+
+
+class _Self:
+    """Le moteur testé = ce fichier lui-même, quel que soit le mode de chargement (script ou import)."""
+    def __getattr__(self, k):
+        return globals()[k]
+
+    def __setattr__(self, k, v):
+        globals()[k] = v
+
+
+_E = _Self()
+_ST_SYM = "XAUUSD"
+_ST_T0 = 1_700_000_000 - (1_700_000_000 % 3600)
+_ST_WAVES = ((37, 1.6), (110, 3.0), (23, 0.8))   # (période en min, amplitude) : créent des swings M5 / M15
+
+
+def _st_load(path, name):
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+# ----------------------------------------------------------------------------- données synthétiques
+def _st_path(waypoints, sigma, seed, waves=_ST_WAVES):
+    rng, out, prev = random.Random(seed), [], waypoints[0][1]
+    ph = [rng.uniform(0, 6.28) for _ in waves]
+    for (m0, p0), (m1, p1) in zip(waypoints, waypoints[1:]):
+        for m in range(m0, m1):
+            wave = sum(a * math.sin(2 * math.pi * m / per + f) for (per, a), f in zip(waves, ph))
+            c = p0 + (p1 - p0) * (m - m0) / (m1 - m0) + wave + rng.gauss(0, sigma)
+            h = max(prev, c) + abs(rng.gauss(0, sigma * .5))
+            l = min(prev, c) - abs(rng.gauss(0, sigma * .5))
+            out.append({"t": _ST_T0 + m * 60, "o": prev, "h": h, "l": l, "c": c})
+            prev = c
+    return out
+
+
+def _st_agg(m1, tf, limit=300):
+    """Bougies `tf` minutes COMPLÈTES construites depuis les M1 (comme get_candles : 300 dernières, clôturées)."""
+    if tf == 1:
+        return m1[-limit:]
+    sec, end, groups = tf * 60, m1[-1]["t"] + 60, {}
+    for x in m1:
+        groups.setdefault(x["t"] // sec * sec, []).append(x)
+    out = [{"t": g, "o": xs[0]["o"], "h": max(x["h"] for x in xs), "l": min(x["l"] for x in xs), "c": xs[-1]["c"]}
+           for g, xs in sorted(groups.items()) if g + sec <= end]
+    return out[-limit:]
+
+
+def _st_zigzag(start, legs):
+    wps, m, p = [(0, start)], 0, start
+    for dur, dp in legs:
+        m, p = m + dur, p + dp
+        wps.append((m, p))
+    return wps
+
+
+def _st_trend_legs(seed, n, sign):
+    """sign=+1 : jambes hautes longues + petits retracements (tendance haussière) ; sign=-1 : l'inverse."""
+    rnd, legs = random.Random(seed), []
+    for _ in range(n):
+        legs.append((rnd.randint(420, 700), sign * rnd.uniform(28, 50)))
+        legs.append((rnd.randint(200, 320), -sign * rnd.uniform(10, 20)))
+    return legs
+
+
+def _st_chop_legs(seed, n=40, amp=12):
+    rnd, legs, sgn = random.Random(seed), [], 1
+    for _ in range(n):
+        legs.append((rnd.randint(150, 330), sgn * rnd.uniform(amp * .7, amp * 1.2)))
+        sgn = -sgn
+    return legs
+
+
+# ----------------------------------------------------------------------------- évaluation
+class _StFeed:
+    """Branche le moteur sur un flux M1 tronqué à `n` bougies (n avance CHoCH par CHoCH)."""
+
+    def __init__(self, mod, m1, only_m1=False):
+        self.mod, self.m1, self.n, self.only_m1 = mod, m1, len(m1), only_m1
+        mod.get_candles = self._get
+        mod._apply_timeframe(1)
+
+    def _get(self, symbol, minutes=None):
+        tf = minutes or self.mod.TIMEFRAME_MIN
+        if self.only_m1 and tf != 1:
+            raise RuntimeError("UT supérieures indisponibles (test « M1 seul »)")
+        return _st_agg(self.m1[:self.n], tf)
+
+
+def _st_eval(mod, m1, only_m1=False, tolerate=False):
+    """[(ev, signal | None, log)] pour chaque CHoCH M1, évalué sur les bougies connues à sa clôture.
+    tolerate=True : une exception du moteur est notée dans le log au lieu d'interrompre (ancien moteur : IndexError si H1 sans cassure)."""
+    feed, res = _StFeed(mod, m1, only_m1), []
+    for ev in mod.analyze(m1):
+        if ev["kind"] != "CHOCH":
+            continue
+        feed.n = ev["i"] + 1
+        mod._htf_cache.clear()
+        mod._ctx_cache.clear()
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            try:
+                sig = mod.build_signal(m1[:feed.n], ev, _ST_SYM)
+            except Exception as exc:
+                if not tolerate:
+                    raise
+                sig = None
+                print(f"EXCEPTION {type(exc).__name__}")
+        res.append((ev, sig, buf.getvalue()))
+    return res
+
+
+def _st_state(m1, n):
+    """(H1, M15, M5 dir, M5 kind) à la clôture de la bougie n-1, via `analyze` direct (indépendant de la logique de décision)."""
+    def last(tf):
+        c = _st_agg(m1[:n], tf)
+        evs = _E.analyze(c) if len(c) > 2 * _E.SWING_DEPTH + 1 else []
+        return (evs[-1]["dir"], evs[-1]["kind"]) if evs else (0, None)
+    (h1, _), (m15, _), (m5, k5) = last(60), last(15), last(5)
+    return h1, m15, m5, k5
+
+
+def _st_reason(log):
+    m = re.search(r"ignoré : (.*)", log)
+    return m.group(1) if m else None
+
+
+def _st_field(log, label):
+    m = re.search(rf"^\[{_ST_SYM}\]   {re.escape(label)}\s*: (.*)$", log, re.M)
+    return m.group(1) if m else None
+
+
+class _StScenarios:
+    """Chaque scénario est évalué une seule fois (l'évaluation est le poste de coût)."""
+    _cache = {}
+
+    @classmethod
+    def get(cls, name, builder):
+        if name not in cls._cache:
+            m1 = builder()
+            cls._cache[name] = (m1, _st_eval(_E, m1))
+        return cls._cache[name]
+
+    @classmethod
+    def bull(cls, seed=3):
+        return cls.get(f"bull{seed}", lambda: _st_path(_st_zigzag(2000, _st_trend_legs(seed, 14, 1)), 0.35, seed))
+
+    @classmethod
+    def bear(cls, seed=3):
+        return cls.get(f"bear{seed}", lambda: _st_path(_st_zigzag(2400, _st_trend_legs(seed, 14, -1)), 0.35, seed))
+
+    @classmethod
+    def flip(cls, seed=4):   # 8 jambes haussières puis 12 jambes baissières
+        legs = _st_trend_legs(seed, 8, 1) + _st_trend_legs(seed + 100, 12, -1)
+        return cls.get(f"flip{seed}", lambda: _st_path(_st_zigzag(2000, legs), 0.35, seed)), sum(d for d, _ in legs[:16])
+
+    @classmethod
+    def chop(cls, seed=1):
+        return cls.get(f"chop{seed}", lambda: _st_path(_st_zigzag(2000, _st_chop_legs(seed)), 0.35, seed, waves=((37, 1.6), (23, .8))))
+
+
+# ----------------------------------------------------------------------------- tests
+class TestRetracement(unittest.TestCase):
+    """H1 + M15 alignés, M5 à contre-sens = retracement interne : jamais un signal dans le sens du M5."""
+
+    def _check(self, m1, res, ctx):
+        # ctx = 1 : contexte haussier (M5 baissier = retracement) ; ctx = -1 : contexte baissier (M5 haussier)
+        bucket = [(ev, sig, log) for ev, sig, log in res
+                  if _st_state(m1, ev["i"] + 1)[:3] == (ctx, ctx, -ctx)]
+        with_ctx = [b for b in bucket if b[0]["dir"] == ctx]        # CHoCH M1 dans le sens du contexte, M5 pas encore retourné
+        against = [b for b in bucket if b[0]["dir"] == -ctx]        # CHoCH M1 dans le sens du M5 = contre le contexte
+        self.assertGreater(len(with_ctx), 5, "scénario non représentatif : pas assez de CHoCH dans le sens du contexte")
+        self.assertGreater(len(against), 5, "scénario non représentatif : pas assez de CHoCH contre le contexte")
+        self.assertEqual([b for b in bucket if b[1]], [], "aucun signal ne doit sortir pendant un retracement M5")
+        for _, _, log in against:
+            self.assertIn(f"contre le contexte {'haussier' if ctx == 1 else 'baissier'}", _st_reason(log))
+            self.assertEqual(_st_field(log, "retracement"), "—", "l'étape M5 ne doit même pas être atteinte")
+        for _, _, log in with_ctx:
+            self.assertIn("retracement M5 en cours", _st_reason(log))
+            self.assertEqual(_st_field(log, "retracement"), "EN COURS")
+        # sur tout le scénario : jamais de signal à contre-sens d'un contexte H1 + M15 aligné
+        for ev, sig, _ in res:
+            h1, m15, _, _ = _st_state(m1, ev["i"] + 1)
+            if sig and h1 == m15 != 0:
+                self.assertEqual(sig["dir"], h1)
+        return len(with_ctx), len(against)
+
+    def test_retracement_bullish_pas_de_sell(self):
+        m1, res = _StScenarios.bull()
+        n_buy, n_sell = self._check(m1, res, 1)
+        print(f"\n  retracement bullish : {n_sell} CHoCH SELL + {n_buy} CHoCH BUY pendant M5 baissier -> 0 signal")
+
+    def test_retracement_bearish_pas_de_buy(self):
+        m1, res = _StScenarios.bear()
+        n_sell, n_buy = self._check(m1, res, -1)
+        print(f"\n  retracement bearish : {n_buy} CHoCH BUY + {n_sell} CHoCH SELL pendant M5 haussier -> 0 signal")
+
+
+class TestContinuation(unittest.TestCase):
+    """Contexte aligné + fin de retracement (CHoCH M5 avec sweep/réaction, ou M5 déjà dans le sens) + POI + CHoCH M1."""
+
+    def _accepted(self, paths, side, ctx):
+        acc, states = [], Counter()
+        for m1, res in paths:
+            for ev, sig, log in res:
+                if not sig:
+                    continue
+                acc.append(sig)
+                h1, m15, m5, _ = _st_state(m1, ev["i"] + 1)
+                self.assertEqual((h1, m15, m5), (ctx, ctx, ctx), "signal accepté hors contexte H1/M15/M5 aligné")
+                self.assertEqual(sig["side"], side)
+                self.assertEqual(sig["setup"], "CONTINUATION")
+                self.assertIsNotNone(sig["poi"])
+                self.assertIn("ACCEPTÉ", _st_field(log, "état final"))
+                states[_st_field(log, "retracement")] += 1
+                for lbl in ("HTF bias", "liquidité ext.", "liquidité int.", "retracement", "CHoCH M5", "trigger M1", "POI"):
+                    self.assertIsNotNone(_st_field(log, lbl), f"ligne de log manquante : {lbl}")
+        return acc, states
+
+    def test_continuation_buy(self):
+        paths = [_StScenarios.bull(s) for s in (1, 2, 3)]
+        acc, states = self._accepted(paths, "BUY", 1)
+        self.assertGreaterEqual(len(acc), 3)
+        self.assertEqual(set(states), {"AUCUN", "TERMINÉ"}, f"attendu : continuation (AUCUN) et fin de retracement (TERMINÉ) : {states}")
+        print(f"\n  continuation BUY : {len(acc)} signaux, états retracement {dict(states)}")
+
+    def test_continuation_sell(self):
+        paths = [_StScenarios.bear(s) for s in (1, 2, 3)]
+        acc, states = self._accepted(paths, "SELL", -1)
+        self.assertGreaterEqual(len(acc), 3)
+        self.assertTrue(set(states) <= {"AUCUN", "TERMINÉ"}, states)
+        print(f"\n  continuation SELL : {len(acc)} signaux, états retracement {dict(states)}")
+
+    def test_pas_de_signal_sans_fin_de_retracement_prouvee(self):
+        """CHoCH M5 dans le sens du contexte mais sans sweep ni réaction : le M1 ne suffit pas."""
+        seen = 0
+        for s in (1, 2, 3):
+            m1, res = _StScenarios.bull(s)
+            for ev, sig, log in res:
+                if _st_field(log, "retracement") == "NON CONFIRMÉ":
+                    seen += 1
+                    self.assertIsNone(sig)
+                    self.assertIn("sans balayage de liquidité interne ni réaction", _st_reason(log))
+        self.assertGreater(seen, 0)
+
+
+class TestInvalidationHTF(unittest.TestCase):
+    """Le biais ne change que lorsque H1 ET M15 sont réellement retournés ; entre les deux : aucun trade."""
+
+    def test_invalidation(self):
+        (m1, res), switch = _StScenarios.flip()
+        by_ctx = Counter()
+        first_bear_aligned = None
+        for ev, sig, log in res:
+            h1, m15, _, _ = _st_state(m1, ev["i"] + 1)
+            by_ctx[((h1, m15), bool(sig))] += 1
+            if sig:
+                self.assertEqual((h1, m15), (sig["dir"], sig["dir"]), "signal accepté sans H1 et M15 alignés dans son sens")
+            if h1 != m15:                                   # transition : un seul des deux a cassé -> contexte non confirmé
+                self.assertIsNone(sig)
+                self.assertIn("indéterminé" if h1 == 0 else "non confirmé", _st_reason(log))
+            if (h1, m15) == (-1, -1) and first_bear_aligned is None:
+                first_bear_aligned = ev["i"]
+        buys = [s for _, s, _ in res if s and s["side"] == "BUY"]
+        sells = [s for _, s, _ in res if s and s["side"] == "SELL"]
+        self.assertGreater(len(buys), 0, "il doit y avoir des BUY avant l'invalidation")
+        self.assertGreater(len(sells), 0, "il doit y avoir des SELL après l'invalidation")
+        # chronologie : tous les BUY avant les SELL ; aucun SELL tant que H1 et M15 ne sont pas tous deux baissiers
+        self.assertLess(max(s["t"] for s in buys), min(s["t"] for s in sells))
+        self.assertGreaterEqual(min(s["t"] for s in sells), _ST_T0 + first_bear_aligned * 60)
+        self.assertGreater(first_bear_aligned, switch, "H1 et M15 ne doivent basculer qu'après la cassure de structure")
+        print(f"\n  invalidation HTF : {len(buys)} BUY (contexte haussier) puis {len(sells)} SELL (après H1+M15 baissiers) ; "
+              f"transition (H1 != M15) : {sum(v for (k, _), v in by_ctx.items() if k[0] != k[1])} CHoCH, 0 signal")
+
+
+class TestChop(unittest.TestCase):
+    """Marché en oscillation : peu de contextes alignés, chaque signal reste conforme, les protections d'origine sont conservées."""
+
+    def test_chop(self):
+        m1, res = _StScenarios.chop()
+        n = len(res)
+        acc = [(ev, sig, log) for ev, sig, log in res if sig]
+        reasons = Counter(re.sub(r"[-+]?\d+\.\d+", "X", _st_reason(log) or "")[:40] for _, sig, log in res if not sig)
+        for ev, sig, log in acc:
+            h1, m15, m5, _ = _st_state(m1, ev["i"] + 1)
+            self.assertEqual((h1, m15, m5), (sig["dir"],) * 3)
+        self.assertGreater(n, 200)
+        self.assertLessEqual(len(acc), 0.06 * n, f"trop de signaux en chop : {len(acc)}/{n}")
+        blocked_ctx = sum(v for k, v in reasons.items() if "contre le contexte" in k or "non confirmé" in k)
+        self.assertGreater(blocked_ctx, 0.4 * n, "la plupart des CHoCH M1 doivent être stoppés par le contexte")
+        print(f"\n  chop : {n} CHoCH M1 -> {len(acc)} signaux ({100 * len(acc) / n:.1f} %) ; "
+              f"{blocked_ctx} stoppés par le contexte H1/M15")
+
+
+class TestM1NeDecidePasSeul(unittest.TestCase):
+    def test_m1_seul(self):
+        m1 = _StScenarios.bull()[0]
+        res = _st_eval(_E, m1, only_m1=True)
+        self.assertGreater(len(res), 100)
+        self.assertEqual([r for r in res if r[1]], [])
+        self.assertTrue(all("indéterminé" in _st_reason(r[2]) for r in res), "sans H1, le M1 ne doit jamais fournir le biais")
+
+
+class TestLogs(unittest.TestCase):
+    def test_lignes_de_log(self):
+        m1, res = _StScenarios.bull()
+        acc = next(r for r in res if r[1])
+        rej = next(r for r in res if not r[1] and _st_field(r[2], "retracement") == "EN COURS")
+        for _, _, log in (acc, rej):
+            for lbl in ("HTF bias", "liquidité ext.", "liquidité int.", "retracement", "CHoCH M5", "trigger M1", "POI", "état final"):
+                self.assertIsNotNone(_st_field(log, lbl), lbl)
+        self.assertIn("✅ ACCEPTÉ", _st_field(acc[2], "état final"))
+        self.assertIn("⛔ REJETÉ", _st_field(rej[2], "état final"))
+        self.assertIn("contexte HAUSSIER", _st_field(rej[2], "HTF bias"))
+        print("\n--- log d'un signal accepté ---\n" + acc[2].rstrip() + "\n--- log d'un CHoCH rejeté (retracement M5 en cours) ---\n" + rej[2].rstrip())
+
+
+class TestEntreeM5(unittest.TestCase):
+    """UT d'entrée M5 : l'étape M5 est sautée (M5 est alors le trigger), H1 + M15 restent le contexte."""
+
+    def test_smoke(self):
+        m1 = _StScenarios.bull()[0]
+        try:
+            _E._apply_timeframe(5)
+            m5 = _st_agg(m1, 5, limit=10_000)
+            _E.get_candles = lambda symbol, minutes=None: _st_agg(m1[:feed["n"]], minutes or 5)
+            feed, out = {"n": len(m1)}, []
+            for ev in _E.analyze(m5):
+                if ev["kind"] != "CHOCH":
+                    continue
+                feed["n"] = (ev["i"] + 1) * 5
+                _E._htf_cache.clear()
+                _E._ctx_cache.clear()
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    sig = _E.build_signal(m5[:ev["i"] + 1], ev, _ST_SYM)
+                out.append((sig, buf.getvalue()))
+            self.assertGreater(len(out), 20)
+            self.assertTrue(any("non applicable" in (_st_field(log, "retracement") or "") for _, log in out))
+            for sig, _ in out:
+                self.assertTrue(sig is None or sig["setup"] == "CONTINUATION")
+        finally:
+            _E._apply_timeframe(1)
+
+
+@unittest.skipUnless(_ST_OLD, "_ST_OLD non défini : comparaison avec l'ancien moteur ignorée")
+class TestNonRegression(unittest.TestCase):
+    def test_poi_reaction_identique(self):
+        """Le refactor (_turn_index / _sweep_at) ne doit rien changer à poi_reaction, dans les conditions réelles du moteur :
+        CHoCH M1 évalués face aux POI M5 / M15 / H1 (les 4 issues possibles doivent apparaître, sinon le test serait vide)."""
+        old = _st_load(_ST_OLD, "engine_old")
+        outcomes = Counter()
+        for seed in (1, 2, 3):
+            m1 = _StScenarios.bull(seed)[0]
+            for ev in (e for e in _E.analyze(m1) if e["kind"] == "CHOCH"):
+                c = m1[:ev["i"] + 1]
+                for tf in (5, 15, 60):
+                    for p in _E.find_pois(_st_agg(c, tf), tf, ev["dir"]):
+                        got = _E.poi_reaction(c, ev, p)
+                        self.assertEqual(got, old.poi_reaction(c, ev, p))
+                        outcomes[got] += 1
+        self.assertEqual(set(outcomes), {(False, None), (True, None), (True, "rejet du POI"), (True, "balayage de liquidité")})
+
+    def test_nouveau_sous_ensemble_de_l_ancien(self):
+        old = _st_load(_ST_OLD, "engine_old2")
+        for name, (m1, res) in (("bull", _StScenarios.bull()), ("chop", _StScenarios.chop())):
+            res_old = _st_eval(old, m1, tolerate=True)
+            crashes = sum(1 for r in res_old if "EXCEPTION" in r[2])
+            kn = {r[0]["t"] for r in res if r[1]}
+            ko = {r[0]["t"] for r in res_old if r[1]}
+            self.assertTrue(kn <= ko, f"{name} : un signal du nouveau moteur n'existe pas dans l'ancien")
+            rev = sum(1 for r in res_old if r[1] and r[1]["setup"] == "REVERSAL FROM POI")
+            print(f"\n  {name} : ancien {len(ko)} signaux (dont {rev} REVERSAL contre H1, {crashes} CHoCH en exception) -> nouveau {len(kn)}")
+
+
+
+
+def _selftest():
+    suite, loader = unittest.TestSuite(), unittest.TestLoader()
+    for cls in (TestRetracement, TestContinuation, TestInvalidationHTF, TestChop, TestM1NeDecidePasSeul,
+                TestLogs, TestEntreeM5, TestNonRegression):
+        suite.addTests(loader.loadTestsFromTestCase(cls))
+    return 0 if unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful() else 1
+
+
 if __name__ == "__main__":
+    if "--selftest" in sys.argv:
+        sys.exit(_selftest())
     main()
