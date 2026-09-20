@@ -21,13 +21,14 @@ nouvelle bougie clôturée du timeframe choisi.
 Risque : le lot est calculé à partir du risque $ choisi + SL, SANS solde de compte.
 Le levier ne sert qu'à afficher une marge indicative (jamais utilisé pour le lot).
 Grille de sortie par défaut : paliers RR1/RR2/RR3 notifiés au groupe, BE (SL -> entrée) à
-RR2, TP finale à RR4 (réglable via BE_RR / TP_RR / RR_LEVELS). Aucun PnL $ n'est affiché,
+RR2, TP finale à RR4 (réglable : BE depuis Telegram (/be), ou via BE_RR / TP_RR / RR_LEVELS). Aucun PnL $ n'est affiché,
 ni au groupe ni en privé Leader — uniquement des R et des taux de réussite par RR.
 
 Réglages : section 1 (CONFIGURATION) ou fichier .env (voir README) — ex. TIMEFRAME=M15.
 Le timeframe se change aussi à chaud depuis Telegram (/timeframe) : le dernier choix est mémorisé, sauf si la
 variable TIMEFRAME est modifiée sur Render (elle reprend alors la main au démarrage suivant).
-RR (RR1-RR4), timeframe d'entrée (M1/M5/M15) et filtre HTF (ON/OFF) se règlent aussi à chaud depuis le menu
+RR (RR1-RR4), timeframe d'entrée (M1/M5/M15), filtre HTF (OFF / M15 / COMPLET), niveau du BE et nombre de signaux
+simultanés par actif se règlent aussi à chaud depuis le menu
 Telegram « ⚙️ Paramètres signal » (/signal) : mémorisés en base, ils survivent aux redémarrages Render.
 Stickers / images / GIF du groupe (TP, SL, BE, motivation) : envoyer le média au bot en privé, puis choisir la
 catégorie (gestion via /medias). Optionnel : variables MEDIA_TP, MEDIA_SL, MEDIA_BE, MEDIA_MOTIV.
@@ -105,6 +106,10 @@ DERIV_WS_URL = os.getenv("DERIV_WS_URL", "wss://api.derivws.com/trading/v1/optio
 # Valeur de départ : variable TIMEFRAME (Render / .env), ex. TIMEFRAME=M15 ; ensuite /timeframe sur Telegram.
 TF_LABELS = {1: "M1", 3: "M3", 5: "M5", 15: "M15", 30: "M30", 60: "H1"}
 
+# UT supplémentaire utilisée UNIQUEMENT comme UT de liquidité (jamais une UT d'entrée) : ne pas fusionner dans
+# TF_LABELS, qui est itéré par les boutons /timeframe.
+HTF_ONLY_LABELS = {240: "H4"}
+
 
 def _parse_timeframe(txt):
     """'M5' / '5m' / '5' -> 5 ; 'H1' / '1h' -> 60 ; sinon None."""
@@ -128,11 +133,13 @@ SYMBOLS = {
         "source": "deriv", "deriv_symbol": "frxXAUUSD",
         "value_per_point": 100.0,   # $ par point (1.00 de prix) pour 1 lot standard
         "min_lot": 0.01, "lot_step": 0.01, "decimals": 2,
+        "min_sl_pct": 0.0010,       # plancher SL absolu : ~0.10% (ex. ~2.6 pts sur du Gold à 2 600)
     },
     "BTCUSD": {
         "source": "binance", "binance_symbol": "BTCUSDT",
         "value_per_point": 1.0,     # $ par point pour 1 lot (1 BTC) - à ajuster selon le broker
         "min_lot": 0.001, "lot_step": 0.001, "decimals": 0,
+        "min_sl_pct": 0.0020,       # plancher SL absolu : ~0.20% (ex. ~160 pts sur du BTC à 80 000) -- plus volatile/mèches larges que le Gold
     },
 }
 
@@ -144,23 +151,45 @@ ENTRY_CHOCH2 = _env_bool("ENTRY_CHOCH2", True)    # CHoCH + CHoCH (CHoCH qui sui
 DEBUG_CHOCH = _env_bool("DEBUG_CHOCH", True)      # logge chaque CHoCH ignoré (et pourquoi) au lieu de rien dire
 HTF_FILTER = _env_bool("HTF_FILTER", True)   # ON : HTF = contexte, POI = zone de réaction, CHoCH = déclencheur (htf_poi_setup)
 HTF_MINUTES = _env_int("HTF_MINUTES", 60)    # unité de temps de référence pour la tendance ("liquidité externe")
+# Mode du filtre HTF quand il est actif (réglable depuis Telegram : OFF / M15 / COMPLET) :
+#   M15  = tendance de fond simple : le CHoCH d'entrée doit aller dans le sens de la dernière cassure de structure de l'UT de
+#          référence (HTF_REF_TF : M15 pour une entrée M1/M3/M5, H1 pour M15/M30, H4 pour H1). M15 baissier -> que des SELL.
+#   FULL = cascade complète H1 + M15 + M5 + POI (htf_poi_setup).
+HTF_MODE = os.getenv("HTF_MODE", "M15").strip().upper()   # mode utilisé quand le filtre est ON et qu'aucun choix Telegram n'existe
+if HTF_MODE == "COMPLET":
+    HTF_MODE = "FULL"
+if HTF_MODE not in ("M15", "FULL"):
+    HTF_MODE = "M15"
+HTF_MODES = ("OFF", "M15", "FULL")
+HTF_REF_TF = {1: 15, 3: 15, 5: 15, 15: 60, 30: 60, 60: 240}   # UT d'entrée -> UT de la tendance de fond (mode M15)
 # Cascade du filtre HTF : H1 (biais + liquidité externe) -> M15 (confirmation du contexte) -> M5 (retracement, liquidité interne,
 # fin du mouvement) -> UT d'entrée (trigger final uniquement). Seules les UT > UT d'entrée portent des POI.
 HTF_CASCADE = tuple(sorted({HTF_MINUTES, 15, 5}, reverse=True))
+# UT d'entrée -> UT de liquidité externe par défaut (liquidité interne = l'UT d'entrée elle-même).
+# Réglable uniquement pour l'entrée M5, via get_ext_tf() / set_ext_tf_m5() (réglage 'ext_tf_m5' en base).
+LIQ_EXT = {1: 15, 3: 15, 5: 60, 15: 240, 30: 240, 60: 240}
+EXT_DEPTH = _env_int("EXT_DEPTH", 5)   # profondeur (bougies de chaque côté) pour confirmer un pivot swing de liquidité externe
+EQ_TOL_ATR = 0.1                       # tolérance EQH/EQL : 2 pivots à moins de EQ_TOL_ATR ATR sont considérés au même niveau
 POI_MAX_AGE = _env_int("POI_MAX_AGE", 60)                  # âge max d'un POI (OB / FVG), en bougies de sa propre UT
 POI_MIN_ATR = _env_float("POI_MIN_ATR", 0.15)              # taille mini d'un POI, en ATR de son UT (écarte les micro-gaps)
 SWEEP_LOOKBACK = _env_int("SWEEP_LOOKBACK", 10)            # bougies d'entrée comparées pour détecter un balayage de liquidité
-SL_BUFFER_ATR = _env_float("SL_BUFFER_ATR", 0.1)   # buffer au-delà de la ligne du BOS
-MIN_SL_ATR = _env_float("MIN_SL_ATR", 0.3)         # SL minimum (en ATR)
+SL_BUFFER_ATR = _env_float("SL_BUFFER_ATR", 0.2)   # buffer au-delà de la ligne du BOS (0.1 laissait le SL pile sur la mèche -> balayé par le bruit)
+MIN_SL_ATR = _env_float("MIN_SL_ATR", 0.6)         # SL minimum (en ATR) -- 0.3 donnait des SL de quelques points sur BTC en M1/M5, balayés par le spread/bruit
 MAX_SL_ATR = _env_float("MAX_SL_ATR", 6.0)         # au-delà : signal ignoré (BOS trop ancien)
-BE_RR = _env_float("BE_RR", 2.0)          # RR auquel le SL est déplacé à l'entrée (BE)
+# Plancher ABSOLU du SL, en % du prix d'entrée : filet de sécurité indépendant de l'ATR (l'ATR d'une UT basse comme M1
+# peut lui-même être minuscule en marché calme -> MIN_SL_ATR seul ne suffit pas à empêcher un SL de quelques points).
+# Réglable par actif ci-dessous (SYMBOLS[...]["min_sl_pct"]), sinon valeur par défaut MIN_SL_PCT.
+MIN_SL_PCT = _env_float("MIN_SL_PCT", 0.0015)      # 0.15% par défaut (ex. ~120 pts sur du BTC à 80 000)
+BE_RR = _env_float("BE_RR", 2.0)          # RR auquel le SL est déplacé à l'entrée (BE) : valeur de départ, ensuite /be sur Telegram
+BE_RR_CHOICES = (0.5, 1, 1.5, 2, 3)       # boutons du menu BE (n'importe quelle valeur > 0 via /be 0.75)
 TP_RR = _env_float("TP_RR", 4.0)          # RR de la TP finale (clôture complète, pas de TP1/TP2)
 RR_LEVELS = (1.0, 2.0, 3.0)                # paliers intermédiaires notifiés au groupe (hors TP finale)
 # ⚙️ PARAMÈTRES SIGNAL (menu Telegram) : TP_RR, HTF_FILTER et le timeframe ci-dessus ne sont que les valeurs de
 # DÉPART ; le choix fait sur Telegram est mémorisé en base (table settings) et prime après chaque redémarrage.
 SIGNAL_RR_CHOICES = (1, 2, 3, 4)     # boutons « RR1 | RR2 | RR3 | RR4 »
 SIGNAL_TF_CHOICES = (1, 5, 15)       # boutons « M1 | M5 | M15 » (timeframe du déclenchement final)
-MAX_POSITIONS = _env_int("MAX_POSITIONS", 3)     # positions max en cours par actif
+MAX_POSITIONS = _env_int("MAX_POSITIONS", 1)     # signaux ouverts max par actif (1 = aucun nouveau signal tant que le précédent n'est pas clôturé) ; ensuite /maxpos
+MAX_POSITIONS_CHOICES = (1, 2, 3)               # boutons du menu « signaux simultanés »
 
 # --- Type d'entrée : DIRECT (au marché) ou LIMIT (on attend le retour du prix) ---------------
 # ENTRY_MODE : MARKET = toujours direct (par défaut) | LIMIT = toujours limit | BOTH = le bot choisit et le précise.
@@ -254,6 +283,9 @@ _ensure_column("trades", "order_type", "TEXT DEFAULT 'MARKET'")
 _ensure_column("trades", "placed_ts", "INTEGER")
 _ensure_column("trades", "filled_ts", "INTEGER")
 _ensure_column("trades", "ref_price", "REAL")
+# RR d'armement du BE et mode du filtre HTF FIGÉS à la création du signal (changer le réglage n'affecte pas un trade ouvert).
+_ensure_column("trades", "be_rr", "REAL")
+_ensure_column("trades", "htf_mode", "TEXT")
 
 
 # --- paramètres / méta -------------------------------------------------------
@@ -307,14 +339,85 @@ def set_tp_rr(v):
     set_setting("tp_rr", float(v))
 
 
+def get_htf_mode():
+    """Mode du filtre HTF : 'OFF' | 'M15' | 'FULL'. Dernier choix Telegram ('htf_mode' en base) ; sinon l'ancien réglage
+    ON/OFF ('htf_filter', versions précédentes : ON = HTF_MODE) ; sinon HTF_FILTER / HTF_MODE (Render / défaut)."""
+    v = get_setting("htf_mode")
+    if v in HTF_MODES:
+        return v
+    legacy = get_setting("htf_filter")
+    if legacy is not None:
+        return HTF_MODE if str(legacy) == "1" else "OFF"
+    return HTF_MODE if HTF_FILTER else "OFF"
+
+
+def set_htf_mode(mode):
+    if mode in HTF_MODES:
+        set_setting("htf_mode", mode)
+
+
 def get_htf_filter():
-    """Filtre HTF actif ? Dernier choix Telegram, sinon HTF_FILTER (Render / défaut)."""
-    v = get_setting("htf_filter")
-    return HTF_FILTER if v is None else str(v) == "1"
+    """Filtre HTF actif ? (M15 ou COMPLET)."""
+    return get_htf_mode() != "OFF"
 
 
 def set_htf_filter(on):
-    set_setting("htf_filter", "1" if on else "0")
+    set_htf_mode(HTF_MODE if on else "OFF")   # compatibilité : ON = mode par défaut
+
+
+def get_max_positions():
+    """Signaux ouverts max par actif : dernier choix Telegram, sinon MAX_POSITIONS (Render / défaut = 1)."""
+    try:
+        v = int(float(get_setting("max_positions", MAX_POSITIONS)))
+    except (TypeError, ValueError):
+        return max(1, MAX_POSITIONS)
+    return v if v >= 1 else max(1, MAX_POSITIONS)
+
+
+def set_max_positions(n):
+    set_setting("max_positions", int(n))
+
+
+def get_be_rr():
+    """RR d'armement du BE des NOUVEAUX signaux : dernier choix Telegram, sinon BE_RR (Render / défaut)."""
+    try:
+        v = float(get_setting("be_rr", BE_RR))
+    except (TypeError, ValueError):
+        return BE_RR
+    return v if v > 0 else BE_RR
+
+
+def set_be_rr(v):
+    set_setting("be_rr", float(v))
+
+
+def trade_be_rr(trade):
+    """RR d'armement du BE d'UN trade, fixé à la création du signal (changer /be n'affecte jamais un trade ouvert).
+    Repli : BE_RR pour les anciens trades sans valeur enregistrée."""
+    try:
+        v = trade.get("be_rr")
+        if v is not None and float(v) > 0:
+            return float(v)
+    except (TypeError, ValueError):
+        pass
+    return BE_RR
+
+
+def get_ext_tf(entry_tf):
+    """UT de liquidité externe pour l'UT d'entrée `entry_tf` (minutes) : réglable (H1/H4) uniquement pour
+    l'entrée M5 — dernier choix Telegram ('ext_tf_m5' en base), H1 par défaut ; fixe (LIQ_EXT) pour toute
+    autre UT d'entrée."""
+    if entry_tf == 5:
+        try:
+            v = int(get_setting("ext_tf_m5", LIQ_EXT[5]))
+        except (TypeError, ValueError):
+            v = LIQ_EXT[5]
+        return v if v in (60, 240) else LIQ_EXT[5]
+    return LIQ_EXT.get(entry_tf, HTF_MINUTES)
+
+
+def set_ext_tf_m5(minutes):
+    set_setting("ext_tf_m5", int(minutes))
 
 
 def trade_tp_rr(trade):
@@ -462,7 +565,7 @@ def now_ts():
 
 CLOSE_GRACE_SEC = 2   # marge après la clôture : décalage d'horloge / finalisation de la bougie chez la source
 BINANCE_BASES = ["https://api.binance.com", "https://data-api.binance.vision"]  # 2e = miroir public Binance
-BINANCE_INTERVALS = {1: "1m", 3: "3m", 5: "5m", 15: "15m", 30: "30m", 60: "1h"}
+BINANCE_INTERVALS = {1: "1m", 3: "3m", 5: "5m", 15: "15m", 30: "30m", 60: "1h", 240: "4h"}
 
 
 def _only_closed(candles, tf_sec=None):
@@ -789,13 +892,156 @@ def _sweep_at(c, e, d):
     return lvl, x["h"] > lvl > x["c"]
 
 
+def _flag_eq(pivots, atr_now):
+    """Marque eq=True sur chaque pivot (highs OU lows, jamais mélangés) ayant au moins un autre pivot du même
+    côté à moins de EQ_TOL_ATR ATR — repère les zones EQH / EQL (liquidité égale, plusieurs mèches au même niveau)."""
+    tol = EQ_TOL_ATR * atr_now
+    for pv in pivots:
+        pv["eq"] = False
+    for i, a in enumerate(pivots):
+        for b in pivots[i + 1:]:
+            if abs(a["level"] - b["level"]) < tol:
+                a["eq"] = b["eq"] = True
+
+
+def ext_map(symbol):
+    """Carte de liquidité externe (fonction pure, lecture seule — ne modifie rien et n'influence JAMAIS l'acceptation d'un
+    signal : build_signal / htf_poi_setup ne s'en servent que pour l'affichage, sig["ext"] et le log) : pivots swing (profondeur EXT_DEPTH) sur l'UT de liquidité externe de
+    l'UT d'entrée courante (get_ext_tf), NON balayés (aucune mèche ultérieure au-delà, cf. `_flag_eq`/sweep
+    ci-dessous — un pivot balayé n'est plus une liquidité disponible et est exclu).
+
+    Retourne {"tf": UT utilisée, "highs": [...], "lows": [...]} — chaque pivot : {"i", "t", "level", "eq"},
+    "eq" = True si un autre pivot du même côté est à moins de EQ_TOL_ATR ATR (EQH côté highs, EQL côté lows).
+    Les deux listes sont triées par distance croissante au dernier prix clôturé."""
+    tf = get_ext_tf(TIMEFRAME_MIN)
+    raw = _ctx_candles(symbol, tf)
+    if len(raw) <= 2 * EXT_DEPTH + 1:
+        return {"tf": tf, "highs": [], "lows": []}
+    atr = atr_series(raw)
+    highs, lows = [], []
+    for p in range(EXT_DEPTH, len(raw) - EXT_DEPTH):
+        win_h = [x["h"] for x in raw[p - EXT_DEPTH:p + EXT_DEPTH + 1]]
+        win_l = [x["l"] for x in raw[p - EXT_DEPTH:p + EXT_DEPTH + 1]]
+        if raw[p]["h"] == max(win_h) and all(raw[p]["h"] > raw[k]["h"] for k in range(p - EXT_DEPTH, p)):
+            if not any(k["h"] > raw[p]["h"] for k in raw[p + 1:]):   # non balayé depuis
+                highs.append({"i": p, "t": raw[p]["t"], "level": raw[p]["h"]})
+        if raw[p]["l"] == min(win_l) and all(raw[p]["l"] < raw[k]["l"] for k in range(p - EXT_DEPTH, p)):
+            if not any(k["l"] < raw[p]["l"] for k in raw[p + 1:]):   # non balayé depuis
+                lows.append({"i": p, "t": raw[p]["t"], "level": raw[p]["l"]})
+    a_now = atr[-1] if atr else 0.0
+    _flag_eq(highs, a_now)
+    _flag_eq(lows, a_now)
+    price = raw[-1]["c"]
+    highs.sort(key=lambda pv: abs(pv["level"] - price))
+    lows.sort(key=lambda pv: abs(pv["level"] - price))
+    return {"tf": tf, "highs": highs, "lows": lows}
+
+
+def int_sweep(c, ev):
+    """Liquidité interne sur les bougies d'entrée `c`, pour le CHoCH `ev` (`analyze`) — fonction pure, lecture
+    seule : n'influence JAMAIS l'acceptation d'un signal (affichage : sig["sweep"] et log). Aucune redétection : réutilise `_turn_index`
+    (point de retournement) et `_sweep_at` (balayage), comme `m5_retracement`.
+
+    Retourne {"swept": bool, "level": niveau balayé | None, "extreme": index du point de retournement, "eq":
+    True si au moins 2 des SWEEP_LOOKBACK bougies précédant le retournement touchent ce niveau à moins de
+    EQ_TOL_ATR ATR (EQL / EQH interne — liquidité renforcée par plusieurs mèches)}."""
+    d = ev["dir"]
+    e = _turn_index(c, ev)
+    lvl, swept = _sweep_at(c, e, d)
+    eq = False
+    if lvl is not None:
+        tol = EQ_TOL_ATR * ev["atr"]
+        prior = c[max(0, e - SWEEP_LOOKBACK):e]
+        touches = sum(1 for k in prior if abs((k["l"] if d == 1 else k["h"]) - lvl) < tol)
+        eq = touches >= 2
+    return {"swept": swept, "level": lvl, "extreme": e, "eq": eq}
+
+
+# --- lecture ext / int : AFFICHAGE UNIQUEMENT (graphique, message, log, analyse). Rien ici ne décide d'un signal. ----------
+def _liq_lbl(side, eq):
+    """Libellé d'un niveau de liquidité : « haut » / « bas », ou EQH / EQL quand plusieurs mèches sont au même niveau."""
+    return ("EQH" if side == "haut" else "EQL") if eq else side
+
+
+def ext_target(symbol, d, price, m=None):
+    """Liquidité externe VISÉE par un trade de sens d (1 = BUY -> plus proche plus haut non balayé au-dessus du prix ;
+    -1 = SELL -> plus proche plus bas non balayé en dessous). Lecture de `ext_map` (m : carte déjà calculée, optionnelle).
+    Retourne {"tf", "side", "level", "eq", "dist"} ou None si aucune liquidité externe dans cette direction."""
+    m = m or ext_map(symbol)
+    pool = [pv for pv in (m["highs"] if d == 1 else m["lows"]) if (pv["level"] - price) * d > 0]
+    if not pool:
+        return None
+    pv = min(pool, key=lambda q: abs(q["level"] - price))
+    return {"tf": m["tf"], "side": "haut" if d == 1 else "bas", "level": pv["level"], "eq": bool(pv["eq"]),
+            "dist": abs(pv["level"] - price)}
+
+
+def sweep_reading(c, ev, tf_lbl=None):
+    """Liquidité interne de l'UT d'entrée pour le CHoCH `ev`, lue via `int_sweep` : {"tf", "side", "level", "swept", "eq",
+    "t" (bougie du point de retournement), "i"}. side = « bas » pour un CHoCH haussier (liquidité sous les plus bas),
+    « haut » pour un CHoCH baissier."""
+    r = int_sweep(c, ev)
+    return {"tf": tf_lbl or TF_LABEL, "side": "bas" if ev["dir"] == 1 else "haut", "level": r["level"],
+            "swept": bool(r["swept"]), "eq": bool(r["eq"]), "t": c[r["extreme"]]["t"], "i": r["extreme"]}
+
+
+def liquidity_reading(symbol, c, ev, entry):
+    """(ext, sweep) d'un signal : sig["ext"] / sig["sweep"]. Ne lève jamais : un souci de lecture (données H/M15 absentes,
+    réseau) laisse simplement la clé à None, le signal part quand même — c'est de l'affichage, pas une condition."""
+    ext = sweep = None
+    try:
+        ext = ext_target(symbol, ev["dir"], entry)
+    except Exception as e:
+        print(f"[{symbol}] lecture liquidité externe impossible ({type(e).__name__}) : signal sans ligne « Ext. »")
+    try:
+        sweep = sweep_reading(c, ev)
+    except Exception as e:
+        print(f"[{symbol}] lecture liquidité interne impossible ({type(e).__name__}) : signal sans ligne « Int. »")
+    return ext, sweep
+
+
+def _ext_short(x, dec):
+    return f"{_liq_lbl(x['side'], x['eq'])} {_fmt(x['level'], dec)} (à {_fmt(x['dist'], dec)} pts)"
+
+
+def _ext_txt(x, dec):
+    """« M15 haut 80 900 (à 134 pts) » / « M15 EQL 80 500 (à 266 pts) »."""
+    return f"{_tf_lbl(x['tf'])} {_ext_short(x, dec)}"
+
+
+def _sweep_txt(x, dec):
+    """« M1 EQL 80 780 balayé » / « M1 haut 80 780 non balayé »."""
+    if x.get("level") is None:
+        return f"{x['tf']} — (pas d'historique)"
+    return f"{x['tf']} {_liq_lbl(x['side'], x['eq'])} {_fmt(x['level'], dec)} " + ("balayé" if x["swept"] else "non balayé")
+
+
+def _liq_lines(sig, dec):
+    """Lignes « Ext. : … » et « Int. : … » d'un message de signal ; chaîne vide si sig n'a pas ces clés (ex. renvoi différé)."""
+    out = []
+    if sig.get("ext"):
+        out.append("Ext. : " + _ext_txt(sig["ext"], dec))
+    if sig.get("sweep") and sig["sweep"].get("level") is not None:
+        out.append("Int. : " + _sweep_txt(sig["sweep"], dec))
+    return "".join(line + "\n" for line in out)
+
+
+def _ext_trace_txt(symbol, d, price, dec):
+    """Ligne « liquidité ext. » du log multi-UT : `ext_map` (visée dans le sens d), à défaut l'extrême de la jambe H1."""
+    try:
+        x = ext_target(symbol, d, price)
+    except Exception:
+        x = None
+    return _ext_txt(x, dec) if x else _ext_liquidity(symbol, d, dec)
+
+
 def _poi_log(symbol, msg):
     if DEBUG_CHOCH:
         print(f"[{symbol}]   {msg}")
 
 
 def _tf_lbl(tf):
-    return TF_LABELS.get(tf, f"M{tf}")
+    return TF_LABELS.get(tf) or HTF_ONLY_LABELS.get(tf, f"M{tf}")
 
 
 def _poi_txt(p, dec):
@@ -895,6 +1141,11 @@ def htf_poi_setup(symbol, c, ev, trace=None):
     setup = "CONTINUATION"   # seul setup possible : un contexte aligné, jamais un trade à contre-sens
     tr["trigger"] = (f"{ev['type']} {_dir_txt(d)} · clôture {c[ev['i']]['c']:.{dec}f} "
                      f"{'>' if d == 1 else '<'} {ev['level']:.{dec}f}")
+    try:   # liquidité interne de l'UT d'entrée (int_sweep) : affichage, ne décide de rien
+        int_txt = _sweep_txt(sweep_reading(c, ev), dec)
+    except Exception:
+        int_txt = "—"
+    tr["int"] = int_txt
 
     # 1) contexte : H1 (biais) confirmé par M15
     bias = htf_bias(symbol)
@@ -902,7 +1153,7 @@ def htf_poi_setup(symbol, c, ev, trace=None):
     m15 = _last_dir(_ctx_candles(symbol, 15)) if use_m15 else bias
     ctx_txt = f"{htf} {_dir_txt(bias)}" + (f" · M15 {_dir_txt(m15)}" if use_m15 else "")
     if bias:
-        tr["ext"] = _ext_liquidity(symbol, bias, dec)
+        tr["ext"] = _ext_trace_txt(symbol, bias, c[ev["i"]]["c"], dec)   # ext_map ; repli : jambe H1
     if bias == 0:
         tr["htf"] = f"{ctx_txt} → contexte INDÉTERMINÉ"
         return setup, None, f"biais {htf} indéterminé -- {tfl} ne peut pas déterminer le biais seul"
@@ -920,7 +1171,7 @@ def htf_poi_setup(symbol, c, ev, trace=None):
     # 3) M5 : liquidité interne -> sweep / réaction -> fin du retracement -> CHoCH M5
     if TIMEFRAME_MIN < 5:
         r = m5_retracement(symbol, d, dec)
-        tr.update({"int": r["liq"], "retr": r["state"], "choch5": r["choch"]})
+        tr.update({"int": f"{int_txt} · {r['liq']}", "retr": r["state"], "choch5": r["choch"]})
         if r["state"] == "INDÉTERMINÉ":
             return setup, None, "structure M5 indéterminée -- retracement impossible à évaluer"
         if r["state"] == "EN COURS":
@@ -929,7 +1180,7 @@ def htf_poi_setup(symbol, c, ev, trace=None):
         if r["state"] == "NON CONFIRMÉ":
             return setup, None, "CHoCH M5 sans balayage de liquidité interne ni réaction sur POI -- fin du retracement non confirmée"
     else:
-        tr.update({"int": "—", "retr": f"non applicable (UT d'entrée {tfl})", "choch5": "—"})
+        tr.update({"retr": f"non applicable (UT d'entrée {tfl})", "choch5": "—"})
 
     # 4) POI -> mitigation -> réaction (inchangé)
     tfs = [tf for tf in HTF_CASCADE if tf > TIMEFRAME_MIN]
@@ -969,6 +1220,31 @@ def htf_poi_setup(symbol, c, ev, trace=None):
     return setup, poi, None
 
 
+def htf_ref_tf(entry_tf=None):
+    """UT de la tendance de fond utilisée par le mode M15 : M15 pour une entrée M1/M3/M5, H1 pour M15/M30, H4 pour H1."""
+    return HTF_REF_TF.get(entry_tf or TIMEFRAME_MIN, 15)
+
+
+def htf_trend_check(symbol, ev, trace=None):
+    """Filtre HTF en mode M15 : le CHoCH d'entrée doit aller dans le sens de la tendance de fond (direction de la dernière
+    cassure de structure de l'UT de référence, règles d'`analyze`). Aucun autre barrage (ni H1, ni M5, ni POI).
+    Retourne (tendance 1 / -1 / 0, motif_de_refus) ; motif_de_refus vaut None quand le CHoCH suit la tendance de fond.
+    Tendance indéterminée (pas assez de bougies, lecture impossible) -> refus : pas de signal sans contexte lisible."""
+    tf = htf_ref_tf()
+    lbl = _tf_lbl(tf)
+    d = ev["dir"]
+    side = "BUY" if d == 1 else "SELL"
+    trend = _last_dir(_ctx_candles(symbol, tf))
+    if trace is not None:
+        trace["htf"] = f"{lbl} {_dir_txt(trend)}"
+    if trend == 0:
+        return 0, f"tendance de fond {lbl} indéterminée -- pas de signal sans contexte {lbl} lisible"
+    if d != trend:
+        return trend, (f"{side} contre la tendance de fond {lbl} ({_dir_txt(trend)}) -- seuls les "
+                       f"{'BUY' if trend == 1 else 'SELL'} sont autorisés tant que {lbl} ne casse pas sa structure")
+    return trend, None
+
+
 def build_signal(c, ev, symbol=None):
     """Transforme un CHoCH en signal (entrée, SL, TP). None si invalide.
 
@@ -993,21 +1269,33 @@ def build_signal(c, ev, symbol=None):
         return _rej("ENTRY_CHOCH1 désactivé")
     if ev["type"] == "CHOCH2" and not ENTRY_CHOCH2:
         return _rej("ENTRY_CHOCH2 désactivé")
-    htf_on, tp_rr = get_htf_filter(), get_tp_rr()   # réglages Telegram, lus à chaque signal : effet immédiat
+    htf_mode, tp_rr, be_rr = get_htf_mode(), get_tp_rr(), get_be_rr()   # réglages Telegram, lus à chaque signal : effet immédiat
+    htf_on = htf_mode != "OFF"
     setup = poi = None
     if htf_on and symbol:
-        # HTF = contexte · POI = zone de réaction · CHoCH = déclencheur : plus de blocage automatique contre le biais H1
-        setup, poi, why = htf_poi_setup(symbol, c, ev, trace)
-        if why:
-            return _rej(why)
+        if htf_mode == "FULL":
+            # HTF = contexte · POI = zone de réaction · CHoCH = déclencheur : plus de blocage automatique contre le biais H1
+            setup, poi, why = htf_poi_setup(symbol, c, ev, trace)
+            if why:
+                return _rej(why)
+        else:   # M15 : le CHoCH doit suivre la tendance de fond, rien d'autre
+            trend, why = htf_trend_check(symbol, ev)
+            if why:
+                return _rej(why)
+            setup = f"TENDANCE {_tf_lbl(htf_ref_tf())} {_dir_txt(trend).upper()}"
     d, a = ev["dir"], ev["atr"]
     entry = c[ev["i"]]["c"]
     sl = ev["sl_level"] - d * SL_BUFFER_ATR * a
     if (d == 1 and sl >= entry) or (d == -1 and sl <= entry):
         return _rej(f"SL structurel du mauvais côté de l'entrée (sl={sl:.2f}, entrée={entry:.2f})")
     risk = abs(entry - sl)
-    if risk < MIN_SL_ATR * a:
-        risk = MIN_SL_ATR * a
+    # Double plancher : ATR (MIN_SL_ATR) ET % du prix (min_sl_pct/MIN_SL_PCT) -- le plus grand des deux gagne.
+    # Sans le plancher en %, un ATR minuscule (marché calme sur une UT basse comme M1) laissait passer des SL de
+    # quelques points, balayés par le moindre bruit/spread : c'est ce plancher absolu qui l'empêche.
+    min_pct = SYMBOLS.get(symbol, {}).get("min_sl_pct", MIN_SL_PCT) if symbol else MIN_SL_PCT
+    min_risk = max(MIN_SL_ATR * a, entry * min_pct)
+    if risk < min_risk:
+        risk = min_risk
         sl = entry - d * risk
     if risk > MAX_SL_ATR * a:
         return _rej(f"SL trop large : {risk:.2f} pts > {MAX_SL_ATR}xATR ({MAX_SL_ATR * a:.2f} pts) "
@@ -1018,20 +1306,23 @@ def build_signal(c, ev, symbol=None):
         "entry": entry, "sl": sl, "risk": risk,
         "tp": entry + d * risk * tp_rr,
         "t": ev["t"], "bos_level": ev["sl_level"],
-        "rr": tp_rr, "htf": htf_on, "tf": TF_LABEL,   # affichés sur le signal
-        "setup": setup, "poi": poi,                   # CONTINUATION (None si filtre HTF OFF)
+        "rr": tp_rr, "htf": htf_on, "htf_mode": htf_mode, "be_rr": be_rr, "tf": TF_LABEL,   # affichés sur le signal
+        "setup": setup, "poi": poi,   # CONTINUATION (COMPLET) / TENDANCE M15 ... (M15) ; None si filtre HTF OFF
     }
     # Entrée LIMIT : retest du niveau cassé (la ligne du CHoCH), avec le même SL structurel.
     lvl = ev["level"]
     want_limit = ENTRY_MODE == "LIMIT" or (ENTRY_MODE == "BOTH" and abs(entry - lvl) > LIMIT_EXT_ATR * a)
     if want_limit and ((d == 1 and sl < lvl < entry) or (d == -1 and entry < lvl < sl)):
         risk_l = abs(lvl - sl)
-        if risk_l < MIN_SL_ATR * a:
-            risk_l = MIN_SL_ATR * a
+        min_risk_l = max(MIN_SL_ATR * a, lvl * min_pct)
+        if risk_l < min_risk_l:
+            risk_l = min_risk_l
             sl = lvl - d * risk_l
         # si le prix a déjà dépassé le seuil d'annulation, la limit n'a plus de sens : on reste en DIRECT
         if (entry - lvl) * d < LIMIT_CANCEL_RR * risk_l:
             sig.update(order="LIMIT", entry=lvl, sl=sl, risk=risk_l, tp=lvl + d * risk_l * tp_rr)
+    # Lecture liquidité externe / interne : AFFICHAGE (graphique + message), jamais une condition d'acceptation.
+    sig["ext"], sig["sweep"] = liquidity_reading(symbol, c, ev, sig["entry"]) if symbol else (None, None)
     if setup:   # dernier maillon de la chaîne POI -> mitigation -> réaction -> CHoCH : accepté (les refus passent par _rej)
         src = f" depuis {_poi_txt(poi, SYMBOLS[symbol]['decimals'])}" if poi else ""
         print(f"[{symbol}] signal ACCEPTÉ : {sig['side']} {sig['type']} -- {setup}{src}")
@@ -1083,15 +1374,15 @@ def calc_margin(symbol, lot, price, leverage):
 #
 # Suivi des positions sur les bougies clôturées.
 #
-# Grille : RR{BE_RR} -> SL à l'entrée (BE) | RR{TP_RR} -> clôture finale (TP), pas de clôture partielle.
+# Grille : RR{be_rr du trade} -> SL à l'entrée (BE) | RR{TP_RR} -> clôture finale (TP), pas de clôture partielle.
 # Si SL et objectif sont touchés dans la même bougie, le SL est compté en premier (prudent).
 # ============================================================================
 
 def track_trade(trade, candles):
     """Fait avancer un trade avec les nouvelles bougies. Retourne la liste des événements.
 
-    Grille simple : RR{BE_RR} -> SL déplacé à l'entrée (BE) ; RR{TP_RR} -> clôture finale (TP).
-    Pas de clôture partielle (pas de TP1/TP2).
+    Grille simple : RR{be_rr du trade} -> SL déplacé à l'entrée (BE) ; RR{TP_RR} -> clôture finale (TP).
+    Le RR du BE est propre à chaque trade (figé à la création du signal, comme le TP). Pas de clôture partielle.
     Événements : {"name": "BE_MOVED"|"TP"|"SL"|"BE", "trade": trade_dict}
       - "BE_MOVED" : SL déplacé à l'entrée, position toujours ouverte.
       - "BE"       : position refermée à l'entrée (0 R), après un déplacement du SL.
@@ -1103,6 +1394,7 @@ def track_trade(trade, candles):
     side = 1 if trade["side"] == "BUY" else -1
     entry, risk = trade["entry"], abs(trade["entry"] - trade["sl_initial"])
     tp_rr = trade_tp_rr(trade)   # RR de CE trade (fixé à l'ouverture), pas le réglage courant
+    be_rr = trade_be_rr(trade)   # idem pour le BE
     last_ts = trade["last_ts"]
 
     for c in candles:
@@ -1144,8 +1436,13 @@ def track_trade(trade, candles):
         if just_filled:
             continue   # bougie d'exécution : pas de progression comptée (l'ordre des mèches est inconnu)
 
-        # 2) progression : paliers RR1/RR2/RR3 (notification groupe, BE combiné au palier BE_RR)
+        # 2) progression : BE (armé au RR propre au trade), paliers RR1/RR2/RR3 (notification groupe), TP finale
         r_fav = (favorable - entry) * side / risk
+        be_arm = False    # le BE vient d'être armé sur CETTE bougie
+        if not trade["be_hit"] and be_rr < tp_rr and r_fav >= be_rr:
+            trade["be_hit"], trade["sl"] = 1, entry
+            be_arm = True
+        be_told = False   # ... et il est annoncé avec un palier RR (sinon : événement BE_MOVED seul)
         for lvl in RR_LEVELS:
             if lvl > tp_rr:
                 continue   # palier au-delà de la TP de ce trade : jamais atteint (trade clôturé avant)
@@ -1154,13 +1451,11 @@ def track_trade(trade, candles):
                 trade[field] = 1
                 if lvl >= tp_rr:
                     continue   # palier = TP finale : annoncé par l'événement TP, pas en double
-                be_now = not trade["be_hit"] and lvl >= BE_RR
-                if be_now:
-                    trade["be_hit"], trade["sl"] = 1, entry
+                be_now = be_arm and not be_told and lvl >= be_rr
+                be_told = be_told or be_now
                 events.append({"name": f"RR{int(lvl)}", "be_moved": be_now, "trade": dict(trade)})
-        # BE_RR peut ne pas être un palier RR1/2/3 rond (ex. BE_RR=2.5) : on le couvre séparément
-        if not trade["be_hit"] and BE_RR not in RR_LEVELS and BE_RR < tp_rr and r_fav >= BE_RR:
-            trade["be_hit"], trade["sl"] = 1, entry
+        # BE armé à un RR qui n'est pas un palier annoncé (ex. 0.5, 1.5) : message dédié
+        if be_arm and not be_told and r_fav < tp_rr:
             events.append({"name": "BE_MOVED", "trade": dict(trade)})
         if r_fav >= tp_rr:
             trade.update(status="CLOSED", closed_ts=c["t"], result_r=tp_rr,
@@ -1225,6 +1520,18 @@ def make_chart(symbol, candles, events, sig, decimals=2, n_show=70, extend=25):
             ax.text((ev["src"] + ev["i"]) / 2 - start, ev["level"], ev["kind"].replace("CHOCH", "CHoCH"),
                     color=col, fontsize=7, ha="center", va="bottom")
 
+    # Lecture ext / int (sig["ext"], sig["sweep"]) : absente pour make_event_chart / anciens signaux -> simplement pas dessinée.
+    ext, sw = sig.get("ext"), sig.get("sweep")
+    if sw and sw.get("swept") and sw.get("level") is not None:   # niveau interne balayé : « SWEEP » (+ EQH / EQL si égaux)
+        k = next((j for j, cc in enumerate(view) if cc["t"] == sw.get("t")), None)
+        if k is not None:
+            col = "#e040fb"
+            ax.plot([max(0, k - SWEEP_LOOKBACK), k], [sw["level"]] * 2, color=col, lw=1.0)
+            ax.plot([k], [sw["level"]], marker="x", color=col, ms=5)
+            eq_txt = f" {_liq_lbl(sw['side'], True)}" if sw.get("eq") else ""
+            ax.text(k, sw["level"], f"SWEEP{eq_txt}", color=col, fontsize=7, ha="center",
+                    va="bottom" if sw["side"] == "haut" else "top")
+
     x0, x1 = len(view) - 1, len(view) - 1 + extend
     e, sl, tp = sig["entry"], sig["sl"], sig["tp"]
     ax.add_patch(Rectangle((x0, min(e, tp)), x1 - x0, abs(tp - e), color="#26a69a", alpha=0.25))
@@ -1237,8 +1544,22 @@ def make_chart(symbol, candles, events, sig, decimals=2, n_show=70, extend=25):
     ax.set_xlim(-1, x1 + 14)
     lo = min(min(c["l"] for c in view), sl, tp)
     hi = max(max(c["h"] for c in view), sl, tp)
+    ext_edge = None
+    if ext:   # liquidité externe visée : ligne pointillée si elle tient dans le cadre, sinon simple repère au bord du graphique
+        lv, span = ext["level"], (hi - lo) or 1.0
+        ext_lbl = f"EXT {_tf_lbl(ext['tf'])} {_liq_lbl(ext['side'], ext['eq'])} {lv:.{decimals}f}"
+        if lo - 0.6 * span <= lv <= hi + 0.6 * span:
+            lo, hi = min(lo, lv), max(hi, lv)
+            ax.axhline(lv, color="#f5a623", lw=1.0, ls=(0, (1, 2.5)))
+            ax.text(x1 + 0.5, lv, ext_lbl, color="#f5a623", fontsize=8, va="bottom")
+        else:
+            ext_edge = (lv > hi, ext_lbl)
     pad = (hi - lo) * 0.05
     ax.set_ylim(lo - pad, hi + pad)
+    if ext_edge:
+        up, lbl = ext_edge
+        ax.text(0, (hi + pad) if up else (lo - pad), f"{lbl} {'↑' if up else '↓'}", color="#f5a623", fontsize=7,
+                va="top" if up else "bottom")
     ax.set_title(f"{symbol} {TF_LABEL} - {sig['side']}{' LIMIT' if sig.get('order') == 'LIMIT' else ''} ({'CHoCH + CHoCH' if sig['type'] == 'CHOCH2' else 'CHoCH'})",
                  color="white", fontsize=11)
     ax.tick_params(colors="#888888", labelsize=7)
@@ -1420,13 +1741,35 @@ def build_technical_analysis(symbol):
         scenario = (f"Contexte {htf_lbl} <b>{_dir_txt(bias).upper()}</b> (à confirmer par M15). {state_txt}. "
                     f"Liquidité externe visée : {ext_txt}.")
 
+    try:   # liquidité externe (ext_map : plus proche pivot non balayé de chaque côté, EQH / EQL signalés)
+        m_ext = ext_map(symbol)
+        sides = []
+        for d_, word in ((1, "haut"), (-1, "bas")):
+            x = ext_target(symbol, d_, price, m=m_ext)
+            sides.append(_ext_short(x, dec) if x else f"{word} —")
+        ext_map_txt = f"Externe ({_tf_lbl(m_ext['tf'])}) : " + " · ".join(sides)
+    except Exception:
+        ext_map_txt = "Externe (carte) : indisponible"
+    try:   # liquidité interne (int_sweep) : dernier CHoCH M1 -> niveau balayé ou non
+        chochs = [e_ for e_ in data[1]["events"] if e_["kind"] == "CHOCH"]
+        if chochs:
+            last_ch = chochs[-1]
+            int_m1 = (f"Interne (M1) : dernier CHoCH {_dir_txt(last_ch['dir'])} — "
+                      f"{_sweep_txt(sweep_reading(data[1]['raw'], last_ch, tf_lbl='M1'), dec)}")
+        else:
+            int_m1 = "Interne (M1) : aucun CHoCH M1 dans l'historique lu"
+    except Exception:
+        int_m1 = "Interne (M1) : indisponible"
+
     text = (
         f"📈 <b>ANALYSE TECHNIQUE — {symbol}</b>\n"
         f"Prix actuel : <b>{price:.{dec}f}</b>\n\n"
         f"<b>Structure multi-UT</b>\n" + "\n".join(struct_lines) + "\n\n"
         f"<b>Liquidité</b>\n"
         f"Externe ({htf_lbl}) : {ext_txt}\n"
-        f"Interne (M5) : {retr['liq']}\n\n"
+        f"{ext_map_txt}\n"
+        f"Interne (M5) : {retr['liq']}\n"
+        f"{int_m1}\n\n"
         f"<b>Sweep récents</b>\n" + "\n".join(sweep_lines) + "\n\n"
         f"<b>CHoCH M5</b>\n{retr['choch']}\n\n"
         f"<b>Zones OB / FVG / POI ({htf_lbl}/M15/M5)</b>\n" + "\n".join(poi_lines) + "\n\n"
@@ -1703,14 +2046,28 @@ def _sig_rr(sig):
     return round(abs(sig["tp"] - sig["entry"]) / sig["risk"], 2) if sig.get("risk") else TP_RR
 
 
+def _htf_txt(mode):
+    """Libellé du mode HTF : OFF / ON (M15) / ON (complet)."""
+    if mode == "OFF":
+        return "OFF"
+    return "ON (complet)" if mode == "FULL" else f"ON ({_tf_lbl(htf_ref_tf())})"
+
+
 def _params_lines(sig, tf=None):
     """Les 3 paramètres affichés sur un nouveau signal."""
-    htf = sig.get("htf")
-    if htf is None:
-        htf = get_htf_filter()
+    mode = sig.get("htf_mode")
+    if mode not in HTF_MODES:
+        htf = sig.get("htf")
+        mode = get_htf_mode() if htf is None else (HTF_MODE if htf else "OFF")
     return (f"Timeframe : {tf or sig.get('tf') or TF_LABEL}\n"
             f"RR : {_sig_rr(sig):g}\n"
-            f"Filtre HTF : {'ON' if htf else 'OFF'}")
+            f"Filtre HTF : {_htf_txt(mode)}")
+
+
+def _be_line(sig):
+    """Ligne « BE → RRx » d'un signal ; « BE : non utilisé » si le RR du BE n'est pas sous la TP finale."""
+    be_rr = sig.get("be_rr") or BE_RR
+    return f"BE → RR{be_rr:g}" if be_rr < _sig_rr(sig) else "BE : non utilisé (RR du BE ≥ TP)"
 
 
 def group_signal(symbol, sig, position_n, dec, tf=None):
@@ -1725,13 +2082,15 @@ def group_signal(symbol, sig, position_n, dec, tf=None):
         f"Type : {_kind_label(sig['type'])}\n"
         f"Exécution : {exec_txt}\n\n"
         f"{entry_line}\n"
+        f"{_liq_lines(sig, dec)}"
         f"SL : {_fmt(sig['sl'], dec)} ({_dist(sig, sig['sl'], dec)} pts)\n"
         f"{rr_lines}\n"
         f"TP : {_fmt(sig['tp'], dec)} ({_dist(sig, sig['tp'], dec)} pts)\n\n"
-        f"BE → RR{BE_RR:g}\n"
+        f"{_be_line(sig)}\n"
         f"TP final → RR{_sig_rr(sig):g}\n\n"
         f"{_params_lines(sig, tf)}"
-        + (f"\n\nPosition {position_n}/{MAX_POSITIONS} sur {symbol}" if position_n else "")
+        + (f"\n\nPosition {position_n}/{get_max_positions()} sur {symbol}"
+           if position_n and get_max_positions() > 1 else "")
     )
 
 
@@ -1744,6 +2103,7 @@ def admin_signal(symbol, sig, risk_usd, leverage, lot_info, margin, dec):
         f"💰 <b>{symbol} {label}</b> (privé)\n"
         f"Exécution : {exec_txt}\n"
         f"{entry_line.replace('<b>', '').replace('</b>', '')}\n"
+        f"{_liq_lines(sig, dec)}"
         f"SL : {_fmt(sig['sl'], dec)} (distance {_fmt(sig['risk'], dec)} pts)\n"
         f"TP : {_fmt(sig['tp'], dec)} (RR{_sig_rr(sig):g})\n"
         f"📐 Si ton prix broker diffère : SL {_dist(sig, sig['sl'], dec)} / TP {_dist(sig, sig['tp'], dec)} "
@@ -1792,11 +2152,12 @@ def group_event(ev, dec):
         return (f"❌ <b>Ordre LIMIT annulé</b> — {head}\n{ev['reason']}\n"
                 f"Retire ton ordre limit s'il est encore en attente.")
     if name == "BE_MOVED":
-        return f"🔒 <b>RR{BE_RR:g} atteint</b> — {head}\nSL déplacé à l'entrée (BE)."
+        return f"🔒 <b>RR{trade_be_rr(t):g} atteint</b> — {head}\nSL déplacé à l'entrée (BE)."
     if name == "TP":
         return f"🎯 <b>RR{trade_tp_rr(t):g} atteint — TP ✅</b> — {head}\nRésultat : <b>WIN ({t['result_r']:+.2f} R)</b>"
     if name == "BE":
-        return f"➖ <b>Clôture à l'entrée (BE)</b> — {head}\nRésultat : <b>{t['result_r']:+.2f} R</b>"
+        return (f"🟰 <b>BE touché ✅</b> — {head}\n"
+                f"Position refermée à l'entrée : <b>0 R</b> (capital protégé, ce n'est pas un SL).")
     return (f"🔴 <b>SL touché ❌</b> — {head}\nRésultat : <b>LOSS ({t['result_r']:+.2f} R)</b>\n\n"
             f"<i>{random.choice(MOTIVATION_LINES)}</i>")
 
@@ -1875,18 +2236,27 @@ def _tf_text():
             f"bougie clôturée, sans rejouer l'historique.{note}")
 
 
-# --- ⚙️ PARAMÈTRES SIGNAL : RR / timeframe d'entrée / filtre HTF ------------------------------------
+# --- ⚙️ PARAMÈTRES SIGNAL : RR / timeframe d'entrée / filtre HTF / BE / signaux simultanés -----------
+def _htf_mode_txt(mode=None):
+    mode = mode or get_htf_mode()
+    return {"OFF": "🔴 OFF", "M15": f"🟢 ON — tendance {_tf_lbl(htf_ref_tf())}", "FULL": "🟣 ON — complet"}[mode]
+
+
 def _signal_text():
     return (f"⚙️ <b>PARAMÈTRES SIGNAL</b>\n\n"
             f"🎯 RR actuel : RR{get_tp_rr():g}\n"
             f"⏱ Timeframe : {TF_LABEL}\n"
-            f"🧠 Filtre HTF : {'🟢 ACTIVÉ' if get_htf_filter() else '🔴 DÉSACTIVÉ'}")
+            f"🧠 Filtre HTF : {_htf_mode_txt()}\n"
+            f"🔒 BE à : RR{get_be_rr():g}\n"
+            f"📍 Signaux ouverts max par actif : {get_max_positions()}")
 
 
 def _signal_keyboard():
     return {"inline_keyboard": [
         [{"text": "🎯 RR", "callback_data": "sig:rr"}, {"text": "⏱ TIMEFRAME", "callback_data": "sig:tf"},
          {"text": "🧠 FILTRE HTF", "callback_data": "sig:htf"}],
+        [{"text": "🔒 BE", "callback_data": "sig:be"}, {"text": "📍 SIGNAUX MAX", "callback_data": "sig:max"}],
+        [{"text": "🌐 LIQ. EXTERNE", "callback_data": "sig:ext"}],
         [{"text": "🔙 Menu", "callback_data": "menu:home"}]]}
 
 
@@ -1919,17 +2289,67 @@ def _signal_tf_keyboard():
 
 
 def _signal_htf_text():
-    return (f"🧠 Filtre HTF : {'🟢 ACTIVÉ' if get_htf_filter() else '🔴 DÉSACTIVÉ'}\n"
-            f"ACTIVÉ : H{HTF_MINUTES // 60 or 1} = biais, M15 = confirmation du contexte, M5 = fin du retracement, "
-            f"POI (OB / FVG) mitigé = zone de réaction, CHoCH d'entrée = trigger final. "
-            f"Un CHoCH seul ne suffit pas et ne peut jamais aller contre le contexte H1 / M15 (c'est un retracement). "
-            f"DÉSACTIVÉ : logique de signal d'origine, sans ce filtre. Effet immédiat.")
+    ref = _tf_lbl(htf_ref_tf())
+    return (f"🧠 Filtre HTF : {_htf_mode_txt()}\n\n"
+            f"🟢 {ref} : le CHoCH d'entrée doit suivre la tendance de fond {ref} (dernière cassure de structure {ref}). "
+            f"{ref} baissier = uniquement des SELL, {ref} haussier = uniquement des BUY, rien d'autre n'est exigé. "
+            f"(Entrée M1/M5 → M15 · entrée M15/M30 → H1 · entrée H1 → H4.)\n\n"
+            f"🟣 COMPLET : H{HTF_MINUTES // 60 or 1} = biais, M15 = confirmation du contexte, M5 = fin du retracement, "
+            f"POI (OB / FVG) mitigé = zone de réaction, CHoCH d'entrée = trigger final.\n\n"
+            f"🔴 OFF : aucun filtre, tout CHoCH valide devient un signal (BUY ou SELL). Effet immédiat.")
 
 
 def _signal_htf_keyboard():
-    on = get_htf_filter()
-    return _signal_back([[{"text": ("✅ " if on else "") + "🟢 ACTIVÉ", "callback_data": "shtf:1"},
-                          {"text": ("✅ " if not on else "") + "🔴 DÉSACTIVÉ", "callback_data": "shtf:0"}]])
+    cur = get_htf_mode()
+    return _signal_back([[
+        {"text": ("✅ " if cur == "M15" else "") + f"🟢 {_tf_lbl(htf_ref_tf())}", "callback_data": "shtf:M15"},
+        {"text": ("✅ " if cur == "FULL" else "") + "🟣 COMPLET", "callback_data": "shtf:FULL"},
+        {"text": ("✅ " if cur == "OFF" else "") + "🔴 OFF", "callback_data": "shtf:OFF"}]])
+
+
+def _signal_be_text():
+    return (f"🔒 BE actuel : <b>RR{get_be_rr():g}</b>\n"
+            f"Quand le prix atteint ce RR, le SL est déplacé à l'entrée. Si le prix revient sur l'entrée : "
+            f"« BE touché » (0 R), pas un SL. S'applique aux NOUVEAUX signaux : les trades déjà ouverts gardent leur BE. "
+            f"Un BE égal ou supérieur au RR de la TP finale est ignoré. Autre valeur : /be 0.75")
+
+
+def _signal_be_keyboard():
+    cur = get_be_rr()
+    return _signal_back([[{"text": ("✅ " if abs(cur - v) < 1e-9 else "") + f"RR{v:g}", "callback_data": f"sbe:{v}"}
+                          for v in BE_RR_CHOICES]])
+
+
+def _signal_max_text():
+    return (f"📍 Signaux ouverts max par actif : <b>{get_max_positions()}</b>\n"
+            f"1 = aucun nouveau signal sur un actif tant que le signal précédent n'est pas clôturé (TP, SL ou BE). "
+            f"Effet immédiat. Autre valeur : /maxpos 4")
+
+
+def _signal_max_keyboard():
+    cur = get_max_positions()
+    return _signal_back([[{"text": ("✅ " if cur == n else "") + str(n), "callback_data": f"smax:{n}"}
+                          for n in MAX_POSITIONS_CHOICES]])
+
+
+def _signal_ext_text():
+    entry, ext = TIMEFRAME_MIN, get_ext_tf(TIMEFRAME_MIN)
+    pair = f"{_tf_lbl(entry)} → ext. {_tf_lbl(ext)} / int. {_tf_lbl(entry)}"
+    if entry == 5:
+        return (f"🌐 <b>Liquidité externe</b>\n{pair}\n"
+                f"UT de référence pour le biais + la liquidité externe, quand l'UT d'entrée est M5. Effet immédiat.")
+    fixed = ", ".join(f"{_tf_lbl(k)}→{_tf_lbl(v)}" for k, v in LIQ_EXT.items() if k != 5)
+    return (f"🌐 <b>Liquidité externe</b>\n{pair}\n"
+            f"Fixe pour l'UT d'entrée {_tf_lbl(entry)} ({fixed}). Réglable (H1/H4) uniquement quand l'UT d'entrée "
+            f"est M5 (menu ⏱ Timeframe → M5).")
+
+
+def _signal_ext_keyboard():
+    if TIMEFRAME_MIN != 5:
+        return _signal_back([])
+    cur = get_ext_tf(5)
+    return _signal_back([[{"text": ("✅ " if cur == 60 else "") + "H1", "callback_data": "sext:60"},
+                          {"text": ("✅ " if cur == 240 else "") + "H4", "callback_data": "sext:240"}]])
 
 
 def _media_keyboard(prefix, suffix="", verb=""):
@@ -2027,7 +2447,9 @@ def handle_command(text):
                "/testgroupe — envoie un message test au groupe (vérifie CHAT_ID_GROUPE)\n"
                "/trades — positions en cours (avec RR actuel)\n"
                "/timeframe [M1|M3|M5|M15|M30|H1] — change le timeframe à chaud\n"
-               "/signal — paramètres du signal (RR, timeframe, filtre HTF)\n"
+               "/signal — paramètres du signal (RR, timeframe, filtre HTF, BE, signaux max)\n"
+               "/be [RR] — RR auquel le SL passe à l'entrée (ex. /be 1)\n"
+               "/maxpos [n] — signaux ouverts max par actif (1 = pas de doublon)\n"
                "/medias — stickers / images / GIF du groupe (TP, SL, BE, motivation)\n"
                "/analyse — analyse technique / fondamentale à la demande (BTCUSD, XAUUSD)\n"
                "/menu — menu à boutons")
@@ -2042,6 +2464,26 @@ def handle_command(text):
         return (_home_text(), _menu_keyboard())
     if cmd in ("/signal", "/parametres", "/paramètres"):
         return (_signal_text(), _signal_keyboard())
+    if cmd == "/be":
+        if len(parts) > 1:
+            try:
+                v = float(parts[1].replace(",", "."))
+                if not 0 < v <= 20:
+                    raise ValueError
+                set_be_rr(v)
+            except ValueError:
+                return ("RR invalide. Exemple : /be 1 ou /be 0.5", None)
+        return (_signal_be_text(), _signal_be_keyboard())
+    if cmd in ("/maxpos", "/signauxmax"):
+        if len(parts) > 1:
+            try:
+                v = int(parts[1])
+                if not 1 <= v <= 10:
+                    raise ValueError
+                set_max_positions(v)
+            except ValueError:
+                return ("Valeur invalide (1 à 10). Exemple : /maxpos 1", None)
+        return (_signal_max_text(), _signal_max_keyboard())
     if cmd == "/risque":
         if len(parts) > 1:
             try:
@@ -2173,6 +2615,12 @@ def _handle_update(u):
                 _edit(cq, _signal_tf_text(), _signal_tf_keyboard())
             elif page == "htf":
                 _edit(cq, _signal_htf_text(), _signal_htf_keyboard())
+            elif page == "ext":
+                _edit(cq, _signal_ext_text(), _signal_ext_keyboard())
+            elif page == "be":
+                _edit(cq, _signal_be_text(), _signal_be_keyboard())
+            elif page == "max":
+                _edit(cq, _signal_max_text(), _signal_max_keyboard())
             else:
                 _edit(cq, _signal_text(), _signal_keyboard())
         elif data.startswith("srr:"):
@@ -2188,9 +2636,30 @@ def _handle_update(u):
                 _edit(cq, _signal_text(), _signal_keyboard())
                 ack = TF_LABEL
         elif data.startswith("shtf:"):
-            set_htf_filter(data[5:] == "1")
-            _edit(cq, _signal_text(), _signal_keyboard())
-            ack = "Filtre HTF : " + ("ON" if get_htf_filter() else "OFF")
+            arg = data[5:]
+            mode = {"1": HTF_MODE, "0": "OFF"}.get(arg, arg)   # « 1 » / « 0 » : anciens boutons d'un message déjà envoyé
+            if mode in HTF_MODES:
+                set_htf_mode(mode)
+                _edit(cq, _signal_text(), _signal_keyboard())
+                ack = "Filtre HTF : " + _htf_txt(mode)
+        elif data.startswith("sbe:"):
+            v = float(data[4:])
+            if any(abs(v - x) < 1e-9 for x in BE_RR_CHOICES):
+                set_be_rr(v)
+                _edit(cq, _signal_text(), _signal_keyboard())
+                ack = f"BE à RR{v:g}"
+        elif data.startswith("smax:"):
+            n = int(data[5:])
+            if n in MAX_POSITIONS_CHOICES:
+                set_max_positions(n)
+                _edit(cq, _signal_text(), _signal_keyboard())
+                ack = f"{n} signal(s) max"
+        elif data.startswith("sext:"):
+            v = int(data[5:])
+            if TIMEFRAME_MIN == 5 and v in (60, 240):
+                set_ext_tf_m5(v)
+                _edit(cq, _signal_ext_text(), _signal_ext_keyboard())
+                ack = _tf_lbl(v)
         elif data.startswith("mset:"):
             _, cat, mid = data.split(":")
             item = _pending_media.pop((cq["message"]["chat"]["id"], int(mid)), None)
@@ -2367,8 +2836,9 @@ def publish_signal(symbol, candles, events, sig):
     if signal_exists(key):
         return
     n_open = count_open(symbol)
-    if n_open >= MAX_POSITIONS:
-        print(f"[{symbol}] {sig['side']} {sig['type']} ignoré ({n_open}/{MAX_POSITIONS} positions ouvertes)")
+    max_pos = get_max_positions()
+    if n_open >= max_pos:
+        print(f"[{symbol}] {sig['side']} {sig['type']} ignoré ({n_open}/{max_pos} signal(s) encore ouvert(s) : pas de doublon)")
         return
 
     risk_usd = get_risk()
@@ -2385,6 +2855,7 @@ def publish_signal(symbol, candles, events, sig):
         sent_admin=0, sent_group=0,   # passent à 1 seulement quand Telegram a confirmé l'envoi
         signal_key=key, symbol=symbol, side=sig["side"], kind=sig["type"], timeframe=TF_LABEL,
         entry=sig["entry"], sl=sig["sl"], sl_initial=sig["sl"], tp=sig["tp"],
+        be_rr=sig.get("be_rr"), htf_mode=sig.get("htf_mode"),
         risk_usd=lot_info["real_risk"],  # risque réel du lot pris (= risque demandé sauf lot minimum)
         lot=lot_info["lot"], leverage=leverage, opened_ts=now_ts(), last_ts=sig["t"])
     print(f"[{symbol}] SIGNAL {sig['side']} {sig.get('order', 'MARKET')} {sig['type']} @ {sig['entry']:.{dec}f} "
@@ -2447,7 +2918,8 @@ def retry_unsent_signals():
         dec = SYMBOLS[sym]["decimals"]
         sig = {"side": t["side"], "type": t["kind"], "entry": t["entry"], "sl": t["sl_initial"],
                "tp": t["tp"], "risk": abs(t["entry"] - t["sl_initial"]),
-               "order": t.get("order_type") or "MARKET", "ref_price": t.get("ref_price"), "tf": t["timeframe"]}
+               "order": t.get("order_type") or "MARKET", "ref_price": t.get("ref_price"), "tf": t["timeframe"],
+               "be_rr": t.get("be_rr"), "htf_mode": t.get("htf_mode")}
         lot_info = {"lot": t["lot"], "real_risk": t["risk_usd"], "raised_to_min": False}
         lev = t["leverage"] or get_leverage()
         margin = calc_margin(sym, t["lot"], t["entry"], lev)
@@ -2922,6 +3394,86 @@ class TestChop(unittest.TestCase):
               f"{blocked_ctx} stoppés par le contexte H1/M15")
 
 
+class TestGetExtTf(unittest.TestCase):
+    """get_ext_tf : UT de liquidité externe par UT d'entrée — fixe (LIQ_EXT) sauf pour M5, réglable en base
+    ('ext_tf_m5') pour M5."""
+
+    def test_get_ext_tf(self):
+        for entry_tf, expected in LIQ_EXT.items():
+            if entry_tf != 5:
+                self.assertEqual(get_ext_tf(entry_tf), expected, f"entrée {_tf_lbl(entry_tf)}")
+        self.assertEqual(get_ext_tf(5), LIQ_EXT[5], "M5 sans réglage en base -> défaut H1")
+        set_ext_tf_m5(240)
+        self.assertEqual(get_ext_tf(5), 240, "M5 après réglage en base -> H4")
+        set_ext_tf_m5(60)
+        self.assertEqual(get_ext_tf(5), 60, "M5 remis à H1")
+
+
+class TestLiquiditePure(unittest.TestCase):
+    """ext_map / int_sweep (section 4) : fonctions pures, ne touchent ni build_signal ni htf_poi_setup."""
+
+    def _seed_ctx(self, tf, candles):
+        _ctx_cache[(_ST_SYM, tf)] = (time.time(), candles)
+
+    def test_pivot_balaye_exclu_non_balaye_inclus(self):
+        _apply_timeframe(1)   # entrée M1 -> UT externe LIQ_EXT[1] = M15
+        tf, base, margin = get_ext_tf(1), 2000.0, EXT_DEPTH + 3
+
+        def _series(sweep_level=None):
+            n = 2 * margin + 1
+            c = [{"t": _ST_T0 + i * tf * 60, "o": base, "h": base, "l": base, "c": base} for i in range(n)]
+            c[margin] = {**c[margin], "h": base + 10}   # pivot high isolé, non balayé
+            if sweep_level is not None:
+                pad = [{"t": c[-1]["t"] + (i + 1) * tf * 60, "o": base, "h": base, "l": base, "c": base}
+                       for i in range(EXT_DEPTH + 2)]
+                sweep = [{"t": pad[-1]["t"] + tf * 60, "o": base, "h": sweep_level, "l": base, "c": base}]
+                c = c + pad + sweep + [{"t": sweep[-1]["t"] + (i + 1) * tf * 60, "o": base, "h": base,
+                                        "l": base, "c": base} for i in range(EXT_DEPTH + 2)]
+            return c
+
+        self._seed_ctx(tf, _series())
+        highs_ok = ext_map(_ST_SYM)["highs"]
+        self.assertTrue(any(pv["level"] == base + 10 for pv in highs_ok), "pivot non balayé absent du résultat")
+
+        self._seed_ctx(tf, _series(sweep_level=base + 20))
+        highs_swept = ext_map(_ST_SYM)["highs"]
+        self.assertFalse(any(pv["level"] == base + 10 for pv in highs_swept), "pivot balayé n'a pas été exclu")
+
+    def test_eql_detectee(self):
+        _apply_timeframe(1)
+        tf, base, margin = get_ext_tf(1), 2000.0, EXT_DEPTH + 3
+
+        def _flat(n, t0):
+            return [{"t": t0 + i * tf * 60, "o": base, "h": base, "l": base, "c": base} for i in range(n)]
+
+        c = _flat(margin, _ST_T0)
+        c.append({"t": c[-1]["t"] + tf * 60, "o": base, "h": base, "l": base - 10, "c": base})   # creux 1
+        c += _flat(2 * margin, c[-1]["t"] + tf * 60)   # écart large : fenêtres de confirmation disjointes
+        c.append({"t": c[-1]["t"] + tf * 60, "o": base, "h": base, "l": base - 10, "c": base})   # creux 2, même niveau
+        c += _flat(margin, c[-1]["t"] + tf * 60)
+
+        self._seed_ctx(tf, c)
+        lows = ext_map(_ST_SYM)["lows"]
+        eql = [pv for pv in lows if pv["level"] == base - 10]
+        self.assertEqual(len(eql), 2, "les deux creux au même niveau doivent être détectés")
+        self.assertTrue(all(pv["eq"] for pv in eql), "les deux creux au même niveau doivent être marqués eq (EQL)")
+
+    def test_sweep_interne(self):
+        base = 2000.0
+        prior = [{"t": _ST_T0 + i * 60, "o": base, "h": base, "l": base, "c": base} for i in range(SWEEP_LOOKBACK)]
+        prior[2]["l"] = base - 5   # deux creux internes au même niveau avant le retournement -> EQL interne
+        prior[6]["l"] = base - 5
+        turn = {"t": prior[-1]["t"] + 60, "o": base, "h": base + 1, "l": base - 6, "c": base + 0.5}   # mèche sous le creux, clôture au-dessus
+        c = prior + [turn]
+        e = len(c) - 1
+        ev = {"dir": 1, "i": e, "src": 0, "atr": 2.0}
+        r = int_sweep(c, ev)
+        self.assertTrue(r["swept"], "mèche sous le creux + clôture au-dessus -> balayage détecté")
+        self.assertEqual(r["level"], base - 5)
+        self.assertEqual(r["extreme"], e)
+        self.assertTrue(r["eq"], "deux creux internes au même niveau -> eq (EQL interne)")
+
+
 class TestM1NeDecidePasSeul(unittest.TestCase):
     def test_m1_seul(self):
         m1 = _StScenarios.bull()[0]
@@ -3005,10 +3557,371 @@ class TestNonRegression(unittest.TestCase):
 
 
 
+# ----------------------------------------------------------------------------- tests : filtre HTF M15, BE par trade, doublons
+class TestHtfM15(unittest.TestCase):
+    """Mode M15 : le CHoCH d'entrée doit suivre la dernière cassure M15 ; jamais de signal à contre-sens, jamais sans contexte."""
+
+    def test_sens_du_m15(self):
+        old = _E.HTF_MODE
+        try:
+            _E.HTF_MODE = "M15"
+            seen = {}
+            for name, m1 in (("bull", _StScenarios.bull()[0]), ("bear", _StScenarios.bear()[0]),
+                             ("flip", _StScenarios.flip()[0][0])):
+                res = _st_eval(_E, m1)
+                self.assertGreater(len(res), 20, name)
+                for ev, sig, log in res:
+                    m15 = _st_state(m1, ev["i"] + 1)[1]
+                    if sig:
+                        self.assertEqual(sig["dir"], m15, f"{name} : signal à contre-sens du M15")
+                        self.assertEqual(sig["htf_mode"], "M15")
+                        seen.setdefault(name, set()).add(sig["side"])
+                    elif m15 == 0:
+                        self.assertIn("indéterminée", _st_reason(log))
+                    elif ev["dir"] != m15:
+                        self.assertIn("contre la tendance de fond M15", _st_reason(log), name)
+                        seen.setdefault(name + "-refus", set()).add("BUY" if ev["dir"] == 1 else "SELL")
+            # le M15 peut se retourner (brièvement) même dans un scénario globalement haussier : la garantie testée est
+            # « chaque signal suit le M15 du moment » (ci-dessus) ; ici on vérifie seulement que le filtre travaille dans les 2 sens
+            self.assertIn("BUY", seen.get("bull", set()))
+            self.assertIn("SELL", seen.get("bear", set()))
+            self.assertTrue(seen.get("bull-refus") or seen.get("bear-refus"), "des CHoCH à contre-sens M15 doivent être refusés")
+            print(f"\n  M15 : signaux {({k: sorted(v) for k, v in seen.items()})}")
+        finally:
+            _E.HTF_MODE = old
+
+    def test_sans_contexte_pas_de_signal(self):
+        old = _E.HTF_MODE
+        try:
+            _E.HTF_MODE = "M15"
+            res = _st_eval(_E, _StScenarios.bull()[0], only_m1=True)   # UT supérieures indisponibles
+            self.assertEqual([r for r in res if r[1]], [])
+            self.assertTrue(all("indéterminée" in _st_reason(r[2]) for r in res))
+        finally:
+            _E.HTF_MODE = old
+
+    def test_mode_off_laisse_tout_passer(self):
+        try:
+            _E.set_setting("htf_mode", "OFF")
+            m1 = _StScenarios.bull()[0]
+            res = _st_eval(_E, m1)
+            sides = {r[1]["side"] for r in res if r[1]}
+            self.assertEqual(sides, {"BUY", "SELL"}, "OFF = aucun filtre : les deux sens passent")
+            self.assertTrue(all(r[1]["htf_mode"] == "OFF" for r in res if r[1]))
+        finally:
+            _E._q("DELETE FROM settings WHERE key='htf_mode'", commit=True)
+
+    def test_reglage_et_migration(self):
+        try:
+            for k in ("htf_mode", "htf_filter"):
+                _E._q("DELETE FROM settings WHERE key=?", (k,), commit=True)
+            self.assertEqual(_E.get_htf_mode(), "FULL" if _E.HTF_FILTER else "OFF")   # défaut = HTF_MODE (FULL en test)
+            _E.set_setting("htf_filter", "0")            # ancienne base : OFF
+            self.assertEqual(_E.get_htf_mode(), "OFF")
+            _E.set_setting("htf_filter", "1")            # ancienne base : ON -> mode par défaut
+            self.assertEqual(_E.get_htf_mode(), _E.HTF_MODE)
+            _E.set_htf_mode("M15")                       # le choix explicite prime
+            self.assertEqual(_E.get_htf_mode(), "M15")
+            self.assertTrue(_E.get_htf_filter())
+            _E.set_htf_mode("OFF")
+            self.assertFalse(_E.get_htf_filter())
+        finally:
+            for k in ("htf_mode", "htf_filter"):
+                _E._q("DELETE FROM settings WHERE key=?", (k,), commit=True)
+
+    def test_ut_de_reference(self):
+        self.assertEqual([_E.htf_ref_tf(t) for t in (1, 3, 5, 15, 30, 60)], [15, 15, 15, 60, 60, 240])
+
+
+def _st_trade(side="BUY", be_rr=None, tp_rr=4.0, entry=100.0, risk=1.0):
+    s = 1 if side == "BUY" else -1
+    sl = entry - s * risk
+    return {"id": -1, "symbol": "XAUUSD", "side": side, "entry": entry, "sl": sl, "sl_initial": sl,
+            "tp": entry + s * risk * tp_rr, "status": "OPEN", "be_hit": 0, "rr1_hit": 0, "rr2_hit": 0, "rr3_hit": 0,
+            "last_ts": 0, "closed_ts": None, "filled_ts": None, "result_r": None, "pnl_usd": None, "outcome": None,
+            "risk_usd": 10.0, "be_rr": be_rr}
+
+
+def _st_c(t, h, l, o=None, c=None):
+    return {"t": t, "o": o if o is not None else (h + l) / 2, "h": h, "l": l, "c": c if c is not None else (h + l) / 2}
+
+
+def _st_names(events):
+    return [e["name"] for e in events]
+
+
+class TestBE(unittest.TestCase):
+    """BE réglable par trade : armement au bon RR, « BE touché » (0 R) distinct du SL, trade ouvert jamais modifié."""
+
+    def test_be_rr1_puis_retour_entree(self):
+        t = _st_trade("BUY", be_rr=1)
+        ev = _E.track_trade(t, [_st_c(1, 101.2, 100.1)])
+        self.assertEqual(_st_names(ev), ["RR1"])
+        self.assertTrue(ev[0]["be_moved"])
+        self.assertEqual((t["be_hit"], t["sl"]), (1, 100.0))
+        ev = _E.track_trade(t, [_st_c(2, 100.6, 99.95)])   # le prix revient toucher l'entrée
+        self.assertEqual(_st_names(ev), ["BE"])
+        self.assertEqual((t["outcome"], t["result_r"], t["status"]), ("BE", 0.0, "CLOSED"))
+        self.assertIn("BE touché", _E.group_event(ev[0], 2))
+        self.assertNotIn("SL touché", _E.group_event(ev[0], 2))
+
+    def test_be_demi_r(self):
+        t = _st_trade("BUY", be_rr=0.5)
+        ev = _E.track_trade(t, [_st_c(1, 100.6, 100.1)])
+        self.assertEqual(_st_names(ev), ["BE_MOVED"])
+        self.assertIn("RR0.5", _E.group_event(ev[0], 2))
+        ev = _E.track_trade(t, [_st_c(2, 100.4, 99.9)])
+        self.assertEqual((_st_names(ev), t["result_r"]), (["BE"], 0.0))
+
+    def test_sell_symetrique(self):
+        t = _st_trade("SELL", be_rr=1)
+        ev = _E.track_trade(t, [_st_c(1, 99.9, 98.7)])
+        self.assertEqual((_st_names(ev), t["sl"]), (["RR1"], 100.0))
+        ev = _E.track_trade(t, [_st_c(2, 100.05, 99.5)])
+        self.assertEqual((_st_names(ev), t["outcome"]), (["BE"], "BE"))
+
+    def test_meme_bougie_pique_puis_sl_reste_un_sl(self):
+        """Un pic à +2R puis retour sous l'entrée dans la MÊME bougie : l'ordre des mèches est inconnu -> SL (prudent)."""
+        t = _st_trade("BUY", be_rr=1)
+        ev = _E.track_trade(t, [_st_c(1, 102.0, 98.9)])
+        self.assertEqual((_st_names(ev), t["result_r"]), (["SL"], -1.0))
+
+    def test_sl_initial_sans_be(self):
+        t = _st_trade("BUY", be_rr=1)
+        ev = _E.track_trade(t, [_st_c(1, 100.5, 98.9)])
+        self.assertEqual((_st_names(ev), t["outcome"], t["result_r"]), (["SL"], "SL", -1.0))
+
+    def test_be_au_dela_de_la_tp_ignore(self):
+        t = _st_trade("BUY", be_rr=5, tp_rr=4)
+        ev = _E.track_trade(t, [_st_c(1, 103.5, 100.2)])
+        self.assertEqual(_st_names(ev), ["RR1", "RR2", "RR3"])
+        self.assertFalse(any(e.get("be_moved") for e in ev))
+        self.assertEqual(t["be_hit"], 0)
+        self.assertIn("non utilisé", _E._be_line({"be_rr": 5, "tp": 104.0, "entry": 100.0, "risk": 1.0, "rr": 4}))
+
+    def test_be_1_5_dans_une_bougie_qui_saute_plusieurs_paliers(self):
+        t = _st_trade("BUY", be_rr=1.5)
+        ev = _E.track_trade(t, [_st_c(1, 103.2, 100.2)])
+        self.assertEqual(_st_names(ev), ["RR1", "RR2", "RR3"])
+        self.assertEqual([e["be_moved"] for e in ev], [False, True, False])   # annoncé une seule fois, avec RR2
+
+    def test_ancien_trade_sans_be_rr_garde_be_rr_global(self):
+        t = _st_trade("BUY", be_rr=None, tp_rr=6)
+        g = _E.BE_RR
+        ev = _E.track_trade(t, [_st_c(1, 100 + g - 0.1, 100.2)])
+        self.assertFalse(t["be_hit"])
+        ev = _E.track_trade(t, [_st_c(2, 100 + g + 0.1, 100.2)])
+        self.assertEqual(t["be_hit"], 1)
+
+    def test_reglage_be_naffecte_pas_un_trade_ouvert(self):
+        try:
+            _E.set_be_rr(3)
+            t = _st_trade("BUY", be_rr=1)
+            _E.track_trade(t, [_st_c(1, 101.2, 100.1)])
+            self.assertEqual(t["be_hit"], 1, "le trade garde SON be_rr (1), pas le réglage courant (3)")
+        finally:
+            _E._q("DELETE FROM settings WHERE key='be_rr'", commit=True)
+
+    def test_commande_be_et_menu(self):
+        try:
+            txt, kb = _E.handle_command("/be 1.5")
+            self.assertEqual(_E.get_be_rr(), 1.5)
+            self.assertIn("RR1.5", txt)
+            self.assertIn("RR1.5", str(kb))
+            self.assertIn("Exemple", _E.handle_command("/be abc")[0])
+            self.assertEqual(_E.get_be_rr(), 1.5)
+            self.assertIn("BE à : RR1.5", _E._signal_text())
+        finally:
+            _E._q("DELETE FROM settings WHERE key='be_rr'", commit=True)
+
+
+class TestSignauxSimultanes(unittest.TestCase):
+    """Un seul signal ouvert par actif par défaut : pas de doublon tant que le précédent n'est pas clôturé."""
+
+    def _sig(self, t):
+        return {"dir": -1, "side": "SELL", "type": "CHOCH1", "order": "MARKET", "ref_price": 100.0, "entry": 100.0,
+                "sl": 101.0, "risk": 1.0, "tp": 96.0, "t": t, "rr": 4.0, "htf": True, "htf_mode": "M15",
+                "be_rr": 1.0, "tf": "M1", "setup": "TENDANCE M15 BAISSIER", "poi": None}
+
+    def test_pas_de_doublon(self):
+        sent = []
+        saved = (_E._deliver_signal, _E.make_chart)
+        try:
+            _E._q("DELETE FROM trades", commit=True)
+            _E._deliver_signal = lambda trade_id, symbol, admin_txt, group_txt, **k: sent.append((trade_id, group_txt))
+            _E.make_chart = lambda *a, **k: None
+            self.assertEqual(_E.get_max_positions(), _E.MAX_POSITIONS)
+            self.assertEqual(_E.MAX_POSITIONS, 1, "défaut : 1 signal ouvert par actif")
+            _E.publish_signal("XAUUSD", [], [], self._sig(1000))
+            _E.publish_signal("XAUUSD", [], [], self._sig(1060))   # doublon : ignoré tant que le 1er est ouvert
+            self.assertEqual(_E.count_open("XAUUSD"), 1)
+            self.assertEqual(len(sent), 1)
+            self.assertNotIn("Position ", sent[0][1], "avec max = 1 la ligne « Position n/m » n'a pas de sens")
+            self.assertIn("BE → RR1", sent[0][1])
+            self.assertIn("Filtre HTF : ON (M15)", sent[0][1])
+            row = _E._q("SELECT be_rr, htf_mode FROM trades").fetchone()
+            self.assertEqual((row["be_rr"], row["htf_mode"]), (1.0, "M15"))
+            _E.publish_signal("BTCUSD", [], [], self._sig(1000))   # un autre actif reste libre
+            self.assertEqual(_E.count_open("BTCUSD"), 1)
+            _E._q("UPDATE trades SET status='CLOSED' WHERE symbol='XAUUSD'", commit=True)   # clôturé (SL, TP ou BE)
+            _E.publish_signal("XAUUSD", [], [], self._sig(1120))
+            self.assertEqual(_E.count_open("XAUUSD"), 1)
+            self.assertEqual(len(sent), 3)
+            _E.handle_command("/maxpos 2")
+            self.assertEqual(_E.get_max_positions(), 2)
+            _E.publish_signal("XAUUSD", [], [], self._sig(1180))
+            self.assertEqual(_E.count_open("XAUUSD"), 2)
+            self.assertIn("Position 2/2", sent[-1][1])
+        finally:
+            _E._deliver_signal, _E.make_chart = saved
+            _E._q("DELETE FROM trades", commit=True)
+            _E._q("DELETE FROM settings WHERE key='max_positions'", commit=True)
+
+    def test_menu_htf(self):
+        kb = str(_E._signal_htf_keyboard())
+        for cb in ("shtf:M15", "shtf:FULL", "shtf:OFF"):
+            self.assertIn(cb, kb)
+
+
+# ----------------------------------------------------------------------------- tests : lecture liquidité ext / int (affichage)
+class TestLectureExtInt(unittest.TestCase):
+    """sig["ext"] / sig["sweep"] : affichage uniquement — présents dans le signal, dans le message, le graphique, le log
+    multi-UT et l'analyse ; jamais une condition d'acceptation ; absents (renvoi différé, make_event_chart) sans erreur."""
+
+    @staticmethod
+    def _off_signals(m1):
+        _E.set_setting("htf_mode", "OFF")
+        try:
+            return _st_eval(_E, m1)
+        finally:
+            _E._q("DELETE FROM settings WHERE key='htf_mode'", commit=True)
+
+    def test_cles_du_signal(self):
+        m1 = _StScenarios.bull()[0]
+        sigs = [(ev, sig) for ev, sig, _ in self._off_signals(m1) if sig]
+        self.assertGreater(len(sigs), 10)
+        times = {c["t"] for c in m1}
+        n_ext = 0
+        for ev, sig in sigs:
+            sw, ext = sig["sweep"], sig["ext"]
+            self.assertIsNotNone(sw)
+            self.assertEqual(sw["side"], "bas" if sig["dir"] == 1 else "haut")
+            self.assertIn(sw["t"], times)
+            self.assertEqual(sw["tf"], "M1")
+            if ext:
+                n_ext += 1
+                self.assertEqual(ext["side"], "haut" if sig["dir"] == 1 else "bas")
+                self.assertGreater((ext["level"] - sig["entry"]) * sig["dir"], 0, "l'externe visée est dans le sens du trade")
+                self.assertEqual(ext["tf"], 15)
+        self.assertGreater(n_ext, 0, "au moins un signal doit avoir une liquidité externe M15 visée")
+
+    def test_affichage_seulement_ne_decide_de_rien(self):
+        """Mêmes signaux acceptés, que la lecture ext / int fonctionne ou qu'elle plante."""
+        m1 = _StScenarios.bull()[0]
+        ref = {ev["t"] for ev, sig, _ in self._off_signals(m1) if sig}
+        saved = (_E.ext_target, _E.sweep_reading)
+
+        def boom(*a, **k):
+            raise RuntimeError("panne de lecture")
+        try:
+            _E.ext_target, _E.sweep_reading = boom, boom
+            res = self._off_signals(m1)
+        finally:
+            _E.ext_target, _E.sweep_reading = saved
+        self.assertEqual({ev["t"] for ev, sig, _ in res if sig}, ref)
+        self.assertTrue(all(sig["ext"] is None and sig["sweep"] is None for _, sig, _ in res if sig))
+
+    def _fake_sig(self, **kw):
+        sig = {"side": "SELL", "dir": -1, "type": "CHOCH1", "entry": 80766.0, "sl": 80778.0, "risk": 12.0, "tp": 80718.0,
+               "rr": 4.0, "order": "MARKET", "htf_mode": "M15", "be_rr": 1.0, "tf": "M1", "t": 1}
+        sig.update(kw)
+        return sig
+
+    def test_lignes_message(self):
+        ext = {"tf": 15, "side": "bas", "level": 80500.0, "eq": True, "dist": 266.0}
+        sw = {"tf": "M1", "side": "haut", "level": 80780.0, "swept": True, "eq": True, "t": 1, "i": 1}
+        sig = self._fake_sig(ext=ext, sweep=sw)
+        lot = {"lot": 0.01, "real_risk": 10.0, "raised_to_min": False}
+        for txt in (_E.group_signal("BTCUSD", sig, 1, 0), _E.admin_signal("BTCUSD", sig, 10.0, 100.0, lot, 5.0, 0)):
+            self.assertIn("Ext. : M15 EQL 80 500 (à 266 pts)", txt)
+            self.assertIn("Int. : M1 EQH 80 780 balayé", txt)
+            self.assertLess(txt.index("Ext. :"), txt.index("Int. :"))
+            self.assertLess(txt.index("Int. :"), txt.index("SL :"), "les lignes Ext./Int. précèdent SL/TP")
+        sig = self._fake_sig(ext={**ext, "eq": False, "side": "haut"}, sweep={**sw, "swept": False, "eq": False})
+        txt = _E.group_signal("BTCUSD", sig, 1, 0)
+        self.assertIn("Ext. : M15 haut 80 500", txt)
+        self.assertIn("Int. : M1 haut 80 780 non balayé", txt)
+
+    def test_cles_absentes_tolerees(self):
+        sig = self._fake_sig()   # renvoi différé : pas de sig["ext"] / sig["sweep"]
+        lot = {"lot": 0.01, "real_risk": 10.0, "raised_to_min": False}
+        for txt in (_E.group_signal("BTCUSD", sig, None, 0), _E.admin_signal("BTCUSD", sig, 10.0, 100.0, lot, 5.0, 0)):
+            self.assertNotIn("Ext. :", txt)
+            self.assertNotIn("Int. :", txt)
+            self.assertIn("SL :", txt)
+        sig = self._fake_sig(ext=None, sweep={"tf": "M1", "side": "haut", "level": None, "swept": False, "eq": False})
+        self.assertNotIn("Int. :", _E.group_signal("BTCUSD", sig, None, 0))
+
+    @unittest.skipUnless(importlib.util.find_spec("matplotlib"), "matplotlib absent")
+    def test_graphiques(self):
+        import tempfile
+        m1 = _StScenarios.bull()[0]
+        acc = [(ev, sig) for ev, sig, _ in self._off_signals(m1) if sig and sig["ext"] and sig["sweep"]["swept"]]
+        self.assertTrue(acc, "il faut un signal avec ext + sweep balayé")
+        ev, sig = acc[-1]
+        candles = m1[:ev["i"] + 1]
+        old_dir = _E.CHART_DIR
+        _E.CHART_DIR = tempfile.mkdtemp()
+        try:
+            evs = _E.analyze(candles)
+            far = {**sig, "ext": {**sig["ext"], "level": sig["entry"] + 100 * sig["dir"] * sig["risk"]}}   # hors cadre
+            for name, sg in (("complet", sig), ("ext hors cadre", far), ("sans lecture", {**sig, "ext": None, "sweep": None}),
+                             ("cles absentes", {k: v for k, v in sig.items() if k not in ("ext", "sweep")}),
+                             ("sweep non balaye", {**sig, "sweep": {**sig["sweep"], "swept": False}})):
+                path = _E.make_chart("XAUUSD", candles, evs, sg, 2)
+                self.assertTrue(path and os.path.exists(path), name)
+                os.replace(path, os.path.join(_E.CHART_DIR, name.replace(" ", "_") + ".png"))
+            trade = {"entry": sig["entry"], "sl": sig["sl"], "tp": sig["tp"], "side": sig["side"], "kind": sig["type"]}
+            path = _E.make_event_chart("XAUUSD", candles, evs, trade, 2)   # pas de ext / sweep : toléré
+            self.assertTrue(path and os.path.exists(path))
+            if os.environ.get("KEEP_CHARTS"):
+                import shutil
+                shutil.copytree(_E.CHART_DIR, os.environ["KEEP_CHARTS"], dirs_exist_ok=True)
+        finally:
+            _E.CHART_DIR = old_dir
+
+    def test_log_multi_ut(self):
+        m1, res = _StScenarios.bull()   # filtre COMPLET
+        acc = [r for r in res if r[1]]
+        self.assertTrue(acc)
+        for _, _, log in acc:
+            self.assertRegex(_st_field(log, "liquidité int."), r"^M1 (haut|bas|EQH|EQL) [\d .]+ (non )?balayé", "int_sweep")
+        self.assertTrue(any(re.match(r"^M15 (haut|bas|EQH|EQL) ", _st_field(log, "liquidité ext.") or "") for _, _, log in acc),
+                        "ext_map : « M15 haut/bas … » dans au moins un log")
+
+    def test_analyse_technique(self):
+        import tempfile
+        m1 = _StScenarios.bull()[0]
+        _StFeed(_E, m1)
+        _E._htf_cache.clear()
+        _E._ctx_cache.clear()
+        old_dir = _E.CHART_DIR
+        _E.CHART_DIR = tempfile.mkdtemp()
+        try:
+            txt, _chart = _E.build_technical_analysis("XAUUSD")
+        finally:
+            _E.CHART_DIR = old_dir
+        self.assertIn("Externe (M15) :", txt)
+        self.assertRegex(txt, r"Interne \(M1\) : dernier CHoCH \w+ — M1 (haut|bas|EQH|EQL) [\d .]+ (non )?balayé")
+        print("\n  " + "\n  ".join(l for l in txt.splitlines() if l.startswith(("Externe", "Interne"))))
+
+
 def _selftest():
+    _E.HTF_MODE = "FULL"   # les tests historiques (H1 -> M15 -> M5 -> POI) évaluent la cascade complète ; TestHtfM15 passe en mode M15
     suite, loader = unittest.TestSuite(), unittest.TestLoader()
-    for cls in (TestRetracement, TestContinuation, TestInvalidationHTF, TestChop, TestM1NeDecidePasSeul,
-                TestLogs, TestEntreeM5, TestNonRegression):
+    for cls in (TestRetracement, TestContinuation, TestInvalidationHTF, TestChop, TestGetExtTf,
+                TestLiquiditePure, TestM1NeDecidePasSeul, TestLogs, TestEntreeM5, TestNonRegression,
+                TestHtfM15, TestBE, TestSignauxSimultanes, TestLectureExtInt):
         suite.addTests(loader.loadTestsFromTestCase(cls))
     return 0 if unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful() else 1
 
