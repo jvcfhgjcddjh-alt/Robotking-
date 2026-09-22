@@ -1,4 +1,5 @@
 
+
 #!/usr/bin/env python3
 """AlphaBot BOS + CHoCH — Gold & BTC — version en un seul fichier.
 
@@ -257,8 +258,10 @@ DAILY_REPORT_HOUR_UTC = _env_int("DAILY_REPORT_HOUR_UTC", 21)
 # Remplace les deux valeurs ci-dessous par les tiennes (dashboard MetaApi.cloud), ou laisse-les
 # vides et utilise les variables d'environnement METAAPI_TOKEN / METAAPI_ACCOUNT_ID (Render / .env) —
 # la variable d'environnement, si définie, garde toujours la priorité sur ces valeurs par défaut.
-_DEFAULT_METAAPI_TOKEN = "eyJhbGciOiJSUzUxMiIsInR5cCI6IkpXVCJ9.eyJfaWQiOiJkNzEzMzhmZjUzN2JjODAzM2EwMjQ1MjVmZmUwZTRlNiIsImFjY2Vzc1J1bGVzIjpbeyJpZCI6InRyYWRpbmctYWNjb3VudC1tYW5hZ2VtZW50LWFwaSIsIm1ldGhvZHMiOlsidHJhZGluZy1hY2NvdW50LW1hbmFnZW1lbnQtYXBpOnJlc3Q6cHVibGljOio6KiJdLCJyb2xlcyI6WyJyZWFkZXIiLCJ3cml0ZXIiXSwicmVzb3VyY2VzIjpbIio6JFVTRVJfSUQkOioiXX0seyJpZCI6Im1ldGFhcGktcmVzdC1hcGkiLCJtZXRob2RzIjpbIm1ldGFhcGktYXBpOnJlc3Q6cHVibGljOio6KiJdLCJyb2xlcyI6WyJyZWFkZXIiLCJ3cml0ZXIiXSwicmVzb3VyY2VzIjpbIio6JFVTRVJfSUQkOioiXX0seyJpZCI6Im1ldGFhcGktcnBjLWFwaSIsIm1ldGhvZHMiOlsibWV0YWFwaS1hcGk6d3M6cHVibGljOio6KiJdLCJyb2xlcyI6WyJyZWFkZXIiLCJ3cml0ZXIiXSwicmVzb3VyY2VzIjpbIio6JFVTRVJfSUQkOioiXX0seyJpZCI6Im1ldGFhcGktcmVhbC10aW1lLXN0cmVhbWluZy1hcGkiLCJtZXRob2RzIjpbIm1ldGFhcGktYXBpOndzOnB1YmxpYzoqOioiXSwicm9sZXMiOlsicmVhZGVyIiwid3JpdGVyIl0sInJlc291cmNlcyI6WyIqOiRVU0VSX0lEJDoqIl19LHsiaWQiOiJtZXRhc3RhdHMtYXBpIiwibWV0aG9kcyI6WyJtZXRhc3RhdHMtYXBpOnJlc3Q6cHVibGljOio6KiJdLCJyb2xlcyI6WyJyZWFkZXIiLCJ3cml0ZXIiXSwicmVzb3VyY2VzIjpbIio6JFVTRVJfSUQkOioiXX0seyJpZCI6InJpc2stbWFuYWdlbWVudC1hcGkiLCJtZXRob2RzIjpbInJpc2stbWFuYWdlbWVudC1hcGk6cmVzdDpwdWJsaWM6KjoqIl0sInJvbGVzIjpbInJlYWRlciIsIndyaXRlciJdLCJyZXNvdXJjZXMiOlsiKjokVVNFUl9JRCQ6KiJdfSx7ImlkIjoiY29weWZhY3RvcnktYXBpIiwibWV0aG9kcyI6WyJjb3B5ZmFjdG9yeS1hcGk6cmVzdDpwdWJsaWM6KjoqIl0sInJvbGVzIjpbInJlYWRlciIsIndyaXRlciJdLCJyZXNvdXJjZXMiOlsiKjokVVNFUl9JRCQ6KiJdfSx7ImlkIjoibXQtbWFuYWdlci1hcGkiLCJtZXRob2RzIjpbIm10LW1hbmFnZXItYXBpOnJlc3Q6ZGVhbGluZzoqOioiLCJtdC1tYW5hZ2VyLWFwaTpyZXN0OnB1YmxpYzoqOioiXSwicm9sZXMiOlsicmVhZGVyIiwid3JpdGVyIl0sInJlc291cmNlcyI6WyIqOiRVU0VSX0lEJDoqIl19LHsiaWQiOiJiaWxsaW5nLWFwaSIsIm1ldGhvZHMiOlsiYmlsbGluZy1hcGk6cmVzdDpwdWJsaWM6KjoqIl0sInJvbGVzIjpbInJlYWRlciJdLCJyZXNvdXJjZXMiOlsiKjokVVNFUl9JRCQ6KiJdfV0sImlnbm9yZVJhdGVMaW1pdHMiOmZhbHNlLCJ0b2tlbklkIjoiMjAyMTAyMTMiLCJpbXBlcnNvbmF0ZWQiOmZhbHNlLCJyZWFsVXNlcklkIjoiZDcxMzM4ZmY1MzdiYzgwMzNhMDI0NTI1ZmZlMGU0ZTYiLCJpYXQiOjE3OTAwODU0NDAsImV4cCI6MTc5Nzg2MTQ0MH0.QjEElILrPimee9u04PyS8ZignPY9ASqqwWFTkrrdUvyZ1iu-1_XiXsh-753lL-9AwcClkVILOMDspDJllza7cNDYxfiYGayBp9V5euJXLFSsiRKuDgOgFgyiOlOuHgMJcCCRY-tr9f5ZcS9DGLCPAr-MJQ5MOxMXR1A7wvn0QK_dVaetqp9F8w2Lxn14nethZn97EQ4O1el6K3Tlq_BFs6gEI1YqK3lKdocVW4H072wT8av0BNDuS8BF5kQlfkckMYfrUCplJFJBw0axYTuA-yd968iTZaxfdkWwBq8WkERXAMqfU9TzkF2E45rK9-wIT6MLH5k7gtN_iWGCMl7vfq1_JdUnQw9m3_D6FUBSU7lxI3hFT9gy9WG_wiUUbunC3mO3tKsctxyVQ-qZx5SK9yaGKg9_rn7qgsBmtqwivLxIJjRrV5GVQZiy1j4QshULmxz50qv6oYAAP4BhrlesOJViZmo_EgplUu9TJh3O7O3Xy0wMTb1sR-tEosTf0Zy3pmV_LRQ8C5aW6DxLRYN6qHCAejQh2SuB0OhonSdRzGKjuiPF56N8bdb_c3dI24OVdWgFv34fpANHNok2_IdePl8V6nBwNUWNNX-Jzy6BpOMPUDzxh0Ir3GSJAfG-M-oa84ToPkiszS_Iq0SveKRhCo1rUDjfyX75IifyrueS9QU"        # <-- colle ton token MetaApi ici
-_DEFAULT_METAAPI_ACCOUNT_ID = "7034fdb9-9628-4e36-b37c-dd072c5e5481"   # <-- colle ton account id MetaApi ici
+# SÉCURITÉ : ne jamais coder le token / account ID en dur ici (risque de fuite si le fichier est
+# partagé, uploadé ou versionné). Utilise exclusivement les variables d'environnement Render/.env.
+_DEFAULT_METAAPI_TOKEN = ""        # <-- ne pas coller de token ici, utiliser METAAPI_TOKEN (env)
+_DEFAULT_METAAPI_ACCOUNT_ID = ""   # <-- ne pas coller d'account id ici, utiliser METAAPI_ACCOUNT_ID (env)
 METAAPI_TOKEN = os.getenv("METAAPI_TOKEN", "") or _DEFAULT_METAAPI_TOKEN
 METAAPI_ACCOUNT_ID = os.getenv("METAAPI_ACCOUNT_ID", "") or _DEFAULT_METAAPI_ACCOUNT_ID
 # Mappe les symboles internes (XAUUSD, BTCUSD) vers ceux du broker si différents,
@@ -307,7 +310,30 @@ except ImportError:  # metaapi-cloud-sdk optionnel : absent -> pas d'exécution 
 
 _metaapi_instance = None
 _metaapi_connection = None
+_metaapi_connected_at = None   # timestamp (time.time()) de la dernière (re)synchronisation réussie
 _metaapi_lock = threading.Lock()
+
+# Délai minimum (s) à laisser au terminal MT5 après "wait_synchronized" avant d'autoriser un
+# trade : le flag "synchronized" peut être vrai avant que le cache des specs de symboles (stops
+# level, filling modes...) soit entièrement peuplé. Réglable via MT5_SYNC_WAIT_SEC.
+MT5_SYNC_WAIT_SEC = _env_float("MT5_SYNC_WAIT_SEC", 3.0)
+
+# Marge de sécurité appliquée au-delà du stopsLevel minimum imposé par le broker, pour ne pas
+# coller pile au seuil (le prix peut légèrement bouger entre le calcul du signal et l'envoi de
+# l'ordre). Réglable via MT5_STOP_BUFFER (1.0 = pas de marge, 1.2 = +20%).
+MT5_STOP_BUFFER = _env_float("MT5_STOP_BUFFER", 1.2)
+
+
+class SLTooCloseError(Exception):
+    """Levée quand le SL (ou le TP) calculé par le moteur de signal est plus proche du prix
+    d'entrée que le stopsLevel minimum imposé par le broker pour ce symbole. Ne doit JAMAIS
+    entraîner un déplacement automatique du SL : l'appelant doit rejeter le signal tel quel."""
+
+    def __init__(self, symbol, broker_symbol, which, required, actual):
+        self.symbol, self.broker_symbol, self.which = symbol, broker_symbol, which
+        self.required, self.actual = required, actual
+        super().__init__(
+            f"{which} trop proche pour {broker_symbol} : requis >= {required}, calculé {actual}")
 
 
 async def get_metaapi_connection():
@@ -317,7 +343,7 @@ async def get_metaapi_connection():
     d'exception vers l'appelant : toute erreur est logguée et None est retourné,
     pour ne jamais interrompre la boucle de trading / l'envoi des signaux Telegram.
     """
-    global _metaapi_instance, _metaapi_connection
+    global _metaapi_instance, _metaapi_connection, _metaapi_connected_at
 
     if MetaApi is None:
         print("[metaapi] SDK non installé (pip install metaapi-cloud-sdk) — exécution MT5 désactivée.")
@@ -353,6 +379,7 @@ async def get_metaapi_connection():
             await connection.wait_synchronized()
 
             _metaapi_connection = connection
+            _metaapi_connected_at = time.time()
             print("[metaapi] Connecté et synchronisé.")
             return _metaapi_connection
 
@@ -360,38 +387,161 @@ async def get_metaapi_connection():
             print(f"[metaapi] Échec de connexion : {e}")
             traceback.print_exc()
             _metaapi_connection = None
+            _metaapi_connected_at = None
             return None
 
 
-async def _execute_mt5_order_async(symbol, side, lot, entry, sl, tp):
-    """Passe un ordre MARKET MT5 via MetaApi. Retourne le dict résultat MetaApi (contient
-    positionId/orderId) en cas de succès, ou lève une exception en cas d'échec — à charge de
-    l'appelant sync (execute_mt5_order) de l'attraper et de notifier l'admin."""
+async def _ensure_terminal_ready():
+    """1. Étape « synchronisation » : attend, si besoin, le reste de MT5_SYNC_WAIT_SEC depuis la
+    dernière (re)connexion avant d'autoriser un trade — même si `wait_synchronized()` est déjà
+    revenu (le cache des specs peut se peupler juste après). Retourne la connexion, ou None."""
     connection = await get_metaapi_connection()
+    if connection is None:
+        return None
+    if _metaapi_connected_at is not None:
+        remaining = MT5_SYNC_WAIT_SEC - (time.time() - _metaapi_connected_at)
+        if remaining > 0:
+            print(f"[metaapi] Attente synchronisation terminal ({remaining:.1f}s restantes)...")
+            await asyncio.sleep(remaining)
+    return connection
+
+
+def _spec_get(spec, *keys, default=None):
+    """Lit la 1re clé présente dans `spec` parmi `keys` — les SDK/versions MetaApi n'exposent pas
+    toujours les mêmes noms de champs pour les specs de symbole."""
+    for k in keys:
+        try:
+            if isinstance(spec, dict) and k in spec and spec[k] is not None:
+                return spec[k]
+            v = getattr(spec, k, None)
+            if v is not None:
+                return v
+        except Exception:
+            pass
+    return default
+
+
+async def _get_symbol_spec(connection, broker_symbol):
+    """2. Étape « specs symbole » : récupère les specs MT5 (stopsLevel, point, filling modes...)
+    juste avant l'envoi. Retourne None si indisponible (l'appelant devient alors permissif sur la
+    vérif de distance plutôt que de bloquer tous les trades sur un souci d'API)."""
+    try:
+        return await connection.get_symbol_specification(broker_symbol)
+    except Exception as e:
+        print(f"[metaapi] Impossible de récupérer les specs de {broker_symbol} : {e} — vérif stop-level ignorée.")
+        return None
+
+
+def _min_stop_distance(spec, symbol):
+    """Distance minimale (en prix brut) entre l'entrée et un SL/TP, d'après stopsLevel (en points)
+    x la taille du point, avec la marge MT5_STOP_BUFFER. Retourne 0.0 si les specs ne permettent
+    pas de calculer ce seuil (vérif alors ignorée, jamais bloquante par excès de prudence)."""
+    stops_level = _spec_get(spec, "stopsLevel", "tradeStopsLevel", "stops_level", default=0) or 0
+    if not stops_level:
+        return 0.0
+    dec = SYMBOLS.get(symbol, {}).get("decimals", 2)
+    point = _spec_get(spec, "point", "tickSize", "tick_size", default=None)
+    if not point:
+        digits = _spec_get(spec, "digits", default=dec)
+        point = 10 ** (-digits)
+    return float(stops_level) * float(point) * MT5_STOP_BUFFER
+
+
+def _pick_filling_mode(spec):
+    """3. Étape « filling mode » : choisit un mode réellement supporté par le symbole plutôt que
+    de supposer IOC/FOK à l'aveugle. Priorité : override MT5_FILLING_MODE (env) si défini, sinon
+    le 1er mode supporté d'après les specs (IOC préféré s'il est dans la liste), sinon fallback IOC."""
+    override = os.getenv("MT5_FILLING_MODE", "").strip()
+    if override:
+        return override
+    modes = _spec_get(spec, "fillingModes", "filling_modes", default=None) or []
+    if "ORDER_FILLING_IOC" in modes:
+        return "ORDER_FILLING_IOC"
+    if modes:
+        return modes[0]
+    return "ORDER_FILLING_IOC"   # défaut le plus largement accepté si les specs n'en disent rien
+
+
+async def _execute_mt5_stop_check_only(symbol, entry, sl, tp):
+    """Étapes (1) et (2) seules, sans passer d'ordre : utilisée par publish_signal pour rejeter un
+    signal AVANT toute création de trade si le SL/TP est trop proche du stopsLevel du broker."""
+    connection = await _ensure_terminal_ready()
+    if connection is None:
+        raise RuntimeError("connexion MetaApi indisponible")
+    broker_symbol = MT5_SYMBOL_MAP.get(symbol, symbol)
+    spec = await _get_symbol_spec(connection, broker_symbol)
+    min_dist = _min_stop_distance(spec, symbol)
+    if min_dist > 0:
+        sl_dist = abs(entry - sl) if sl else None
+        tp_dist = abs(entry - tp) if tp else None
+        if sl_dist is not None and sl_dist < min_dist:
+            raise SLTooCloseError(symbol, broker_symbol, "SL", min_dist, sl_dist)
+        if tp_dist is not None and tp_dist < min_dist:
+            raise SLTooCloseError(symbol, broker_symbol, "TP", min_dist, tp_dist)
+
+
+async def _execute_mt5_order_async(symbol, side, lot, entry, sl, tp):
+    """Passe un ordre MARKET MT5 via MetaApi, dans l'ordre : (1) attente sync terminal,
+    (2) récupération des specs + vérif stopsLevel (rejet net via SLTooCloseError si SL/TP trop
+    proche — jamais de déplacement automatique du SL), (3) fillingMode déduit des specs,
+    (4) une seule retentative en dernier recours si l'ordre échoue quand même. Retourne le dict
+    résultat MetaApi (positionId/orderId) en cas de succès, ou lève une exception."""
+    connection = await _ensure_terminal_ready()
     if connection is None:
         raise RuntimeError("connexion MetaApi indisponible")
 
     broker_symbol = MT5_SYMBOL_MAP.get(symbol, symbol)
+
+    spec = await _get_symbol_spec(connection, broker_symbol)
+    min_dist = _min_stop_distance(spec, symbol)
+    if min_dist > 0:
+        sl_dist = abs(entry - sl) if sl else None
+        tp_dist = abs(entry - tp) if tp else None
+        if sl_dist is not None and sl_dist < min_dist:
+            raise SLTooCloseError(symbol, broker_symbol, "SL", min_dist, sl_dist)
+        if tp_dist is not None and tp_dist < min_dist:
+            raise SLTooCloseError(symbol, broker_symbol, "TP", min_dist, tp_dist)
+
     comment = f"AlphaBot {symbol}"[:26]  # MT5 limite les commentaires à ~26-31 caractères
     slippage = get_mt5_slippage(symbol)
-    options = {"comment": comment, "slippage": slippage}
+    filling_mode = _pick_filling_mode(spec)
+    options = {"comment": comment, "slippage": slippage, "fillingMode": filling_mode}
 
-    if side == "BUY":
-        result = await connection.create_market_buy_order(broker_symbol, lot, sl, tp, options=options)
-    elif side == "SELL":
-        result = await connection.create_market_sell_order(broker_symbol, lot, sl, tp, options=options)
-    else:
-        raise ValueError(f"side invalide : {side!r} (attendu BUY ou SELL)")
+    async def _place():
+        if side == "BUY":
+            return await connection.create_market_buy_order(broker_symbol, lot, sl, tp, options=options)
+        elif side == "SELL":
+            return await connection.create_market_sell_order(broker_symbol, lot, sl, tp, options=options)
+        else:
+            raise ValueError(f"side invalide : {side!r} (attendu BUY ou SELL)")
 
-    return result
+    try:
+        return await _place()
+    except Exception as e:
+        # Dernier recours seulement (pas pour SLTooCloseError, qui n'atterrit jamais ici) : un
+        # court délai + un rafraîchissement des specs suffit dans la plupart des cas restants.
+        print(f"[metaapi] 1re tentative d'ordre échouée ({e}) — nouvel essai dans 1.5s après vérif spécs symbole.")
+        await asyncio.sleep(1.5)
+        try:
+            await connection.get_symbol_specification(broker_symbol)
+        except Exception:
+            pass  # best-effort : sert juste à forcer le chargement du cache, pas bloquant
+        return await _place()
 
 
 def execute_mt5_order(symbol, side, lot, entry, sl, tp):
     """Wrapper sync : exécute un ordre MARKET côté MT5 avec le lot/SL/TP déjà calculés par le
-    moteur de signal. Ne lève jamais d'exception : retourne le position_id (str) en cas de
-    succès, ou None en cas d'échec (loggé + admin notifié par l'appelant)."""
+    moteur de signal. Laisse remonter SLTooCloseError telle quelle (à l'appelant de décider du
+    rejet du signal) ; toute autre erreur ne lève jamais d'exception : retourne le position_id
+    (str) en cas de succès, ou None en cas d'échec (loggé + admin notifié par l'appelant)."""
     try:
         result = asyncio.run(_execute_mt5_order_async(symbol, side, lot, entry, sl, tp))
+    except SLTooCloseError as e:
+        # Rare : le prix a bougé entre la pré-vérif (publish_signal) et l'exécution, faisant
+        # basculer le SL sous le stopsLevel entre-temps. Jamais de déplacement automatique du
+        # SL : on traite ça comme un échec d'exécution classique, notifié par l'appelant.
+        print(f"[metaapi] Ordre refusé à l'exécution ({e}) — signal déjà envoyé, à traiter manuellement.")
+        return None
     except Exception as e:
         print(f"[metaapi] Échec d'exécution {symbol} {side} lot={lot} : {e}")
         traceback.print_exc(limit=-3)
@@ -3330,6 +3480,25 @@ def publish_signal(symbol, candles, events, sig):
         return
     margin = calc_margin(symbol, lot_info["lot"], sig["entry"], leverage)
 
+    # Vérif stop-level AVANT toute création de trade : si le SL (ou TP) est trop proche du prix
+    # pour le stopsLevel minimum imposé par Exness sur ce symbole, on rejette le signal tel quel
+    # (aucun trade ouvert, aucun message groupe) plutôt que de forcer un déplacement du SL — ça
+    # permet de distinguer un vrai problème de stratégie d'un problème d'exécution MT5/Exness.
+    if sig.get("order", "MARKET") == "MARKET" and METAAPI_TOKEN and METAAPI_ACCOUNT_ID:
+        try:
+            asyncio.run(_execute_mt5_stop_check_only(symbol, sig["entry"], sig["sl"], sig.get("tp")))
+        except SLTooCloseError as e:
+            print(f"[{symbol}] Signal {sig['side']} {sig['type']} rejeté : {e}")
+            send(CHAT_ID_ADMIN,
+                 f"❌ Ordre refusé — {e.which} trop proche pour {e.broker_symbol}\n"
+                 f"Distance requise : {e.required:.{dec}f}\n"
+                 f"Distance calculée : {e.actual:.{dec}f}")
+            return
+        except Exception as e:
+            # Connexion/API indisponible : on ne bloque pas le signal pour autant, l'échec sera
+            # de toute façon re-tenté et notifié au moment de l'exécution réelle ci-dessous.
+            print(f"[{symbol}] Vérif stop-level ignorée (indisponible) : {e}")
+
     trade_id = add_trade(
         status="PENDING" if sig.get("order") == "LIMIT" else "OPEN",
         order_type=sig.get("order", "MARKET"), placed_ts=sig["t"], ref_price=sig.get("ref_price"),
@@ -4491,4 +4660,3 @@ if __name__ == "__main__":
     if "--selftest" in sys.argv:
         sys.exit(_selftest())
     main()
-
