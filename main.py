@@ -335,6 +335,78 @@ MT5_RECONNECT_BACKOFF_SEC = _env_float("MT5_RECONNECT_BACKOFF_SEC", 2.0)
 MT5_STOP_BUFFER = _env_float("MT5_STOP_BUFFER", 1.2)
 
 
+# --- Connexion MetaApi PERSISTANTE en arrière-plan ---------------------------------------------
+# Problème résolu ici : avant, la connexion/synchronisation MetaApi (jusqu'à 3 tentatives x 60s =
+# ~3 minutes) se déclenchait AU MOMENT du signal, ce qui est bien trop lent pour un timeframe M1 et
+# bloque l'envoi du signal. Désormais : un thread d'arrière-plan connecte et resynchronise MetaApi
+# en continu dès le démarrage du bot, indépendamment des signaux. Au moment d'un trade, on ne fait
+# QUE consulter l'état courant (prêt / pas prêt) — jamais de nouvelle attente de synchronisation.
+_metaapi_ready = threading.Event()          # set() <=> connexion RPC connectée ET synchronisée, prête à trader
+MT5_BG_RETRY_SEC = _env_float("MT5_BG_RETRY_SEC", 15.0)   # intervalle entre 2 tentatives de reconnexion en arrière-plan
+MT5_BG_HEALTHCHECK_SEC = _env_float("MT5_BG_HEALTHCHECK_SEC", 10.0)  # intervalle de vérif santé une fois connecté
+
+
+def get_ready_connection():
+    """Chemin RAPIDE utilisé au moment d'un trade : ne connecte JAMAIS et n'attend JAMAIS —
+    retourne la connexion courante si le thread d'arrière-plan la considère prête, sinon None
+    immédiatement (aucun délai de plusieurs dizaines de secondes au moment du signal)."""
+    if not _metaapi_ready.is_set():
+        return None
+    connection = _metaapi_connection
+    if connection is None:
+        return None
+    try:
+        if not connection.terminal_state.connected:
+            return None
+    except Exception:
+        return None
+    return connection
+
+
+def _metaapi_background_loop():
+    """Boucle d'arrière-plan (thread daemon dédié) : connecte/synchronise MetaApi une bonne fois
+    au démarrage, puis surveille la connexion en continu et la ré-établit sans jamais bloquer le
+    reste du bot (signal M1, Telegram...). C'est la SEULE fonction qui appelle
+    get_metaapi_connection() avec ses tentatives/backoff ; le reste du code ne fait que lire
+    _metaapi_ready via get_ready_connection()."""
+    if MetaApi is None or not METAAPI_TOKEN or not METAAPI_ACCOUNT_ID:
+        return  # exécution MT5 désactivée : rien à faire en arrière-plan
+    print("[metaapi] Thread de connexion persistante démarré.")
+    while True:
+        try:
+            connection = asyncio.run(get_metaapi_connection())
+        except Exception as e:
+            connection = None
+            print(f"[metaapi] Boucle d'arrière-plan : erreur inattendue ({e}).")
+        if connection is not None:
+            _metaapi_ready.set()
+            print("[metaapi] ✅ MetaApi PRÊT (connecté + synchronisé) — signaux exécutables immédiatement.")
+            # Une fois prêt, on surveille juste la santé de la connexion (pas de nouvelle
+            # tentative bloquante tant qu'elle reste connectée) et on la refait sans attendre
+            # dès qu'elle tombe, toujours en arrière-plan.
+            while True:
+                time.sleep(MT5_BG_HEALTHCHECK_SEC)
+                try:
+                    still_ok = connection.terminal_state.connected
+                except Exception:
+                    still_ok = False
+                if not still_ok:
+                    _metaapi_ready.clear()
+                    print("[metaapi] ⚠️ Connexion MetaApi perdue — reconnexion en arrière-plan...")
+                    break
+        else:
+            _metaapi_ready.clear()
+            print(f"[metaapi] MetaApi non prêt — nouvelle tentative dans {MT5_BG_RETRY_SEC:.0f}s (en arrière-plan, "
+                  f"n'affecte pas les signaux Telegram).")
+            time.sleep(MT5_BG_RETRY_SEC)
+
+
+def start_metaapi_background():
+    """À appeler une fois au démarrage du bot (main()) : lance la connexion MetaApi persistante
+    dans un thread daemon séparé. Ne bloque jamais le démarrage du bot."""
+    threading.Thread(target=_metaapi_background_loop, daemon=True, name="metaapi-bg").start()
+
+
 class SLTooCloseError(Exception):
     """Levée quand le SL (ou le TP) calculé par le moteur de signal est plus proche du prix
     d'entrée que le stopsLevel minimum imposé par le broker pour ce symbole. Ne doit JAMAIS
@@ -432,16 +504,17 @@ async def get_metaapi_connection(force_reconnect=False):
 
 
 async def _ensure_terminal_ready():
-    """1. Étape « synchronisation » : attend, si besoin, le reste de MT5_SYNC_WAIT_SEC depuis la
-    dernière (re)connexion avant d'autoriser un trade — même si `wait_synchronized()` est déjà
-    revenu (le cache des specs peut se peupler juste après). Retourne la connexion, ou None."""
-    connection = await get_metaapi_connection()
+    """Chemin utilisé au moment d'un trade (signal M1) : ne connecte/synchronise JAMAIS ici — la
+    connexion persistante est maintenue en continu par le thread d'arrière-plan
+    (_metaapi_background_loop / start_metaapi_background). On se contente de lire l'état courant :
+    si MetaApi n'est pas prêt (pas encore synchronisé, ou connexion tombée), on retourne None
+    IMMÉDIATEMENT (aucune attente de plusieurs dizaines de secondes / minutes sur un signal M1)."""
+    connection = get_ready_connection()
     if connection is None:
         return None
     if _metaapi_connected_at is not None:
         remaining = MT5_SYNC_WAIT_SEC - (time.time() - _metaapi_connected_at)
         if remaining > 0:
-            print(f"[metaapi] Attente synchronisation terminal ({remaining:.1f}s restantes)...")
             await asyncio.sleep(remaining)
     return connection
 
@@ -507,7 +580,7 @@ async def _execute_mt5_stop_check_only(symbol, entry, sl, tp):
     signal AVANT toute création de trade si le SL/TP est trop proche du stopsLevel du broker."""
     connection = await _ensure_terminal_ready()
     if connection is None:
-        raise RuntimeError("connexion MetaApi indisponible")
+        raise RuntimeError("MetaApi non synchronisé (connexion persistante pas encore prête)")
     broker_symbol = MT5_SYMBOL_MAP.get(symbol, symbol)
     spec = await _get_symbol_spec(connection, broker_symbol)
     min_dist = _min_stop_distance(spec, symbol)
@@ -550,7 +623,7 @@ async def _execute_mt5_order_async(symbol, side, lot, entry, sl, tp, client_id=N
     dict résultat MetaApi (positionId/orderId) en cas de succès, ou lève une exception."""
     connection = await _ensure_terminal_ready()
     if connection is None:
-        raise RuntimeError("connexion MetaApi indisponible")
+        raise RuntimeError("MetaApi non synchronisé (connexion persistante pas encore prête)")
 
     broker_symbol = MT5_SYMBOL_MAP.get(symbol, symbol)
 
@@ -648,7 +721,7 @@ def execute_mt5_order(symbol, side, lot, entry, sl, tp, client_id=None):
     # est confirmée absente (found=False), c'est un échec net ; si la vérif elle-même échoue
     # (found=None, ex. API indisponible), on ne bloque pas sur ce doute, l'ordre a déjà un ticket.
     try:
-        connection = asyncio.run(get_metaapi_connection())
+        connection = get_ready_connection()
         found, reason = asyncio.run(_confirm_position_async(connection, position_id)) \
             if connection is not None else (None, "connexion MetaApi indisponible pour la confirmation")
     except Exception as e:
@@ -3680,9 +3753,19 @@ def publish_signal(symbol, candles, events, sig):
             update_trade(trade_id, status="OPEN", mt5_position_id=mt5_position_id)
         else:
             update_trade(trade_id, status="EXECUTION_FAILED")
-            send(CHAT_ID_ADMIN,
-                 f"⚠️ Échec d'exécution MT5 pour le signal {symbol} {sig['side']} {sig['type']} "
-                 f"(trade #{trade_id}) — signal envoyé quand même, à ouvrir manuellement si besoin.")
+            # Verrou de sécurité : si MetaApi n'est simplement pas prêt (connexion persistante
+            # d'arrière-plan pas encore synchronisée), le message le dit clairement plutôt que de
+            # renvoyer un échec générique — le signal, lui, part toujours normalement.
+            if not _metaapi_ready.is_set():
+                send(CHAT_ID_ADMIN,
+                     f"⚠️ {symbol} {sig['side']}\nSignal valide\n"
+                     f"Exécution automatique impossible : MetaApi non synchronisé.\n"
+                     f"Aucune position ouverte par le bot (trade #{trade_id}) — "
+                     f"à ouvrir manuellement si besoin.")
+            else:
+                send(CHAT_ID_ADMIN,
+                     f"⚠️ Échec d'exécution MT5 pour le signal {symbol} {sig['side']} {sig['type']} "
+                     f"(trade #{trade_id}) — signal envoyé quand même, à ouvrir manuellement si besoin.")
 
     try:
         chart = make_chart(symbol, candles, events, sig, dec)
@@ -3960,6 +4043,7 @@ def main():
             print("⚠️  CHAT_ID_ADMIN absent : ni lot, ni commandes.")
 
     start_polling()
+    start_metaapi_background()   # connexion MT5 persistante en arrière-plan, indépendante des signaux M1
     ok_grp, msg_grp = check_group()
     print(f"[groupe] {msg_grp}")
     if not ok_grp and TELEGRAM_TOKEN:
