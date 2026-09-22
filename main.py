@@ -1,5 +1,4 @@
 
-
 #!/usr/bin/env python3
 """AlphaBot BOS + CHoCH — Gold & BTC — version en un seul fichier.
 
@@ -258,17 +257,38 @@ DAILY_REPORT_HOUR_UTC = _env_int("DAILY_REPORT_HOUR_UTC", 21)
 # Remplace les deux valeurs ci-dessous par les tiennes (dashboard MetaApi.cloud), ou laisse-les
 # vides et utilise les variables d'environnement METAAPI_TOKEN / METAAPI_ACCOUNT_ID (Render / .env) —
 # la variable d'environnement, si définie, garde toujours la priorité sur ces valeurs par défaut.
-_DEFAULT_METAAPI_TOKEN = ""        # <-- colle ton token MetaApi ici
-_DEFAULT_METAAPI_ACCOUNT_ID = ""   # <-- colle ton account id MetaApi ici
+_DEFAULT_METAAPI_TOKEN = "eyJhbGciOiJSUzUxMiIsInR5cCI6IkpXVCJ9.eyJfaWQiOiJkNzEzMzhmZjUzN2JjODAzM2EwMjQ1MjVmZmUwZTRlNiIsImFjY2Vzc1J1bGVzIjpbeyJpZCI6InRyYWRpbmctYWNjb3VudC1tYW5hZ2VtZW50LWFwaSIsIm1ldGhvZHMiOlsidHJhZGluZy1hY2NvdW50LW1hbmFnZW1lbnQtYXBpOnJlc3Q6cHVibGljOio6KiJdLCJyb2xlcyI6WyJyZWFkZXIiLCJ3cml0ZXIiXSwicmVzb3VyY2VzIjpbIio6JFVTRVJfSUQkOioiXX0seyJpZCI6Im1ldGFhcGktcmVzdC1hcGkiLCJtZXRob2RzIjpbIm1ldGFhcGktYXBpOnJlc3Q6cHVibGljOio6KiJdLCJyb2xlcyI6WyJyZWFkZXIiLCJ3cml0ZXIiXSwicmVzb3VyY2VzIjpbIio6JFVTRVJfSUQkOioiXX0seyJpZCI6Im1ldGFhcGktcnBjLWFwaSIsIm1ldGhvZHMiOlsibWV0YWFwaS1hcGk6d3M6cHVibGljOio6KiJdLCJyb2xlcyI6WyJyZWFkZXIiLCJ3cml0ZXIiXSwicmVzb3VyY2VzIjpbIio6JFVTRVJfSUQkOioiXX0seyJpZCI6Im1ldGFhcGktcmVhbC10aW1lLXN0cmVhbWluZy1hcGkiLCJtZXRob2RzIjpbIm1ldGFhcGktYXBpOndzOnB1YmxpYzoqOioiXSwicm9sZXMiOlsicmVhZGVyIiwid3JpdGVyIl0sInJlc291cmNlcyI6WyIqOiRVU0VSX0lEJDoqIl19LHsiaWQiOiJtZXRhc3RhdHMtYXBpIiwibWV0aG9kcyI6WyJtZXRhc3RhdHMtYXBpOnJlc3Q6cHVibGljOio6KiJdLCJyb2xlcyI6WyJyZWFkZXIiLCJ3cml0ZXIiXSwicmVzb3VyY2VzIjpbIio6JFVTRVJfSUQkOioiXX0seyJpZCI6InJpc2stbWFuYWdlbWVudC1hcGkiLCJtZXRob2RzIjpbInJpc2stbWFuYWdlbWVudC1hcGk6cmVzdDpwdWJsaWM6KjoqIl0sInJvbGVzIjpbInJlYWRlciIsIndyaXRlciJdLCJyZXNvdXJjZXMiOlsiKjokVVNFUl9JRCQ6KiJdfSx7ImlkIjoiY29weWZhY3RvcnktYXBpIiwibWV0aG9kcyI6WyJjb3B5ZmFjdG9yeS1hcGk6cmVzdDpwdWJsaWM6KjoqIl0sInJvbGVzIjpbInJlYWRlciIsIndyaXRlciJdLCJyZXNvdXJjZXMiOlsiKjokVVNFUl9JRCQ6KiJdfSx7ImlkIjoibXQtbWFuYWdlci1hcGkiLCJtZXRob2RzIjpbIm10LW1hbmFnZXItYXBpOnJlc3Q6ZGVhbGluZzoqOioiLCJtdC1tYW5hZ2VyLWFwaTpyZXN0OnB1YmxpYzoqOioiXSwicm9sZXMiOlsicmVhZGVyIiwid3JpdGVyIl0sInJlc291cmNlcyI6WyIqOiRVU0VSX0lEJDoqIl19LHsiaWQiOiJiaWxsaW5nLWFwaSIsIm1ldGhvZHMiOlsiYmlsbGluZy1hcGk6cmVzdDpwdWJsaWM6KjoqIl0sInJvbGVzIjpbInJlYWRlciJdLCJyZXNvdXJjZXMiOlsiKjokVVNFUl9JRCQ6KiJdfV0sImlnbm9yZVJhdGVMaW1pdHMiOmZhbHNlLCJ0b2tlbklkIjoiMjAyMTAyMTMiLCJpbXBlcnNvbmF0ZWQiOmZhbHNlLCJyZWFsVXNlcklkIjoiZDcxMzM4ZmY1MzdiYzgwMzNhMDI0NTI1ZmZlMGU0ZTYiLCJpYXQiOjE3OTAwODU0NDAsImV4cCI6MTc5Nzg2MTQ0MH0.QjEElILrPimee9u04PyS8ZignPY9ASqqwWFTkrrdUvyZ1iu-1_XiXsh-753lL-9AwcClkVILOMDspDJllza7cNDYxfiYGayBp9V5euJXLFSsiRKuDgOgFgyiOlOuHgMJcCCRY-tr9f5ZcS9DGLCPAr-MJQ5MOxMXR1A7wvn0QK_dVaetqp9F8w2Lxn14nethZn97EQ4O1el6K3Tlq_BFs6gEI1YqK3lKdocVW4H072wT8av0BNDuS8BF5kQlfkckMYfrUCplJFJBw0axYTuA-yd968iTZaxfdkWwBq8WkERXAMqfU9TzkF2E45rK9-wIT6MLH5k7gtN_iWGCMl7vfq1_JdUnQw9m3_D6FUBSU7lxI3hFT9gy9WG_wiUUbunC3mO3tKsctxyVQ-qZx5SK9yaGKg9_rn7qgsBmtqwivLxIJjRrV5GVQZiy1j4QshULmxz50qv6oYAAP4BhrlesOJViZmo_EgplUu9TJh3O7O3Xy0wMTb1sR-tEosTf0Zy3pmV_LRQ8C5aW6DxLRYN6qHCAejQh2SuB0OhonSdRzGKjuiPF56N8bdb_c3dI24OVdWgFv34fpANHNok2_IdePl8V6nBwNUWNNX-Jzy6BpOMPUDzxh0Ir3GSJAfG-M-oa84ToPkiszS_Iq0SveKRhCo1rUDjfyX75IifyrueS9QU"        # <-- colle ton token MetaApi ici
+_DEFAULT_METAAPI_ACCOUNT_ID = "7034fdb9-9628-4e36-b37c-dd072c5e5481"   # <-- colle ton account id MetaApi ici
 METAAPI_TOKEN = os.getenv("METAAPI_TOKEN", "") or _DEFAULT_METAAPI_TOKEN
 METAAPI_ACCOUNT_ID = os.getenv("METAAPI_ACCOUNT_ID", "") or _DEFAULT_METAAPI_ACCOUNT_ID
 # Mappe les symboles internes (XAUUSD, BTCUSD) vers ceux du broker si différents,
 # ex. MT5_SYMBOL_MAP={"XAUUSD":"XAUUSD.m","BTCUSD":"BTCUSDm"}. Vide -> pas de mapping (identité).
 try:
-    MT5_SYMBOL_MAP = json.loads(os.getenv("MT5_SYMBOL_MAP", "{}"))
+    MT5_SYMBOL_MAP = json.loads(os.getenv("MT5_SYMBOL_MAP", "") or '{"XAUUSD":"XAUUSDm","BTCUSD":"BTCUSDm"}')
 except Exception:
     print("[metaapi] MT5_SYMBOL_MAP invalide (JSON attendu) — mapping ignoré.")
-    MT5_SYMBOL_MAP = {}
+    MT5_SYMBOL_MAP = {"XAUUSD": "XAUUSDm", "BTCUSD": "BTCUSDm"}
+
+# Tolérance de slippage (en points de prix, prix brut) transmise à MetaApi pour chaque ordre
+# MARKET : au-delà de cet écart entre le prix demandé et le prix d'exécution, le broker (Exness)
+# rejette l'ordre plutôt que de l'exécuter à un prix trop éloigné. Réglable par variable d'env
+# MT5_SLIPPAGE_XAUUSD / MT5_SLIPPAGE_BTCUSD (sinon défaut ci-dessous par actif).
+MT5_SLIPPAGE_DEFAULT = {"XAUUSD": 0.5, "BTCUSD": 30.0}
+
+
+def get_mt5_slippage(symbol):
+    env_val = os.getenv(f"MT5_SLIPPAGE_{symbol}", "").strip()
+    if env_val:
+        try:
+            return float(env_val)
+        except ValueError:
+            print(f"[metaapi] MT5_SLIPPAGE_{symbol}={env_val!r} invalide (nombre attendu) — défaut utilisé.")
+    return MT5_SLIPPAGE_DEFAULT.get(symbol, 1.0)
+
+
+# Écart (en % du prix) entre sig["entry"] (prix Deriv/Binance) et le prix d'ouverture réel côté
+# Exness au-delà duquel l'admin est notifié (l'ordre reste ouvert : seule une alerte est envoyée).
+MT5_PRICE_GAP_ALERT_PCT = {"XAUUSD": 0.0015, "BTCUSD": 0.0005}
 
 
 # ============================================================================
@@ -353,13 +373,13 @@ async def _execute_mt5_order_async(symbol, side, lot, entry, sl, tp):
 
     broker_symbol = MT5_SYMBOL_MAP.get(symbol, symbol)
     comment = f"AlphaBot {symbol}"[:26]  # MT5 limite les commentaires à ~26-31 caractères
+    slippage = get_mt5_slippage(symbol)
+    options = {"comment": comment, "slippage": slippage}
 
     if side == "BUY":
-        result = await connection.create_market_buy_order(
-            broker_symbol, lot, sl, tp, options={"comment": comment})
+        result = await connection.create_market_buy_order(broker_symbol, lot, sl, tp, options=options)
     elif side == "SELL":
-        result = await connection.create_market_sell_order(
-            broker_symbol, lot, sl, tp, options={"comment": comment})
+        result = await connection.create_market_sell_order(broker_symbol, lot, sl, tp, options=options)
     else:
         raise ValueError(f"side invalide : {side!r} (attendu BUY ou SELL)")
 
@@ -378,8 +398,21 @@ def execute_mt5_order(symbol, side, lot, entry, sl, tp):
         return None
 
     position_id = str(result.get("positionId") or result.get("orderId") or "")
-    print(f"[metaapi] Ordre exécuté : {symbol} {side} lot={lot} entry~{entry} SL={sl} TP={tp} "
+    fill_price = result.get("price") or result.get("openPrice")
+    print(f"[metaapi] Ordre exécuté : {symbol} {side} lot={lot} entry~{entry} fill={fill_price} SL={sl} TP={tp} "
           f"-> ticket {position_id}")
+
+    if position_id and fill_price:
+        try:
+            gap_pct = abs(float(fill_price) - entry) / entry
+        except (TypeError, ZeroDivisionError):
+            gap_pct = None
+        if gap_pct is not None and gap_pct > MT5_PRICE_GAP_ALERT_PCT.get(symbol, 0.001):
+            send(CHAT_ID_ADMIN,
+                 f"⚠️ Écart de prix {symbol} {side} : signal @ {entry:.2f} / exécuté @ {float(fill_price):.2f} "
+                 f"({gap_pct * 100:.2f}%) — ticket {position_id}. SL/TP restent basés sur le prix du signal, "
+                 f"pense à vérifier le risque réel de cette position.")
+
     return position_id or None
 
 
@@ -864,7 +897,7 @@ def _deriv_request(payload):
                 if "error" in msg:
                     err = msg["error"]
                     raise DerivError(err.get("message", err) if isinstance(err, dict) else err)
-                if "candles" in msg:
+                if "candles" in msg or "history" in msg:
                     return msg
         except DerivError:
             raise
@@ -889,6 +922,34 @@ def _deriv(deriv_symbol, minutes=None):
     })
     return [{"t": int(k["epoch"]), "o": float(k["open"]), "h": float(k["high"]),
              "l": float(k["low"]), "c": float(k["close"])} for k in msg["candles"]]
+
+
+def get_live_price(symbol):
+    """Prix instantané (dernier tick), pour la surveillance BE temps réel — un seul point, pas
+    un historique de bougies : appel volontairement léger pour pouvoir tourner toutes les 5-10 s
+    sans peser sur les APIs publiques. Retourne un float, ou None si indisponible (réseau, etc.)."""
+    cfg = SYMBOLS[symbol]
+    try:
+        if cfg["source"] == "binance":
+            last_err = None
+            for base in BINANCE_BASES:
+                try:
+                    r = requests.get(base + "/api/v3/ticker/price",
+                                      params={"symbol": cfg["binance_symbol"]}, timeout=6)
+                    r.raise_for_status()
+                    return float(r.json()["price"])
+                except Exception as e:
+                    last_err = e
+            raise RuntimeError(f"Binance indisponible : {last_err}")
+        if cfg["source"] == "deriv":
+            msg = _deriv_request({
+                "ticks_history": cfg["deriv_symbol"], "style": "ticks",
+                "count": 1, "end": "latest"})
+            return float(msg["history"]["prices"][-1])
+        raise ValueError(f"Source de prix inconnue pour {symbol} : {cfg['source']}")
+    except Exception as e:
+        print(f"[{symbol}] get_live_price indisponible : {e}")
+        return None
 
 
 def get_candles(symbol, minutes=None):
@@ -3424,6 +3485,66 @@ def maybe_daily_report():
     to_group_media("MOTIV")
 
 
+BE_WATCH_INTERVAL = _env_int("BE_WATCH_INTERVAL", 7)   # secondes entre deux vérifications BE temps réel (5-10s conseillé)
+
+
+def check_be_realtime():
+    """Vérifie le BE en dehors du cycle de bougies : un tick suffit à armer le SL dès que le RR
+    propre au trade (be_rr) est atteint, sans attendre la clôture de la bougie en cours.
+
+    Ne duplique jamais track_trade : ne touche que be_hit/sl (et rr{N}_hit si le palier coïncide),
+    jamais TP/SL final (une clôture ne peut être décidée qu'à la clôture de bougie, avec l'historique
+    complet — ici on n'a qu'un tick isolé). Notifie Telegram immédiatement (pas d'attente du scan)."""
+    dec_by_symbol = {s: SYMBOLS[s]["decimals"] for s in SYMBOLS}
+    for trade in open_trades():
+        if trade["status"] != "OPEN" or trade["be_hit"]:
+            continue
+        be_rr, tp_rr = trade_be_rr(trade), trade_tp_rr(trade)
+        if be_rr >= tp_rr:
+            continue   # BE désactivé pour ce trade (voir _be_line)
+        price = get_live_price(trade["symbol"])
+        if price is None:
+            continue
+        side = 1 if trade["side"] == "BUY" else -1
+        entry, risk = trade["entry"], abs(trade["entry"] - trade["sl_initial"])
+        if risk <= 0:
+            continue
+        # sécurité : si le SL a déjà été touché entre-temps (tick défavorable), on laisse track_trade
+        # gérer la clôture au prochain scan — on n'arme jamais un BE sur un trade déjà perdant du tick.
+        adverse_hit = (price <= trade["sl"]) if side == 1 else (price >= trade["sl"])
+        if adverse_hit:
+            continue
+        r_fav = (price - entry) * side / risk
+        if r_fav < be_rr:
+            continue
+
+        trade["be_hit"], trade["sl"] = 1, entry
+        pos_id = trade.get("mt5_position_id")
+        if pos_id:
+            move_to_breakeven(pos_id, entry, trade["side"], get_be_fees_buffer(trade["symbol"]))
+        update_trade(trade["id"], be_hit=1, sl=entry)
+        print(f"[be-realtime] {trade['symbol']} {trade['side']} #{trade['id']} : BE armé à RR{be_rr:g} "
+              f"(prix {price:g}) — SL -> entrée.")
+        ev = {"name": "BE_MOVED", "trade": dict(trade)}
+        dec = dec_by_symbol[trade["symbol"]]
+        to_group(group_event(ev, dec))
+        txt = admin_event(ev)
+        if txt:
+            to_admin(txt)
+
+
+def _be_watch_loop():
+    """Boucle dédiée BE, en parallèle de _trading_loop (qui reste cadencée sur les bougies) :
+    tourne toutes les BE_WATCH_INTERVAL secondes, ne fait qu'armer le BE au tick — jamais de TP/SL,
+    jamais de nouveau signal, pour ne jamais interférer avec la logique bougie par bougie."""
+    while True:
+        try:
+            check_be_realtime()
+        except Exception:
+            traceback.print_exc()
+        time.sleep(BE_WATCH_INTERVAL)
+
+
 def _trading_loop():
     """La boucle de scan (symboles + rapport quotidien), tourne en continu en arrière-plan."""
     try:
@@ -3473,6 +3594,7 @@ def _run(port):
     """Lance le serveur Flask (bloquant) — la boucle de trading tourne dans un thread séparé."""
     if Flask is None:
         print("⚠️  Flask absent (pip install flask) : pas de serveur /health, boucle en direct.")
+        threading.Thread(target=_be_watch_loop, daemon=True).start()
         _trading_loop()
         return
     app = Flask(__name__)
@@ -3486,6 +3608,7 @@ def _run(port):
         return "AlphaBot en ligne.", 200
 
     threading.Thread(target=_trading_loop, daemon=True).start()
+    threading.Thread(target=_be_watch_loop, daemon=True).start()
     app.run(host="0.0.0.0", port=port)
 
 
@@ -4368,3 +4491,4 @@ if __name__ == "__main__":
     if "--selftest" in sys.argv:
         sys.exit(_selftest())
     main()
+
