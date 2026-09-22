@@ -1,4 +1,9 @@
-
+requests
+python-dotenv
+matplotlib
+websocket-client
+flask
+metaapi-cloud-sdk
 requests>=2.32
 flask>=3.0
 websocket-client>=1.8
