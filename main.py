@@ -1,4 +1,5 @@
 
+
 #!/usr/bin/env python3
 """AlphaBot BOS + CHoCH — Gold & BTC — version en un seul fichier.
 
@@ -7,13 +8,13 @@ entrée directe sur CHoCH.
 Prix : Gold via l'API publique Deriv (WebSocket), BTC via l'API publique Binance. Aucune clé de prix.
 
 Lancer :
-    pip install requests python-dotenv matplotlib websocket-client flask
+    pip install requests python-dotenv matplotlib websocket-client flask metaapi-cloud-sdk
     python main.py
 
 Déploiement Render (Web Service) : le process écoute sur $PORT et expose GET /health,
 pendant que la boucle de trading et le polling Telegram tournent en arrière-plan.
 Variables utiles : TELEGRAM_TOKEN, CHAT_ID_GROUPE, CHAT_ID_ADMIN, TIMEFRAME,
-DEFAULT_RISK_USD, DEFAULT_LEVERAGE, PORT.
+DEFAULT_RISK_USD, DEFAULT_LEVERAGE, PORT, METAAPI_TOKEN, METAAPI_ACCOUNT_ID.
 
 Le bot tourne en permanence (pas de /start /stop) : scan continu, une analyse à chaque
 nouvelle bougie clôturée du timeframe choisi.
@@ -40,6 +41,7 @@ Sommaire : 1 Configuration · 2 Base de données · 3 Données de prix · 4 Sign
 import json
 import math
 import os
+import asyncio
 import random
 import re
 import sqlite3
@@ -134,14 +136,29 @@ SYMBOLS = {
         "value_per_point": 100.0,   # $ par point (1.00 de prix) pour 1 lot standard
         "min_lot": 0.01, "lot_step": 0.01, "decimals": 2,
         "min_sl_pct": 0.0010,       # plancher SL absolu : ~0.10% (ex. ~2.6 pts sur du Gold à 2 600)
+        "be_fees_buffer": 0.05,     # défaut BE : SL à entrée +/- 0.05 pt (couvre spread/commission), voir BE_FEES_BUFFER
     },
     "BTCUSD": {
         "source": "binance", "binance_symbol": "BTCUSDT",
         "value_per_point": 1.0,     # $ par point pour 1 lot (1 BTC) - à ajuster selon le broker
         "min_lot": 0.001, "lot_step": 0.001, "decimals": 0,
         "min_sl_pct": 0.0020,       # plancher SL absolu : ~0.20% (ex. ~160 pts sur du BTC à 80 000) -- plus volatile/mèches larges que le Gold
+        "be_fees_buffer": 5.0,      # défaut BE : SL à entrée +/- 5 pts (couvre spread/commission), voir BE_FEES_BUFFER
     },
 }
+
+
+def get_be_fees_buffer(symbol):
+    """Marge (en points, prix brut) ajoutée au-delà de l'entrée pure lors du déplacement du SL au
+    BE, pour couvrir le spread / la commission. Priorité : variable d'env BE_FEES_BUFFER (globale,
+    tous symboles) si définie, sinon le défaut propre à SYMBOLS[symbol]["be_fees_buffer"]."""
+    env_val = os.getenv("BE_FEES_BUFFER", "").strip()
+    if env_val:
+        try:
+            return float(env_val)
+        except ValueError:
+            print(f"[be] BE_FEES_BUFFER={env_val!r} invalide (nombre attendu) — défaut symbole utilisé.")
+    return SYMBOLS.get(symbol, {}).get("be_fees_buffer", 0.0)
 
 # --- Stratégie BOS + CHoCH ---------------------------------------------------
 SWING_DEPTH = _env_int("SWING_DEPTH", 3)
@@ -168,6 +185,19 @@ HTF_CASCADE = tuple(sorted({HTF_MINUTES, 15, 5}, reverse=True))
 # UT d'entrée -> UT de liquidité externe par défaut (liquidité interne = l'UT d'entrée elle-même).
 # Réglable uniquement pour l'entrée M5, via get_ext_tf() / set_ext_tf_m5() (réglage 'ext_tf_m5' en base).
 LIQ_EXT = {1: 15, 3: 15, 5: 60, 15: 240, 30: 240, 60: 240}
+
+# --- Filtre Fibonacci HTF Premium/Discount (indépendant de HTF_MODE / htf_poi_setup) -----------
+# use_mtf_fibonacci_pd_filter = true/false : activable/désactivable à tout moment (ENV MTF_FIBONACCI_PD_FILTER,
+# ou à chaud via /mtffib sur Telegram -- le choix Telegram est mémorisé en base et prime au redémarrage suivant).
+# N'ajoute AUCUNE nouvelle règle de score/OB/FVG : ne fait que filtrer les signaux M1/M5 déjà produits par la
+# logique existante, selon la position du prix dans le Fibonacci du swing HTF (mèches High/Low) :
+#   tendance HTF haussière -> seuls les BUY autorisés, et seulement si le retracement a atteint >= 50% (Discount)
+#   tendance HTF baissière -> seuls les SELL autorisés, et seulement si le retracement a atteint >= 50% (Premium)
+USE_MTF_FIBONACCI_PD_FILTER = _env_bool("MTF_FIBONACCI_PD_FILTER", _env_bool("USE_MTF_FIBONACCI_PD_FILTER", True))
+# UT d'entrée -> UT du Fibonacci HTF : M1/M3 -> M15, M5 -> H1, M15 -> H4 (imposé, indépendant de HTF_REF_TF/LIQ_EXT).
+MTF_FIB_TF = {1: 15, 3: 15, 5: 60, 15: 240}
+MTF_FIB_MIN_RETRACE = 0.5   # niveau minimum (50%) à atteindre pour considérer la zone Premium/Discount comme mitigée
+
 EXT_DEPTH = _env_int("EXT_DEPTH", 5)   # profondeur (bougies de chaque côté) pour confirmer un pivot swing de liquidité externe
 EQ_TOL_ATR = 0.1                       # tolérance EQH/EQL : 2 pivots à moins de EQ_TOL_ATR ATR sont considérés au même niveau
 POI_MAX_AGE = _env_int("POI_MAX_AGE", 60)                  # âge max d'un POI (OB / FVG), en bougies de sa propre UT
@@ -223,6 +253,198 @@ if "--selftest" in sys.argv:   # auto-tests (section 11) : base SQLite jetable, 
     os.environ["DB_PATH"] = os.path.join(tempfile.mkdtemp(), "selftest.db")
 DB_PATH = os.getenv("DB_PATH", "alphabot.db")
 DAILY_REPORT_HOUR_UTC = _env_int("DAILY_REPORT_HOUR_UTC", 21)
+
+# --- MetaApi (exécution MT5) ------------------------------------------------
+# Remplace les deux valeurs ci-dessous par les tiennes (dashboard MetaApi.cloud), ou laisse-les
+# vides et utilise les variables d'environnement METAAPI_TOKEN / METAAPI_ACCOUNT_ID (Render / .env) —
+# la variable d'environnement, si définie, garde toujours la priorité sur ces valeurs par défaut.
+_DEFAULT_METAAPI_TOKEN = ""        # <-- colle ton token MetaApi ici
+_DEFAULT_METAAPI_ACCOUNT_ID = ""   # <-- colle ton account id MetaApi ici
+METAAPI_TOKEN = os.getenv("METAAPI_TOKEN", "") or _DEFAULT_METAAPI_TOKEN
+METAAPI_ACCOUNT_ID = os.getenv("METAAPI_ACCOUNT_ID", "") or _DEFAULT_METAAPI_ACCOUNT_ID
+# Mappe les symboles internes (XAUUSD, BTCUSD) vers ceux du broker si différents,
+# ex. MT5_SYMBOL_MAP={"XAUUSD":"XAUUSD.m","BTCUSD":"BTCUSDm"}. Vide -> pas de mapping (identité).
+try:
+    MT5_SYMBOL_MAP = json.loads(os.getenv("MT5_SYMBOL_MAP", "{}"))
+except Exception:
+    print("[metaapi] MT5_SYMBOL_MAP invalide (JSON attendu) — mapping ignoré.")
+    MT5_SYMBOL_MAP = {}
+
+
+# ============================================================================
+# 1bis. METAAPI — connexion au compte MT5 (exécution réelle des ordres)
+#
+# Connexion RPC vers MetaApi.cloud, utilisée par l'exécution d'ordres (section
+# suivante). Ne bloque jamais le process principal : si METAAPI_TOKEN /
+# METAAPI_ACCOUNT_ID sont absents ou que la connexion échoue, on logge et on
+# continue (le bot reste fonctionnel en mode "signal only").
+# ============================================================================
+
+try:
+    from metaapi_cloud_sdk import MetaApi
+except ImportError:  # metaapi-cloud-sdk optionnel : absent -> pas d'exécution MT5
+    MetaApi = None
+
+_metaapi_instance = None
+_metaapi_connection = None
+_metaapi_lock = threading.Lock()
+
+
+async def get_metaapi_connection():
+    """Retourne une connexion RPC MetaApi connectée et synchronisée, ou None si indisponible.
+
+    Réutilise la connexion existante si elle est encore active. Ne lève jamais
+    d'exception vers l'appelant : toute erreur est logguée et None est retourné,
+    pour ne jamais interrompre la boucle de trading / l'envoi des signaux Telegram.
+    """
+    global _metaapi_instance, _metaapi_connection
+
+    if MetaApi is None:
+        print("[metaapi] SDK non installé (pip install metaapi-cloud-sdk) — exécution MT5 désactivée.")
+        return None
+    if not METAAPI_TOKEN or not METAAPI_ACCOUNT_ID:
+        print("[metaapi] METAAPI_TOKEN / METAAPI_ACCOUNT_ID absents — exécution MT5 désactivée.")
+        return None
+
+    with _metaapi_lock:
+        if _metaapi_connection is not None:
+            try:
+                if _metaapi_connection.terminal_state.connected:
+                    return _metaapi_connection
+            except Exception:
+                pass  # connexion caduque -> on retente une connexion propre ci-dessous
+
+        try:
+            if _metaapi_instance is None:
+                _metaapi_instance = MetaApi(METAAPI_TOKEN)
+
+            account = await _metaapi_instance.metatrader_account_api.get_account(METAAPI_ACCOUNT_ID)
+
+            deployed_states = ("DEPLOYED",)
+            if account.state not in deployed_states:
+                print(f"[metaapi] Déploiement du compte {METAAPI_ACCOUNT_ID}...")
+                await account.deploy()
+
+            print(f"[metaapi] Connexion au compte {METAAPI_ACCOUNT_ID}...")
+            await account.wait_connected()
+
+            connection = account.get_rpc_connection()
+            await connection.connect()
+            await connection.wait_synchronized()
+
+            _metaapi_connection = connection
+            print("[metaapi] Connecté et synchronisé.")
+            return _metaapi_connection
+
+        except Exception as e:
+            print(f"[metaapi] Échec de connexion : {e}")
+            traceback.print_exc()
+            _metaapi_connection = None
+            return None
+
+
+async def _execute_mt5_order_async(symbol, side, lot, entry, sl, tp):
+    """Passe un ordre MARKET MT5 via MetaApi. Retourne le dict résultat MetaApi (contient
+    positionId/orderId) en cas de succès, ou lève une exception en cas d'échec — à charge de
+    l'appelant sync (execute_mt5_order) de l'attraper et de notifier l'admin."""
+    connection = await get_metaapi_connection()
+    if connection is None:
+        raise RuntimeError("connexion MetaApi indisponible")
+
+    broker_symbol = MT5_SYMBOL_MAP.get(symbol, symbol)
+    comment = f"AlphaBot {symbol}"[:26]  # MT5 limite les commentaires à ~26-31 caractères
+
+    if side == "BUY":
+        result = await connection.create_market_buy_order(
+            broker_symbol, lot, sl, tp, options={"comment": comment})
+    elif side == "SELL":
+        result = await connection.create_market_sell_order(
+            broker_symbol, lot, sl, tp, options={"comment": comment})
+    else:
+        raise ValueError(f"side invalide : {side!r} (attendu BUY ou SELL)")
+
+    return result
+
+
+def execute_mt5_order(symbol, side, lot, entry, sl, tp):
+    """Wrapper sync : exécute un ordre MARKET côté MT5 avec le lot/SL/TP déjà calculés par le
+    moteur de signal. Ne lève jamais d'exception : retourne le position_id (str) en cas de
+    succès, ou None en cas d'échec (loggé + admin notifié par l'appelant)."""
+    try:
+        result = asyncio.run(_execute_mt5_order_async(symbol, side, lot, entry, sl, tp))
+    except Exception as e:
+        print(f"[metaapi] Échec d'exécution {symbol} {side} lot={lot} : {e}")
+        traceback.print_exc(limit=-3)
+        return None
+
+    position_id = str(result.get("positionId") or result.get("orderId") or "")
+    print(f"[metaapi] Ordre exécuté : {symbol} {side} lot={lot} entry~{entry} SL={sl} TP={tp} "
+          f"-> ticket {position_id}")
+    return position_id or None
+
+
+async def _move_to_breakeven_async(position_id, entry, side, fees_buffer):
+    """Modifie le SL d'une position MT5 déjà ouverte pour le placer au BE (entrée +/- fees_buffer,
+    dans le sens qui couvre spread/commission). Lève une exception en cas d'échec — à charge de
+    l'appelant sync (move_to_breakeven) de l'attraper."""
+    connection = await get_metaapi_connection()
+    if connection is None:
+        raise RuntimeError("connexion MetaApi indisponible")
+
+    if side == "BUY":
+        new_sl = entry + fees_buffer   # au-dessus de l'entrée : couvre spread/commission sur un long
+    elif side == "SELL":
+        new_sl = entry - fees_buffer   # en-dessous de l'entrée : couvre spread/commission sur un short
+    else:
+        raise ValueError(f"side invalide : {side!r} (attendu BUY ou SELL)")
+
+    await connection.modify_position(position_id, stop_loss=new_sl)
+    return new_sl
+
+
+def move_to_breakeven(position_id, entry, side, fees_buffer=None):
+    """Déplace le SL d'une position MT5 ouverte (identifiée par position_id) au BE via MetaApi :
+    nouveau SL = entry + fees_buffer (BUY) ou entry - fees_buffer (SELL), fees_buffer en points
+    (prix bruts) pour couvrir le spread/la commission — voir get_be_fees_buffer(symbol) pour le
+    défaut (variable d'env BE_FEES_BUFFER, sinon SYMBOLS[symbol]).
+
+    Ne lève jamais d'exception : retourne True en cas de succès, False sinon (loggé)."""
+    if not position_id:
+        print("[metaapi] move_to_breakeven : pas de position_id MT5 (ordre non exécuté côté broker) — ignoré.")
+        return False
+    if fees_buffer is None:
+        fees_buffer = 0.0
+    try:
+        new_sl = asyncio.run(_move_to_breakeven_async(position_id, entry, side, fees_buffer))
+    except Exception as e:
+        print(f"[metaapi] Échec move_to_breakeven position={position_id} : {e}")
+        traceback.print_exc(limit=-3)
+        return False
+
+    print(f"[metaapi] BE appliqué : position {position_id} -> SL={new_sl}")
+    return True
+
+
+async def _mt5_open_position_ids_async():
+    """Retourne l'ensemble des IDs (str) de toutes les positions actuellement ouvertes côté broker,
+    ou None si MetaApi est indisponible (pour ne jamais conclure à tort à une clôture)."""
+    connection = await get_metaapi_connection()
+    if connection is None:
+        return None
+    positions = await connection.get_positions()
+    return {str(p.get("id")) for p in positions}
+
+
+async def _mt5_position_deals_async(position_id):
+    """Historique des deals MT5 d'une position (utilisé pour déduire pourquoi/comment elle a été
+    fermée côté broker : SL, TP, ou clôture manuelle/autre)."""
+    connection = await get_metaapi_connection()
+    if connection is None:
+        return None
+    deals = await connection.get_deals_by_position(position_id)
+    if isinstance(deals, dict):
+        deals = deals.get("deals", [])
+    return deals or []
 
 
 # ============================================================================
@@ -286,6 +508,8 @@ _ensure_column("trades", "ref_price", "REAL")
 # RR d'armement du BE et mode du filtre HTF FIGÉS à la création du signal (changer le réglage n'affecte pas un trade ouvert).
 _ensure_column("trades", "be_rr", "REAL")
 _ensure_column("trades", "htf_mode", "TEXT")
+# Exécution MT5 (MetaApi) : ticket de la position ouverte côté broker, si l'exécution a réussi.
+_ensure_column("trades", "mt5_position_id", "TEXT")
 
 
 # --- paramètres / méta -------------------------------------------------------
@@ -363,6 +587,19 @@ def get_htf_filter():
 
 def set_htf_filter(on):
     set_htf_mode(HTF_MODE if on else "OFF")   # compatibilité : ON = mode par défaut
+
+
+def get_mtf_fib_filter():
+    """Filtre Fibonacci HTF Premium/Discount : ON/OFF, réglable à tout moment. Dernier choix Telegram
+    ('mtf_fib_filter' en base) sinon USE_MTF_FIBONACCI_PD_FILTER (ENV / défaut)."""
+    v = get_setting("mtf_fib_filter")
+    if v is not None:
+        return str(v).strip().lower() in ("1", "true", "yes", "on")
+    return USE_MTF_FIBONACCI_PD_FILTER
+
+
+def set_mtf_fib_filter(on):
+    set_setting("mtf_fib_filter", "1" if on else "0")
 
 
 def get_max_positions():
@@ -1245,6 +1482,78 @@ def htf_trend_check(symbol, ev, trace=None):
     return trend, None
 
 
+_mtf_fib_cache = {}   # symbole -> {"tf", "leg_id", "dir", "hi", "lo", "mid", "mitigated"}
+
+
+def mtf_fib_tf(entry_tf=None):
+    """UT du Fibonacci HTF pour l'UT d'entrée `entry_tf` (minutes) : M1/M3 -> M15, M5 -> H1, M15 -> H4."""
+    return MTF_FIB_TF.get(entry_tf or TIMEFRAME_MIN, 15)
+
+
+def mtf_fib_zone(symbol, tf=None):
+    """Un seul Fibonacci HTF actif par symbole : construit (mèches High/Low) sur le dernier swing HTF
+    confirmé (dernier événement de structure d'`analyze`, UT `tf`), et mis à jour UNIQUEMENT quand ce
+    swing change -- jamais plusieurs Fibonacci empilés/qui se chevauchent.
+
+    0% / 50% / 100% sont toujours calculés du Low vers le High (Discount = 0-50%, Premium = 50-100%).
+    'mitigated' mémorise qu'un retracement a atteint au moins 50% depuis que ce swing existe : une fois
+    vrai, cela reste vrai même si le prix ressort ensuite de la zone (mitigation mémorisée, pas ponctuelle).
+    None si pas assez de bougies HTF ou lecture impossible (le filtre doit alors refuser, jamais laisser passer)."""
+    tf = tf or mtf_fib_tf()
+    raw = _ctx_candles(symbol, tf)
+    if len(raw) <= 2 * SWING_DEPTH + 1:
+        return None
+    evs = analyze(raw)
+    if not evs:
+        return None
+    ev = evs[-1]
+    i0 = ev.get("src")
+    if i0 is None or i0 >= len(raw) - 1:
+        return None
+    seg = raw[i0:]                              # du swing d'origine (mèche) jusqu'à la dernière bougie HTF clôturée
+    hi, lo = max(x["h"] for x in seg), min(x["l"] for x in seg)
+    if hi <= lo:
+        return None
+    mid = (hi + lo) / 2.0
+    d = ev["dir"]
+    leg_id = (ev["t"], d)                        # identifie le swing HTF courant -> ne change que sur un nouveau swing
+    cached = _mtf_fib_cache.get(symbol)
+    if not cached or cached["tf"] != tf or cached["leg_id"] != leg_id:
+        cached = {"tf": tf, "leg_id": leg_id, "dir": d, "hi": hi, "lo": lo, "mid": mid, "mitigated": False}
+    else:
+        cached.update(dir=d, hi=hi, lo=lo, mid=mid)   # même swing : les mèches peuvent encore s'étendre un peu
+    reached_50 = (lo <= mid - 1e-9 and min(x["l"] for x in seg) <= mid) if d == 1 else (max(x["h"] for x in seg) >= mid)
+    if reached_50:
+        cached["mitigated"] = True
+    _mtf_fib_cache[symbol] = cached
+    return cached
+
+
+def mtf_fib_pd_filter(symbol, ev, trace=None):
+    """Filtre Fibonacci HTF Premium/Discount (voir get_mtf_fib_filter) : indépendant de htf_mode / htf_poi_setup,
+    ne fait que filtrer un signal M1/M5 déjà produit. Retourne (autorisé: bool, motif_de_refus ou None)."""
+    tf = mtf_fib_tf()
+    lbl = _tf_lbl(tf)
+    fib = mtf_fib_zone(symbol, tf)
+    if fib is None:
+        if trace is not None:
+            trace["mtf_fib"] = f"Fibo HTF {lbl} indisponible"
+        return False, f"Fibonacci HTF {lbl} indisponible -- pas assez de bougies / lecture impossible"
+    d = ev["dir"]
+    side = "BUY" if d == 1 else "SELL"
+    zone = "Discount (0-50%)" if fib["dir"] == 1 else "Premium (50-100%)"
+    if trace is not None:
+        trace["mtf_fib"] = (f"{lbl} {_dir_txt(fib['dir'])} -- 0% {fib['lo']:.2f} / 50% {fib['mid']:.2f} / "
+                             f"100% {fib['hi']:.2f} -- {zone} {'mitigée' if fib['mitigated'] else 'non mitigée'}")
+    if d != fib["dir"]:
+        return False, (f"{side} contre la tendance Fibonacci HTF {lbl} ({_dir_txt(fib['dir'])}) -- seuls les "
+                        f"{'BUY' if fib['dir'] == 1 else 'SELL'} sont autorisés (filtre Premium/Discount)")
+    if not fib["mitigated"]:
+        return False, (f"retracement HTF {lbl} < 50% (50% = {fib['mid']:.2f}) -- zone {zone} pas encore "
+                        f"atteinte, signal {side} ignoré tant que le retracement n'a pas atteint 50%")
+    return True, None
+
+
 def build_signal(c, ev, symbol=None):
     """Transforme un CHoCH en signal (entrée, SL, TP). None si invalide.
 
@@ -1283,6 +1592,14 @@ def build_signal(c, ev, symbol=None):
             if why:
                 return _rej(why)
             setup = f"TENDANCE {_tf_lbl(htf_ref_tf())} {_dir_txt(trend).upper()}"
+    # Filtre Fibonacci HTF Premium/Discount : totalement indépendant de htf_mode ci-dessus (peut être actif
+    # même si htf_mode == OFF, et inversement) -- ne fait que filtrer un signal M1/M5 déjà produit par la
+    # logique existante, jamais de nouvelle règle de score/OB/FVG. Voir use_mtf_fibonacci_pd_filter.
+    mtf_fib_on = bool(symbol and get_mtf_fib_filter())
+    if mtf_fib_on:
+        ok, why = mtf_fib_pd_filter(symbol, ev, trace)
+        if not ok:
+            return _rej(why)
     d, a = ev["dir"], ev["atr"]
     entry = c[ev["i"]]["c"]
     sl = ev["sl_level"] - d * SL_BUFFER_ATR * a
@@ -1311,6 +1628,7 @@ def build_signal(c, ev, symbol=None):
         "t": ev["t"], "bos_level": ev["sl_level"],
         "rr": tp_rr, "htf": htf_on, "htf_mode": htf_mode, "be_rr": be_rr, "tf": TF_LABEL,   # affichés sur le signal
         "setup": setup, "poi": poi,   # CONTINUATION (COMPLET) / TENDANCE M15 ... (M15) ; None si filtre HTF OFF
+        "mtf_fib_on": mtf_fib_on, "mtf_fib": trace.get("mtf_fib"),   # affichage filtre Fibonacci HTF Premium/Discount
     }
     # Entrée LIMIT : retest du niveau cassé (la ligne du CHoCH), avec le même SL structurel.
     lvl = ev["level"]
@@ -1445,6 +1763,9 @@ def track_trade(trade, candles):
         if not trade["be_hit"] and be_rr < tp_rr and r_fav >= be_rr:
             trade["be_hit"], trade["sl"] = 1, entry
             be_arm = True
+            pos_id = trade.get("mt5_position_id")
+            if pos_id:   # position réellement exécutée côté broker (MetaApi) : on synchronise son SL
+                move_to_breakeven(pos_id, entry, trade["side"], get_be_fees_buffer(trade["symbol"]))
         be_told = False   # ... et il est annoncé avec un palier RR (sinon : événement BE_MOVED seul)
         for lvl in RR_LEVELS:
             if lvl > tp_rr:
@@ -1472,6 +1793,79 @@ def track_trade(trade, candles):
                                     "rr1_hit", "rr2_hit", "rr3_hit")}
     update_trade(trade["id"], **fields)
     return events
+
+
+# --- réconciliation broker (MetaApi) : détecte les positions fermées côté MT5 ------------------
+# Indépendant du suivi RR ci-dessus (track_trade, qui avance sur les bougies clôturées) : ici on
+# vérifie juste, côté broker, qu'une position censée être ouverte l'est toujours. Utile si le SL/TP
+# a été exécuté par MT5 entre deux bougies, ou en cas de clôture manuelle/autre côté broker — cas
+# que track_trade (qui ne regarde que les bougies) ne peut pas voir de lui-même.
+MT5_SYNC_INTERVAL = _env_int("MT5_SYNC_INTERVAL", 60)   # secondes entre 2 réconciliations MetaApi
+
+
+def _mt5_close_outcome(trade, deals):
+    """Déduit l'issue (SL/TP/BE/CLOSED_EXT) et le résultat ($ et R) d'une position MT5 fermée côté
+    broker, à partir de son historique de deals MetaApi. Best-effort : si la raison de clôture est
+    absente ou inconnue (clôture manuelle, stop-out, etc.), l'issue retombe sur CLOSED_EXT plutôt
+    que de deviner TP/SL à tort."""
+    profit = sum((d.get("profit") or 0) + (d.get("commission") or 0) + (d.get("swap") or 0) for d in deals)
+    reason = None
+    for d in reversed(deals):   # dernier deal de sortie (DEAL_ENTRY_OUT / DEAL_ENTRY_OUT_BY) = celui qui a clôturé
+        if d.get("entryType") in ("DEAL_ENTRY_OUT", "DEAL_ENTRY_OUT_BY"):
+            reason = d.get("reason")
+            break
+    if reason == "DEAL_REASON_SL":
+        outcome = "BE" if trade.get("be_hit") else "SL"   # SL déjà déplacé à l'entrée -> c'est un BE, pas une perte
+    elif reason == "DEAL_REASON_TP":
+        outcome = "TP"
+    else:
+        outcome = "CLOSED_EXT"   # clôture manuelle / stop-out / raison inconnue : pas de TP/SL supposé
+    risk_usd = trade.get("risk_usd") or 0
+    result_r = (profit / risk_usd) if risk_usd else None
+    return outcome, result_r, profit
+
+
+def sync_mt5_positions():
+    """Réconciliation périodique, à appeler depuis la boucle principale (indépendamment du scan par
+    symbole) : compare les trades OPEN en base ayant un mt5_position_id à la liste des positions
+    réellement ouvertes côté broker (MetaApi). Si une position a disparu côté broker, le trade
+    correspondant est marqué CLOSED en base avec l'issue déduite de l'historique MetaApi.
+
+    Ne duplique jamais la grille RR (sl/be_hit/rrN_hit/paliers RR1-RR3), qui reste entièrement gérée
+    par track_trade ci-dessus ; ne touche pas non plus aux trades sans mt5_position_id (mode
+    "signal only", sans exécution MT5)."""
+    trades = [t for t in open_trades() if t.get("mt5_position_id") and t["status"] == "OPEN"]
+    if not trades:
+        return
+
+    try:
+        broker_ids = asyncio.run(_mt5_open_position_ids_async())
+    except Exception as e:
+        print(f"[metaapi] sync positions : échec récupération des positions ouvertes : {e}")
+        traceback.print_exc(limit=-3)
+        return
+    if broker_ids is None:
+        return   # MetaApi indisponible : on ne conclut à aucune clôture plutôt que de clôturer à tort
+
+    for t in trades:
+        pos_id = str(t["mt5_position_id"])
+        if pos_id in broker_ids:
+            continue   # toujours ouverte côté broker : rien à faire ici (track_trade s'en occupe)
+
+        try:
+            deals = asyncio.run(_mt5_position_deals_async(pos_id))
+        except Exception as e:
+            print(f"[metaapi] sync positions : échec historique deals position {pos_id} : {e}")
+            traceback.print_exc(limit=-3)
+            deals = []
+
+        outcome, result_r, profit = _mt5_close_outcome(t, deals or [])
+        update_trade(t["id"], status="CLOSED", closed_ts=int(time.time()),
+                     outcome=outcome, result_r=result_r, pnl_usd=profit)
+        r_txt = f", {result_r:+.2f} R" if result_r is not None else ""
+        print(f"[metaapi] Position {pos_id} fermée côté broker ({t['symbol']} {t['side']}) -> {outcome}{r_txt} "
+              f"(base mise à jour).")
+        to_admin(f"📒 {t['symbol']} {t['side']} — position fermée côté broker (MT5) : <b>{outcome}</b>{r_txt}")
 
 
 # ============================================================================
@@ -2062,9 +2456,18 @@ def _params_lines(sig, tf=None):
     if mode not in HTF_MODES:
         htf = sig.get("htf")
         mode = get_htf_mode() if htf is None else (HTF_MODE if htf else "OFF")
-    return (f"Timeframe : {tf or sig.get('tf') or TF_LABEL}\n"
-            f"RR : {_sig_rr(sig):g}\n"
-            f"Filtre HTF : {_htf_txt(mode)}")
+    lines = (f"Timeframe : {tf or sig.get('tf') or TF_LABEL}\n"
+             f"RR : {_sig_rr(sig):g}\n"
+             f"Filtre HTF : {_htf_txt(mode)}")
+    fib_line = _mtf_fib_line(sig)
+    return f"{lines}\n{fib_line}" if fib_line else lines
+
+
+def _mtf_fib_line(sig):
+    """Ligne « Fibo HTF » d'un signal : None si le filtre Fibonacci HTF Premium/Discount est OFF."""
+    if not sig.get("mtf_fib_on"):
+        return None
+    return f"Fibo HTF : {sig.get('mtf_fib') or 'ON'}"
 
 
 def _be_line(sig):
@@ -2453,6 +2856,7 @@ def handle_command(text):
                "/signal — paramètres du signal (RR, timeframe, filtre HTF, BE, signaux max)\n"
                "/be [RR] — RR auquel le SL passe à l'entrée (ex. /be 1)\n"
                "/maxpos [n] — signaux ouverts max par actif (1 = pas de doublon)\n"
+               "/mtffib [on|off] — filtre Fibonacci HTF Premium/Discount\n"
                "/medias — stickers / images / GIF du groupe (TP, SL, BE, motivation)\n"
                "/analyse — analyse technique / fondamentale à la demande (BTCUSD, XAUUSD)\n"
                "/menu — menu à boutons")
@@ -2477,6 +2881,19 @@ def handle_command(text):
             except ValueError:
                 return ("RR invalide. Exemple : /be 1 ou /be 0.5", None)
         return (_signal_be_text(), _signal_be_keyboard())
+    if cmd in ("/mtffib", "/fibohtf"):
+        if len(parts) > 1:
+            arg = parts[1].strip().lower()
+            if arg in ("on", "1", "true", "activer", "activé"):
+                set_mtf_fib_filter(True)
+            elif arg in ("off", "0", "false", "desactiver", "désactiver"):
+                set_mtf_fib_filter(False)
+            else:
+                return ("Valeur invalide. Exemple : /mtffib on  ou  /mtffib off", None)
+        on = get_mtf_fib_filter()
+        return (f"📐 Filtre Fibonacci HTF Premium/Discount : <b>{'ON' if on else 'OFF'}</b>\n"
+                f"UT Fibo : {_tf_lbl(mtf_fib_tf())} (auto selon le timeframe d'entrée {TF_LABEL})\n"
+                f"Change avec /mtffib on ou /mtffib off.", None)
     if cmd in ("/maxpos", "/signauxmax"):
         if len(parts) > 1:
             try:
@@ -2864,6 +3281,17 @@ def publish_signal(symbol, candles, events, sig):
     print(f"[{symbol}] SIGNAL {sig['side']} {sig.get('order', 'MARKET')} {sig['type']} @ {sig['entry']:.{dec}f} "
           f"(bougie {_ts_str(sig['t'])})")
 
+    # Exécution réelle côté MT5 (si configurée) — seulement pour les entrées MARKET immédiates.
+    # Un échec ici n'empêche jamais l'envoi du signal Telegram : c'est juste loggé + notifié à l'admin.
+    if sig.get("order", "MARKET") == "MARKET" and METAAPI_TOKEN and METAAPI_ACCOUNT_ID:
+        mt5_position_id = execute_mt5_order(symbol, sig["side"], lot_info["lot"], sig["entry"], sig["sl"], sig["tp"])
+        if mt5_position_id:
+            update_trade(trade_id, mt5_position_id=mt5_position_id)
+        else:
+            send(CHAT_ID_ADMIN,
+                 f"⚠️ Échec d'exécution MT5 pour le signal {symbol} {sig['side']} {sig['type']} "
+                 f"(trade #{trade_id}) — signal envoyé quand même, à ouvrir manuellement si besoin.")
+
     try:
         chart = make_chart(symbol, candles, events, sig, dec)
     except Exception as e:   # un souci de graphique ne doit JAMAIS empêcher l'envoi du signal
@@ -3000,6 +3428,7 @@ def _trading_loop():
     """La boucle de scan (symboles + rapport quotidien), tourne en continu en arrière-plan."""
     try:
         last_hb = 0.0
+        last_mt5_sync = 0.0
         while True:
             if time.time() - last_hb >= 300:   # « je scanne bien » dans les logs, toutes les 5 min
                 last_hb = time.time()
@@ -3017,6 +3446,12 @@ def _trading_loop():
                         process_symbol(symbol)
                 except Exception:
                     print(f"[{symbol}] erreur :")
+                    traceback.print_exc()
+            if time.time() - last_mt5_sync >= MT5_SYNC_INTERVAL:   # réconciliation broker, indépendante du scan par symbole
+                last_mt5_sync = time.time()
+                try:
+                    sync_mt5_positions()
+                except Exception:
                     traceback.print_exc()
             try:
                 maybe_daily_report()
