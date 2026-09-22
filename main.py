@@ -318,6 +318,17 @@ _metaapi_lock = threading.Lock()
 # level, filling modes...) soit entièrement peuplé. Réglable via MT5_SYNC_WAIT_SEC.
 MT5_SYNC_WAIT_SEC = _env_float("MT5_SYNC_WAIT_SEC", 3.0)
 
+# Nombre de tentatives de connexion/synchronisation MetaApi avant d'abandonner : un
+# wait_synchronized() qui timeout ne veut pas dire que le compte n'est pas Connected/Deployed
+# côté dashboard MetaApi — on retente proprement (nouvelle connexion RPC à chaque tentative)
+# plutôt que d'abandonner sur le 1er timeout. Réglable via MT5_SYNC_RETRIES.
+MT5_SYNC_RETRIES = max(1, _env_int("MT5_SYNC_RETRIES", 3))
+# Timeout (s) passé à wait_synchronized() à chaque tentative. Réglable via MT5_SYNC_TIMEOUT_SEC.
+MT5_SYNC_TIMEOUT_SEC = _env_float("MT5_SYNC_TIMEOUT_SEC", 60.0)
+# Backoff (s) entre deux tentatives de (re)connexion, multiplié par le numéro de la tentative
+# (1re relance après MT5_RECONNECT_BACKOFF_SEC, 2e après 2x, ...). Réglable via MT5_RECONNECT_BACKOFF_SEC.
+MT5_RECONNECT_BACKOFF_SEC = _env_float("MT5_RECONNECT_BACKOFF_SEC", 2.0)
+
 # Marge de sécurité appliquée au-delà du stopsLevel minimum imposé par le broker, pour ne pas
 # coller pile au seuil (le prix peut légèrement bouger entre le calcul du signal et l'envoi de
 # l'ordre). Réglable via MT5_STOP_BUFFER (1.0 = pas de marge, 1.2 = +20%).
@@ -336,12 +347,27 @@ class SLTooCloseError(Exception):
             f"{which} trop proche pour {broker_symbol} : requis >= {required}, calculé {actual}")
 
 
-async def get_metaapi_connection():
+async def _close_stale_connection(connection):
+    """Ferme proprement une connexion RPC devenue inutilisable avant d'en recréer une —
+    best-effort : une erreur ici ne doit jamais empêcher la tentative de reconnexion suivante."""
+    if connection is None:
+        return
+    try:
+        await connection.close()
+    except Exception:
+        pass
+
+
+async def get_metaapi_connection(force_reconnect=False):
     """Retourne une connexion RPC MetaApi connectée et synchronisée, ou None si indisponible.
 
-    Réutilise la connexion existante si elle est encore active. Ne lève jamais
-    d'exception vers l'appelant : toute erreur est logguée et None est retourné,
-    pour ne jamais interrompre la boucle de trading / l'envoi des signaux Telegram.
+    Réutilise la connexion existante si elle est encore active (connexion RPC persistante :
+    jamais recréée à chaque ordre). Si elle est absente/caduque, ou si `force_reconnect=True`,
+    tente jusqu'à MT5_SYNC_RETRIES connexions propres (nouvelle connexion RPC à chaque tentative,
+    avec backoff croissant) : un `wait_synchronized()` qui timeout ne signifie pas forcément que
+    le compte n'est pas Connected/Deployed côté dashboard MetaApi, donc on ne renonce jamais sur
+    un seul échec. Ne lève jamais d'exception vers l'appelant : toute erreur est logguée et None
+    est retourné, pour ne jamais interrompre la boucle de trading / l'envoi des signaux Telegram.
     """
     global _metaapi_instance, _metaapi_connection, _metaapi_connected_at
 
@@ -353,42 +379,56 @@ async def get_metaapi_connection():
         return None
 
     with _metaapi_lock:
-        if _metaapi_connection is not None:
+        if not force_reconnect and _metaapi_connection is not None:
             try:
                 if _metaapi_connection.terminal_state.connected:
-                    return _metaapi_connection
+                    return _metaapi_connection  # connexion persistante réutilisée telle quelle
             except Exception:
                 pass  # connexion caduque -> on retente une connexion propre ci-dessous
 
-        try:
-            if _metaapi_instance is None:
-                _metaapi_instance = MetaApi(METAAPI_TOKEN)
+        stale = _metaapi_connection
+        _metaapi_connection = None
+        _metaapi_connected_at = None
+        await _close_stale_connection(stale)
 
-            account = await _metaapi_instance.metatrader_account_api.get_account(METAAPI_ACCOUNT_ID)
+        last_err = None
+        for attempt in range(1, MT5_SYNC_RETRIES + 1):
+            connection = None
+            try:
+                if _metaapi_instance is None:
+                    _metaapi_instance = MetaApi(METAAPI_TOKEN)
 
-            deployed_states = ("DEPLOYED",)
-            if account.state not in deployed_states:
-                print(f"[metaapi] Déploiement du compte {METAAPI_ACCOUNT_ID}...")
-                await account.deploy()
+                account = await _metaapi_instance.metatrader_account_api.get_account(METAAPI_ACCOUNT_ID)
 
-            print(f"[metaapi] Connexion au compte {METAAPI_ACCOUNT_ID}...")
-            await account.wait_connected()
+                if account.state not in ("DEPLOYED",):
+                    print(f"[metaapi] Déploiement du compte {METAAPI_ACCOUNT_ID}...")
+                    await account.deploy()
 
-            connection = account.get_rpc_connection()
-            await connection.connect()
-            await connection.wait_synchronized()
+                print(f"[metaapi] Connexion au compte {METAAPI_ACCOUNT_ID} "
+                      f"(tentative {attempt}/{MT5_SYNC_RETRIES})...")
+                await account.wait_connected()
 
-            _metaapi_connection = connection
-            _metaapi_connected_at = time.time()
-            print("[metaapi] Connecté et synchronisé.")
-            return _metaapi_connection
+                connection = account.get_rpc_connection()
+                await connection.connect()
+                await connection.wait_synchronized(timeout_in_seconds=MT5_SYNC_TIMEOUT_SEC)
 
-        except Exception as e:
-            print(f"[metaapi] Échec de connexion : {e}")
-            traceback.print_exc()
-            _metaapi_connection = None
-            _metaapi_connected_at = None
-            return None
+                _metaapi_connection = connection
+                _metaapi_connected_at = time.time()
+                print(f"[metaapi] Connecté et synchronisé (tentative {attempt}/{MT5_SYNC_RETRIES}).")
+                return _metaapi_connection
+
+            except Exception as e:
+                last_err = e
+                print(f"[metaapi] Échec connexion/synchronisation (tentative {attempt}/{MT5_SYNC_RETRIES}) : {e}")
+                await _close_stale_connection(connection)
+                _metaapi_connection = None
+                _metaapi_connected_at = None
+                if attempt < MT5_SYNC_RETRIES:
+                    await asyncio.sleep(MT5_RECONNECT_BACKOFF_SEC * attempt)
+
+        print(f"[metaapi] Connexion abandonnée après {MT5_SYNC_RETRIES} tentatives : {last_err}")
+        traceback.print_exc()
+        return None
 
 
 async def _ensure_terminal_ready():
@@ -480,12 +520,34 @@ async def _execute_mt5_stop_check_only(symbol, entry, sl, tp):
             raise SLTooCloseError(symbol, broker_symbol, "TP", min_dist, tp_dist)
 
 
-async def _execute_mt5_order_async(symbol, side, lot, entry, sl, tp):
-    """Passe un ordre MARKET MT5 via MetaApi, dans l'ordre : (1) attente sync terminal,
+async def _find_position_by_client_id(connection, client_id):
+    """Cherche, parmi les positions actuellement ouvertes côté broker, une position déjà créée
+    pour ce client_id (retrouvé via le champ clientId ou, à défaut, via le commentaire — selon ce
+    que le broker/SDK renvoie). Utilisé UNIQUEMENT avant une retentative, pour ne jamais renvoyer
+    un 2e ordre MARKET si le 1er a en fait été exécuté côté MT5 malgré une erreur réseau/timeout
+    côté RPC. Retourne le dict position, ou None si rien trouvé (best-effort, jamais bloquant)."""
+    if not client_id:
+        return None
+    try:
+        positions = await connection.get_positions()
+    except Exception as e:
+        print(f"[metaapi] Vérif anti-doublon impossible (get_positions a échoué) : {e}")
+        return None
+    for p in positions or []:
+        if str(p.get("clientId") or "") == client_id or client_id in str(p.get("comment") or ""):
+            return p
+    return None
+
+
+async def _execute_mt5_order_async(symbol, side, lot, entry, sl, tp, client_id=None):
+    """Passe un ordre MARKET MT5 via MetaApi, dans l'ordre : (1) attente sync terminal (connexion
+    RPC persistante, reconnexion avec plusieurs tentatives si besoin — voir get_metaapi_connection),
     (2) récupération des specs + vérif stopsLevel (rejet net via SLTooCloseError si SL/TP trop
     proche — jamais de déplacement automatique du SL), (3) fillingMode déduit des specs,
-    (4) une seule retentative en dernier recours si l'ordre échoue quand même. Retourne le dict
-    résultat MetaApi (positionId/orderId) en cas de succès, ou lève une exception."""
+    (4) une seule retentative en dernier recours si l'ordre échoue quand même — précédée d'une
+    vérif anti-doublon par client_id, pour ne jamais soumettre un 2e ordre si le 1er a en fait été
+    exécuté côté broker malgré une erreur côté RPC (timeout réseau, reconnexion...). Retourne le
+    dict résultat MetaApi (positionId/orderId) en cas de succès, ou lève une exception."""
     connection = await _ensure_terminal_ready()
     if connection is None:
         raise RuntimeError("connexion MetaApi indisponible")
@@ -506,6 +568,8 @@ async def _execute_mt5_order_async(symbol, side, lot, entry, sl, tp):
     slippage = get_mt5_slippage(symbol)
     filling_mode = _pick_filling_mode(spec)
     options = {"comment": comment, "slippage": slippage, "fillingMode": filling_mode}
+    if client_id:
+        options["clientId"] = client_id[:32]  # champ MetaApi dédié à la corrélation/anti-doublon
 
     async def _place():
         if side == "BUY":
@@ -518,10 +582,17 @@ async def _execute_mt5_order_async(symbol, side, lot, entry, sl, tp):
     try:
         return await _place()
     except Exception as e:
-        # Dernier recours seulement (pas pour SLTooCloseError, qui n'atterrit jamais ici) : un
-        # court délai + un rafraîchissement des specs suffit dans la plupart des cas restants.
-        print(f"[metaapi] 1re tentative d'ordre échouée ({e}) — nouvel essai dans 1.5s après vérif spécs symbole.")
+        # Dernier recours seulement (pas pour SLTooCloseError, qui n'atterrit jamais ici). AVANT
+        # de retenter, on vérifie que le 1er ordre n'est pas en fait passé côté broker (erreur
+        # survenue après exécution réelle, ex. timeout sur la réponse RPC) : si on le retrouve via
+        # client_id, on le renvoie tel quel plutôt que de soumettre un 2e ordre MARKET (doublon).
+        print(f"[metaapi] 1re tentative d'ordre échouée ({e}) — vérif anti-doublon puis nouvel essai dans 1.5s.")
         await asyncio.sleep(1.5)
+        existing = await _find_position_by_client_id(connection, client_id)
+        if existing is not None:
+            print(f"[metaapi] Ordre déjà exécuté côté broker (retrouvé via client_id={client_id}) "
+                  f"— pas de nouvel ordre, réutilisation de la position existante.")
+            return existing
         try:
             await connection.get_symbol_specification(broker_symbol)
         except Exception:
@@ -529,13 +600,31 @@ async def _execute_mt5_order_async(symbol, side, lot, entry, sl, tp):
         return await _place()
 
 
-def execute_mt5_order(symbol, side, lot, entry, sl, tp):
-    """Wrapper sync : exécute un ordre MARKET côté MT5 avec le lot/SL/TP déjà calculés par le
-    moteur de signal. Laisse remonter SLTooCloseError telle quelle (à l'appelant de décider du
-    rejet du signal) ; toute autre erreur ne lève jamais d'exception : retourne le position_id
-    (str) en cas de succès, ou None en cas d'échec (loggé + admin notifié par l'appelant)."""
+async def _confirm_position_async(connection, position_id):
+    """Confirme réellement, côté MT5 (pas seulement via la réponse de création d'ordre), qu'une
+    position positionId/orderId existe bien. Best-effort : si la vérification elle-même échoue
+    (API indisponible), on ne conclut PAS à un échec d'exécution — seule l'absence confirmée de
+    la position (position introuvable) doit faire douter du succès de l'ordre."""
+    if not position_id:
+        return False, "pas d'identifiant de position renvoyé par MetaApi"
     try:
-        result = asyncio.run(_execute_mt5_order_async(symbol, side, lot, entry, sl, tp))
+        positions = await connection.get_positions()
+    except Exception as e:
+        return None, f"vérification impossible ({e})"
+    found = any(str(p.get("id")) == str(position_id) for p in positions or [])
+    return found, None
+
+
+def execute_mt5_order(symbol, side, lot, entry, sl, tp, client_id=None):
+    """Wrapper sync : exécute un ordre MARKET côté MT5 avec le lot/SL/TP déjà calculés par le
+    moteur de signal, puis confirme réellement l'existence de la position créée (positionId/
+    orderId) avant de la considérer comme ouverte. Laisse remonter SLTooCloseError telle quelle (à
+    l'appelant de décider du rejet du signal) ; toute autre erreur ne lève jamais d'exception :
+    retourne le position_id (str) en cas de succès confirmé, ou None en cas d'échec (loggé +
+    admin notifié par l'appelant). `client_id` (ex. l'id du trade en base) sert à la déduplication
+    lors d'une éventuelle retentative — voir _execute_mt5_order_async."""
+    try:
+        result = asyncio.run(_execute_mt5_order_async(symbol, side, lot, entry, sl, tp, client_id))
     except SLTooCloseError as e:
         # Rare : le prix a bougé entre la pré-vérif (publish_signal) et l'exécution, faisant
         # basculer le SL sous le stopsLevel entre-temps. Jamais de déplacement automatique du
@@ -547,12 +636,38 @@ def execute_mt5_order(symbol, side, lot, entry, sl, tp):
         traceback.print_exc(limit=-3)
         return None
 
-    position_id = str(result.get("positionId") or result.get("orderId") or "")
+    position_id = str(result.get("positionId") or result.get("orderId") or result.get("id") or "")
     fill_price = result.get("price") or result.get("openPrice")
+
+    if not position_id:
+        print(f"[metaapi] Échec d'exécution {symbol} {side} lot={lot} : "
+              f"aucun positionId/orderId dans la réponse MetaApi ({result!r}).")
+        return None
+
+    # Confirmation réelle côté MT5 (pas seulement la réponse de création d'ordre) : si la position
+    # est confirmée absente (found=False), c'est un échec net ; si la vérif elle-même échoue
+    # (found=None, ex. API indisponible), on ne bloque pas sur ce doute, l'ordre a déjà un ticket.
+    try:
+        connection = asyncio.run(get_metaapi_connection())
+        found, reason = asyncio.run(_confirm_position_async(connection, position_id)) \
+            if connection is not None else (None, "connexion MetaApi indisponible pour la confirmation")
+    except Exception as e:
+        found, reason = None, f"confirmation impossible ({e})"
+
+    if found is False:
+        print(f"[metaapi] Position {position_id} introuvable côté broker après exécution "
+              f"({symbol} {side} lot={lot}) — traité comme échec d'exécution.")
+        return None
+    if found is None:
+        print(f"[metaapi] Ticket {position_id} obtenu mais non re-confirmé ({reason}) — "
+              f"considéré exécuté (ticket déjà attribué par MetaApi).")
+    else:
+        print(f"[metaapi] Position {position_id} confirmée côté broker.")
+
     print(f"[metaapi] Ordre exécuté : {symbol} {side} lot={lot} entry~{entry} fill={fill_price} SL={sl} TP={tp} "
           f"-> ticket {position_id}")
 
-    if position_id and fill_price:
+    if fill_price:
         try:
             gap_pct = abs(float(fill_price) - entry) / entry
         except (TypeError, ZeroDivisionError):
@@ -563,7 +678,7 @@ def execute_mt5_order(symbol, side, lot, entry, sl, tp):
                  f"({gap_pct * 100:.2f}%) — ticket {position_id}. SL/TP restent basés sur le prix du signal, "
                  f"pense à vérifier le risque réel de cette position.")
 
-    return position_id or None
+    return position_id
 
 
 async def _move_to_breakeven_async(position_id, entry, side, fees_buffer):
@@ -895,7 +1010,10 @@ def signal_exists(key):
 
 
 def count_open(symbol):
-    return _q("SELECT COUNT(*) n FROM trades WHERE symbol=? AND status IN ('OPEN','PENDING')", (symbol,)).fetchone()["n"]
+    # 'EXECUTING' inclus : un trade MARKET en cours de confirmation MT5 doit réserver sa place,
+    # sinon un nouveau signal pourrait être publié (et un 2e ordre envoyé) avant confirmation.
+    return _q("SELECT COUNT(*) n FROM trades WHERE symbol=? AND status IN ('OPEN','PENDING','EXECUTING')",
+              (symbol,)).fetchone()["n"]
 
 
 def add_trade(**t):
@@ -2864,6 +2982,7 @@ def _signal_text():
             f"🎯 RR actuel : RR{get_tp_rr():g}\n"
             f"⏱ Timeframe : {TF_LABEL}\n"
             f"🧠 Filtre HTF : {_htf_mode_txt()}\n"
+            f"📐 Filtre Fibo HTF : {'ON' if get_mtf_fib_filter() else 'OFF'}\n"
             f"🔒 BE à : RR{get_be_rr():g}\n"
             f"📍 Signaux ouverts max par actif : {get_max_positions()}")
 
@@ -2873,7 +2992,7 @@ def _signal_keyboard():
         [{"text": "🎯 RR", "callback_data": "sig:rr"}, {"text": "⏱ TIMEFRAME", "callback_data": "sig:tf"},
          {"text": "🧠 FILTRE HTF", "callback_data": "sig:htf"}],
         [{"text": "🔒 BE", "callback_data": "sig:be"}, {"text": "📍 SIGNAUX MAX", "callback_data": "sig:max"}],
-        [{"text": "🌐 LIQ. EXTERNE", "callback_data": "sig:ext"}],
+        [{"text": "🌐 LIQ. EXTERNE", "callback_data": "sig:ext"}, {"text": "📐 FIBO HTF", "callback_data": "sig:fib"}],
         [{"text": "🔙 Menu", "callback_data": "menu:home"}]]}
 
 
@@ -2922,6 +3041,25 @@ def _signal_htf_keyboard():
         {"text": ("✅ " if cur == "M15" else "") + f"🟢 {_tf_lbl(htf_ref_tf())}", "callback_data": "shtf:M15"},
         {"text": ("✅ " if cur == "FULL" else "") + "🟣 COMPLET", "callback_data": "shtf:FULL"},
         {"text": ("✅ " if cur == "OFF" else "") + "🔴 OFF", "callback_data": "shtf:OFF"}]])
+
+
+def _signal_fib_text():
+    on = get_mtf_fib_filter()
+    return (f"📐 Filtre Fibonacci HTF Premium/Discount : <b>{'ON' if on else 'OFF'}</b>\n\n"
+            f"UT Fibo : {_tf_lbl(mtf_fib_tf())} (auto selon le timeframe d'entrée {TF_LABEL})\n\n"
+            f"🟢 ON : tendance HTF haussière → seuls les BUY sont autorisés (et seulement si le retracement a "
+            f"atteint la zone Discount, 0-50%) ; tendance HTF baissière → seuls les SELL (zone Premium, 50-100%).\n\n"
+            f"🔴 OFF : aucune contrainte Premium/Discount, tout CHoCH valide devient un signal (BUY ou SELL).\n\n"
+            f"Indépendant du filtre HTF ci-dessus — les deux peuvent être combinés ou activés séparément. "
+            f"Effet immédiat sur les NOUVEAUX signaux ; les trades déjà ouverts ne sont pas affectés.\n"
+            f"Aussi réglable via /mtffib on ou /mtffib off.")
+
+
+def _signal_fib_keyboard():
+    on = get_mtf_fib_filter()
+    return _signal_back([[
+        {"text": ("✅ " if on else "") + "🟢 ON", "callback_data": "sfib:on"},
+        {"text": ("✅ " if not on else "") + "🔴 OFF", "callback_data": "sfib:off"}]])
 
 
 def _signal_be_text():
@@ -3252,6 +3390,8 @@ def _handle_update(u):
                 _edit(cq, _signal_be_text(), _signal_be_keyboard())
             elif page == "max":
                 _edit(cq, _signal_max_text(), _signal_max_keyboard())
+            elif page == "fib":
+                _edit(cq, _signal_fib_text(), _signal_fib_keyboard())
             else:
                 _edit(cq, _signal_text(), _signal_keyboard())
         elif data.startswith("srr:"):
@@ -3273,6 +3413,12 @@ def _handle_update(u):
                 set_htf_mode(mode)
                 _edit(cq, _signal_text(), _signal_keyboard())
                 ack = "Filtre HTF : " + _htf_txt(mode)
+        elif data.startswith("sfib:"):
+            arg = data[5:]
+            if arg in ("on", "off"):
+                set_mtf_fib_filter(arg == "on")
+                _edit(cq, _signal_text(), _signal_keyboard())
+                ack = "Filtre Fibo HTF : " + ("ON" if arg == "on" else "OFF")
         elif data.startswith("sbe:"):
             v = float(data[4:])
             if any(abs(v - x) < 1e-9 for x in BE_RR_CHOICES):
@@ -3499,8 +3645,20 @@ def publish_signal(symbol, candles, events, sig):
             # de toute façon re-tenté et notifié au moment de l'exécution réelle ci-dessous.
             print(f"[{symbol}] Vérif stop-level ignorée (indisponible) : {e}")
 
+    is_market = sig.get("order", "MARKET") == "MARKET"
+    mt5_enabled = bool(METAAPI_TOKEN and METAAPI_ACCOUNT_ID)
+    # Un ordre MARKET dont l'exécution MT5 est activée démarre en "EXECUTING" : il ne passe à
+    # "OPEN" qu'après confirmation réelle côté broker (positionId/orderId vérifié), sinon il
+    # bascule en "EXECUTION_FAILED" — jamais marqué OPEN avant confirmation.
+    if sig.get("order") == "LIMIT":
+        initial_status = "PENDING"
+    elif is_market and mt5_enabled:
+        initial_status = "EXECUTING"
+    else:
+        initial_status = "OPEN"   # pas d'exécution MT5 configurée : signal-only, comportement inchangé
+
     trade_id = add_trade(
-        status="PENDING" if sig.get("order") == "LIMIT" else "OPEN",
+        status=initial_status,
         order_type=sig.get("order", "MARKET"), placed_ts=sig["t"], ref_price=sig.get("ref_price"),
         sent_admin=0, sent_group=0,   # passent à 1 seulement quand Telegram a confirmé l'envoi
         signal_key=key, symbol=symbol, side=sig["side"], kind=sig["type"], timeframe=TF_LABEL,
@@ -3512,12 +3670,16 @@ def publish_signal(symbol, candles, events, sig):
           f"(bougie {_ts_str(sig['t'])})")
 
     # Exécution réelle côté MT5 (si configurée) — seulement pour les entrées MARKET immédiates.
+    # Le trade ne passe "OPEN" qu'ici, après confirmation réelle de positionId/orderId ;
+    # `client_id` (trade_id) permet d'éviter un doublon si une retentative interne a lieu.
     # Un échec ici n'empêche jamais l'envoi du signal Telegram : c'est juste loggé + notifié à l'admin.
-    if sig.get("order", "MARKET") == "MARKET" and METAAPI_TOKEN and METAAPI_ACCOUNT_ID:
-        mt5_position_id = execute_mt5_order(symbol, sig["side"], lot_info["lot"], sig["entry"], sig["sl"], sig["tp"])
+    if is_market and mt5_enabled:
+        mt5_position_id = execute_mt5_order(symbol, sig["side"], lot_info["lot"], sig["entry"], sig["sl"], sig["tp"],
+                                            client_id=f"AB{trade_id}")
         if mt5_position_id:
-            update_trade(trade_id, mt5_position_id=mt5_position_id)
+            update_trade(trade_id, status="OPEN", mt5_position_id=mt5_position_id)
         else:
+            update_trade(trade_id, status="EXECUTION_FAILED")
             send(CHAT_ID_ADMIN,
                  f"⚠️ Échec d'exécution MT5 pour le signal {symbol} {sig['side']} {sig['type']} "
                  f"(trade #{trade_id}) — signal envoyé quand même, à ouvrir manuellement si besoin.")
