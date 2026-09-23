@@ -1,5 +1,4 @@
 
-
 #!/usr/bin/env python3
 """AlphaBot BOS + CHoCH — Gold & BTC — version en un seul fichier.
 
@@ -311,7 +310,28 @@ except ImportError:  # metaapi-cloud-sdk optionnel : absent -> pas d'exécution 
 _metaapi_instance = None
 _metaapi_connection = None
 _metaapi_connected_at = None   # timestamp (time.time()) de la dernière (re)synchronisation réussie
-_metaapi_lock = threading.Lock()
+_metaapi_lock = asyncio.Lock()   # verrou asyncio (une seule boucle MT5 partagée, voir _run_mt5)
+
+# --- UNE SEULE boucle asyncio permanente pour tout MetaApi ---------------------------------------
+# Correctif : avant, chaque appel faisait asyncio.run(...), qui crée puis FERME une boucle. Les
+# tâches internes du SDK (websocket, abonnements) mouraient à la fermeture et la connexion restait
+# liée à une boucle morte. Désormais toutes les coroutines MetaApi tournent sur la même boucle.
+_mt5_loop = asyncio.new_event_loop()
+threading.Thread(target=_mt5_loop.run_forever, daemon=True, name="mt5-loop").start()
+
+
+def _run_mt5(coro, timeout=None):
+    """Exécute une coroutine MetaApi sur la boucle permanente et attend le résultat (appel bloquant)."""
+    return asyncio.run_coroutine_threadsafe(coro, _mt5_loop).result(timeout)
+
+
+async def _rpc_alive_async(connection):
+    """Test de vie réel : une connexion RPC n'a pas de terminal_state, on interroge le compte."""
+    try:
+        await asyncio.wait_for(connection.get_account_information(), timeout=15)
+        return True
+    except Exception:
+        return False
 
 # Délai minimum (s) à laisser au terminal MT5 après "wait_synchronized" avant d'autoriser un
 # trade : le flag "synchronized" peut être vrai avant que le cache des specs de symboles (stops
@@ -352,15 +372,7 @@ def get_ready_connection():
     immédiatement (aucun délai de plusieurs dizaines de secondes au moment du signal)."""
     if not _metaapi_ready.is_set():
         return None
-    connection = _metaapi_connection
-    if connection is None:
-        return None
-    try:
-        if not connection.terminal_state.connected:
-            return None
-    except Exception:
-        return None
-    return connection
+    return _metaapi_connection
 
 
 def _metaapi_background_loop():
@@ -374,7 +386,7 @@ def _metaapi_background_loop():
     print("[metaapi] Thread de connexion persistante démarré.")
     while True:
         try:
-            connection = asyncio.run(get_metaapi_connection())
+            connection = _run_mt5(get_metaapi_connection())
         except Exception as e:
             connection = None
             print(f"[metaapi] Boucle d'arrière-plan : erreur inattendue ({e}).")
@@ -387,7 +399,7 @@ def _metaapi_background_loop():
             while True:
                 time.sleep(MT5_BG_HEALTHCHECK_SEC)
                 try:
-                    still_ok = connection.terminal_state.connected
+                    still_ok = _run_mt5(_rpc_alive_async(connection), timeout=30)
                 except Exception:
                     still_ok = False
                 if not still_ok:
@@ -450,13 +462,11 @@ async def get_metaapi_connection(force_reconnect=False):
         print("[metaapi] METAAPI_TOKEN / METAAPI_ACCOUNT_ID absents — exécution MT5 désactivée.")
         return None
 
-    with _metaapi_lock:
+    async with _metaapi_lock:
         if not force_reconnect and _metaapi_connection is not None:
-            try:
-                if _metaapi_connection.terminal_state.connected:
-                    return _metaapi_connection  # connexion persistante réutilisée telle quelle
-            except Exception:
-                pass  # connexion caduque -> on retente une connexion propre ci-dessous
+            if await _rpc_alive_async(_metaapi_connection):
+                return _metaapi_connection  # connexion persistante réutilisée telle quelle
+            # connexion caduque -> on retente une connexion propre ci-dessous
 
         stale = _metaapi_connection
         _metaapi_connection = None
@@ -697,7 +707,7 @@ def execute_mt5_order(symbol, side, lot, entry, sl, tp, client_id=None):
     admin notifié par l'appelant). `client_id` (ex. l'id du trade en base) sert à la déduplication
     lors d'une éventuelle retentative — voir _execute_mt5_order_async."""
     try:
-        result = asyncio.run(_execute_mt5_order_async(symbol, side, lot, entry, sl, tp, client_id))
+        result = _run_mt5(_execute_mt5_order_async(symbol, side, lot, entry, sl, tp, client_id))
     except SLTooCloseError as e:
         # Rare : le prix a bougé entre la pré-vérif (publish_signal) et l'exécution, faisant
         # basculer le SL sous le stopsLevel entre-temps. Jamais de déplacement automatique du
@@ -722,7 +732,7 @@ def execute_mt5_order(symbol, side, lot, entry, sl, tp, client_id=None):
     # (found=None, ex. API indisponible), on ne bloque pas sur ce doute, l'ordre a déjà un ticket.
     try:
         connection = get_ready_connection()
-        found, reason = asyncio.run(_confirm_position_async(connection, position_id)) \
+        found, reason = _run_mt5(_confirm_position_async(connection, position_id)) \
             if connection is not None else (None, "connexion MetaApi indisponible pour la confirmation")
     except Exception as e:
         found, reason = None, f"confirmation impossible ({e})"
@@ -786,7 +796,7 @@ def move_to_breakeven(position_id, entry, side, fees_buffer=None):
     if fees_buffer is None:
         fees_buffer = 0.0
     try:
-        new_sl = asyncio.run(_move_to_breakeven_async(position_id, entry, side, fees_buffer))
+        new_sl = _run_mt5(_move_to_breakeven_async(position_id, entry, side, fees_buffer))
     except Exception as e:
         print(f"[metaapi] Échec move_to_breakeven position={position_id} : {e}")
         traceback.print_exc(limit=-3)
@@ -2324,7 +2334,7 @@ def sync_mt5_positions():
         return
 
     try:
-        broker_ids = asyncio.run(_mt5_open_position_ids_async())
+        broker_ids = _run_mt5(_mt5_open_position_ids_async())
     except Exception as e:
         print(f"[metaapi] sync positions : échec récupération des positions ouvertes : {e}")
         traceback.print_exc(limit=-3)
@@ -2338,7 +2348,7 @@ def sync_mt5_positions():
             continue   # toujours ouverte côté broker : rien à faire ici (track_trade s'en occupe)
 
         try:
-            deals = asyncio.run(_mt5_position_deals_async(pos_id))
+            deals = _run_mt5(_mt5_position_deals_async(pos_id))
         except Exception as e:
             print(f"[metaapi] sync positions : échec historique deals position {pos_id} : {e}")
             traceback.print_exc(limit=-3)
@@ -4982,3 +4992,4 @@ if __name__ == "__main__":
     if "--selftest" in sys.argv:
         sys.exit(_selftest())
     main()
+
