@@ -1,4 +1,5 @@
 
+
 #!/usr/bin/env python3
 """AlphaBot BOS + CHoCH — Gold & BTC — version en un seul fichier.
 
@@ -192,7 +193,10 @@ LIQ_EXT = {1: 15, 3: 15, 5: 60, 15: 240, 30: 240, 60: 240}
 # logique existante, selon la position du prix dans le Fibonacci du swing HTF (mèches High/Low) :
 #   tendance HTF haussière -> seuls les BUY autorisés, et seulement si le retracement a atteint >= 50% (Discount)
 #   tendance HTF baissière -> seuls les SELL autorisés, et seulement si le retracement a atteint >= 50% (Premium)
-USE_MTF_FIBONACCI_PD_FILTER = _env_bool("MTF_FIBONACCI_PD_FILTER", _env_bool("USE_MTF_FIBONACCI_PD_FILTER", True))
+# DÉFAUT = OFF (False) : si la base SQLite est perdue (Render sans disque persistant : redémarrage / redéploiement /
+# mise en veille), le réglage Telegram disparaît et on retombe ICI -- le filtre ne doit donc JAMAIS se réactiver seul.
+# Pour l'activer volontairement de façon permanente : variable Render MTF_FIBONACCI_PD_FILTER=true (ou /mtffib on).
+USE_MTF_FIBONACCI_PD_FILTER = _env_bool("MTF_FIBONACCI_PD_FILTER", _env_bool("USE_MTF_FIBONACCI_PD_FILTER", False))
 # UT d'entrée -> UT du Fibonacci HTF : M1/M3 -> M15, M5 -> H1, M15 -> H4 (imposé, indépendant de HTF_REF_TF/LIQ_EXT).
 MTF_FIB_TF = {1: 15, 3: 15, 5: 60, 15: 240}
 MTF_FIB_MIN_RETRACE = 0.5   # niveau minimum (50%) à atteindre pour considérer la zone Premium/Discount comme mitigée
@@ -366,10 +370,175 @@ MT5_BG_RETRY_SEC = _env_float("MT5_BG_RETRY_SEC", 15.0)   # intervalle entre 2 t
 MT5_BG_HEALTHCHECK_SEC = _env_float("MT5_BG_HEALTHCHECK_SEC", 10.0)  # intervalle de vérif santé une fois connecté
 
 
+# ============================================================================
+# MODE REST (par défaut) : plus AUCUN websocket vers MetaApi.
+#
+# Le SDK (metaapi_cloud_sdk) ouvre un websocket socket.io permanent + attend « wait_synchronized ». Depuis Render ce
+# websocket échoue en boucle (« socket client failed to connect to the server », « Failed to subscribe »), même quand
+# le compte est Connected/Deployed côté MetaApi : c'est le TRANSPORT qui tombe, pas le compte ni le broker.
+# En mode REST, chaque action (ordre, positions, specs, BE, deals) est un simple appel HTTPS vers l'API REST MetaApi
+# (mt-client-api-v1.<region>.agiliumtrade.ai). Rien à connecter, rien à synchroniser côté bot, donc plus de time-out
+# de synchronisation : l'ordre part directement au moment du signal.
+# METAAPI_MODE=sdk remet l'ancien fonctionnement (websocket) ; METAAPI_REGION (défaut : auto puis london) et
+# METAAPI_REST_URL (URL complète, prioritaire) permettent de forcer l'hôte.
+# ============================================================================
+METAAPI_MODE = os.getenv("METAAPI_MODE", "rest").strip().lower()
+METAAPI_REST_TIMEOUT_SEC = _env_float("METAAPI_REST_TIMEOUT_SEC", 25.0)
+_MT5_TRADE_OK_CODES = {10008, 10009, 10010}   # PLACED / DONE / DONE_PARTIAL
+_rest_base_cache = None
+
+
+def _metaapi_rest_base():
+    """URL de base de l'API REST : METAAPI_REST_URL, sinon METAAPI_REGION, sinon région lue sur le compte
+    (API de provisioning), sinon london (région vue dans les logs)."""
+    global _rest_base_cache
+    if _rest_base_cache:
+        return _rest_base_cache
+    url = os.getenv("METAAPI_REST_URL", "").strip().rstrip("/")
+    if not url:
+        region = os.getenv("METAAPI_REGION", "").strip().lower()
+        if not region:
+            try:
+                r = requests.get("https://mt-provisioning-api-v1.agiliumtrade.agiliumtrade.ai/users/current/accounts/"
+                                 + METAAPI_ACCOUNT_ID, headers={"auth-token": METAAPI_TOKEN}, timeout=15)
+                region = str((r.json() or {}).get("region") or "").strip().lower() if r.ok else ""
+            except Exception as e:
+                print(f"[metaapi-rest] région du compte non lue ({e}) — london par défaut.")
+        region = region or "london"
+        url = f"https://mt-client-api-v1.{region}.agiliumtrade.ai"
+    _rest_base_cache = url
+    print(f"[metaapi-rest] API REST : {url}")
+    return url
+
+
+class _MetaApiRestConnection:
+    """Même interface que la connexion RPC du SDK (get_positions, create_market_*_order, modify_position, ...) mais en
+    HTTPS pur : le reste du bot n'a rien à changer. Chaque appel est indépendant (aucun état de connexion)."""
+
+    def _call(self, method, path, body=None):
+        url = f"{_metaapi_rest_base()}/users/current/accounts/{METAAPI_ACCOUNT_ID}{path}"
+        r = requests.request(method, url, json=body, timeout=METAAPI_REST_TIMEOUT_SEC,
+                             headers={"auth-token": METAAPI_TOKEN, "Accept": "application/json"})
+        try:
+            data = r.json()
+        except ValueError:
+            data = None
+        if r.status_code >= 400:
+            msg = (data.get("message") or data.get("stringCode")) if isinstance(data, dict) else r.text[:200]
+            raise RuntimeError(f"MetaApi REST {method} {path} -> HTTP {r.status_code} : {msg}")
+        return data
+
+    async def _acall(self, method, path, body=None):
+        return await asyncio.get_running_loop().run_in_executor(None, lambda: self._call(method, path, body))
+
+    async def get_account_information(self):
+        return await self._acall("GET", "/account-information")
+
+    async def get_symbol_specification(self, symbol):
+        return await self._acall("GET", f"/symbols/{symbol}/specification")
+
+    async def get_positions(self):
+        return await self._acall("GET", "/positions") or []
+
+    async def get_deals_by_position(self, position_id):
+        return await self._acall("GET", f"/history-deals/position/{position_id}")
+
+    async def _trade(self, body):
+        res = await self._acall("POST", "/trade", body)
+        code = res.get("numericCode") if isinstance(res, dict) else None
+        if code is not None and code not in _MT5_TRADE_OK_CODES:
+            raise RuntimeError(f"ordre refusé par le broker : {res.get('stringCode')} — {res.get('message')}")
+        return res
+
+    async def _market(self, action, symbol, volume, sl, tp, options):
+        o = dict(options or {})
+        body = {"actionType": action, "symbol": symbol, "volume": volume}
+        if sl:
+            body["stopLoss"] = sl
+        if tp:
+            body["takeProfit"] = tp
+        for k in ("comment", "clientId", "slippage"):
+            if o.get(k) is not None:
+                body[k] = o[k]
+        if o.get("fillingMode"):
+            body["fillingModes"] = [o["fillingMode"]]
+        return await self._trade(body)
+
+    async def create_market_buy_order(self, symbol, volume, stop_loss=None, take_profit=None, options=None):
+        return await self._market("ORDER_TYPE_BUY", symbol, volume, stop_loss, take_profit, options)
+
+    async def create_market_sell_order(self, symbol, volume, stop_loss=None, take_profit=None, options=None):
+        return await self._market("ORDER_TYPE_SELL", symbol, volume, stop_loss, take_profit, options)
+
+    async def modify_position(self, position_id, stop_loss=None, take_profit=None):
+        body = {"actionType": "POSITION_MODIFY", "positionId": str(position_id)}
+        if stop_loss is not None:
+            body["stopLoss"] = stop_loss
+        if take_profit is not None:
+            body["takeProfit"] = take_profit
+        return await self._trade(body)
+
+    async def close(self):
+        return None
+
+
+_rest_connection = _MetaApiRestConnection()
+
+
+def _notify_mt5_recovered(since_ts):
+    """MetaApi de nouveau joignable : prévient l'admin et liste les signaux publiés pendant la panne, dont l'ordre
+    n'a PAS été exécuté (exec_status FAILED, sans ticket MT5) -- à ouvrir/ignorer à la main."""
+    try:
+        rows = _q("SELECT id, symbol, side, kind FROM trades WHERE exec_status='FAILED' AND opened_ts>=? "
+                  "AND (mt5_position_id IS NULL OR mt5_position_id='') ORDER BY id", (since_ts,)).fetchall()
+        txt = "✅ Exécution MT5 réactivée (MetaApi de nouveau joignable)."
+        if rows:
+            txt += "\n❌ Signaux détectés pendant la panne, ordre NON exécuté :\n" + "\n".join(
+                f"• #{r['id']} {r['symbol']} {r['side']} {r['kind']}" for r in rows)
+        to_admin(txt)
+    except Exception as e:
+        print(f"[metaapi-rest] notification de reprise impossible : {e}")
+
+
+def _metaapi_rest_background_loop():
+    """Mode REST : simple témoin de santé (aucune connexion à maintenir). Ne sert qu'à l'affichage « prêt / pas
+    prêt » : les ordres, eux, partent TOUJOURS directement (voir get_ready_connection). 3 échecs de suite pour
+    passer en « pas prêt », un seul succès pour repasser en « prêt » ; logs uniquement aux changements d'état."""
+    print("[metaapi-rest] Mode REST actif (aucun websocket, aucune synchronisation à attendre).")
+    fails = 0
+    down_since = None   # début de la dernière panne (None = pas de panne en cours)
+    while True:
+        try:
+            _run_mt5(_rest_connection.get_account_information(), timeout=40)
+            fails = 0
+            if not _metaapi_ready.is_set():
+                _metaapi_ready.set()
+                print("[metaapi-rest] ✅ API REST MetaApi joignable — ordres exécutables immédiatement.")
+                if down_since is not None:
+                    _notify_mt5_recovered(down_since)
+                    down_since = None
+        except Exception as e:
+            fails += 1
+            if fails == 3 and _metaapi_ready.is_set():
+                _metaapi_ready.clear()
+                down_since = now_ts()
+                print(f"[metaapi-rest] ⚠️ API REST injoignable 3 fois de suite ({e}).")
+                try:
+                    to_admin("⚠️ Exécution MT5 INDISPONIBLE (API MetaApi injoignable). Les signaux restent analysés et "
+                             "publiés, mais leurs ordres ne seront PAS exécutés tant que MetaApi n'est pas revenu.")
+                except Exception:
+                    pass
+            elif fails == 1 and not _metaapi_ready.is_set():
+                print(f"[metaapi-rest] API REST : {e}")
+        time.sleep(max(MT5_BG_HEALTHCHECK_SEC, 30.0))
+
+
 def get_ready_connection():
     """Chemin RAPIDE utilisé au moment d'un trade : ne connecte JAMAIS et n'attend JAMAIS —
     retourne la connexion courante si le thread d'arrière-plan la considère prête, sinon None
     immédiatement (aucun délai de plusieurs dizaines de secondes au moment du signal)."""
+    if METAAPI_MODE == "rest":
+        return _rest_connection if (METAAPI_TOKEN and METAAPI_ACCOUNT_ID) else None   # stateless : on tente toujours
     if not _metaapi_ready.is_set():
         return None
     return _metaapi_connection
@@ -381,6 +550,10 @@ def _metaapi_background_loop():
     reste du bot (signal M1, Telegram...). C'est la SEULE fonction qui appelle
     get_metaapi_connection() avec ses tentatives/backoff ; le reste du code ne fait que lire
     _metaapi_ready via get_ready_connection()."""
+    if METAAPI_MODE == "rest":
+        if METAAPI_TOKEN and METAAPI_ACCOUNT_ID:
+            _metaapi_rest_background_loop()
+        return
     if MetaApi is None or not METAAPI_TOKEN or not METAAPI_ACCOUNT_ID:
         return  # exécution MT5 désactivée : rien à faire en arrière-plan
     print("[metaapi] Thread de connexion persistante démarré.")
@@ -454,6 +627,9 @@ async def get_metaapi_connection(force_reconnect=False):
     est retourné, pour ne jamais interrompre la boucle de trading / l'envoi des signaux Telegram.
     """
     global _metaapi_instance, _metaapi_connection, _metaapi_connected_at
+
+    if METAAPI_MODE == "rest":   # HTTPS pur : rien à connecter ni à synchroniser
+        return _rest_connection if (METAAPI_TOKEN and METAAPI_ACCOUNT_ID) else None
 
     if MetaApi is None:
         print("[metaapi] SDK non installé (pip install metaapi-cloud-sdk) — exécution MT5 désactivée.")
@@ -3850,11 +4026,11 @@ def _run_mt5_execution(trade_id, symbol, sig, lot):
 
     update_trade(trade_id, exec_status="FAILED")
     if not _metaapi_ready.is_set():
-        why = "MetaApi non synchronisé (compte MT5 non connecté)."
+        why = "MetaApi indisponible au moment du signal (API injoignable / compte MT5 non connecté)."
     else:
         why = "le broker a refusé l'ordre ou la confirmation a échoué (voir logs)."
     to_admin(f"⚠️ {symbol} {sig['side']} {sig['type']} (trade #{trade_id})\n"
-             f"Signal envoyé, mais l'exécution MT5 a échoué : {why}\n"
+             f"❌ ORDRE NON EXÉCUTÉ sur MT5 : {why}\n"
              f"Le suivi RR / BE / TP / SL continue normalement sur le groupe et ici. "
              f"Ordre à ouvrir manuellement si besoin.")
 
@@ -4992,4 +5168,3 @@ if __name__ == "__main__":
     if "--selftest" in sys.argv:
         sys.exit(_selftest())
     main()
-
