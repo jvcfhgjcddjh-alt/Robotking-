@@ -881,6 +881,11 @@ _ensure_column("trades", "be_rr", "REAL")
 _ensure_column("trades", "htf_mode", "TEXT")
 # Exécution MT5 (MetaApi) : ticket de la position ouverte côté broker, si l'exécution a réussi.
 _ensure_column("trades", "mt5_position_id", "TEXT")
+# Résultat de l'exécution MT5 : PENDING (en cours) / OK / FAILED. Indépendant du SUIVI du signal (statut OPEN).
+_ensure_column("trades", "exec_status", "TEXT")
+# message_id Telegram du signal d'ouverture dans le groupe : toutes les notifications de suivi (RR1/RR2/
+# BE/TP/SL) répondent (reply_to_message_id) à CE message précis, jamais au dernier message du groupe.
+_ensure_column("trades", "signal_message_id", "INTEGER")
 
 
 # --- paramètres / méta -------------------------------------------------------
@@ -1186,8 +1191,24 @@ def _only_closed(candles, tf_sec=None):
                   key=lambda c: c["t"])
 
 
-# --- BTC : API publique Binance (klines), sans clé --------------------------------------
-def _binance(symbol, minutes=None):
+# --- BTC : Binance (klines) avec BASCULE AUTOMATIQUE vers Bybit puis OKX -----------------------
+# Binance bannit régulièrement les IP partagées des hébergeurs (erreur 418 / 429 / 451). Dans ce cas
+# on met Binance en pause quelques minutes (insister prolonge le ban) et on passe sur Bybit / OKX.
+BYBIT_INTERVALS = {1: "1", 3: "3", 5: "5", 15: "15", 30: "30", 60: "60", 240: "240"}
+OKX_INTERVALS = {1: "1m", 3: "3m", 5: "5m", 15: "15m", 30: "30m", 60: "1H", 240: "4H"}
+BINANCE_PAUSE_SEC = _env_int("BINANCE_PAUSE_SEC", 300)
+_binance_blocked_until = 0.0
+
+
+def _binance_ban(err):
+    """Met Binance en pause si l'erreur ressemble à un ban / blocage IP (418, 429, 451, 403)."""
+    global _binance_blocked_until
+    code = getattr(getattr(err, "response", None), "status_code", None)
+    if code in (418, 429, 451, 403):
+        _binance_blocked_until = time.time() + BINANCE_PAUSE_SEC
+
+
+def _binance_only(symbol, minutes=None):
     last_err = None
     interval = BINANCE_INTERVALS[minutes or TIMEFRAME_MIN]
     for base in BINANCE_BASES:
@@ -1202,7 +1223,53 @@ def _binance(symbol, minutes=None):
                      "l": float(k[3]), "c": float(k[4])} for k in r.json()]
         except Exception as e:  # essaie l'URL suivante
             last_err = e
+            _binance_ban(e)
     raise RuntimeError(f"Binance indisponible : {last_err}")
+
+
+def _bybit(symbol, minutes=None):
+    r = requests.get("https://api.bybit.com/v5/market/kline",
+                     params={"category": "linear", "symbol": symbol,
+                             "interval": BYBIT_INTERVALS[minutes or TIMEFRAME_MIN],
+                             "limit": min(CANDLES_LIMIT, 1000)}, timeout=15)
+    r.raise_for_status()
+    j = r.json()
+    if j.get("retCode") != 0:
+        raise RuntimeError(f"Bybit : {j.get('retMsg')}")
+    return [{"t": int(k[0]) // 1000, "o": float(k[1]), "h": float(k[2]),
+             "l": float(k[3]), "c": float(k[4])} for k in j["result"]["list"]]
+
+
+def _okx(symbol, minutes=None):
+    inst = symbol.replace("USDT", "-USDT")   # BTCUSDT -> BTC-USDT
+    r = requests.get("https://www.okx.com/api/v5/market/candles",
+                     params={"instId": inst, "bar": OKX_INTERVALS[minutes or TIMEFRAME_MIN],
+                             "limit": min(CANDLES_LIMIT, 300)}, timeout=15)
+    r.raise_for_status()
+    j = r.json()
+    if j.get("code") != "0":
+        raise RuntimeError(f"OKX : {j.get('msg')}")
+    return [{"t": int(k[0]) // 1000, "o": float(k[1]), "h": float(k[2]),
+             "l": float(k[3]), "c": float(k[4])} for k in j["data"]]
+
+
+def _binance(symbol, minutes=None):
+    """Bougies BTC : Binance si dispo, sinon Bybit, sinon OKX (ordre chronologique dans tous les cas)."""
+    errors = []
+    sources = [("Binance", _binance_only), ("Bybit", _bybit), ("OKX", _okx)]
+    for name, fn in sources:
+        if name == "Binance" and time.time() < _binance_blocked_until:
+            errors.append("Binance en pause (IP bloquée)")
+            continue
+        try:
+            raw = sorted(fn(symbol, minutes), key=lambda c: c["t"])
+            if raw:
+                if name != "Binance":
+                    print(f"[BTC] source de secours utilisée : {name}")
+                return raw
+        except Exception as e:
+            errors.append(f"{name} : {e}")
+    raise RuntimeError("Aucune source BTC disponible — " + " | ".join(errors))
 
 
 # --- Gold : API publique Deriv (WebSocket ticks_history), sans clé ni authentification --------
@@ -1272,16 +1339,32 @@ def get_live_price(symbol):
     cfg = SYMBOLS[symbol]
     try:
         if cfg["source"] == "binance":
-            last_err = None
-            for base in BINANCE_BASES:
-                try:
-                    r = requests.get(base + "/api/v3/ticker/price",
-                                      params={"symbol": cfg["binance_symbol"]}, timeout=6)
-                    r.raise_for_status()
-                    return float(r.json()["price"])
-                except Exception as e:
-                    last_err = e
-            raise RuntimeError(f"Binance indisponible : {last_err}")
+            errors = []
+            if time.time() >= _binance_blocked_until:
+                for base in BINANCE_BASES:
+                    try:
+                        r = requests.get(base + "/api/v3/ticker/price",
+                                          params={"symbol": cfg["binance_symbol"]}, timeout=6)
+                        r.raise_for_status()
+                        return float(r.json()["price"])
+                    except Exception as e:
+                        errors.append(str(e))
+                        _binance_ban(e)
+            try:   # secours : Bybit puis OKX
+                r = requests.get("https://api.bybit.com/v5/market/tickers",
+                                 params={"category": "linear", "symbol": cfg["binance_symbol"]}, timeout=6)
+                r.raise_for_status()
+                return float(r.json()["result"]["list"][0]["lastPrice"])
+            except Exception as e:
+                errors.append(f"Bybit : {e}")
+            try:
+                r = requests.get("https://www.okx.com/api/v5/market/ticker",
+                                 params={"instId": cfg["binance_symbol"].replace("USDT", "-USDT")}, timeout=6)
+                r.raise_for_status()
+                return float(r.json()["data"][0]["last"])
+            except Exception as e:
+                errors.append(f"OKX : {e}")
+            raise RuntimeError("prix BTC indisponible — " + " | ".join(errors))
         if cfg["source"] == "deriv":
             msg = _deriv_request({
                 "ticks_history": cfg["deriv_symbol"], "style": "ticks",
@@ -2268,6 +2351,20 @@ def sync_mt5_positions():
         print(f"[metaapi] Position {pos_id} fermée côté broker ({t['symbol']} {t['side']}) -> {outcome}{r_txt} "
               f"(base mise à jour).")
         to_admin(f"📒 {t['symbol']} {t['side']} — position fermée côté broker (MT5) : <b>{outcome}</b>{r_txt}")
+        # Le trade n'est plus OPEN en base : track_trade ne l'annoncera donc jamais. On prévient le groupe ici
+        # pour qu'un TP / SL / BE exécuté par MT5 entre deux bougies ne passe jamais sous silence.
+        if outcome in ("TP", "SL", "BE"):
+            try:
+                row = _q("SELECT * FROM trades WHERE id=?", (t["id"],)).fetchone()
+                tr = dict(row)
+                if tr.get("result_r") is None:
+                    tr["result_r"] = {"TP": trade_tp_rr(tr), "SL": -1.0, "BE": 0.0}[outcome]
+                ev = {"name": outcome, "trade": tr}
+                dec = SYMBOLS[t["symbol"]]["decimals"]
+                to_group(group_event(ev, dec), reply_to_message_id=tr.get("signal_message_id"))
+                group_event_media(outcome)
+            except Exception:
+                traceback.print_exc()
 
 
 # ============================================================================
@@ -2694,12 +2791,17 @@ def _post(method, data=None, files=None, _retry=True):
     return res
 
 
-def send(chat_id, text, photo=None, reply_markup=None):
+def send(chat_id, text, photo=None, reply_markup=None, reply_to_message_id=None):
     if not chat_id:
         return None
     data = {"chat_id": chat_id, "parse_mode": "HTML"}
     if reply_markup:
         data["reply_markup"] = json.dumps(reply_markup)
+    if reply_to_message_id:
+        # Répond au message original du signal (jamais recherché visuellement, jamais "le dernier du groupe") :
+        # allow_sending_without_reply évite un crash Telegram si ce message a été supprimé entre-temps.
+        data["reply_to_message_id"] = reply_to_message_id
+        data["allow_sending_without_reply"] = True
     if photo:
         try:
             with open(photo, "rb") as f:
@@ -2747,8 +2849,8 @@ def check_group(send_test=False):
                    f"(administrateur si c'est un canal).")
 
 
-def to_group(text, photo=None):
-    return send(CHAT_ID_GROUPE, text, photo)
+def to_group(text, photo=None, reply_to_message_id=None):
+    return send(CHAT_ID_GROUPE, text, photo, reply_to_message_id=reply_to_message_id)
 
 
 def to_admin(text, reply_markup=None):
@@ -2879,48 +2981,31 @@ def _be_line(sig):
 
 
 def group_signal(symbol, sig, position_n, dec, tf=None):
+    """Message groupe ultra court : sens, entrée, SL, TP."""
     icon = "🟢" if sig["side"] == "BUY" else "🔴"
-    rr_lines = "\n".join(
-        f"RR{int(lvl)} : {_fmt(_rr_price(sig, lvl), dec)}" for lvl in RR_LEVELS)
-    exec_txt, entry_line = _exec_block(sig, dec)
-    label = f"{sig['side']} LIMIT" if sig.get("order") == "LIMIT" else sig["side"]
+    limit = sig.get("order") == "LIMIT"
+    label = f"{sig['side']} LIMIT" if limit else sig["side"]
     return (
-        f"Nouveau signal\n"
         f"{icon} <b>{label} {symbol}</b> · {tf or TF_LABEL}\n"
-        f"Type : {_kind_label(sig['type'])}\n"
-        f"Exécution : {exec_txt}\n\n"
-        f"{entry_line}\n"
-        f"{_liq_lines(sig, dec)}"
-        f"SL : {_fmt(sig['sl'], dec)} ({_dist(sig, sig['sl'], dec)} pts)\n"
-        f"{rr_lines}\n"
-        f"TP : {_fmt(sig['tp'], dec)} ({_dist(sig, sig['tp'], dec)} pts)\n\n"
-        f"{_be_line(sig)}\n"
-        f"TP final → RR{_sig_rr(sig):g}\n\n"
-        f"{_params_lines(sig, tf)}"
-        + (f"\n\nPosition {position_n}/{get_max_positions()} sur {symbol}"
-           if position_n and get_max_positions() > 1 else "")
+        f"Entrée : {'limit ' if limit else '≈ '}{_fmt(sig['entry'], dec)}\n"
+        f"🛡 SL : {_fmt(sig['sl'], dec)}\n"
+        f"🎯 TP : {_fmt(sig['tp'], dec)}\n"
+        f"{_be_line(sig)}"
     )
 
 
 def admin_signal(symbol, sig, risk_usd, leverage, lot_info, margin, dec):
-    """Message complet envoyé uniquement en privé/admin : signal + risque + levier + lot."""
-    exec_txt, entry_line = _exec_block(sig, dec)
+    """Message privé/admin : 1re ligne = devise + LOT (aperçu de notification), puis le détail."""
     label = f"{sig['side']} LIMIT" if sig.get("order") == "LIMIT" else sig["side"]
-    base = "TA limit" if sig.get("order") == "LIMIT" else "TON prix d'entrée réel"
+    icon = "🟢" if sig["side"] == "BUY" else "🔴"
+    base = "ta limit" if sig.get("order") == "LIMIT" else "ton prix réel"
     txt = (
-        f"💰 <b>{symbol} {label}</b> (privé)\n"
-        f"Exécution : {exec_txt}\n"
-        f"{entry_line.replace('<b>', '').replace('</b>', '')}\n"
-        f"{_liq_lines(sig, dec)}"
-        f"SL : {_fmt(sig['sl'], dec)} (distance {_fmt(sig['risk'], dec)} pts)\n"
-        f"TP : {_fmt(sig['tp'], dec)} (RR{_sig_rr(sig):g})\n"
-        f"📐 Si ton prix broker diffère : SL {_dist(sig, sig['sl'], dec)} / TP {_dist(sig, sig['tp'], dec)} "
-        f"pts depuis {base}.\n\n"
-        f"Risque : {risk_usd:g} $\n"
-        f"Levier : {leverage:g}x\n"
-        f"👉 <b>Lot calculé : {lot_info['lot']:g}</b>\n"
-        f"Marge indicative ≈ {margin:.2f} $\n\n"
-        f"{_params_lines(sig)}"
+        f"<b>{symbol} · LOT {lot_info['lot']:g}</b>\n"
+        f"{icon} {label} · Entrée ≈ {_fmt(sig['entry'], dec)}\n"
+        f"🛡 SL {_fmt(sig['sl'], dec)} · 🎯 TP {_fmt(sig['tp'], dec)} (RR{_sig_rr(sig):g})\n"
+        f"📐 Depuis {base} : SL {_dist(sig, sig['sl'], dec)} pts / TP {_dist(sig, sig['tp'], dec)} pts\n"
+        f"Risque {risk_usd:g} $ · Levier {leverage:g}x · Marge ≈ {margin:.2f} $\n"
+        f"{_be_line(sig)}"
     )
     if lot_info["raised_to_min"]:
         txt += f"\n⚠️ Lot minimum appliqué : risque réel ≈ {lot_info['real_risk']:.2f} $"
@@ -2943,31 +3028,24 @@ def group_event_media(name):
 
 
 def group_event(ev, dec):
+    """Messages de suivi du groupe : une ligne, le strict nécessaire."""
     t, name = ev["trade"], ev["name"]
-    head = f"{t['symbol']} {t['side']} @ {_fmt(t['entry'], dec)}"
+    head = f"{t['symbol']} {t['side']}"
     if name.startswith("RR"):
-        lvl = int(name[2:])
-        txt = f"🟡 <b>{name} atteint ✅</b> — {head}"
-        if ev.get("be_moved"):
-            txt += "\nSL déplacé à l'entrée (BE) 🔒"
-        if lvl >= 2:
-            txt += "\n💡 Clôture partielle possible ici pour ceux qui le souhaitent."
-        return txt
+        return f"🟡 <b>{name} ✅</b> — {head}" + (" · SL → BE 🔒" if ev.get("be_moved") else "")
     if name == "FILLED":
-        return (f"✅ <b>{t['side']} LIMIT exécuté</b> — {t['symbol']} @ {_fmt(t['entry'], dec)}\n"
-                f"Position ouverte · SL {_fmt(t['sl'], dec)} · TP {_fmt(t['tp'], dec)}")
+        return f"✅ <b>LIMIT exécuté</b> — {head} @ {_fmt(t['entry'], dec)}"
     if name == "CANCELLED":
-        return (f"❌ <b>Ordre LIMIT annulé</b> — {head}\n{ev['reason']}\n"
-                f"Retire ton ordre limit s'il est encore en attente.")
+        return f"❌ <b>LIMIT annulé</b> — {head}"
     if name == "BE_MOVED":
-        return f"🔒 <b>RR{trade_be_rr(t):g} atteint</b> — {head}\nSL déplacé à l'entrée (BE)."
+        return f"🔒 <b>BE armé</b> — {head} · SL → entrée"
+    r = t.get("result_r")
+    r_txt = f" ({r:+.1f}R)" if r is not None else ""
     if name == "TP":
-        return f"🎯 <b>RR{trade_tp_rr(t):g} atteint — TP ✅</b> — {head}\nRésultat : <b>WIN ({t['result_r']:+.2f} R)</b>"
+        return f"🎯 <b>TP ✅</b> — {head}{r_txt}"
     if name == "BE":
-        return (f"🟰 <b>BE touché ✅</b> — {head}\n"
-                f"Position refermée à l'entrée : <b>0 R</b> (capital protégé, ce n'est pas un SL).")
-    return (f"🔴 <b>SL touché ❌</b> — {head}\nRésultat : <b>LOSS ({t['result_r']:+.2f} R)</b>\n\n"
-            f"<i>{random.choice(MOTIVATION_LINES)}</i>")
+        return f"🟰 <b>BE touché</b> — {head} (0R)"
+    return f"🔴 <b>SL ❌</b> — {head}{r_txt}"
 
 
 def admin_event(ev):
@@ -3699,36 +3777,11 @@ def publish_signal(symbol, candles, events, sig):
         return
     margin = calc_margin(symbol, lot_info["lot"], sig["entry"], leverage)
 
-    # Vérif stop-level AVANT toute création de trade : si le SL (ou TP) est trop proche du prix
-    # pour le stopsLevel minimum imposé par Exness sur ce symbole, on rejette le signal tel quel
-    # (aucun trade ouvert, aucun message groupe) plutôt que de forcer un déplacement du SL — ça
-    # permet de distinguer un vrai problème de stratégie d'un problème d'exécution MT5/Exness.
-    if sig.get("order", "MARKET") == "MARKET" and METAAPI_TOKEN and METAAPI_ACCOUNT_ID:
-        try:
-            asyncio.run(_execute_mt5_stop_check_only(symbol, sig["entry"], sig["sl"], sig.get("tp")))
-        except SLTooCloseError as e:
-            print(f"[{symbol}] Signal {sig['side']} {sig['type']} rejeté : {e}")
-            send(CHAT_ID_ADMIN,
-                 f"❌ Ordre refusé — {e.which} trop proche pour {e.broker_symbol}\n"
-                 f"Distance requise : {e.required:.{dec}f}\n"
-                 f"Distance calculée : {e.actual:.{dec}f}")
-            return
-        except Exception as e:
-            # Connexion/API indisponible : on ne bloque pas le signal pour autant, l'échec sera
-            # de toute façon re-tenté et notifié au moment de l'exécution réelle ci-dessous.
-            print(f"[{symbol}] Vérif stop-level ignorée (indisponible) : {e}")
-
     is_market = sig.get("order", "MARKET") == "MARKET"
     mt5_enabled = bool(METAAPI_TOKEN and METAAPI_ACCOUNT_ID)
-    # Un ordre MARKET dont l'exécution MT5 est activée démarre en "EXECUTING" : il ne passe à
-    # "OPEN" qu'après confirmation réelle côté broker (positionId/orderId vérifié), sinon il
-    # bascule en "EXECUTION_FAILED" — jamais marqué OPEN avant confirmation.
-    if sig.get("order") == "LIMIT":
-        initial_status = "PENDING"
-    elif is_market and mt5_enabled:
-        initial_status = "EXECUTING"
-    else:
-        initial_status = "OPEN"   # pas d'exécution MT5 configurée : signal-only, comportement inchangé
+    # Le trade est TOUJOURS suivi (OPEN, ou PENDING pour une LIMIT) dès sa création : le suivi RR / BE / TP / SL
+    # sur le groupe et le bot ne dépend jamais de l'exécution MT5. L'exécution est tracée à part (exec_status).
+    initial_status = "PENDING" if sig.get("order") == "LIMIT" else "OPEN"
 
     trade_id = add_trade(
         status=initial_status,
@@ -3738,35 +3791,12 @@ def publish_signal(symbol, candles, events, sig):
         entry=sig["entry"], sl=sig["sl"], sl_initial=sig["sl"], tp=sig["tp"],
         be_rr=sig.get("be_rr"), htf_mode=sig.get("htf_mode"),
         risk_usd=lot_info["real_risk"],  # risque réel du lot pris (= risque demandé sauf lot minimum)
-        lot=lot_info["lot"], leverage=leverage, opened_ts=now_ts(), last_ts=sig["t"])
+        lot=lot_info["lot"], leverage=leverage, opened_ts=now_ts(), last_ts=sig["t"],
+        exec_status="PENDING" if (is_market and mt5_enabled) else None)
     print(f"[{symbol}] SIGNAL {sig['side']} {sig.get('order', 'MARKET')} {sig['type']} @ {sig['entry']:.{dec}f} "
           f"(bougie {_ts_str(sig['t'])})")
 
-    # Exécution réelle côté MT5 (si configurée) — seulement pour les entrées MARKET immédiates.
-    # Le trade ne passe "OPEN" qu'ici, après confirmation réelle de positionId/orderId ;
-    # `client_id` (trade_id) permet d'éviter un doublon si une retentative interne a lieu.
-    # Un échec ici n'empêche jamais l'envoi du signal Telegram : c'est juste loggé + notifié à l'admin.
-    if is_market and mt5_enabled:
-        mt5_position_id = execute_mt5_order(symbol, sig["side"], lot_info["lot"], sig["entry"], sig["sl"], sig["tp"],
-                                            client_id=f"AB{trade_id}")
-        if mt5_position_id:
-            update_trade(trade_id, status="OPEN", mt5_position_id=mt5_position_id)
-        else:
-            update_trade(trade_id, status="EXECUTION_FAILED")
-            # Verrou de sécurité : si MetaApi n'est simplement pas prêt (connexion persistante
-            # d'arrière-plan pas encore synchronisée), le message le dit clairement plutôt que de
-            # renvoyer un échec générique — le signal, lui, part toujours normalement.
-            if not _metaapi_ready.is_set():
-                send(CHAT_ID_ADMIN,
-                     f"⚠️ {symbol} {sig['side']}\nSignal valide\n"
-                     f"Exécution automatique impossible : MetaApi non synchronisé.\n"
-                     f"Aucune position ouverte par le bot (trade #{trade_id}) — "
-                     f"à ouvrir manuellement si besoin.")
-            else:
-                send(CHAT_ID_ADMIN,
-                     f"⚠️ Échec d'exécution MT5 pour le signal {symbol} {sig['side']} {sig['type']} "
-                     f"(trade #{trade_id}) — signal envoyé quand même, à ouvrir manuellement si besoin.")
-
+    # 1) ENVOI IMMÉDIAT du signal (admin + groupe), AVANT toute tentative d'exécution MT5.
     try:
         chart = make_chart(symbol, candles, events, sig, dec)
     except Exception as e:   # un souci de graphique ne doit JAMAIS empêcher l'envoi du signal
@@ -3782,6 +3812,42 @@ def publish_signal(symbol, candles, events, sig):
                     group_txt=group_signal(symbol, sig, n_open + 1, dec),
                     chart=chart)
 
+    # 2) Exécution MT5 ensuite, dans un thread dédié : n'interrompt ni le scan ni le suivi des autres trades.
+    #    Un échec est notifié à l'admin mais n'arrête JAMAIS le suivi TP / SL / BE du signal.
+    if is_market and mt5_enabled:
+        threading.Thread(target=_run_mt5_execution, name=f"mt5-exec-{trade_id}", daemon=True,
+                         args=(trade_id, symbol, sig, lot_info["lot"])).start()
+
+
+def _run_mt5_execution(trade_id, symbol, sig, lot):
+    """Exécute l'ordre MT5 d'un signal déjà publié et suivi. Ne modifie jamais le statut de suivi (OPEN)."""
+    try:
+        mt5_position_id = execute_mt5_order(symbol, sig["side"], lot, sig["entry"], sig["sl"], sig["tp"],
+                                            client_id=f"AB{trade_id}")
+    except Exception as e:   # filet de sécurité : ce thread ne doit jamais mourir en silence
+        print(f"[{symbol}] exécution MT5 #{trade_id} : erreur inattendue : {e}")
+        traceback.print_exc(limit=-3)
+        mt5_position_id = None
+
+    if mt5_position_id:
+        update_trade(trade_id, mt5_position_id=mt5_position_id, exec_status="OK")
+        # Si le BE a été armé pendant que l'ordre s'exécutait, on répercute le SL sur la position broker.
+        row = _q("SELECT status, be_hit, side, entry, symbol FROM trades WHERE id=?", (trade_id,)).fetchone()
+        if row and row["status"] == "OPEN" and row["be_hit"]:
+            move_to_breakeven(mt5_position_id, row["entry"], row["side"], get_be_fees_buffer(row["symbol"]))
+        to_admin(f"✅ {symbol} {sig['side']} — ordre exécuté sur MT5 (ticket {mt5_position_id}).")
+        return
+
+    update_trade(trade_id, exec_status="FAILED")
+    if not _metaapi_ready.is_set():
+        why = "MetaApi non synchronisé (compte MT5 non connecté)."
+    else:
+        why = "le broker a refusé l'ordre ou la confirmation a échoué (voir logs)."
+    to_admin(f"⚠️ {symbol} {sig['side']} {sig['type']} (trade #{trade_id})\n"
+             f"Signal envoyé, mais l'exécution MT5 a échoué : {why}\n"
+             f"Le suivi RR / BE / TP / SL continue normalement sur le groupe et ici. "
+             f"Ordre à ouvrir manuellement si besoin.")
+
 
 def _deliver_signal(trade_id, symbol, admin_txt, group_txt, chart=None, only_missing=None):
     """Envoie le signal d'ouverture (admin d'abord, puis groupe) et note en base ce qui est bien parti."""
@@ -3796,7 +3862,14 @@ def _deliver_signal(trade_id, symbol, admin_txt, group_txt, chart=None, only_mis
         try:
             res = sender(txt, photo=photo) if who == "group" else sender(txt)
             if _delivered(chat_id, res):
-                update_trade(trade_id, **{f"sent_{who}": 1})
+                fields = {f"sent_{who}": 1}
+                if who == "group" and res:
+                    # Mémorise le message_id RÉEL renvoyé par Telegram : c'est lui, et lui seul, qui sera
+                    # utilisé comme reply_to_message_id pour RR1/RR2/BE/TP/SL de CE trade (jamais deviné).
+                    msg_id = (res.get("result") or {}).get("message_id")
+                    if msg_id:
+                        fields["signal_message_id"] = msg_id
+                update_trade(trade_id, **fields)
             else:
                 print(f"[{symbol}] signal #{trade_id} NON envoyé ({who}) — nouvel essai automatique")
         except Exception:
@@ -3868,7 +3941,10 @@ def process_symbol(symbol):
         for ev in track_trade(trade, candles):
             chart = make_event_chart(symbol, candles, events, ev["trade"], dec) \
                 if ev["name"] in CHART_ON_EVENTS else None
-            to_group(group_event(ev, dec), photo=chart)
+            # Réponse au message Telegram EXACT du signal d'ouverture de CE trade (jamais le dernier
+            # message du groupe) : évite tout mélange entre trades ouverts simultanément (ex. XAUUSD / BTCUSD).
+            to_group(group_event(ev, dec), photo=chart,
+                     reply_to_message_id=ev["trade"].get("signal_message_id"))
             group_event_media(ev["name"])
             txt = admin_event(ev)
             if txt:
