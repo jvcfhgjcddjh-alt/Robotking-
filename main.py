@@ -160,6 +160,24 @@ def get_be_fees_buffer(symbol):
             print(f"[be] BE_FEES_BUFFER={env_val!r} invalide (nombre attendu) — défaut symbole utilisé.")
     return SYMBOLS.get(symbol, {}).get("be_fees_buffer", 0.0)
 
+
+BE_TARGET_USD = _env_float("BE_TARGET_USD", 0.01)   # résultat net minimum visé au BE (0.00 possible)
+BE_COMMISSION_USD_PER_LOT = _env_float("BE_COMMISSION_USD_PER_LOT", 0.0)  # commission round-turn/lot std si connue
+
+
+def _be_price_buffer(symbol, lot):
+    """Buffer de prix à ajouter au-delà de l'entrée pour le BE, calculé pour viser un résultat NET
+    minimum de BE_TARGET_USD (défaut +0.01$) sur CE lot précis — remplace l'ancien buffer fixe en
+    points (0.05 pt), qui se traduisait par une perte nette sur certains lots (frais/commission non
+    couverts). buffer_price = (BE_TARGET_USD + commission_estimée) / (value_per_point x lot)."""
+    cfg = SYMBOLS.get(symbol, {})
+    vpp = cfg.get("value_per_point") or 0.0
+    lot = float(lot or 0.0)
+    if vpp <= 0 or lot <= 0:
+        return get_be_fees_buffer(symbol)   # repli sur l'ancien réglage fixe si lot/valeur inconnus
+    commission = BE_COMMISSION_USD_PER_LOT * lot
+    return (BE_TARGET_USD + commission) / (vpp * lot)
+
 # --- Stratégie BOS + CHoCH ---------------------------------------------------
 SWING_DEPTH = _env_int("SWING_DEPTH", 3)
 ATR_PERIOD = 14
@@ -361,7 +379,7 @@ MT5_RECONNECT_BACKOFF_SEC = _env_float("MT5_RECONNECT_BACKOFF_SEC", 2.0)
 # Marge de sécurité appliquée au-delà du stopsLevel minimum imposé par le broker, pour ne pas
 # coller pile au seuil (le prix peut légèrement bouger entre le calcul du signal et l'envoi de
 # l'ordre). Réglable via MT5_STOP_BUFFER (1.0 = pas de marge, 1.2 = +20%).
-MT5_STOP_BUFFER = _env_float("MT5_STOP_BUFFER", 1.2)
+MT5_STOP_BUFFER = _env_float("MT5_STOP_BUFFER", 1.0)   # 1.0 = pas de marge ajoutée par défaut (diagnostic d'abord)
 
 
 # --- Connexion MetaApi PERSISTANTE en arrière-plan ---------------------------------------------
@@ -391,6 +409,46 @@ METAAPI_MODE = os.getenv("METAAPI_MODE", "rest").strip().lower()
 METAAPI_REST_TIMEOUT_SEC = _env_float("METAAPI_REST_TIMEOUT_SEC", 25.0)
 _MT5_TRADE_OK_CODES = {10008, 10009, 10010}   # PLACED / DONE / DONE_PARTIAL
 _rest_base_cache = None
+
+# 13. Codes d'erreur définitifs MT5 : jamais de retentative, juste une explication en français.
+_DEFINITIVE_ERROR_HINTS = {
+    "INVALID_STOPS": "SL/TP invalide : trop proche du prix (stopsLevel/freezeLevel du broker) "
+                      "ou stop du mauvais côté du prix.",
+    "INVALID_VOLUME": "Volume (lot) hors des bornes volumeMin/volumeMax/volumeStep réelles du broker.",
+    "MARKET_CLOSED": "Marché fermé pour ce symbole à cet instant (hors horaires de trading broker).",
+    "TRADE_DISABLED": "Trading désactivé pour ce symbole ou ce compte côté broker (tradeMode).",
+    "NO_MONEY": "Marge libre insuffisante sur le compte pour ouvrir cette position.",
+}
+# INVALID_FILL n'est PAS dans cette liste : c'est le seul cas où une retentative automatique avec
+# un autre filling mode a un sens (voir _execute_mt5_order_async) — tous les autres codes ci-dessus
+# sont définitifs et ne doivent jamais déclencher de nouvel envoi.
+
+
+def _classify_trade_error(msg):
+    """13. Reconnaît un code d'erreur MT5 DÉFINITIF (hors INVALID_FILL) dans un message MetaApi ->
+    (code, explication_fr), ou (None, None) si aucun code définitif connu (dans ce cas seul un cas
+    précis, INVALID_FILL, peut justifier une retentative corrigée — voir l'appelant)."""
+    msg_u = str(msg or "").upper()
+    for code, explication in _DEFINITIVE_ERROR_HINTS.items():
+        if code in msg_u:
+            return code, explication
+    return None, None
+
+
+class MetaApiUnknownRetcodeError(RuntimeError):
+    """14. TRADE_RETCODE_UNKNOWN / numericCode=-1 : le broker a renvoyé un code que MetaApi ne
+    reconnaît pas dans sa table. Ce n'est PAS une erreur "essayons encore" : c'est un résultat
+    INCERTAIN — l'ordre a pu passer malgré la réponse UNKNOWN. NE JAMAIS renvoyer automatiquement
+    la même requête ni en tenter une variante : l'appelant doit seulement vérifier si une position
+    existe déjà (anti-doublon), logguer un diagnostic complet, puis relever l'exception telle
+    quelle. Porte la réponse brute + le payload envoyé pour ce diagnostic."""
+
+    def __init__(self, raw_response, sent_body):
+        self.raw_response = raw_response
+        self.sent_body = sent_body
+        super().__init__(
+            f"TRADE_RETCODE_UNKNOWN (numericCode=-1) — réponse brute MetaApi={raw_response!r} | "
+            f"payload envoyé={json.dumps(sent_body, default=str)}")
 
 
 def _metaapi_rest_base():
@@ -464,7 +522,14 @@ class _MetaApiRestConnection:
         res = await self._acall("POST", "/trade", body)
         code = res.get("numericCode") if isinstance(res, dict) else None
         if code is not None and code not in _MT5_TRADE_OK_CODES:
-            raise RuntimeError(f"ordre refusé par le broker : {res.get('stringCode')} — {res.get('message')}")
+            string_code = res.get("stringCode") if isinstance(res, dict) else None
+            message = res.get("message") if isinstance(res, dict) else None
+            # 8/14. UNKNOWN : jamais un message générique, jamais une retentative aveugle ensuite —
+            # exception dédiée traitée par _execute_mt5_order_async (vérif anti-doublon, jamais de retry).
+            if code == -1 or str(string_code or "").upper() == "TRADE_RETCODE_UNKNOWN":
+                raise MetaApiUnknownRetcodeError(res, body)
+            raise RuntimeError(f"ordre refusé par le broker : {string_code} — {message} "
+                                f"(numericCode={code}) | payload envoyé={json.dumps(body, default=str)}")
         return res
 
     async def _market(self, action, symbol, volume, sl, tp, options):
@@ -485,8 +550,12 @@ class _MetaApiRestConnection:
         for k in ("comment", "clientId", "slippage"):
             if o.get(k) is not None:
                 body[k] = o[k]
-        if o.get("fillingMode"):
-            body["fillingModes"] = [o["fillingMode"]]
+        # 1. Ne plus forcer systématiquement ORDER_FILLING_IOC : "fillingModes" n'est envoyé QUE si
+        # un ou plusieurs modes réellement supportés ont été déterminés depuis les specs du symbole
+        # (voir _pick_filling_modes) — sinon on omet la clé et MetaApi/le broker choisit lui-même.
+        modes = o.get("fillingModes")
+        if modes:
+            body["fillingModes"] = list(modes)
         return await self._trade(body)
 
     async def create_market_buy_order(self, symbol, volume, stop_loss=None, take_profit=None, options=None):
@@ -794,39 +863,108 @@ def _normalize_volume(spec, lot):
 
 
 def _min_stop_distance(spec, symbol):
-    """Distance minimale (en prix brut) entre l'entrée et un SL/TP, d'après stopsLevel (en points)
-    x la taille du point, avec la marge MT5_STOP_BUFFER. Retourne 0.0 si les specs ne permettent
-    pas de calculer ce seuil (vérif alors ignorée, jamais bloquante par excès de prudence)."""
+    """6. Distance minimale (prix brut) entre l'entrée et un SL/TP, d'après MAX(stopsLevel,
+    freezeLevel) (en points) x la taille du point, avec la marge MT5_STOP_BUFFER (1.0 par défaut =
+    aucune marge ajoutée, réglable via env si besoin). Retourne 0.0 si les specs ne permettent pas
+    de calculer ce seuil (vérif alors ignorée, jamais bloquante par excès de prudence)."""
     stops_level = _spec_get(spec, "stopsLevel", "tradeStopsLevel", "stops_level", default=0) or 0
-    if not stops_level:
+    freeze_level = _spec_get(spec, "freezeLevel", "tradeFreezeLevel", "freeze_level", default=0) or 0
+    level = max(float(stops_level), float(freeze_level))
+    if not level:
         return 0.0
     dec = SYMBOLS.get(symbol, {}).get("decimals", 2)
     point = _spec_get(spec, "point", "tickSize", "tick_size", default=None)
     if not point:
         digits = _spec_get(spec, "digits", default=dec)
         point = 10 ** (-digits)
-    return float(stops_level) * float(point) * MT5_STOP_BUFFER
+    return level * float(point) * MT5_STOP_BUFFER
 
 
-def _pick_filling_mode(spec):
-    """3. Étape « filling mode » : choisit un mode réellement supporté par le symbole plutôt que
-    de supposer IOC/FOK à l'aveugle. Priorité : override MT5_FILLING_MODE (env) si défini, sinon
-    le 1er mode supporté d'après les specs (IOC préféré s'il est dans la liste), sinon fallback IOC.
-
-    Les specs symbole renvoient les modes au format MQL5 SYMBOL_FILLING_* (ex. SYMBOL_FILLING_FOK),
-    mais l'endpoint /trade attend le format requête ORDER_FILLING_* (ex. ORDER_FILLING_FOK) — les
-    envoyer tels quels déclenche un Validation failed sur fillingModes[0]. On convertit donc le
-    préfixe avant de les proposer au payload."""
+def _pick_filling_modes(spec):
+    """3. Modes de filling RÉELLEMENT supportés par le symbole/broker, dans l'ordre de préférence
+    (IOC en tête s'il est supporté) — au lieu de forcer un seul mode à l'aveugle. Conversion du
+    préfixe MQL5 SYMBOL_FILLING_* (renvoyé par les specs) vers ORDER_FILLING_* (attendu par /trade).
+    Renvoie None si les specs ne donnent aucune info : dans ce cas "fillingModes" est omis du
+    payload (voir _market) et MetaApi/le broker choisit lui-même — ne JAMAIS supposer IOC/FOK sans
+    confirmation, c'est la cause la plus probable d'un TRADE_RETCODE_UNKNOWN."""
     override = os.getenv("MT5_FILLING_MODE", "").strip()
     if override:
-        return override
+        return [override]
     modes = _spec_get(spec, "fillingModes", "filling_modes", default=None) or []
-    modes = [m.replace("SYMBOL_FILLING_", "ORDER_FILLING_") if isinstance(m, str) else m for m in modes]
+    modes = [m.replace("SYMBOL_FILLING_", "ORDER_FILLING_") for m in modes if isinstance(m, str)]
+    if not modes:
+        return None
     if "ORDER_FILLING_IOC" in modes:
-        return "ORDER_FILLING_IOC"
-    if modes:
-        return modes[0]
-    return "ORDER_FILLING_IOC"   # défaut le plus largement accepté si les specs n'en disent rien
+        modes = ["ORDER_FILLING_IOC"] + [m for m in modes if m != "ORDER_FILLING_IOC"]
+    return modes
+
+
+def _normalize_price(spec, symbol, price):
+    """4. Arrondit un prix (SL/TP) sur le nombre RÉEL de digits du broker (spec.digits), pas
+    seulement SYMBOLS[...]['decimals'] (config statique côté bot qui peut différer du broker réel).
+    Ne modifie jamais la valeur de SL/TP au-delà de cet arrondi (point 12 : jamais de changement de
+    SL/TP/RR imposé par la stratégie)."""
+    if price is None:
+        return price
+    dec = SYMBOLS.get(symbol, {}).get("decimals", 2)
+    digits = _spec_get(spec, "digits", default=dec) if spec else dec
+    try:
+        digits = int(digits)
+    except (TypeError, ValueError):
+        digits = dec
+    return round(float(price), max(digits, 0))
+
+
+def _check_trade_geometry(symbol, side, price, sl, tp):
+    """5. Vérifie que SL/TP sont du bon côté du prix avant tout envoi :
+    BUY -> SL < prix < TP ; SELL -> SL > prix > TP.
+    Ne recalcule/déplace JAMAIS le SL ou le TP : lève ValueError (rejet net) si la géométrie est
+    incohérente — à traiter comme un échec d'exécution classique par l'appelant."""
+    if not price:
+        return
+    if side == "BUY":
+        if sl and sl >= price:
+            raise ValueError(f"Géométrie invalide {symbol} BUY : SL={sl} doit être < prix d'entrée={price}.")
+        if tp and tp <= price:
+            raise ValueError(f"Géométrie invalide {symbol} BUY : TP={tp} doit être > prix d'entrée={price}.")
+    elif side == "SELL":
+        if sl and sl <= price:
+            raise ValueError(f"Géométrie invalide {symbol} SELL : SL={sl} doit être > prix d'entrée={price}.")
+        if tp and tp >= price:
+            raise ValueError(f"Géométrie invalide {symbol} SELL : TP={tp} doit être < prix d'entrée={price}.")
+
+
+def _log_symbol_diag(symbol, broker_symbol, spec):
+    """7. Diagnostic détaillé des specs du symbole, affiché AVANT chaque ordre — c'est ce log qui
+    doit permettre de confirmer (ou d'infirmer) toute hypothèse sur la cause d'un UNKNOWN, plutôt
+    que de la supposer."""
+    diag = {
+        "digits": _spec_get(spec, "digits", default=None),
+        "point": _spec_get(spec, "point", "tickSize", "tick_size", default=None),
+        "volumeMin": _spec_get(spec, "minVolume", "volumeMin", "min_volume", default=None),
+        "volumeMax": _spec_get(spec, "maxVolume", "volumeMax", "max_volume", default=None),
+        "volumeStep": _spec_get(spec, "volumeStep", "stepVolume", "volume_step", default=None),
+        "tradeMode": _spec_get(spec, "tradeMode", default=None),
+        "executionMode": _spec_get(spec, "executionMode", default=None),
+        "fillingModes": _spec_get(spec, "fillingModes", "filling_modes", default=None),
+        "stopsLevel": _spec_get(spec, "stopsLevel", "tradeStopsLevel", "stops_level", default=None),
+        "freezeLevel": _spec_get(spec, "freezeLevel", "tradeFreezeLevel", "freeze_level", default=None),
+    }
+    print(f"[metaapi-symbol] symbol={broker_symbol} (interne {symbol}) "
+          + " ".join(f"{k}={v}" for k, v in diag.items()))
+    return diag
+
+
+async def _account_snapshot(connection):
+    """8b. État du compte pour diagnostic avant toute décision après une erreur — best-effort,
+    ne lève jamais d'exception (utilisé uniquement pour enrichir les logs/messages admin)."""
+    try:
+        info = await connection.get_account_information()
+        return {"balance": info.get("balance"), "equity": info.get("equity"),
+                "margin": info.get("margin"), "freeMargin": info.get("freeMargin"),
+                "tradeAllowed": info.get("tradeAllowed"), "connected": info.get("connected")}
+    except Exception as e:
+        return {"erreur_lecture_compte": str(e)}
 
 
 async def _execute_mt5_stop_check_only(symbol, entry, sl, tp):
@@ -847,12 +985,14 @@ async def _execute_mt5_stop_check_only(symbol, entry, sl, tp):
             raise SLTooCloseError(symbol, broker_symbol, "TP", min_dist, tp_dist)
 
 
-async def _find_position_by_client_id(connection, client_id):
-    """Cherche, parmi les positions actuellement ouvertes côté broker, une position déjà créée
-    pour ce client_id (retrouvé via le champ clientId ou, à défaut, via le commentaire — selon ce
-    que le broker/SDK renvoie). Utilisé UNIQUEMENT avant une retentative, pour ne jamais renvoyer
-    un 2e ordre MARKET si le 1er a en fait été exécuté côté MT5 malgré une erreur réseau/timeout
-    côté RPC. Retourne le dict position, ou None si rien trouvé (best-effort, jamais bloquant)."""
+async def _find_position_by_signature(connection, symbol, side, client_id):
+    """9. Anti-doublon basé sur symbol + direction + clientId (le clientId, ex. "AB<trade_id>",
+    encode déjà le signal_id unique côté appelant — voir _run_mt5_execution/place_manual_order).
+    Ne renvoie une position que si elle correspond AUSSI au symbole et à la direction, pas
+    seulement au clientId, pour ne jamais réutiliser par erreur une position d'un autre trade dont
+    le commentaire tronqué coïnciderait. Utilisé avant toute décision après une erreur, pour ne
+    jamais renvoyer un 2e ordre si le 1er a en fait été exécuté côté MT5 malgré une erreur réseau/
+    UNKNOWN côté RPC. Retourne le dict position, ou None si rien trouvé (best-effort)."""
     if not client_id:
         return None
     try:
@@ -860,21 +1000,44 @@ async def _find_position_by_client_id(connection, client_id):
     except Exception as e:
         print(f"[metaapi] Vérif anti-doublon impossible (get_positions a échoué) : {e}")
         return None
+    broker_symbol = MT5_SYMBOL_MAP.get(symbol, symbol)
+    want_type = "POSITION_TYPE_BUY" if side == "BUY" else "POSITION_TYPE_SELL"
     for p in positions or []:
-        if str(p.get("clientId") or "") == client_id or client_id in str(p.get("comment") or ""):
-            return p
+        matches_id = str(p.get("clientId") or "") == client_id or client_id in str(p.get("comment") or "")
+        if not matches_id:
+            continue
+        if str(p.get("symbol") or "") not in (symbol, broker_symbol):
+            continue
+        if p.get("type") and p.get("type") != want_type:
+            continue
+        return p
     return None
 
 
 async def _execute_mt5_order_async(symbol, side, lot, entry, sl, tp, client_id=None):
-    """Passe un ordre MARKET MT5 via MetaApi, dans l'ordre : (1) attente sync terminal (connexion
-    RPC persistante, reconnexion avec plusieurs tentatives si besoin — voir get_metaapi_connection),
-    (2) récupération des specs + vérif stopsLevel (rejet net via SLTooCloseError si SL/TP trop
-    proche — jamais de déplacement automatique du SL), (3) fillingMode déduit des specs,
-    (4) une seule retentative en dernier recours si l'ordre échoue quand même — précédée d'une
-    vérif anti-doublon par client_id, pour ne jamais soumettre un 2e ordre si le 1er a en fait été
-    exécuté côté broker malgré une erreur côté RPC (timeout réseau, reconnexion...). Retourne le
-    dict résultat MetaApi (positionId/orderId) en cas de succès, ou lève une exception."""
+    """Passe un ordre MARKET MT5 via MetaApi, dans l'ordre :
+    (1) attente sync terminal (connexion RPC persistante),
+    (2) récupération des specs + diagnostic complet AVANT tout envoi (digits, point, volumes,
+        tradeMode, executionMode, fillingModes, stopsLevel, freezeLevel — voir _log_symbol_diag),
+    (3) normalisation volume/SL/TP sur les VRAIES specs broker + vérif géométrie + vérif distance
+        minimale (stopsLevel/freezeLevel) — rejet net (SLTooCloseError / ValueError), jamais de
+        déplacement automatique du SL/TP,
+    (4) sélection des filling modes réellement supportés par les specs (jamais IOC forcé sans
+        confirmation),
+    (5) envoi de l'ordre.
+
+    Après l'envoi, AUCUNE retentative n'est automatique par défaut :
+    - TRADE_RETCODE_UNKNOWN (numericCode=-1) : résultat INCERTAIN, jamais "essayons encore" — on
+      vérifie seulement si la position existe déjà (symbol+direction+clientId), on logue le
+      diagnostic complet (réponse brute + état du compte), puis on relève l'exception.
+    - Erreur définitive (INVALID_STOPS, INVALID_VOLUME, MARKET_CLOSED, TRADE_DISABLED, NO_MONEY) :
+      jamais de retry, cause explicite en français.
+    - INVALID_FILL : SEUL cas où une retentative automatique a un sens (essai du filling mode
+      suivant de la liste réellement supportée par les specs).
+    - Toute autre erreur (réseau/timeout) : vérification anti-doublon puis on relève l'exception,
+      jamais de renvoi aveugle de la même requête.
+
+    Retourne le dict résultat MetaApi (positionId/orderId) en cas de succès, ou lève une exception."""
     connection = await _ensure_terminal_ready()
     if connection is None:
         raise RuntimeError("MetaApi non synchronisé (connexion persistante pas encore prête)")
@@ -882,8 +1045,15 @@ async def _execute_mt5_order_async(symbol, side, lot, entry, sl, tp, client_id=N
     broker_symbol = MT5_SYMBOL_MAP.get(symbol, symbol)
 
     spec = await _get_symbol_spec(connection, broker_symbol)
+    _log_symbol_diag(symbol, broker_symbol, spec)   # 7. diagnostic AVANT tout envoi
+
     lot = _normalize_volume(spec, lot)
-    min_dist = _min_stop_distance(spec, symbol)
+    sl = _normalize_price(spec, symbol, sl)
+    tp = _normalize_price(spec, symbol, tp)
+
+    _check_trade_geometry(symbol, side, entry, sl, tp)   # 5. rejet net si géométrie incohérente
+
+    min_dist = _min_stop_distance(spec, symbol)          # 6. stopsLevel + freezeLevel
     if min_dist > 0:
         sl_dist = abs(entry - sl) if sl else None
         tp_dist = abs(entry - tp) if tp else None
@@ -893,45 +1063,69 @@ async def _execute_mt5_order_async(symbol, side, lot, entry, sl, tp, client_id=N
             raise SLTooCloseError(symbol, broker_symbol, "TP", min_dist, tp_dist)
 
     slippage = get_mt5_slippage(symbol)
-    filling_mode = _pick_filling_mode(spec)
+    filling_modes = _pick_filling_modes(spec)   # 1/3. jamais IOC forcé si les specs ne le confirment pas
     # MetaApi : longueur totale comment + clientId limitée à 30 caractères si les deux sont
-    # fournis (31 sinon) — voir metaapi.cloud/docs/client/clientIdUsage. On tronque donc le
-    # commentaire en fonction de la longueur réelle du clientId plutôt qu'à une valeur fixe,
-    # pour ne jamais dépasser la limite quel que soit le client_id fourni par l'appelant.
+    # fournis (31 sinon) — voir metaapi.cloud/docs/client/clientIdUsage.
     cid = (client_id or "")[:32]
     max_comment = 30 - len(cid) - 1 if cid else 31
     comment = f"AlphaBot {symbol}"[:max(max_comment, 0)]
-    options = {"comment": comment, "slippage": slippage, "fillingMode": filling_mode}
+    options = {"comment": comment, "slippage": slippage}
+    if filling_modes:
+        options["fillingModes"] = filling_modes
     if cid:
         options["clientId"] = cid
 
-    async def _place():
+    async def _place(opts):
         if side == "BUY":
-            return await connection.create_market_buy_order(broker_symbol, lot, sl, tp, options=options)
+            return await connection.create_market_buy_order(broker_symbol, lot, sl, tp, options=opts)
         elif side == "SELL":
-            return await connection.create_market_sell_order(broker_symbol, lot, sl, tp, options=options)
+            return await connection.create_market_sell_order(broker_symbol, lot, sl, tp, options=opts)
         else:
             raise ValueError(f"side invalide : {side!r} (attendu BUY ou SELL)")
 
     try:
-        return await _place()
-    except Exception as e:
-        # Dernier recours seulement (pas pour SLTooCloseError, qui n'atterrit jamais ici). AVANT
-        # de retenter, on vérifie que le 1er ordre n'est pas en fait passé côté broker (erreur
-        # survenue après exécution réelle, ex. timeout sur la réponse RPC) : si on le retrouve via
-        # client_id, on le renvoie tel quel plutôt que de soumettre un 2e ordre MARKET (doublon).
-        print(f"[metaapi] 1re tentative d'ordre échouée ({e}) — vérif anti-doublon puis nouvel essai dans 1.5s.")
-        await asyncio.sleep(1.5)
-        existing = await _find_position_by_client_id(connection, client_id)
+        return await _place(options)
+
+    except SLTooCloseError:
+        raise
+
+    except MetaApiUnknownRetcodeError as e:
+        # UNKNOWN = résultat incertain, jamais "essayons encore". On vérifie seulement si l'ordre
+        # est en fait passé, puis on relève l'exception dans tous les cas (pas de nouvel envoi).
+        print(f"[metaapi] UNKNOWN — aucune nouvelle tentative automatique. Vérification position...")
+        existing = await _find_position_by_signature(connection, symbol, side, client_id)
         if existing is not None:
-            print(f"[metaapi] Ordre déjà exécuté côté broker (retrouvé via client_id={client_id}) "
-                  f"— pas de nouvel ordre, réutilisation de la position existante.")
+            print(f"[metaapi] ✅ Position retrouvée après UNKNOWN : symbol={symbol} side={side} "
+                  f"clientId={client_id} — réutilisation, pas de nouvel ordre.")
             return existing
-        try:
-            await connection.get_symbol_specification(broker_symbol)
-        except Exception:
-            pass  # best-effort : sert juste à forcer le chargement du cache, pas bloquant
-        return await _place()
+        acc = await _account_snapshot(connection)
+        print(f"[metaapi] ⚠️ UNKNOWN sans position retrouvée | symbol={broker_symbol} side={side} "
+              f"lot={lot} sl={sl} tp={tp} fillingModes={filling_modes} account={acc} "
+              f"raw={e.raw_response!r}")
+        raise
+
+    except Exception as e:
+        msg = str(e)
+        code, explication_fr = _classify_trade_error(msg)
+
+        if code:   # 13. erreur définitive : jamais de retry
+            raise RuntimeError(f"{code} — {explication_fr} | détail brut : {e}") from e
+
+        if "INVALID_FILL" in msg.upper() and filling_modes and len(filling_modes) > 1:
+            # Seul cas où changer de filling mode a un sens : on ne remplace QUE ce paramètre,
+            # jamais après UNKNOWN ni après une erreur réseau/timeout.
+            print(f"[metaapi] INVALID_FILL — nouvel essai avec fillingModes={filling_modes[1:]}.")
+            next_options = dict(options)
+            next_options["fillingModes"] = filling_modes[1:]
+            return await _place(next_options)
+
+        # Réseau/timeout/autre : vérifier d'abord si l'ordre est passé, jamais le renvoyer aveuglément.
+        print(f"[metaapi] Erreur d'exécution ({e}) — vérification anti-doublon avant toute décision.")
+        existing = await _find_position_by_signature(connection, symbol, side, client_id)
+        if existing is not None:
+            print(f"[metaapi] ✅ Position déjà ouverte malgré l'erreur : {existing}")
+            return existing
+        raise
 
 
 async def _confirm_position_async(connection, position_id):
@@ -967,9 +1161,24 @@ def execute_mt5_order(symbol, side, lot, entry, sl, tp, client_id=None):
         # SL : on traite ça comme un échec d'exécution classique, notifié par l'appelant.
         print(f"[metaapi] Ordre refusé à l'exécution ({e}) — signal déjà envoyé, à traiter manuellement.")
         return None
+    except MetaApiUnknownRetcodeError as e:
+        # 14. Diagnostic complet en cas d'UNKNOWN persistant (aucune retentative n'a été tentée).
+        print(f"[metaapi] Échec d'exécution {symbol} {side} lot={lot} — TRADE_RETCODE_UNKNOWN persistant : {e}")
+        traceback.print_exc(limit=-3)
+        send(CHAT_ID_ADMIN,
+             f"❌ {symbol} {side} lot={lot} — le broker a renvoyé TRADE_RETCODE_UNKNOWN (numericCode=-1).\n"
+             f"Réponse brute : {e.raw_response}\n"
+             f"Payload envoyé : {e.sent_body}\n"
+             f"SL={sl} TP={tp}\n"
+             f"Vérifie manuellement sur MT5 si une position a été ouverte avant de relancer.")
+        return None
     except Exception as e:
+        code, explication_fr = _classify_trade_error(str(e))
         print(f"[metaapi] Échec d'exécution {symbol} {side} lot={lot} : {e}")
         traceback.print_exc(limit=-3)
+        if code:
+            send(CHAT_ID_ADMIN, f"❌ {symbol} {side} lot={lot} — ordre rejeté ({code}) : {explication_fr}\n"
+                                 f"SL={sl} TP={tp} | détail brut : {e}")
         return None
 
     position_id = str(result.get("positionId") or result.get("orderId") or result.get("id") or "")
@@ -1030,45 +1239,49 @@ def execute_mt5_order(symbol, side, lot, entry, sl, tp, client_id=None):
     return position_id
 
 
-async def _move_to_breakeven_async(position_id, entry, side, fees_buffer):
-    """Modifie le SL d'une position MT5 déjà ouverte pour le placer au BE (entrée +/- fees_buffer,
-    dans le sens qui couvre spread/commission). Lève une exception en cas d'échec — à charge de
-    l'appelant sync (move_to_breakeven) de l'attraper."""
+async def _move_to_breakeven_async(position_id, entry, side, symbol, lot):
+    """Modifie le SL d'une position MT5 déjà ouverte pour le placer au BE (entrée +/- un buffer
+    dynamique visant BE_TARGET_USD net sur CE lot précis — voir _be_price_buffer). Lève une
+    exception en cas d'échec — à charge de l'appelant sync (move_to_breakeven) de l'attraper."""
     connection = await get_metaapi_connection()
     if connection is None:
         raise RuntimeError("connexion MetaApi indisponible")
 
+    buffer = _be_price_buffer(symbol, lot)
+    dec = SYMBOLS.get(symbol, {}).get("decimals", 2)
+
     if side == "BUY":
-        new_sl = entry + fees_buffer   # au-dessus de l'entrée : couvre spread/commission sur un long
+        new_sl = entry + buffer   # au-dessus de l'entrée : vise un résultat net positif sur un long
     elif side == "SELL":
-        new_sl = entry - fees_buffer   # en-dessous de l'entrée : couvre spread/commission sur un short
+        new_sl = entry - buffer   # en-dessous de l'entrée : vise un résultat net positif sur un short
     else:
         raise ValueError(f"side invalide : {side!r} (attendu BUY ou SELL)")
+    new_sl = round(new_sl, dec)
 
     await connection.modify_position(position_id, stop_loss=new_sl)
+    print(f"[metaapi] BE dynamique {symbol} {side} lot={lot} buffer={buffer:.5f} "
+          f"(cible {BE_TARGET_USD}$"
+          + (f" + commission {BE_COMMISSION_USD_PER_LOT}$/lot" if BE_COMMISSION_USD_PER_LOT else "")
+          + f") -> SL={new_sl}")
     return new_sl
 
 
-def move_to_breakeven(position_id, entry, side, fees_buffer=None):
-    """Déplace le SL d'une position MT5 ouverte (identifiée par position_id) au BE via MetaApi :
-    nouveau SL = entry + fees_buffer (BUY) ou entry - fees_buffer (SELL), fees_buffer en points
-    (prix bruts) pour couvrir le spread/la commission — voir get_be_fees_buffer(symbol) pour le
-    défaut (variable d'env BE_FEES_BUFFER, sinon SYMBOLS[symbol]).
+def move_to_breakeven(position_id, entry, side, symbol, lot):
+    """Déplace le SL d'une position MT5 ouverte (identifiée par position_id) au BE + un buffer
+    calculé pour viser un résultat NET minimum de BE_TARGET_USD (défaut +0.01$, réglable via env ;
+    0.00 pour viser pile l'entrée) sur le lot réel de cette position — remplace l'ancien buffer
+    fixe en points qui pouvait se traduire par une perte nette selon le lot/la commission.
 
     Ne lève jamais d'exception : retourne True en cas de succès, False sinon (loggé)."""
     if not position_id:
         print("[metaapi] move_to_breakeven : pas de position_id MT5 (ordre non exécuté côté broker) — ignoré.")
         return False
-    if fees_buffer is None:
-        fees_buffer = 0.0
     try:
-        new_sl = _run_mt5(_move_to_breakeven_async(position_id, entry, side, fees_buffer))
+        _run_mt5(_move_to_breakeven_async(position_id, entry, side, symbol, lot))
     except Exception as e:
         print(f"[metaapi] Échec move_to_breakeven position={position_id} : {e}")
         traceback.print_exc(limit=-3)
         return False
-
-    print(f"[metaapi] BE appliqué : position {position_id} -> SL={new_sl}")
     return True
 
 
@@ -2692,7 +2905,7 @@ def track_trade(trade, candles):
             be_arm = True
             pos_id = trade.get("mt5_position_id")
             if pos_id:   # position réellement exécutée côté broker (MetaApi) : on synchronise son SL
-                move_to_breakeven(pos_id, entry, trade["side"], get_be_fees_buffer(trade["symbol"]))
+                move_to_breakeven(pos_id, entry, trade["side"], trade["symbol"], trade["lot"])
         be_told = False   # ... et il est annoncé avec un palier RR (sinon : événement BE_MOVED seul)
         for lvl in RR_LEVELS:
             if lvl > tp_rr:
@@ -4291,8 +4504,8 @@ def _handle_update(u):
             else:
                 sym = _internal_symbol(p.get("symbol", ""))
                 side = _pos_side(p)
-                buffer = get_be_fees_buffer(sym)
-                ok = move_to_breakeven(pid, float(p.get("openPrice", 0)), side, buffer)
+                lot = float(p.get("volume") or 0.0)
+                ok = move_to_breakeven(pid, float(p.get("openPrice", 0)), side, sym, lot)
                 ack = "✅ BE appliqué" if ok else "❌ Échec BE (voir logs)"
             _edit(cq, _mpositions_text(), _mpositions_keyboard())
         elif data.startswith("mpos:close:"):
@@ -4508,9 +4721,9 @@ def _run_mt5_execution(trade_id, symbol, sig, lot):
     if mt5_position_id:
         update_trade(trade_id, mt5_position_id=mt5_position_id, exec_status="OK")
         # Si le BE a été armé pendant que l'ordre s'exécutait, on répercute le SL sur la position broker.
-        row = _q("SELECT status, be_hit, side, entry, symbol FROM trades WHERE id=?", (trade_id,)).fetchone()
+        row = _q("SELECT status, be_hit, side, entry, symbol, lot FROM trades WHERE id=?", (trade_id,)).fetchone()
         if row and row["status"] == "OPEN" and row["be_hit"]:
-            move_to_breakeven(mt5_position_id, row["entry"], row["side"], get_be_fees_buffer(row["symbol"]))
+            move_to_breakeven(mt5_position_id, row["entry"], row["side"], row["symbol"], row["lot"])
         to_admin(f"✅ {symbol} {sig['side']} — ordre exécuté sur MT5 (ticket {mt5_position_id}).")
         return
 
@@ -4687,7 +4900,7 @@ def check_be_realtime():
         trade["be_hit"], trade["sl"] = 1, entry
         pos_id = trade.get("mt5_position_id")
         if pos_id:
-            move_to_breakeven(pos_id, entry, trade["side"], get_be_fees_buffer(trade["symbol"]))
+            move_to_breakeven(pos_id, entry, trade["side"], trade["symbol"], trade["lot"])
         update_trade(trade["id"], be_hit=1, sl=entry)
         print(f"[be-realtime] {trade['symbol']} {trade['side']} #{trade['id']} : BE armé à RR{be_rr:g} "
               f"(prix {price:g}) — SL -> entrée.")
