@@ -565,6 +565,22 @@ class _MetaApiRestConnection:
         return await self._market("ORDER_TYPE_SELL", symbol, volume, stop_loss, take_profit, options)
 
     async def modify_position(self, position_id, stop_loss=None, take_profit=None):
+        # POSITION_MODIFY réécrit SL ET TP côté MT5 : un niveau absent de la requête peut être supprimé
+        # (c'est ce qui retirait le TP après le passage en BE, et le SL après un /tpset). On relit donc la
+        # position au broker et on renvoie TOUJOURS le niveau qu'on ne modifie pas.
+        if stop_loss is None or take_profit is None:
+            try:
+                cur = next((p for p in (await self.get_positions() or [])
+                            if str(p.get("id")) == str(position_id)), None)
+            except Exception as e:
+                cur = None
+                print(f"[metaapi] modify_position {position_id} : lecture SL/TP actuels impossible ({e}) "
+                      f"— envoi tel quel.")
+            if cur is not None:
+                if stop_loss is None and cur.get("stopLoss"):
+                    stop_loss = cur["stopLoss"]
+                if take_profit is None and cur.get("takeProfit"):
+                    take_profit = cur["takeProfit"]
         body = {"actionType": "POSITION_MODIFY", "positionId": str(position_id)}
         if stop_loss is not None:
             body["stopLoss"] = stop_loss
@@ -1313,30 +1329,183 @@ def execute_mt5_order(symbol, side, lot, entry, sl, tp, client_id=None):
     return position_id
 
 
+def _be_net_usd(symbol, side, open_px, sl_px, volume):
+    """Résultat NET attendu (en $) si le SL est exécuté exactement à son niveau, commission déduite.
+    Un BUY s'ouvre à l'ASK et se ferme sur le BID (le SL d'un long se déclenche sur le bid) ; un SELL s'ouvre au BID et
+    se ferme sur l'ASK. Le spread payé à l'ouverture est donc DÉJÀ dans le prix d'ouverture réel du broker : le BE doit
+    partir de CE prix (openPrice de la position), jamais du prix du signal (Binance/Deriv) qui en diffère.
+    Retourne None si la valeur du point du symbole est inconnue (calcul impossible)."""
+    vpp = SYMBOLS.get(symbol, {}).get("value_per_point") or 0.0
+    if vpp <= 0:
+        return None
+    sgn = 1 if side == "BUY" else -1
+    return (sl_px - open_px) * sgn * vpp * volume - BE_COMMISSION_USD_PER_LOT * volume
+
+
+def _be_sl_from_open(symbol, side, open_px, volume, point, digits):
+    """SL de BE = prix d'ouverture RÉEL du broker +/- buffer calculé sur le volume RÉEL (pas le lot théorique du bot),
+    arrondi au tick du broker toujours dans le sens FAVORABLE (haut pour un BUY, bas pour un SELL — un arrondi 'au plus
+    proche' pouvait ramener le SL sous l'entrée). VÉRIF 1 : recalcule le net attendu et remonte d'un tick tant qu'il est
+    < BE_TARGET_USD. Retourne (sl, verifie) ; verifie=None si le net n'est pas calculable, False si toujours insuffisant."""
+    sgn = 1 if side == "BUY" else -1
+    buffer = _be_price_buffer(symbol, volume)
+    ticks = (open_px + sgn * buffer) / point
+    n = math.ceil(ticks - 1e-6) if sgn == 1 else math.floor(ticks + 1e-6)
+    sl = round(n * point, digits)
+    for _ in range(10):
+        net = _be_net_usd(symbol, side, open_px, sl, volume)
+        if net is None:
+            return sl, None
+        if net >= BE_TARGET_USD - 1e-9:
+            return sl, True
+        n += sgn
+        sl = round(n * point, digits)
+    return sl, False
+
+
+def _be_market_check(side, new_sl, bid, ask, min_dist=0.0):
+    """VÉRIF 2 (spread / marché) : un long est stoppé sur le BID, un short sur l'ASK. Le nouveau SL doit être du bon côté
+    du prix courant, à plus de stopsLevel : sinon MT5 refuse (INVALID_STOPS) ou la position se ferme aussitôt sur le
+    spread. Retourne (ok, détail) ; ok=True si le prix n'est pas connu (jamais bloquant par excès)."""
+    if side == "BUY":
+        if bid is None:
+            return True, "prix broker indisponible"
+        return (bid - new_sl) > min_dist, f"bid {bid:.2f} / SL {new_sl:.2f} (distance {bid - new_sl:.2f}, min {min_dist:g})"
+    if ask is None:
+        return True, "prix broker indisponible"
+    return (new_sl - ask) > min_dist, f"ask {ask:.2f} / SL {new_sl:.2f} (distance {new_sl - ask:.2f}, min {min_dist:g})"
+
+
 async def _move_to_breakeven_async(position_id, entry, side, symbol, lot):
-    """Modifie le SL d'une position MT5 déjà ouverte pour le placer au BE (entrée +/- un buffer
-    dynamique visant BE_TARGET_USD net sur CE lot précis — voir _be_price_buffer). Lève une
-    exception en cas d'échec — à charge de l'appelant sync (move_to_breakeven) de l'attraper."""
+    """Modifie le SL d'une position MT5 déjà ouverte pour le placer au BE + buffer visant BE_TARGET_USD NET (+0.01 $ par
+    défaut) sur le volume RÉEL de la position. Double vérification :
+      1) AVANT envoi : SL calculé sur l'openPrice et le volume réels du broker (spread d'ouverture inclus), arrondi
+         favorable, net attendu >= cible ; puis contrôle marché (bid/ask, stopsLevel) — sinon BE NON envoyé + alerte admin ;
+      2) APRÈS envoi : relit la position, vérifie que le SL attaché est bien le SL demandé, que le TP est resté et que le
+         net attendu est >= cible — sinon alerte admin.
+    Ne réduit jamais un SL déjà meilleur. Lève une exception en cas d'échec — à charge de l'appelant sync
+    (move_to_breakeven) de l'attraper."""
     connection = await get_metaapi_connection()
     if connection is None:
         raise RuntimeError("connexion MetaApi indisponible")
-
-    buffer = _be_price_buffer(symbol, lot)
+    if side not in ("BUY", "SELL"):
+        raise ValueError(f"side invalide : {side!r} (attendu BUY ou SELL)")
+    sgn = 1 if side == "BUY" else -1
+    broker_symbol = MT5_SYMBOL_MAP.get(symbol, symbol)
     dec = SYMBOLS.get(symbol, {}).get("decimals", 2)
 
-    if side == "BUY":
-        new_sl = entry + buffer   # au-dessus de l'entrée : vise un résultat net positif sur un long
-    elif side == "SELL":
-        new_sl = entry - buffer   # en-dessous de l'entrée : vise un résultat net positif sur un short
-    else:
-        raise ValueError(f"side invalide : {side!r} (attendu BUY ou SELL)")
-    new_sl = round(new_sl, dec)
+    def _f(v):
+        try:
+            v = float(v)
+            return v if math.isfinite(v) and v > 0 else None
+        except (TypeError, ValueError):
+            return None
 
-    await connection.modify_position(position_id, stop_loss=new_sl)
-    print(f"[metaapi] BE dynamique {symbol} {side} lot={lot} buffer={buffer:.5f} "
+    # --- specs du symbole (décimales / tick réels du broker) ---
+    spec = _spec_cache_get(broker_symbol, allow_stale=True) or await _get_symbol_spec(connection, broker_symbol)
+    try:
+        digits = int(_spec_get(spec, "digits", default=dec)) if spec else dec
+    except (TypeError, ValueError):
+        digits = dec
+    digits = max(digits, 0)
+    px = lambda v: f"{v:.{digits}f}"   # prix affichés avec les décimales réelles du broker
+    point = (_f(_spec_get(spec, "point", "tickSize", "tick_size", default=None)) if spec else None) or 10 ** (-digits)
+
+
+    # --- réalité broker : prix d'ouverture RÉEL (spread inclus), volume RÉEL (après arrondi), SL/TP actuels ---
+    found, _why, pos = await _confirm_position_async(connection, position_id)
+    if found is False:
+        raise RuntimeError(f"position {position_id} introuvable côté broker (déjà fermée ?)")
+    open_px, volume, cur_sl, tp_keep = float(entry), float(lot), None, None
+    if pos is not None:
+        open_px = _f(pos.get("openPrice")) or open_px
+        volume = _f(pos.get("volume")) or volume
+        cur_sl, tp_keep = _f(pos.get("stopLoss")), _f(pos.get("takeProfit"))
+        if abs(volume - float(lot)) > 1e-9:
+            print(f"[be-check] {symbol} : volume broker {volume:g} != lot du bot {float(lot):g} — volume broker utilisé.")
+        if abs(open_px - float(entry)) > 1e-9:
+            print(f"[be-check] {symbol} : ouverture broker {px(open_px)} != entrée du signal {float(entry):.2f} "
+                  f"(écart {abs(open_px - float(entry)):.2f}) — prix d'ouverture broker utilisé.")
+    else:
+        print(f"[be-check] {symbol} : position non relue ({_why}) — entrée du signal et lot du bot utilisés (vérif réduite).")
+
+    # --- VÉRIF 1 : calcul (openPrice + volume réels, arrondi favorable, net attendu >= cible) ---
+    new_sl, calc_ok = _be_sl_from_open(symbol, side, open_px, volume, point, digits)
+    net_exp = _be_net_usd(symbol, side, open_px, new_sl, volume)
+    if calc_ok is False:
+        msg = (f"BE {symbol} {side} #{position_id} NON appliqué : net attendu {net_exp:+.4f} $ < cible "
+               f"{BE_TARGET_USD:+.2f} $ (ouverture {px(open_px)}, SL {px(new_sl)}, volume {volume:g}).")
+        print(f"[be-check] ❌ {msg}")
+        send(CHAT_ID_ADMIN, f"⚠️ {msg}")
+        raise RuntimeError(msg)
+
+    # jamais dégrader un SL déjà meilleur (BE déjà posé, SL suiveur, etc.)
+    if cur_sl is not None and (cur_sl - new_sl) * sgn >= 0:
+        print(f"[be-check] {symbol} {side} #{position_id} : SL broker {px(cur_sl)} déjà au-delà du BE {px(new_sl)} — inchangé.")
+        return cur_sl
+
+    # --- VÉRIF 2 : marché / spread (BUY stoppé sur le bid, SELL sur l'ask) ---
+    bid = ask = None
+    try:
+        q = await connection.get_symbol_price(broker_symbol)
+        if q and q.get("bid") is not None and q.get("ask") is not None:
+            bid, ask = float(q["bid"]), float(q["ask"])
+    except Exception as e:
+        print(f"[be-check] {symbol} : bid/ask indisponibles ({e}) — contrôle marché ignoré.")
+    min_dist = _min_stop_distance(spec, symbol) if spec else 0.0
+    mkt_ok, mkt_detail = _be_market_check(side, new_sl, bid, ask, min_dist)
+    spread = (ask - bid) if (bid is not None and ask is not None) else None
+    if not mkt_ok:
+        msg = (f"BE {symbol} {side} #{position_id} NON appliqué : le prix est trop proche/déjà au-delà du BE "
+               f"({mkt_detail}, spread {spread:.2f}). Le SL d'origine reste en place."
+               if spread is not None else
+               f"BE {symbol} {side} #{position_id} NON appliqué : {mkt_detail}.")
+        print(f"[be-check] ❌ {msg}")
+        send(CHAT_ID_ADMIN, f"⚠️ {msg}")
+        raise RuntimeError(msg)
+
+    # Le BE ne touche QUE le SL : le TP doit rester. Priorité au TP réellement attaché côté broker (peut avoir
+    # été changé à la main via /tpset) ; s'il est vide, on retombe sur le TP du trade en base.
+    if tp_keep is None:
+        try:
+            row = _q("SELECT tp FROM trades WHERE CAST(mt5_position_id AS TEXT)=?", (str(position_id),)).fetchone()
+            if row and row["tp"]:
+                tp_keep = round(float(row["tp"]), digits)
+        except Exception as e:
+            print(f"[metaapi] BE {symbol} : lecture du TP en base impossible ({e}).")
+
+    await connection.modify_position(position_id, stop_loss=new_sl, take_profit=tp_keep)
+    print(f"[metaapi] BE dynamique {symbol} {side} lot={volume:g} buffer={abs(new_sl - open_px):.5f} TP conservé={tp_keep} "
           f"(cible {BE_TARGET_USD}$"
           + (f" + commission {BE_COMMISSION_USD_PER_LOT}$/lot" if BE_COMMISSION_USD_PER_LOT else "")
           + f") -> SL={new_sl}")
+
+    # --- VÉRIF 2bis : relecture après envoi (SL réellement attaché, TP conservé, net attendu) ---
+    try:
+        _f2, _w2, pos2 = await _confirm_position_async(connection, position_id)
+    except Exception as e:
+        pos2 = None
+        print(f"[be-check] {symbol} : relecture après BE impossible ({e}).")
+    if pos2 is not None:
+        sl_b, tp_b = _f(pos2.get("stopLoss")), _f(pos2.get("takeProfit"))
+        open_b, vol_b = _f(pos2.get("openPrice")) or open_px, _f(pos2.get("volume")) or volume
+        net_b = _be_net_usd(symbol, side, open_b, sl_b, vol_b) if sl_b is not None else None
+        problems = []
+        if sl_b is None or abs(sl_b - new_sl) > point * 1.5:
+            problems.append(f"SL broker {sl_b} != SL demandé {px(new_sl)}")
+        if tp_keep is not None and tp_b is None:
+            problems.append(f"TP {px(tp_keep)} absent après le BE")
+        if net_b is not None and net_b < BE_TARGET_USD - 1e-9:
+            problems.append(f"net attendu {net_b:+.4f} $ < cible {BE_TARGET_USD:+.2f} $")
+        spread_txt = f"{spread:.2f}" if spread is not None else "?"
+        if problems:
+            msg = f"BE {symbol} {side} #{position_id} à vérifier sur MT5 : " + " ; ".join(problems) + "."
+            print(f"[be-check] ❌ {msg}")
+            send(CHAT_ID_ADMIN, f"⚠️ {msg}")
+        else:
+            print(f"[be-check] ✅ {symbol} {side} #{position_id} : SL {px(sl_b)} / TP {px(tp_b) if tp_b is not None else '-'} | "
+                  f"ouverture {px(open_b)} vol {vol_b:g} spread {spread_txt} | net attendu "
+                  + (f"{net_b:+.4f} $" if net_b is not None else "n/a"))
     return new_sl
 
 
@@ -6116,12 +6285,166 @@ class TestLectureExtInt(unittest.TestCase):
         print("\n  " + "\n  ".join(l for l in txt.splitlines() if l.startswith(("Externe", "Interne"))))
 
 
+class TestModifyPositionGardeSLTP(unittest.TestCase):
+    """POSITION_MODIFY : la requête doit toujours contenir SL ET TP (sinon MT5 supprime celui qui manque)."""
+
+    @staticmethod
+    def _conn(positions):
+        c = _E._MetaApiRestConnection()
+        sent = []
+
+        async def get_positions():
+            return positions
+
+        async def _trade(body):
+            sent.append(body)
+            return {"numericCode": 10009}
+        c.get_positions, c._trade = get_positions, _trade
+        return c, sent
+
+    def test_sl_seul_garde_le_tp(self):
+        c, sent = self._conn([{"id": "42", "stopLoss": 84212.89, "takeProfit": 84887.94}])
+        asyncio.run(c.modify_position("42", stop_loss=84382.0))
+        self.assertEqual(sent[0]["stopLoss"], 84382.0)
+        self.assertEqual(sent[0]["takeProfit"], 84887.94)
+
+    def test_tp_seul_garde_le_sl(self):
+        c, sent = self._conn([{"id": "42", "stopLoss": 84212.89, "takeProfit": 84887.94}])
+        asyncio.run(c.modify_position("42", take_profit=85000.0))
+        self.assertEqual(sent[0]["stopLoss"], 84212.89)
+        self.assertEqual(sent[0]["takeProfit"], 85000.0)
+
+    def test_sl_et_tp_fournis_pas_de_lecture(self):
+        c, sent = self._conn([])
+        asyncio.run(c.modify_position("42", stop_loss=1.0, take_profit=2.0))
+        self.assertEqual((sent[0]["stopLoss"], sent[0]["takeProfit"]), (1.0, 2.0))
+
+
+class _FakeBE:
+    """Connexion MetaApi factice : positions, bid/ask, specs ; enregistre les modify_position."""
+
+    def __init__(self, positions, bid=None, ask=None, apply_modify=True, spec=None):
+        self.pos, self.bid, self.ask, self.apply, self.calls = positions, bid, ask, apply_modify, []
+        self.spec = spec if spec is not None else {"digits": 2, "point": 0.01, "stopsLevel": 0}
+
+    async def get_positions(self):
+        return [dict(p) for p in self.pos]
+
+    async def get_symbol_specification(self, symbol):
+        return self.spec
+
+    async def get_symbol_price(self, symbol):
+        if self.bid is None:
+            raise RuntimeError("pas de prix")
+        return {"bid": self.bid, "ask": self.ask}
+
+    async def modify_position(self, pid, stop_loss=None, take_profit=None):
+        self.calls.append((pid, stop_loss, take_profit))
+        if self.apply:
+            for p in self.pos:
+                if str(p["id"]) == str(pid):
+                    if stop_loss is not None:
+                        p["stopLoss"] = stop_loss
+                    if take_profit is not None:
+                        p["takeProfit"] = take_profit
+
+
+class TestBEDoubleVerif(unittest.TestCase):
+    """BE : SL calculé sur l'ouverture et le volume RÉELS du broker (spread inclus), net attendu >= +0.01 $, contrôle
+    marché (bid/ask) avant envoi, relecture après envoi, TP conservé, jamais de SL dégradé."""
+
+    def _run(self, conn, pid, entry, side, lot, symbol="BTCUSD"):
+        saved = (_E.get_metaapi_connection, _E.send)
+        old_cache = dict(_E._SPEC_CACHE)
+        sent = []
+
+        async def _gc(force_reconnect=False):
+            return conn
+        _E.get_metaapi_connection = _gc
+        _E.send = lambda *a, **k: sent.append(a[1] if len(a) > 1 else "")
+        _E._SPEC_CACHE.clear()
+        try:
+            try:
+                res = _E._run_mt5(_E._move_to_breakeven_async(pid, entry, side, symbol, lot))
+            except RuntimeError as e:
+                res = e
+            return res, sent
+        finally:
+            _E.get_metaapi_connection, _E.send = saved
+            _E._SPEC_CACHE.clear()
+            _E._SPEC_CACHE.update(old_cache)
+
+    def test_buy_part_de_l_ouverture_broker_et_du_volume_reel(self):
+        pos = [{"id": "42", "openPrice": 84385.30, "volume": 0.05, "stopLoss": 84212.89, "takeProfit": 84887.94}]
+        conn = _FakeBE(pos, bid=84600.0, ask=84612.0)
+        res, sent = self._run(conn, "42", 84381.65, "BUY", 0.059)   # signal 84381.65, lot bot 0.059, broker 0.05
+        self.assertAlmostEqual(conn.calls[-1][1], 84385.50, places=6)   # ouverture + 0.2 (0.01 $ / 0.05 lot), pas 84382
+        self.assertEqual(conn.calls[-1][2], 84887.94)                    # TP conservé
+        self.assertGreaterEqual(_E._be_net_usd("BTCUSD", "BUY", 84385.30, conn.calls[-1][1], 0.05), 0.01 - 1e-9)
+        self.assertEqual(sent, [])                                        # aucune alerte : tout est vérifié
+
+    def test_sell_part_de_l_ouverture_broker(self):
+        pos = [{"id": "7", "openPrice": 84455.59, "volume": 0.05, "stopLoss": 84624.5, "takeProfit": 83948.86}]
+        conn = _FakeBE(pos, bid=84300.0, ask=84312.0)
+        self._run(conn, "7", 84456.0, "SELL", 0.059)
+        self.assertAlmostEqual(conn.calls[-1][1], 84455.39, places=6)
+        self.assertGreaterEqual(_E._be_net_usd("BTCUSD", "SELL", 84455.59, conn.calls[-1][1], 0.05), 0.01 - 1e-9)
+
+    def test_arrondi_favorable_jamais_sous_l_entree(self):
+        # digits=0 : l'ancien round() donnait 84381 (< ouverture 84381.2) = perte ; l'arrondi favorable donne 84382
+        pos = [{"id": "9", "openPrice": 84381.2, "volume": 0.05, "stopLoss": 84200.0, "takeProfit": 84900.0}]
+        conn = _FakeBE(pos, bid=84600.0, ask=84610.0, spec={"digits": 0, "point": 1.0, "stopsLevel": 0})
+        self._run(conn, "9", 84381.2, "BUY", 0.05)
+        self.assertEqual(conn.calls[-1][1], 84382.0)
+
+    def test_prix_deja_sous_le_be_pas_d_envoi(self):
+        pos = [{"id": "5", "openPrice": 84385.30, "volume": 0.05, "stopLoss": 84212.89, "takeProfit": 84887.94}]
+        conn = _FakeBE(pos, bid=84385.0, ask=84397.0)   # le bid est repassé sous le BE (84385.5)
+        res, sent = self._run(conn, "5", 84385.3, "BUY", 0.05)
+        self.assertIsInstance(res, RuntimeError)
+        self.assertEqual(conn.calls, [])                 # rien n'est envoyé : le SL d'origine reste
+        self.assertTrue(any("NON appliqué" in t for t in sent))
+
+    def test_ne_degrade_jamais_un_sl_meilleur(self):
+        pos = [{"id": "3", "openPrice": 84385.30, "volume": 0.05, "stopLoss": 84400.0, "takeProfit": 84887.94}]
+        conn = _FakeBE(pos, bid=84600.0, ask=84612.0)
+        res, _ = self._run(conn, "3", 84385.3, "BUY", 0.05)
+        self.assertEqual(conn.calls, [])
+        self.assertEqual(res, 84400.0)
+
+    def test_relecture_detecte_un_sl_non_applique(self):
+        pos = [{"id": "8", "openPrice": 84385.30, "volume": 0.05, "stopLoss": 84212.89, "takeProfit": 84887.94}]
+        conn = _FakeBE(pos, bid=84600.0, ask=84612.0, apply_modify=False)   # le broker ignore la modification
+        _, sent = self._run(conn, "8", 84385.3, "BUY", 0.05)
+        self.assertTrue(any("à vérifier" in t for t in sent))
+
+    def test_tp_repris_en_base_si_le_broker_n_en_a_plus(self):
+        pos = [{"id": "43", "openPrice": 84381.65, "volume": 0.05, "stopLoss": 84212.89}]   # TP déjà perdu
+        conn = _FakeBE(pos, bid=84600.0, ask=84612.0)
+        _E._q("INSERT INTO trades (signal_key, symbol, side, tp, mt5_position_id) VALUES ('t-be-tp','BTCUSD','BUY',84900,'43')",
+              commit=True)
+        try:
+            self._run(conn, "43", 84381.65, "BUY", 0.05)
+        finally:
+            _E._q("DELETE FROM trades WHERE signal_key='t-be-tp'", commit=True)
+        self.assertEqual(conn.calls[-1][2], 84900.0)
+
+    def test_fonctions_pures(self):
+        self.assertTrue(_E._be_market_check("BUY", 100.0, 101.0, 102.0)[0])
+        self.assertFalse(_E._be_market_check("BUY", 100.0, 99.9, 100.5)[0])
+        self.assertTrue(_E._be_market_check("SELL", 100.0, 98.0, 99.0)[0])
+        self.assertFalse(_E._be_market_check("SELL", 100.0, 100.4, 100.9)[0])
+        self.assertTrue(_E._be_market_check("BUY", 100.0, None, None)[0])   # prix inconnu : jamais bloquant
+        self.assertAlmostEqual(_E._be_net_usd("BTCUSD", "BUY", 100.0, 100.2, 0.05), 0.01, places=9)
+        self.assertAlmostEqual(_E._be_net_usd("BTCUSD", "SELL", 100.0, 99.8, 0.05), 0.01, places=9)
+
+
 def _selftest():
     _E.HTF_MODE = "FULL"   # les tests historiques (H1 -> M15 -> M5 -> POI) évaluent la cascade complète ; TestHtfM15 passe en mode M15
     suite, loader = unittest.TestSuite(), unittest.TestLoader()
     for cls in (TestRetracement, TestContinuation, TestInvalidationHTF, TestChop, TestGetExtTf,
                 TestLiquiditePure, TestM1NeDecidePasSeul, TestLogs, TestEntreeM5, TestNonRegression,
-                TestHtfM15, TestBE, TestSignauxSimultanes, TestLectureExtInt):
+                TestHtfM15, TestBE, TestSignauxSimultanes, TestLectureExtInt, TestModifyPositionGardeSLTP, TestBEDoubleVerif):
         suite.addTests(loader.loadTestsFromTestCase(cls))
     return 0 if unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful() else 1
 
