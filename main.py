@@ -623,6 +623,7 @@ def _metaapi_rest_background_loop():
                 if down_since is not None:
                     _notify_mt5_recovered(down_since)
                     down_since = None
+            _prefetch_symbol_specs()   # specs symbole en cache AVANT le prochain signal (évite le Read timed out)
         except Exception as e:
             fails += 1
             if fails == 3 and _metaapi_ready.is_set():
@@ -826,15 +827,64 @@ def _spec_get(spec, *keys, default=None):
     return default
 
 
+# Cache des specs symbole (digits, filling modes, stopsLevel...) : les specs d'un symbole ne changent quasi jamais,
+# donc un « Read timed out » au moment du signal ne doit plus faire tomber digits / fillingModes / stopsLevel à None.
+_SPEC_CACHE = {}   # broker_symbol -> (timestamp, spec)
+_SPEC_CACHE_TTL_SEC = _env_float("MT5_SPEC_CACHE_TTL_SEC", 6 * 3600)
+_SPEC_FETCH_RETRIES = _env_int("MT5_SPEC_FETCH_RETRIES", 3)
+
+
+def _spec_cache_get(broker_symbol, allow_stale=False):
+    item = _SPEC_CACHE.get(broker_symbol)
+    if not item:
+        return None
+    ts, spec = item
+    if allow_stale or (time.time() - ts) < _SPEC_CACHE_TTL_SEC:
+        return spec
+    return None
+
+
 async def _get_symbol_spec(connection, broker_symbol):
     """2. Étape « specs symbole » : récupère les specs MT5 (stopsLevel, point, filling modes...)
-    juste avant l'envoi. Retourne None si indisponible (l'appelant devient alors permissif sur la
-    vérif de distance plutôt que de bloquer tous les trades sur un souci d'API)."""
-    try:
-        return await connection.get_symbol_specification(broker_symbol)
-    except Exception as e:
-        print(f"[metaapi] Impossible de récupérer les specs de {broker_symbol} : {e} — vérif stop-level ignorée.")
-        return None
+    juste avant l'envoi. Ordre : cache frais -> requête avec retry (backoff 1s, 2s) -> cache périmé (mieux que rien)
+    -> None (l'appelant devient alors permissif sur la vérif de distance plutôt que de bloquer tous les trades)."""
+    cached = _spec_cache_get(broker_symbol)
+    if cached is not None:
+        return cached
+    last_err = None
+    for attempt in range(1, max(_SPEC_FETCH_RETRIES, 1) + 1):
+        try:
+            spec = await connection.get_symbol_specification(broker_symbol)
+            if spec:
+                _SPEC_CACHE[broker_symbol] = (time.time(), spec)
+                return spec
+            last_err = "réponse vide"
+        except Exception as e:
+            last_err = e
+            print(f"[metaapi] Specs {broker_symbol} : tentative {attempt}/{_SPEC_FETCH_RETRIES} échouée : {e}")
+        if attempt < _SPEC_FETCH_RETRIES:
+            await asyncio.sleep(attempt)
+    stale = _spec_cache_get(broker_symbol, allow_stale=True)
+    if stale is not None:
+        print(f"[metaapi] Specs de {broker_symbol} injoignables ({last_err}) — dernières specs connues (cache périmé) utilisées.")
+        return stale
+    print(f"[metaapi] Impossible de récupérer les specs de {broker_symbol} : {last_err} — vérif stop-level ignorée.")
+    return None
+
+
+def _prefetch_symbol_specs():
+    """Réchauffe le cache des specs pour tous les symboles du bot (appelé depuis le thread de fond REST) : ainsi, au
+    moment d'un signal, les specs sont déjà en mémoire. Best-effort : ne lève jamais d'exception."""
+    for broker_symbol in {MT5_SYMBOL_MAP.get(k, k) for k in SYMBOLS}:
+        if _spec_cache_get(broker_symbol) is not None:
+            continue
+        try:
+            spec = _run_mt5(_get_symbol_spec(_rest_connection, broker_symbol), timeout=90)
+            if spec:
+                print(f"[metaapi-rest] Specs {broker_symbol} en cache "
+                      f"(digits={_spec_get(spec, 'digits')}, fillingModes={_spec_get(spec, 'fillingModes')}).")
+        except Exception as e:
+            print(f"[metaapi-rest] Préchargement des specs {broker_symbol} impossible : {e}")
 
 
 def _normalize_volume(spec, lot):
