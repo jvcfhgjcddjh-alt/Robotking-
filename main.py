@@ -1175,6 +1175,13 @@ async def _execute_mt5_order_async(symbol, side, lot, entry, sl, tp, client_id=N
         msg = str(e)
         code, explication_fr = _classify_trade_error(msg)
 
+        if "Validation failed" in msg and "clientId" in msg and "clientId" in options:
+            # Rejet de VALIDATION MetaApi (HTTP 400) : l'ordre n'est jamais arrivé au broker -> renvoi sans risque
+            # de doublon, sans clientId (l'anti-doublon par clientId est alors indisponible pour cet ordre).
+            print("[metaapi] clientId refusé par la validation MetaApi — renvoi unique sans clientId.")
+            no_cid = {k: v for k, v in options.items() if k != "clientId"}
+            return await _place(no_cid)
+
         if code:   # 13. erreur définitive : jamais de retry
             raise RuntimeError(f"{code} — {explication_fr} | détail brut : {e}") from e
 
@@ -1424,16 +1431,13 @@ async def _manual_price_async(symbol):
     return price, None
 
 
-def place_manual_order(symbol, side):
-    """Exécute un trade MANUEL déclenché depuis Telegram (📈 TRADE → BUY/SELL), en une seule
-    action, sans confirmation intermédiaire (voir consignes) :
-      1. prix réel broker (MetaApi current-price, pas Deriv/Binance)
-      2. SL via le plancher de risque déjà existant (manual_sl_distance)
-      3. lot via calc_lot (même fonction que le moteur automatique) selon le risque $ configuré
-      4. TP via le RR configuré (get_tp_rr)
-      5. envoi de l'ordre (execute_mt5_order fait déjà toutes les validations techniques : specs,
-         stopsLevel, volume min/max/step, filling mode — et ne lève jamais, retourne None si refusé)
-    Retourne un dict {"ok": True, ...détails...} ou {"ok": False, "error": "..."} — jamais d'exception."""
+def _manual_plan(symbol, side, sl_price=None):
+    """Calcule (sans rien envoyer) le plan d'un trade MANUEL au prix réel du broker :
+      - entrée = ask (BUY) / bid (SELL) via MetaApi current-price
+      - SL : celui choisi par l'utilisateur (sl_price) — le lot et le risque sont calculés à partir de CE SL —
+        ou, si sl_price est None, le plancher de risque automatique (manual_sl_distance)
+      - lot via calc_lot selon le risque $ configuré ; TP via le RR configuré (get_tp_rr)
+    Retourne {"ok": True, entry, spread, sl, tp, sl_distance, lot_info, rr} ou {"ok": False, "error": ...}."""
     if side not in ("BUY", "SELL"):
         return {"ok": False, "error": f"side invalide : {side!r}"}
     if symbol not in SYMBOLS:
@@ -1454,17 +1458,43 @@ def place_manual_order(symbol, side):
         return {"ok": False, "error": f"spread trop large au moment du clic ({spread:.2f} pts, "
                                        f"{spread_pct * 100:.3f}% > seuil {max_spread * 100:.3f}%) — "
                                        f"probablement une news ou un marché peu liquide, réessaie dans un instant."}
-    sl_distance = manual_sl_distance(symbol, entry)
-    if not sl_distance or sl_distance <= 0:
-        return {"ok": False, "error": "distance SL non calculable (ATR/plancher indisponible)"}
     d = 1 if side == "BUY" else -1
-    sl = entry - d * sl_distance
+    dec = SYMBOLS[symbol]["decimals"]
+    if sl_price is None:
+        sl_distance = manual_sl_distance(symbol, entry)
+        if not sl_distance or sl_distance <= 0:
+            return {"ok": False, "error": "distance SL non calculable (ATR/plancher indisponible)"}
+        sl = entry - d * sl_distance
+    else:
+        sl = float(sl_price)
+        sl_distance = (entry - sl) * d
+        if sl_distance <= 0:
+            return {"ok": False, "error": f"SL du mauvais côté : pour un {side} il doit être "
+                                           f"{'sous' if side == 'BUY' else 'au-dessus de'} le prix actuel "
+                                           f"({_fmt(entry, dec)})."}
+        if sl_distance <= 2 * spread:
+            return {"ok": False, "error": f"SL trop proche du prix ({_fmt(sl_distance, dec)} pts pour un spread de "
+                                           f"{_fmt(spread, dec)}) : il serait touché presque immédiatement."}
     rr = get_tp_rr()
     tp = entry + d * sl_distance * rr
 
     lot_info = calc_lot(symbol, get_risk(), sl_distance)
     if lot_info["lot"] <= 0:
         return {"ok": False, "error": "lot calculé nul (risque ou distance SL invalide)"}
+    return {"ok": True, "symbol": symbol, "side": side, "entry": entry, "spread": spread, "sl": sl, "tp": tp,
+            "sl_distance": sl_distance, "lot_info": lot_info, "rr": rr, "custom_sl": sl_price is not None}
+
+
+def place_manual_order(symbol, side, sl_price=None):
+    """Exécute un trade MANUEL déclenché depuis Telegram (📈 TRADE → BUY/SELL). Si sl_price est fourni (SL choisi par
+    l'utilisateur), le lot/risque/TP sont recalculés au prix réel du broker AU MOMENT de la validation à partir de ce SL,
+    qui reste inchangé. Sans sl_price : SL automatique (plancher de risque). execute_mt5_order fait toutes les validations
+    techniques (specs, stopsLevel, volume, filling mode) et ne lève jamais, il retourne None si refusé.
+    Retourne {"ok": True, ...détails...} ou {"ok": False, "error": "..."} — jamais d'exception."""
+    plan = _manual_plan(symbol, side, sl_price)
+    if not plan["ok"]:
+        return plan
+    entry, sl, tp, lot_info = plan["entry"], plan["sl"], plan["tp"], plan["lot_info"]
 
     # clientId MetaApi : format court strategyId_positionId_orderId, alphanumérique uniquement
     # (pas de tirets) — voir metaapi.cloud/docs/client/clientIdUsage. "MAN" = stratégie manuelle,
@@ -1478,7 +1508,7 @@ def place_manual_order(symbol, side):
 
     return {"ok": True, "position_id": position_id, "symbol": symbol, "side": side,
             "entry": entry, "sl": sl, "tp": tp, "lot": lot_info["lot"],
-            "risk_usd": lot_info["real_risk"], "rr": rr, "spread": spread,
+            "risk_usd": lot_info["real_risk"], "rr": plan["rr"], "spread": plan["spread"],
             "raised_to_min": lot_info["raised_to_min"]}
 
 
@@ -2897,6 +2927,39 @@ def manual_sl_distance(symbol, entry):
     return max(candidates)
 
 
+MANUAL_SWEEP_SCAN = _env_int("MANUAL_SWEEP_SCAN", 40)            # bougies récentes explorées pour trouver le dernier sweep
+MANUAL_SWEEP_MARGIN_ATR = _env_float("MANUAL_SWEEP_MARGIN_ATR", 0.10)   # marge sous la mèche du sweep, en ATR (plancher : 1.5 x spread)
+
+
+def manual_sweep_sl(symbol, side, spread=0.0):
+    """SL d'un trade MANUEL placé au-delà du dernier SWEEP de l'UT d'entrée courante (M1 par défaut), avec une petite marge.
+    BUY : dernier balayage de liquidité SOUS un plus bas (mèche puis clôture de retour) -> SL sous la mèche.
+    SELL : dernier balayage AU-DESSUS d'un plus haut -> SL au-dessus de la mèche. Réutilise `_sweep_at` (même définition
+    du balayage que le moteur). Un sweep déjà repris par le prix (une bougie ultérieure a dépassé la mèche) est ignoré.
+    Retourne (sl, infos) ou (None, raison lisible). Ne lève jamais."""
+    d = 1 if side == "BUY" else -1
+    try:
+        c = get_candles(symbol)
+    except Exception as e:
+        return None, f"bougies indisponibles ({type(e).__name__})"
+    if len(c) < SWEEP_LOOKBACK + 3:
+        return None, "pas assez de bougies pour lire un sweep"
+    atr = atr_series(c)[-1] or 0.0
+    margin = max(1.5 * float(spread or 0.0), MANUAL_SWEEP_MARGIN_ATR * atr)
+    last = len(c) - 1
+    for e in range(last, max(last - MANUAL_SWEEP_SCAN, SWEEP_LOOKBACK) - 1, -1):
+        lvl, swept = _sweep_at(c, e, d)
+        if not swept:
+            continue
+        extreme = c[e]["l"] if d == 1 else c[e]["h"]
+        if any((k["l"] <= extreme) if d == 1 else (k["h"] >= extreme) for k in c[e + 1:]):
+            continue   # mèche déjà reprise par le prix : ce sweep n'est plus un repère valide
+        return extreme - d * margin, {"level": lvl, "extreme": extreme, "margin": margin,
+                                       "tf": TF_LABEL, "age": last - e, "t": c[e]["t"]}
+    return None, (f"aucun sweep {'sous un plus bas' if d == 1 else 'au-dessus d un plus haut'} "
+                  f"exploitable sur les {MANUAL_SWEEP_SCAN} dernières bougies {TF_LABEL}")
+
+
 # ============================================================================
 # 6. SUIVI DES POSITIONS
 #
@@ -4092,8 +4155,8 @@ def _trade_home_keyboard():
 def _trade_side_text(symbol):
     return (f"📈 <b>{symbol}</b>\n\n"
             f"💵 Risque : {get_risk():g} $ · 🎯 RR : {get_tp_rr():g}\n"
-            f"Le lot, le SL et le TP sont calculés automatiquement au prix réel du broker au moment du clic.\n\n"
-            f"⚡️ Le clic exécute directement l'ordre (pas de confirmation).")
+            f"Choisis BUY ou SELL, puis envoie <b>ton SL</b> : le lot est calculé sur ce SL et le risque configuré, "
+            f"et tu valides avant l'envoi de l'ordre.")
 
 
 def _trade_side_keyboard(symbol):
@@ -4101,6 +4164,78 @@ def _trade_side_keyboard(symbol):
     return {"inline_keyboard": [
         [{"text": "🟢 BUY", "callback_data": f"mtr:buy:{code}"}, {"text": "🔴 SELL", "callback_data": f"mtr:sell:{code}"}],
         [{"text": "🔙 Trade", "callback_data": "mtr:home"}, {"text": "🔙 Menu", "callback_data": "menu:home"}]]}
+
+
+# Trade manuel en attente : chat_id -> {"symbol", "side", "sl" (None tant que non saisi), "ts"}. En mémoire seulement :
+# un redémarrage annule l'attente (rien n'a été envoyé au broker à ce stade).
+_pending_manual = {}
+_PENDING_MANUAL_TTL_SEC = 300
+
+
+def _pending_manual_get(chat_id):
+    p = _pending_manual.get(chat_id)
+    if p and time.time() - p["ts"] > _PENDING_MANUAL_TTL_SEC:
+        _pending_manual.pop(chat_id, None)
+        return None
+    return p
+
+
+def _trade_sl_prompt_text(symbol, side):
+    return (f"✍️ <b>{symbol} {side}</b>\n\n"
+            f"Envoie ton <b>SL</b> (un prix), ex. <code>{'4281.50' if symbol == 'XAUUSD' else '84200'}</code>.\n"
+            f"Le lot sera calculé pour risquer {get_risk():g} $ sur ce SL, avec un TP à RR {get_tp_rr():g}.\n"
+            f"Ou touche 🎯 SL au sweep : le SL est placé sous (BUY) / au-dessus (SELL) de la mèche du dernier sweep.\n"
+            f"Rien n'est envoyé au broker avant ta validation. ⏱ Valable 5 min.")
+
+
+def _trade_sl_keyboard():
+    return {"inline_keyboard": [
+        [{"text": "🎯 SL au sweep", "callback_data": "mtr:sweep"}],
+        [{"text": "⚙️ SL auto (plancher)", "callback_data": "mtr:auto"}],
+        [{"text": "❌ Annuler", "callback_data": "mtr:cancel"}]]}
+
+
+def _trade_confirm_keyboard():
+    return {"inline_keyboard": [
+        [{"text": "✅ Valider", "callback_data": "mtr:go"}, {"text": "❌ Annuler", "callback_data": "mtr:cancel"}]]}
+
+
+def _manual_preview_text(plan, note=""):
+    dec = SYMBOLS[plan["symbol"]]["decimals"]
+    li = plan["lot_info"]
+    warn = (f"\n⚠️ Lot minimum appliqué : risque réel {li['real_risk']:.2f} $ au lieu de {get_risk():g} $."
+            if li["raised_to_min"] else "")
+    return (f"📝 <b>{plan['symbol']} {plan['side']} — à valider</b>\n\n"
+            f"Entrée (prix actuel) : {_fmt(plan['entry'], dec)}\n"
+            f"SL : {_fmt(plan['sl'], dec)} ({_fmt(plan['sl_distance'], dec)} pts)\n"
+            f"TP : {_fmt(plan['tp'], dec)} (RR 1:{plan['rr']:g})\n"
+            f"Lot : {li['lot']:g}\n"
+            f"Risque : {li['real_risk']:.2f} $\n"
+            f"Spread : {_fmt(plan['spread'], dec)}{warn}\n"
+            f"{note}\n"
+            f"Aperçu indicatif : à la validation, le lot et le TP sont recalculés au prix réel, ton SL reste inchangé.")
+
+
+def _handle_manual_sl_input(chat_id, text):
+    """Message texte reçu pendant qu'un trade manuel attend son SL : lit le prix, calcule le plan, demande validation."""
+    pend = _pending_manual_get(chat_id)
+    if not pend:
+        return
+    try:
+        sl = float(re.sub(r"\s", "", text).replace(",", "."))
+    except ValueError:
+        sl = None
+    if sl is None or not math.isfinite(sl) or sl <= 0:
+        send(chat_id, "Envoie uniquement le prix du SL (un nombre), ex. <code>4281.50</code>.",
+             reply_markup=_trade_sl_keyboard())
+        return
+    plan = _manual_plan(pend["symbol"], pend["side"], sl)
+    if not plan["ok"]:
+        send(chat_id, f"❌ {plan['error']}\n\nRenvoie un autre SL, ou annule.", reply_markup=_trade_sl_keyboard())
+        return
+    pend["sl"] = sl
+    pend["ts"] = time.time()
+    send(chat_id, _manual_preview_text(plan), reply_markup=_trade_confirm_keyboard())
 
 
 def _manual_order_text(r):
@@ -4553,12 +4688,66 @@ def _handle_update(u):
                       {"callback_query_id": cq["id"], "text": "👤 Manuel OFF — active-le d'abord.", "show_alert": True})
                 return
             else:
-                _post("answerCallbackQuery", {"callback_query_id": cq["id"], "text": f"⏳ {side} {sym}…"})
-                r = place_manual_order(sym, side)
-                _edit(cq, _manual_order_text(r), _trade_side_keyboard(sym))
-                if r["ok"]:
-                    to_admin(f"👤 Trade manuel : {_manual_order_text(r)}")
+                # Nouveau flux : on n'exécute plus au clic. On attend le SL de l'utilisateur, puis validation.
+                _pending_manual[cq["message"]["chat"]["id"]] = {"symbol": sym, "side": side, "sl": None,
+                                                                "ts": time.time()}
+                _post("answerCallbackQuery", {"callback_query_id": cq["id"], "text": f"✍️ Envoie ton SL ({side} {sym})"})
+                _edit(cq, _trade_sl_prompt_text(sym, side), _trade_sl_keyboard())
                 return
+        elif data == "mtr:sweep":
+            chat_id = cq["message"]["chat"]["id"]
+            pend = _pending_manual_get(chat_id)
+            if not pend:
+                _post("answerCallbackQuery", {"callback_query_id": cq["id"],
+                                              "text": "⏱ Expiré — recommence depuis 📈 TRADE.", "show_alert": True})
+                return
+            sym, side = pend["symbol"], pend["side"]
+            try:
+                price, perr = _run_mt5(_manual_price_async(sym))
+            except Exception as e:
+                price, perr = None, str(e)
+            if perr:
+                _post("answerCallbackQuery", {"callback_query_id": cq["id"], "text": f"❌ {perr}"[:180], "show_alert": True})
+                return
+            spread = abs(float(price["ask"]) - float(price["bid"]))
+            sl, info = manual_sweep_sl(sym, side, spread)
+            if sl is None:
+                _post("answerCallbackQuery", {"callback_query_id": cq["id"], "text": f"🎯 {info}"[:180], "show_alert": True})
+                return
+            plan = _manual_plan(sym, side, sl)
+            if not plan["ok"]:
+                _edit(cq, f"❌ {plan['error']}\n\nEnvoie ton propre SL, ou annule.", _trade_sl_keyboard())
+                return
+            dec = SYMBOLS[sym]["decimals"]
+            note = (f"\n🎯 SL au sweep {info['tf']} : mèche à {_fmt(info['extreme'], dec)} "
+                    f"(niveau balayé {_fmt(info['level'], dec)}, il y a {info['age']} bougie(s)), marge {_fmt(info['margin'], dec)}.\n")
+            pend["sl"], pend["ts"] = sl, time.time()
+            _edit(cq, _manual_preview_text(plan, note), _trade_confirm_keyboard())
+            ack = "SL au sweep"
+        elif data in ("mtr:auto", "mtr:go"):
+            chat_id = cq["message"]["chat"]["id"]
+            pend = _pending_manual_get(chat_id)
+            if not pend or (data == "mtr:go" and pend["sl"] is None):
+                _post("answerCallbackQuery", {"callback_query_id": cq["id"],
+                                              "text": "⏱ Expiré — recommence depuis 📈 TRADE.", "show_alert": True})
+                _pending_manual.pop(chat_id, None)
+                return
+            if not get_manual_mode():
+                _post("answerCallbackQuery", {"callback_query_id": cq["id"],
+                                              "text": "👤 Manuel OFF — active-le d'abord.", "show_alert": True})
+                return
+            _pending_manual.pop(chat_id, None)   # une seule exécution par validation (anti double-clic)
+            sym, side = pend["symbol"], pend["side"]
+            _post("answerCallbackQuery", {"callback_query_id": cq["id"], "text": f"⏳ {side} {sym}…"})
+            r = place_manual_order(sym, side, sl_price=pend["sl"] if data == "mtr:go" else None)
+            _edit(cq, _manual_order_text(r), _trade_side_keyboard(sym))
+            if r["ok"]:
+                to_admin(f"👤 Trade manuel : {_manual_order_text(r)}")
+            return
+        elif data == "mtr:cancel":
+            _pending_manual.pop(cq["message"]["chat"]["id"], None)
+            _edit(cq, _trade_home_text(), _trade_home_keyboard())
+            ack = "Annulé"
         elif data == "mpos:home":
             _edit(cq, _mpositions_text(), _mpositions_keyboard())
             ack = "Actualisé"
@@ -4598,8 +4787,11 @@ def _handle_update(u):
         return
     text = msg.get("text", "")
     if text.startswith("/"):
+        _pending_manual.pop(msg["chat"]["id"], None)   # une commande annule l'attente d'un SL
         reply, kb = handle_command(text)
         send(msg["chat"]["id"], reply, reply_markup=kb)
+    elif text:
+        _handle_manual_sl_input(msg["chat"]["id"], text)   # ne fait rien si aucun trade manuel n'attend de SL
 
 
 def poll_loop():
@@ -4779,7 +4971,7 @@ def _run_mt5_execution(trade_id, symbol, sig, lot):
     """Exécute l'ordre MT5 d'un signal déjà publié et suivi. Ne modifie jamais le statut de suivi (OPEN)."""
     try:
         mt5_position_id = execute_mt5_order(symbol, sig["side"], lot, sig["entry"], sig["sl"], sig["tp"],
-                                            client_id=f"AB{trade_id}")
+                                            client_id=f"AB_{trade_id}_{symbol[:3]}{sig['side'][0]}_{str(int(time.time() * 1000))[-8:]}")
     except Exception as e:   # filet de sécurité : ce thread ne doit jamais mourir en silence
         print(f"[{symbol}] exécution MT5 #{trade_id} : erreur inattendue : {e}")
         traceback.print_exc(limit=-3)
