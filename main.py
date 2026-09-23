@@ -239,6 +239,11 @@ LIMIT_EXPIRY_CANDLES = _env_int("LIMIT_EXPIRY_CANDLES", 30)  # ordre annulé s'i
 # Le lot est calculé uniquement à partir du risque $ et de la distance du SL (aucun solde requis).
 DEFAULT_RISK_USD = _env_float("DEFAULT_RISK_USD", 10.0)  # modifiable à tout moment via /risque
 MAX_RISK_USD = 100000.0
+# Garde-fou spread (trading manuel uniquement) : refuse l'ordre si le spread au moment du clic
+# dépasse ce % du prix — vise les moments anormaux (news, ouverture de session, faible liquidité),
+# pas le scalping M1 normal (le spread y reste d'habitude bien sous ce seuil). Réglable par env ;
+# 0 désactive complètement le contrôle (l'ordre part quel que soit le spread).
+MAX_SPREAD_PCT = _env_float("MAX_SPREAD_PCT", 0.0015)   # 0.15% par défaut (ex. ~6.4 pts sur Gold à 4290)
 # Le levier ne sert qu'à afficher une marge indicative en privé (n'influence jamais le lot).
 DEFAULT_LEVERAGE = _env_float("DEFAULT_LEVERAGE", 200.0)  # modifiable via /levier
 LEVERAGE_PRESETS = (50, 100, 200, 500)
@@ -806,11 +811,17 @@ def _min_stop_distance(spec, symbol):
 def _pick_filling_mode(spec):
     """3. Étape « filling mode » : choisit un mode réellement supporté par le symbole plutôt que
     de supposer IOC/FOK à l'aveugle. Priorité : override MT5_FILLING_MODE (env) si défini, sinon
-    le 1er mode supporté d'après les specs (IOC préféré s'il est dans la liste), sinon fallback IOC."""
+    le 1er mode supporté d'après les specs (IOC préféré s'il est dans la liste), sinon fallback IOC.
+
+    Les specs symbole renvoient les modes au format MQL5 SYMBOL_FILLING_* (ex. SYMBOL_FILLING_FOK),
+    mais l'endpoint /trade attend le format requête ORDER_FILLING_* (ex. ORDER_FILLING_FOK) — les
+    envoyer tels quels déclenche un Validation failed sur fillingModes[0]. On convertit donc le
+    préfixe avant de les proposer au payload."""
     override = os.getenv("MT5_FILLING_MODE", "").strip()
     if override:
         return override
     modes = _spec_get(spec, "fillingModes", "filling_modes", default=None) or []
+    modes = [m.replace("SYMBOL_FILLING_", "ORDER_FILLING_") if isinstance(m, str) else m for m in modes]
     if "ORDER_FILLING_IOC" in modes:
         return "ORDER_FILLING_IOC"
     if modes:
@@ -881,12 +892,18 @@ async def _execute_mt5_order_async(symbol, side, lot, entry, sl, tp, client_id=N
         if tp_dist is not None and tp_dist < min_dist:
             raise SLTooCloseError(symbol, broker_symbol, "TP", min_dist, tp_dist)
 
-    comment = f"AlphaBot {symbol}"[:26]  # MT5 limite les commentaires à ~26-31 caractères
     slippage = get_mt5_slippage(symbol)
     filling_mode = _pick_filling_mode(spec)
+    # MetaApi : longueur totale comment + clientId limitée à 30 caractères si les deux sont
+    # fournis (31 sinon) — voir metaapi.cloud/docs/client/clientIdUsage. On tronque donc le
+    # commentaire en fonction de la longueur réelle du clientId plutôt qu'à une valeur fixe,
+    # pour ne jamais dépasser la limite quel que soit le client_id fourni par l'appelant.
+    cid = (client_id or "")[:32]
+    max_comment = 30 - len(cid) - 1 if cid else 31
+    comment = f"AlphaBot {symbol}"[:max(max_comment, 0)]
     options = {"comment": comment, "slippage": slippage, "fillingMode": filling_mode}
-    if client_id:
-        options["clientId"] = client_id[:32]  # champ MetaApi dédié à la corrélation/anti-doublon
+    if cid:
+        options["clientId"] = cid
 
     async def _place():
         if side == "BUY":
@@ -1150,6 +1167,13 @@ def place_manual_order(symbol, side):
         return {"ok": False, "error": err}
 
     entry = float(price["ask"]) if side == "BUY" else float(price["bid"])
+    spread = abs(float(price["ask"]) - float(price["bid"]))
+    spread_pct = spread / entry if entry else 0
+    max_spread = get_max_spread_pct()
+    if max_spread > 0 and spread_pct > max_spread:
+        return {"ok": False, "error": f"spread trop large au moment du clic ({spread:.2f} pts, "
+                                       f"{spread_pct * 100:.3f}% > seuil {max_spread * 100:.3f}%) — "
+                                       f"probablement une news ou un marché peu liquide, réessaie dans un instant."}
     sl_distance = manual_sl_distance(symbol, entry)
     if not sl_distance or sl_distance <= 0:
         return {"ok": False, "error": "distance SL non calculable (ATR/plancher indisponible)"}
@@ -1162,14 +1186,19 @@ def place_manual_order(symbol, side):
     if lot_info["lot"] <= 0:
         return {"ok": False, "error": "lot calculé nul (risque ou distance SL invalide)"}
 
-    client_id = f"manual-{symbol}-{side}-{int(time.time() * 1000)}"[:32]
+    # clientId MetaApi : format court strategyId_positionId_orderId, alphanumérique uniquement
+    # (pas de tirets) — voir metaapi.cloud/docs/client/clientIdUsage. "MAN" = stratégie manuelle,
+    # code 3 lettres du symbole + 1ère lettre du sens = positionId, fin du timestamp ms = orderId.
+    code = next(k for k, v in _MANUAL_SYMS.items() if v == symbol) if symbol in _MANUAL_SYMS.values() \
+        else symbol[:3].upper()
+    client_id = f"MAN_{code}{side[0]}_{str(int(time.time() * 1000))[-8:]}"
     position_id = execute_mt5_order(symbol, side, lot_info["lot"], entry, sl, tp, client_id=client_id)
     if not position_id:
         return {"ok": False, "error": "ordre refusé par le broker (voir logs serveur pour le détail exact)"}
 
     return {"ok": True, "position_id": position_id, "symbol": symbol, "side": side,
             "entry": entry, "sl": sl, "tp": tp, "lot": lot_info["lot"],
-            "risk_usd": lot_info["real_risk"], "rr": rr,
+            "risk_usd": lot_info["real_risk"], "rr": rr, "spread": spread,
             "raised_to_min": lot_info["raised_to_min"]}
 
 
@@ -1300,6 +1329,14 @@ def get_manual_mode():
 
 def set_manual_mode(on):
     set_setting("manual_mode", "1" if on else "0")
+
+
+def get_max_spread_pct():
+    return float(get_setting("max_spread_pct", MAX_SPREAD_PCT))
+
+
+def set_max_spread_pct(v):
+    set_setting("max_spread_pct", v)
 
 
 def get_leverage():
@@ -3796,6 +3833,7 @@ def _manual_order_text(r):
             f"Lot : {r['lot']:g}\n"
             f"SL : {_fmt(r['sl'], dec)}\n"
             f"TP : {_fmt(r['tp'], dec)}\n"
+            f"Spread : {_fmt(r['spread'], dec)}\n"
             f"Risque : {r['risk_usd']:.2f} $\n"
             f"RR : 1:{r['rr']:g}{warn}")
 
@@ -3890,6 +3928,7 @@ def handle_command(text):
                "/manuel [on|off] — active/désactive le trading manuel Telegram\n"
                "/trade — menu BUY/SELL manuel (exécution directe, sans confirmation)\n"
                "/mpositions — positions réelles du broker + BE/Fermer\n"
+               "/spread [%] — seuil de spread max au-delà duquel un ordre manuel est refusé\n"
                "/slset <ticket> <valeur> — modifie le SL d'une position\n"
                "/tpset <ticket> <valeur> — modifie le TP d'une position\n"
                "/menu — menu à boutons")
@@ -4035,6 +4074,19 @@ def handle_command(text):
         return (_trade_home_text(), _trade_home_keyboard())
     if cmd == "/mpositions":
         return (_mpositions_text(), _mpositions_keyboard())
+    if cmd == "/spread":
+        if len(parts) > 1:
+            try:
+                v = float(parts[1].replace(",", ".").replace("%", "")) / 100
+                if not 0 <= v <= 0.05:
+                    raise ValueError
+                set_max_spread_pct(v)
+            except ValueError:
+                return ("Valeur invalide (0 à 5). Exemple : /spread 0.15  (0 = désactive le contrôle)", None)
+        cur = get_max_spread_pct()
+        return (f"📏 Seuil spread max (trading manuel) : <b>{cur * 100:.3f}%</b>\n"
+                f"Un ordre manuel est refusé si le spread au clic dépasse ce %. 0 = jamais refusé.\n"
+                f"Change avec /spread 0.15 (en %).", None)
     if cmd in ("/slset", "/tpset"):
         if len(parts) < 3:
             return (f"Exemple : {cmd} 123456789 2650.50 (ticket, nouvelle valeur)", None)
