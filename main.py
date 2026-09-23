@@ -417,15 +417,24 @@ class _MetaApiRestConnection:
 
     def _call(self, method, path, body=None):
         url = f"{_metaapi_rest_base()}/users/current/accounts/{METAAPI_ACCOUNT_ID}{path}"
+        if path == "/trade" and isinstance(body, dict):
+            # Log de diagnostic temporaire (aucun secret : ni token ni account ID ici) — permet de
+            # voir EXACTEMENT ce qui part sur le fil avant tout envoi, sans deviner.
+            types = {k: type(v).__name__ for k, v in body.items()}
+            print(f"[metaapi-trade] -> {method} {path} | payload={json.dumps(body, default=str)} | types={types}")
         r = requests.request(method, url, json=body, timeout=METAAPI_REST_TIMEOUT_SEC,
                              headers={"auth-token": METAAPI_TOKEN, "Accept": "application/json"})
+        if path == "/trade":
+            print(f"[metaapi-trade] <- HTTP {r.status_code} | raw={r.text[:2000]}")
         try:
             data = r.json()
         except ValueError:
             data = None
         if r.status_code >= 400:
             if isinstance(data, dict):
-                msg = data.get("message") or data.get("stringCode") or str(data)[:500]
+                details = data.get("details")
+                base = data.get("message") or data.get("stringCode") or str(data)[:500]
+                msg = f"{base} — details: {details}" if details else base
             else:
                 msg = r.text[:500]
             raise RuntimeError(f"MetaApi REST {method} {path} -> HTTP {r.status_code} : {msg}")
@@ -455,11 +464,19 @@ class _MetaApiRestConnection:
 
     async def _market(self, action, symbol, volume, sl, tp, options):
         o = dict(options or {})
-        body = {"actionType": action, "symbol": symbol, "volume": volume}
+        # Normalisation stricte des nombres : jamais de string/None/NaN/inf envoyé à MetaApi.
+        volume = float(volume)
+        if not math.isfinite(volume) or volume <= 0:
+            raise ValueError(f"volume invalide avant envoi MetaApi : {volume!r}")
+        body = {"actionType": action, "symbol": str(symbol), "volume": volume}
         if sl:
-            body["stopLoss"] = sl
+            sl = float(sl)
+            if math.isfinite(sl) and sl > 0:
+                body["stopLoss"] = sl
         if tp:
-            body["takeProfit"] = tp
+            tp = float(tp)
+            if math.isfinite(tp) and tp > 0:
+                body["takeProfit"] = tp
         for k in ("comment", "clientId", "slippage"):
             if o.get(k) is not None:
                 body[k] = o[k]
@@ -480,6 +497,18 @@ class _MetaApiRestConnection:
         if take_profit is not None:
             body["takeProfit"] = take_profit
         return await self._trade(body)
+
+    async def close_position(self, position_id):
+        """Ferme intégralement une position ouverte (POSITION_CLOSE_ID) — utilisé par le mode
+        trading manuel Telegram (bouton 🛑 Fermer)."""
+        body = {"actionType": "POSITION_CLOSE_ID", "positionId": str(position_id)}
+        return await self._trade(body)
+
+    async def get_symbol_price(self, symbol):
+        """Prix bid/ask réel actuellement coté côté broker (endpoint /current-price MetaApi) —
+        utilisé par le mode trading manuel pour ne jamais calculer un lot/SL/TP sur un prix Deriv/
+        Binance qui diffère de celui où l'ordre part réellement."""
+        return await self._acall("GET", f"/symbols/{symbol}/current-price")
 
     async def close(self):
         return None
@@ -734,6 +763,31 @@ async def _get_symbol_spec(connection, broker_symbol):
         return None
 
 
+def _normalize_volume(spec, lot):
+    """Arrondit/clampe le volume sur les VRAIES specs du broker (volumeStep/minVolume/maxVolume
+    renvoyées par MetaApi pour ce symbole), pas seulement sur SYMBOLS[...]['lot_step'] (config
+    statique côté bot qui peut différer du broker réel) — cause plausible d'un 'Validation failed'
+    si le pas/min/max réel du compte Exness diffère de ce qui est codé en dur dans SYMBOLS.
+    Retourne le lot tel quel si les specs ne sont pas disponibles (jamais bloquant par excès)."""
+    if not spec:
+        return lot
+    step = _spec_get(spec, "volumeStep", "stepVolume", "volume_step", default=None)
+    vmin = _spec_get(spec, "minVolume", "volumeMin", "min_volume", default=None)
+    vmax = _spec_get(spec, "maxVolume", "volumeMax", "max_volume", default=None)
+    out = float(lot)
+    if step:
+        step = float(step)
+        out = round(math.floor(out / step + 1e-9) * step, 8)
+    if vmin is not None and out < float(vmin):
+        out = float(vmin)
+    if vmax is not None and out > float(vmax):
+        out = float(vmax)
+    if out != lot:
+        print(f"[metaapi] Volume ajusté aux specs réelles du broker : {lot} -> {out} "
+              f"(step={step}, min={vmin}, max={vmax})")
+    return out
+
+
 def _min_stop_distance(spec, symbol):
     """Distance minimale (en prix brut) entre l'entrée et un SL/TP, d'après stopsLevel (en points)
     x la taille du point, avec la marge MT5_STOP_BUFFER. Retourne 0.0 si les specs ne permettent
@@ -817,6 +871,7 @@ async def _execute_mt5_order_async(symbol, side, lot, entry, sl, tp, client_id=N
     broker_symbol = MT5_SYMBOL_MAP.get(symbol, symbol)
 
     spec = await _get_symbol_spec(connection, broker_symbol)
+    lot = _normalize_volume(spec, lot)
     min_dist = _min_stop_distance(spec, symbol)
     if min_dist > 0:
         sl_dist = abs(entry - sl) if sl else None
@@ -866,15 +921,17 @@ async def _confirm_position_async(connection, position_id):
     """Confirme réellement, côté MT5 (pas seulement via la réponse de création d'ordre), qu'une
     position positionId/orderId existe bien. Best-effort : si la vérification elle-même échoue
     (API indisponible), on ne conclut PAS à un échec d'exécution — seule l'absence confirmée de
-    la position (position introuvable) doit faire douter du succès de l'ordre."""
+    la position (position introuvable) doit faire douter du succès de l'ordre. Retourne aussi le
+    dict position (ou None) pour que l'appelant vérifie que le SL/TP demandés sont réellement
+    attachés côté broker, pas seulement que le HTTP 200 a été reçu."""
     if not position_id:
-        return False, "pas d'identifiant de position renvoyé par MetaApi"
+        return False, "pas d'identifiant de position renvoyé par MetaApi", None
     try:
         positions = await connection.get_positions()
     except Exception as e:
-        return None, f"vérification impossible ({e})"
-    found = any(str(p.get("id")) == str(position_id) for p in positions or [])
-    return found, None
+        return None, f"vérification impossible ({e})", None
+    pos = next((p for p in positions or [] if str(p.get("id")) == str(position_id)), None)
+    return (pos is not None), None, pos
 
 
 def execute_mt5_order(symbol, side, lot, entry, sl, tp, client_id=None):
@@ -911,10 +968,10 @@ def execute_mt5_order(symbol, side, lot, entry, sl, tp, client_id=None):
     # (found=None, ex. API indisponible), on ne bloque pas sur ce doute, l'ordre a déjà un ticket.
     try:
         connection = get_ready_connection()
-        found, reason = _run_mt5(_confirm_position_async(connection, position_id)) \
-            if connection is not None else (None, "connexion MetaApi indisponible pour la confirmation")
+        found, reason, pos = _run_mt5(_confirm_position_async(connection, position_id)) \
+            if connection is not None else (None, "connexion MetaApi indisponible pour la confirmation", None)
     except Exception as e:
-        found, reason = None, f"confirmation impossible ({e})"
+        found, reason, pos = None, f"confirmation impossible ({e})", None
 
     if found is False:
         print(f"[metaapi] Position {position_id} introuvable côté broker après exécution "
@@ -925,6 +982,19 @@ def execute_mt5_order(symbol, side, lot, entry, sl, tp, client_id=None):
               f"considéré exécuté (ticket déjà attribué par MetaApi).")
     else:
         print(f"[metaapi] Position {position_id} confirmée côté broker.")
+        # Vérifie que le SL/TP demandés sont RÉELLEMENT attachés (pas seulement un HTTP 200) :
+        # un écart peut survenir si le broker a accepté l'ordre mais rejeté silencieusement le SL/TP
+        # (rare, mais possible selon le trade mode du symbole).
+        if pos is not None:
+            broker_sl, broker_tp = pos.get("stopLoss"), pos.get("takeProfit")
+            if sl and not broker_sl:
+                print(f"[metaapi] ⚠️ Position {position_id} ouverte MAIS sans SL attaché côté broker "
+                      f"(demandé {sl}) — à vérifier/corriger manuellement.")
+                send(CHAT_ID_ADMIN, f"⚠️ {symbol} {side} — position {position_id} ouverte SANS SL attaché "
+                                     f"(demandé {sl}). Vérifie et corrige manuellement sur MT5/Telegram.")
+            if tp and not broker_tp:
+                print(f"[metaapi] ⚠️ Position {position_id} ouverte MAIS sans TP attaché côté broker "
+                      f"(demandé {tp}).")
 
     print(f"[metaapi] Ordre exécuté : {symbol} {side} lot={lot} entry~{entry} fill={fill_price} SL={sl} TP={tp} "
           f"-> ticket {position_id}")
@@ -983,6 +1053,124 @@ def move_to_breakeven(position_id, entry, side, fees_buffer=None):
 
     print(f"[metaapi] BE appliqué : position {position_id} -> SL={new_sl}")
     return True
+
+
+async def _close_position_async(position_id):
+    connection = await get_metaapi_connection()
+    if connection is None:
+        raise RuntimeError("connexion MetaApi indisponible")
+    return await connection.close_position(position_id)
+
+
+def close_mt5_position(position_id):
+    """Ferme une position MT5 via MetaApi. Ne lève jamais d'exception : (True, None) si fermée,
+    (False, message d'erreur lisible) sinon — à afficher tel quel dans Telegram."""
+    try:
+        _run_mt5(_close_position_async(position_id))
+    except Exception as e:
+        print(f"[metaapi] Échec fermeture position {position_id} : {e}")
+        traceback.print_exc(limit=-3)
+        return False, str(e)
+    return True, None
+
+
+async def _account_summary_async():
+    connection = await get_metaapi_connection()
+    if connection is None:
+        return None
+    info = await connection.get_account_information() or {}
+    positions = await connection.get_positions() or []
+    return {
+        "connected": True,
+        "broker": info.get("broker") or info.get("server") or "Broker inconnu",
+        "server": info.get("server"),
+        "balance": info.get("balance"),
+        "equity": info.get("equity"),
+        "free_margin": info.get("freeMargin"),
+        "currency": info.get("currency") or "",
+        "positions": positions,
+    }
+
+
+def get_account_summary():
+    """Résumé compte/broker pour Telegram (🏦 COMPTE / BROKER). Ne lève jamais d'exception :
+    retourne {"connected": False} si l'API n'est pas joignable, pour ne jamais afficher "Exness"
+    en dur si l'API réellement connectée est différente (ou absente)."""
+    try:
+        res = _run_mt5(_account_summary_async())
+    except Exception as e:
+        print(f"[metaapi] Résumé compte impossible : {e}")
+        return {"connected": False}
+    return res or {"connected": False}
+
+
+REV_MT5_SYMBOL_MAP = {v: k for k, v in MT5_SYMBOL_MAP.items()}
+
+
+def _internal_symbol(broker_symbol):
+    """Symbole interne (XAUUSD/BTCUSD) depuis le symbole broker (ex. XAUUSDm) — l'inverse de
+    MT5_SYMBOL_MAP, pour afficher les positions manuelles avec les mêmes libellés que le reste du bot."""
+    return REV_MT5_SYMBOL_MAP.get(broker_symbol, broker_symbol)
+
+
+async def _manual_price_async(symbol):
+    connection = await _ensure_terminal_ready()
+    if connection is None:
+        return None, "MetaApi non synchronisé (connexion pas encore prête)"
+    broker_symbol = MT5_SYMBOL_MAP.get(symbol, symbol)
+    try:
+        price = await connection.get_symbol_price(broker_symbol)
+    except Exception as e:
+        return None, f"prix indisponible côté broker ({e})"
+    if not price or price.get("bid") is None or price.get("ask") is None:
+        return None, "réponse prix broker invalide (pas de bid/ask)"
+    return price, None
+
+
+def place_manual_order(symbol, side):
+    """Exécute un trade MANUEL déclenché depuis Telegram (📈 TRADE → BUY/SELL), en une seule
+    action, sans confirmation intermédiaire (voir consignes) :
+      1. prix réel broker (MetaApi current-price, pas Deriv/Binance)
+      2. SL via le plancher de risque déjà existant (manual_sl_distance)
+      3. lot via calc_lot (même fonction que le moteur automatique) selon le risque $ configuré
+      4. TP via le RR configuré (get_tp_rr)
+      5. envoi de l'ordre (execute_mt5_order fait déjà toutes les validations techniques : specs,
+         stopsLevel, volume min/max/step, filling mode — et ne lève jamais, retourne None si refusé)
+    Retourne un dict {"ok": True, ...détails...} ou {"ok": False, "error": "..."} — jamais d'exception."""
+    if side not in ("BUY", "SELL"):
+        return {"ok": False, "error": f"side invalide : {side!r}"}
+    if symbol not in SYMBOLS:
+        return {"ok": False, "error": f"symbole inconnu : {symbol!r}"}
+
+    try:
+        price, err = _run_mt5(_manual_price_async(symbol))
+    except Exception as e:
+        price, err = None, str(e)
+    if err:
+        return {"ok": False, "error": err}
+
+    entry = float(price["ask"]) if side == "BUY" else float(price["bid"])
+    sl_distance = manual_sl_distance(symbol, entry)
+    if not sl_distance or sl_distance <= 0:
+        return {"ok": False, "error": "distance SL non calculable (ATR/plancher indisponible)"}
+    d = 1 if side == "BUY" else -1
+    sl = entry - d * sl_distance
+    rr = get_tp_rr()
+    tp = entry + d * sl_distance * rr
+
+    lot_info = calc_lot(symbol, get_risk(), sl_distance)
+    if lot_info["lot"] <= 0:
+        return {"ok": False, "error": "lot calculé nul (risque ou distance SL invalide)"}
+
+    client_id = f"manual-{symbol}-{side}-{int(time.time() * 1000)}"[:32]
+    position_id = execute_mt5_order(symbol, side, lot_info["lot"], entry, sl, tp, client_id=client_id)
+    if not position_id:
+        return {"ok": False, "error": "ordre refusé par le broker (voir logs serveur pour le détail exact)"}
+
+    return {"ok": True, "position_id": position_id, "symbol": symbol, "side": side,
+            "entry": entry, "sl": sl, "tp": tp, "lot": lot_info["lot"],
+            "risk_usd": lot_info["real_risk"], "rr": rr,
+            "raised_to_min": lot_info["raised_to_min"]}
 
 
 async def _mt5_open_position_ids_async():
@@ -1104,6 +1292,14 @@ def get_risk():
 
 def set_risk(v):
     set_setting("risk_usd", round(float(v), 2))
+
+
+def get_manual_mode():
+    return get_setting("manual_mode", "0") == "1"
+
+
+def set_manual_mode(on):
+    set_setting("manual_mode", "1" if on else "0")
 
 
 def get_leverage():
@@ -2364,6 +2560,26 @@ def calc_margin(symbol, lot, price, leverage):
     return notional / leverage
 
 
+def manual_sl_distance(symbol, entry):
+    """Distance SL (en points, prix brut) pour un trade MANUEL déclenché depuis Telegram, en
+    réutilisant le même plancher que le moteur automatique (build_signal) : max(MIN_SL_ATR x ATR,
+    entrée x min_sl_pct). Un trade manuel n'a pas de CHoCH/structure à mesurer (pas de sl_level) —
+    on ne réinvente donc pas un système de SL, on applique le plancher de risque déjà en place,
+    qui est la seule partie de la logique SL existante réutilisable sans contexte de signal.
+    Retourne None si l'ATR n'est pas calculable (pas assez de bougies)."""
+    try:
+        candles = get_candles(symbol)
+        atr = atr_series(candles)[-1] if candles else None
+    except Exception as e:
+        print(f"[manuel] ATR indisponible pour {symbol} ({e}) — plancher % seul utilisé.")
+        atr = None
+    min_pct = SYMBOLS.get(symbol, {}).get("min_sl_pct", MIN_SL_PCT)
+    candidates = [entry * min_pct]
+    if atr:
+        candidates.append(MIN_SL_ATR * atr)
+    return max(candidates)
+
+
 # ============================================================================
 # 6. SUIVI DES POSITIONS
 #
@@ -3502,6 +3718,126 @@ def _analyse_symbol_keyboard(symbol):
     ]}
 
 
+# --- 🏦 TRADING MANUEL (Telegram) --------------------------------------------------------------
+# Section isolée, ajoutée sans toucher au moteur de signal automatique. Utilise l'API déjà
+# connectée (MetaApi REST / MT5) — jamais de 2e connexion, jamais de nom de broker codé en dur :
+# le nom réel vient de get_account_information() (voir get_account_summary).
+_MANUAL_SYMS = {"XAU": "XAUUSD", "BTC": "BTCUSD"}
+
+
+def _compte_text():
+    s = get_account_summary()
+    if not s.get("connected"):
+        return "🔴 <b>API : DÉCONNECTÉE</b>\n\nMetaApi n'est pas joignable pour le moment — réessaie dans quelques secondes."
+    cur = s.get("currency") or ""
+    n_pos = len(s.get("positions") or [])
+    return (
+        f"🟢 <b>API : CONNECTÉ</b>\n"
+        f"🏦 Broker : {s.get('broker')}\n"
+        f"💰 Balance : {s.get('balance'):,.2f} {cur}\n".replace(",", " ")
+        + f"📊 Equity : {s.get('equity'):,.2f} {cur}\n".replace(",", " ")
+        + f"💳 Marge disponible : {s.get('free_margin'):,.2f} {cur}\n".replace(",", " ")
+        + f"📌 Positions ouvertes : {n_pos}"
+    )
+
+
+def _compte_keyboard():
+    return _with_back({"inline_keyboard": [
+        [{"text": "🔄 Actualiser", "callback_data": "acc:home"}, {"text": "📌 Positions", "callback_data": "mpos:home"}]]})
+
+
+def _manuel_text():
+    auto_on = True   # le moteur automatique tourne toujours (pas d'ON/OFF global sur ce bot) — affiché pour repère
+    return (f"🤖 AUTO : {'ON' if auto_on else 'OFF'}\n"
+            f"👤 MANUEL : {'ON' if get_manual_mode() else 'OFF'}\n\n"
+            f"Quand MANUEL est OFF, les boutons BUY/SELL du menu 📈 TRADE n'exécutent aucun ordre.\n"
+            f"💵 Risque par trade : {get_risk():g} $ (menu 💰 Risque)\n"
+            f"🎯 RR : {get_tp_rr():g} (menu ⚙️ Paramètres signal)")
+
+
+def _manuel_keyboard():
+    on = get_manual_mode()
+    return _with_back({"inline_keyboard": [[
+        {"text": ("✅ " if on else "") + "🟢 ON", "callback_data": "man:on"},
+        {"text": ("✅ " if not on else "") + "🔴 OFF", "callback_data": "man:off"}]]})
+
+
+def _trade_home_text():
+    return "📈 <b>TRADE</b>\n\nChoisis l'actif." + ("" if get_manual_mode() else
+           "\n\n⚠️ Trading manuel OFF (menu 👤 Manuel) — aucun ordre ne partira tant qu'il n'est pas activé.")
+
+
+def _trade_home_keyboard():
+    return _with_back({"inline_keyboard": [
+        [{"text": "🟠 XAUUSD", "callback_data": "mtr:sym:XAU"}, {"text": "₿ BTCUSD", "callback_data": "mtr:sym:BTC"}]]})
+
+
+def _trade_side_text(symbol):
+    return (f"📈 <b>{symbol}</b>\n\n"
+            f"💵 Risque : {get_risk():g} $ · 🎯 RR : {get_tp_rr():g}\n"
+            f"Le lot, le SL et le TP sont calculés automatiquement au prix réel du broker au moment du clic.\n\n"
+            f"⚡️ Le clic exécute directement l'ordre (pas de confirmation).")
+
+
+def _trade_side_keyboard(symbol):
+    code = next(k for k, v in _MANUAL_SYMS.items() if v == symbol)
+    return {"inline_keyboard": [
+        [{"text": "🟢 BUY", "callback_data": f"mtr:buy:{code}"}, {"text": "🔴 SELL", "callback_data": f"mtr:sell:{code}"}],
+        [{"text": "🔙 Trade", "callback_data": "mtr:home"}, {"text": "🔙 Menu", "callback_data": "menu:home"}]]}
+
+
+def _manual_order_text(r):
+    if not r["ok"]:
+        return f"❌ <b>Ordre refusé</b>\n\nCause : {r['error']}"
+    dec = SYMBOLS[r["symbol"]]["decimals"]
+    warn = "\n⚠️ Lot minimum appliqué : risque réel différent du montant configuré." if r["raised_to_min"] else ""
+    return (f"✅ <b>{r['symbol']} {r['side']} exécuté</b>\n\n"
+            f"Entrée : {_fmt(r['entry'], dec)}\n"
+            f"Lot : {r['lot']:g}\n"
+            f"SL : {_fmt(r['sl'], dec)}\n"
+            f"TP : {_fmt(r['tp'], dec)}\n"
+            f"Risque : {r['risk_usd']:.2f} $\n"
+            f"RR : 1:{r['rr']:g}{warn}")
+
+
+def _pos_side(p):
+    return "BUY" if str(p.get("type", "")).endswith("BUY") else "SELL"
+
+
+def _mpositions_text():
+    s = get_account_summary()
+    if not s.get("connected"):
+        return "🔴 API déconnectée — positions indisponibles."
+    positions = s.get("positions") or []
+    if not positions:
+        return "📌 <b>POSITIONS (broker)</b>\n\nAucune position ouverte."
+    lines = []
+    for p in positions:
+        sym = _internal_symbol(p.get("symbol", ""))
+        dec = SYMBOLS.get(sym, {}).get("decimals", 2)
+        side = _pos_side(p)
+        icon = "🟢" if side == "BUY" else "🔴"
+        sl = p.get("stopLoss")
+        tp = p.get("takeProfit")
+        lines.append(f"{icon} <b>{sym} {side}</b> · lot {p.get('volume')}\n"
+                     f"Entrée : {_fmt(p.get('openPrice', 0), dec)}\n"
+                     f"SL : {_fmt(sl, dec) if sl else '—'} · TP : {_fmt(tp, dec) if tp else '—'}\n"
+                     f"P&L : {p.get('profit', 0):.2f} $ · ticket {p.get('id')}")
+    return "📌 <b>POSITIONS (broker)</b>\n\n" + "\n\n".join(lines)
+
+
+def _mpositions_keyboard():
+    s = get_account_summary()
+    rows = []
+    for p in (s.get("positions") or []) if s.get("connected") else []:
+        pid = str(p.get("id"))
+        sym = _internal_symbol(p.get("symbol", ""))
+        rows.append([{"text": f"🟢 BE+frais {sym} #{pid}", "callback_data": f"mpos:be:{pid}"},
+                     {"text": f"🛑 Fermer #{pid}", "callback_data": f"mpos:close:{pid}"}])
+    rows.append([{"text": "🔄 Actualiser", "callback_data": "mpos:home"}])
+    return _with_back({"inline_keyboard": rows})
+
+
 def _menu_keyboard():
     return {"inline_keyboard": [
         [{"text": "💰 Risque", "callback_data": "menu:risque"}, {"text": "⚙️ Levier", "callback_data": "menu:levier"}],
@@ -3509,6 +3845,8 @@ def _menu_keyboard():
         [{"text": "📊 Stats", "callback_data": "menu:stats"}, {"text": "📈 Positions", "callback_data": "menu:trades"}],
         [{"text": "📊 Analyse", "callback_data": "ana:home"}],
         [{"text": "⚙️ Paramètres signal", "callback_data": "menu:signal"}],
+        [{"text": "🏦 Compte", "callback_data": "acc:home"}, {"text": "👤 Manuel", "callback_data": "man:home"}],
+        [{"text": "📈 Trade", "callback_data": "mtr:home"}, {"text": "📌 Positions broker", "callback_data": "mpos:home"}],
         [{"text": "🔄 Actualiser", "callback_data": "menu:home"}],
     ]}
 
@@ -3548,6 +3886,12 @@ def handle_command(text):
                "/mtffib [on|off] — filtre Fibonacci HTF Premium/Discount\n"
                "/medias — stickers / images / GIF du groupe (TP, SL, BE, motivation)\n"
                "/analyse — analyse technique / fondamentale à la demande (BTCUSD, XAUUSD)\n"
+               "/compte — statut API/broker, balance, equity, marge\n"
+               "/manuel [on|off] — active/désactive le trading manuel Telegram\n"
+               "/trade — menu BUY/SELL manuel (exécution directe, sans confirmation)\n"
+               "/mpositions — positions réelles du broker + BE/Fermer\n"
+               "/slset <ticket> <valeur> — modifie le SL d'une position\n"
+               "/tpset <ticket> <valeur> — modifie le TP d'une position\n"
                "/menu — menu à boutons")
         return (txt, _menu_keyboard())
     if cmd in ("/analyse", "/analyze"):
@@ -3677,6 +4021,40 @@ def handle_command(text):
                          f"RR actuel : {rr_str}\n"
                          f"Lot : {t['lot']:g}")
         return ("📈 <b>POSITIONS EN COURS</b>\n\n" + "\n\n".join(lines), None)
+    if cmd == "/compte":
+        return (_compte_text(), _compte_keyboard())
+    if cmd == "/manuel":
+        if len(parts) > 1:
+            arg = parts[1].strip().lower()
+            if arg in ("on", "1", "true", "activer", "activé"):
+                set_manual_mode(True)
+            elif arg in ("off", "0", "false", "desactiver", "désactiver"):
+                set_manual_mode(False)
+        return (_manuel_text(), _manuel_keyboard())
+    if cmd == "/trade":
+        return (_trade_home_text(), _trade_home_keyboard())
+    if cmd == "/mpositions":
+        return (_mpositions_text(), _mpositions_keyboard())
+    if cmd in ("/slset", "/tpset"):
+        if len(parts) < 3:
+            return (f"Exemple : {cmd} 123456789 2650.50 (ticket, nouvelle valeur)", None)
+        try:
+            pos_id, value = parts[1], float(parts[2].replace(",", "."))
+        except ValueError:
+            return ("Valeur invalide. Exemple : /slset 123456789 2650.50", None)
+        try:
+            async def _do():
+                conn = await get_metaapi_connection()
+                if conn is None:
+                    raise RuntimeError("connexion MetaApi indisponible")
+                if cmd == "/slset":
+                    return await conn.modify_position(pos_id, stop_loss=value)
+                return await conn.modify_position(pos_id, take_profit=value)
+            _run_mt5(_do())
+        except Exception as e:
+            return (f"❌ Modification refusée : {e}", None)
+        label = "SL" if cmd == "/slset" else "TP"
+        return (f"✅ {label} de la position {pos_id} mis à jour : {value:g}", None)
     return ("Commande inconnue. /aide", None)
 
 
@@ -3813,6 +4191,63 @@ def _handle_update(u):
                 txt = build_fundamental_analysis(sym)
                 send(cq["message"]["chat"]["id"], txt, reply_markup=_analyse_symbol_keyboard(sym))
                 ack = "Analyse envoyée"
+        elif data == "acc:home":
+            _edit(cq, _compte_text(), _compte_keyboard())
+            ack = "Actualisé"
+        elif data == "man:home":
+            _edit(cq, _manuel_text(), _manuel_keyboard())
+        elif data == "man:on":
+            set_manual_mode(True)
+            _edit(cq, _manuel_text(), _manuel_keyboard())
+            ack = "Manuel : ON"
+        elif data == "man:off":
+            set_manual_mode(False)
+            _edit(cq, _manuel_text(), _manuel_keyboard())
+            ack = "Manuel : OFF"
+        elif data == "mtr:home":
+            _edit(cq, _trade_home_text(), _trade_home_keyboard())
+        elif data.startswith("mtr:sym:"):
+            sym = _MANUAL_SYMS.get(data[8:])
+            if sym:
+                _edit(cq, _trade_side_text(sym), _trade_side_keyboard(sym))
+        elif data.startswith("mtr:buy:") or data.startswith("mtr:sell:"):
+            side = "BUY" if data.startswith("mtr:buy:") else "SELL"
+            code = data.split(":")[2]
+            sym = _MANUAL_SYMS.get(code)
+            if not sym:
+                pass
+            elif not get_manual_mode():
+                _post("answerCallbackQuery",
+                      {"callback_query_id": cq["id"], "text": "👤 Manuel OFF — active-le d'abord.", "show_alert": True})
+                return
+            else:
+                _post("answerCallbackQuery", {"callback_query_id": cq["id"], "text": f"⏳ {side} {sym}…"})
+                r = place_manual_order(sym, side)
+                _edit(cq, _manual_order_text(r), _trade_side_keyboard(sym))
+                if r["ok"]:
+                    to_admin(f"👤 Trade manuel : {_manual_order_text(r)}")
+                return
+        elif data == "mpos:home":
+            _edit(cq, _mpositions_text(), _mpositions_keyboard())
+            ack = "Actualisé"
+        elif data.startswith("mpos:be:"):
+            pid = data[8:]
+            positions = (get_account_summary().get("positions") or [])
+            p = next((p for p in positions if str(p.get("id")) == pid), None)
+            if p is None:
+                ack = "Position introuvable (déjà fermée ?)"
+            else:
+                sym = _internal_symbol(p.get("symbol", ""))
+                side = _pos_side(p)
+                buffer = get_be_fees_buffer(sym)
+                ok = move_to_breakeven(pid, float(p.get("openPrice", 0)), side, buffer)
+                ack = "✅ BE appliqué" if ok else "❌ Échec BE (voir logs)"
+            _edit(cq, _mpositions_text(), _mpositions_keyboard())
+        elif data.startswith("mpos:close:"):
+            pid = data[11:]
+            ok, err = close_mt5_position(pid)
+            ack = "✅ Position fermée" if ok else f"❌ {err}"
+            _edit(cq, _mpositions_text(), _mpositions_keyboard())
         elif data == "menu:home":
             _edit(cq, _home_text(), _menu_keyboard())
         elif data.startswith("menu:") and data[5:] in _MENU_ACTIONS:
