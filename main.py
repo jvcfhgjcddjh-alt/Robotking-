@@ -424,7 +424,10 @@ class _MetaApiRestConnection:
         except ValueError:
             data = None
         if r.status_code >= 400:
-            msg = (data.get("message") or data.get("stringCode")) if isinstance(data, dict) else r.text[:200]
+            if isinstance(data, dict):
+                msg = data.get("message") or data.get("stringCode") or str(data)[:500]
+            else:
+                msg = r.text[:500]
             raise RuntimeError(f"MetaApi REST {method} {path} -> HTTP {r.status_code} : {msg}")
         return data
 
