@@ -715,6 +715,29 @@ def start_metaapi_background():
     threading.Thread(target=_metaapi_background_loop, daemon=True, name="metaapi-bg").start()
 
 
+# clientId MetaApi : format strategyId_positionId_orderId, TROIS blocs alphanumériques séparés par « _ » (ex. RF_EURUSD_GjCy5lk),
+# 30 caractères max avec le commentaire — voir metaapi.cloud/docs/client/clientIdUsage. L'ancien format à 4 blocs
+# (AB_3_BTCB_98649045) était refusé en HTTP 400 à CHAQUE ordre puis renvoyé sans clientId.
+_CLIENT_ID_RE = re.compile(r"[A-Za-z0-9]+_[A-Za-z0-9]+_[A-Za-z0-9]+")
+
+
+def _sanitize_client_id(client_id):
+    """Retourne le clientId s'il respecte le format MetaApi, sinon "" (jamais envoyé : évite un HTTP 400 + un 2e envoi)."""
+    cid = (client_id or "").strip()
+    if not cid:
+        return ""
+    if len(cid) > 30 or not _CLIENT_ID_RE.fullmatch(cid):
+        print(f"[metaapi] clientId {cid!r} non conforme (strategyId_positionId_orderId alphanumérique, 30 car. max) "
+              f"— non envoyé.")
+        return ""
+    return cid
+
+
+def _auto_client_id(trade_id, symbol, side):
+    """clientId d'un ordre automatique : AB (stratégie) _ <id trade><symbole><sens> (position) _ <fin timestamp> (ordre)."""
+    return f"AB_{trade_id}{str(symbol)[:3].upper()}{str(side)[:1].upper()}_{str(int(time.time() * 1000))[-8:]}"
+
+
 class SLTooCloseError(Exception):
     """Levée quand le SL (ou le TP) calculé par le moteur de signal est plus proche du prix
     d'entrée que le stopsLevel minimum imposé par le broker pour ce symbole. Ne doit JAMAIS
@@ -1138,7 +1161,7 @@ async def _execute_mt5_order_async(symbol, side, lot, entry, sl, tp, client_id=N
     filling_modes = _pick_filling_modes(spec)   # 1/3. jamais IOC forcé si les specs ne le confirment pas
     # MetaApi : longueur totale comment + clientId limitée à 30 caractères si les deux sont
     # fournis (31 sinon) — voir metaapi.cloud/docs/client/clientIdUsage.
-    cid = (client_id or "")[:32]
+    cid = _sanitize_client_id(client_id)
     max_comment = 30 - len(cid) - 1 if cid else 31
     comment = f"AlphaBot {symbol}"[:max(max_comment, 0)]
     options = {"comment": comment, "slippage": slippage}
@@ -1298,6 +1321,16 @@ def execute_mt5_order(symbol, side, lot, entry, sl, tp, client_id=None):
               f"considéré exécuté (ticket déjà attribué par MetaApi).")
     else:
         print(f"[metaapi] Position {position_id} confirmée côté broker.")
+        if pos is not None:
+            try:
+                real_vol = float(pos.get("volume") or 0)
+            except (TypeError, ValueError):
+                real_vol = 0.0
+            if real_vol > 0 and abs(real_vol - float(lot)) > 1e-9:
+                print(f"[metaapi] Volume réellement exécuté : {real_vol:g} (lot du bot {float(lot):g}, arrondi aux specs du broker).")
+                lot = real_vol
+            if pos.get("openPrice") is not None:
+                print(f"[metaapi] Prix d'ouverture réel broker : {pos.get('openPrice')} (signal {entry}).")
         # Vérifie que le SL/TP demandés sont RÉELLEMENT attachés (pas seulement un HTTP 200) :
         # un écart peut survenir si le broker a accepté l'ordre mais rejeté silencieusement le SL/TP
         # (rare, mais possible selon le trade mode du symbole).
@@ -1376,6 +1409,11 @@ def _be_market_check(side, new_sl, bid, ask, min_dist=0.0):
     return (new_sl - ask) > min_dist, f"ask {ask:.2f} / SL {new_sl:.2f} (distance {new_sl - ask:.2f}, min {min_dist:g})"
 
 
+class BENotApplied(RuntimeError):
+    """BE volontairement NON envoyé par la double vérification (net < cible, ou prix déjà au-delà du BE) : le SL d'origine
+    reste en place. Ce n'est pas une panne — pas de traceback dans les logs."""
+
+
 async def _move_to_breakeven_async(position_id, entry, side, symbol, lot):
     """Modifie le SL d'une position MT5 déjà ouverte pour le placer au BE + buffer visant BE_TARGET_USD NET (+0.01 $ par
     défaut) sur le volume RÉEL de la position. Double vérification :
@@ -1437,7 +1475,7 @@ async def _move_to_breakeven_async(position_id, entry, side, symbol, lot):
                f"{BE_TARGET_USD:+.2f} $ (ouverture {px(open_px)}, SL {px(new_sl)}, volume {volume:g}).")
         print(f"[be-check] ❌ {msg}")
         send(CHAT_ID_ADMIN, f"⚠️ {msg}")
-        raise RuntimeError(msg)
+        raise BENotApplied(msg)
 
     # jamais dégrader un SL déjà meilleur (BE déjà posé, SL suiveur, etc.)
     if cur_sl is not None and (cur_sl - new_sl) * sgn >= 0:
@@ -1462,7 +1500,7 @@ async def _move_to_breakeven_async(position_id, entry, side, symbol, lot):
                f"BE {symbol} {side} #{position_id} NON appliqué : {mkt_detail}.")
         print(f"[be-check] ❌ {msg}")
         send(CHAT_ID_ADMIN, f"⚠️ {msg}")
-        raise RuntimeError(msg)
+        raise BENotApplied(msg)
 
     # Le BE ne touche QUE le SL : le TP doit rester. Priorité au TP réellement attaché côté broker (peut avoir
     # été changé à la main via /tpset) ; s'il est vide, on retombe sur le TP du trade en base.
@@ -1521,6 +1559,9 @@ def move_to_breakeven(position_id, entry, side, symbol, lot):
         return False
     try:
         _run_mt5(_move_to_breakeven_async(position_id, entry, side, symbol, lot))
+    except BENotApplied as e:   # refus voulu de la double vérification : déjà loggé + alerte admin
+        print(f"[metaapi] BE non appliqué position={position_id} : {e}")
+        return False
     except Exception as e:
         print(f"[metaapi] Échec move_to_breakeven position={position_id} : {e}")
         traceback.print_exc(limit=-3)
@@ -5140,7 +5181,7 @@ def _run_mt5_execution(trade_id, symbol, sig, lot):
     """Exécute l'ordre MT5 d'un signal déjà publié et suivi. Ne modifie jamais le statut de suivi (OPEN)."""
     try:
         mt5_position_id = execute_mt5_order(symbol, sig["side"], lot, sig["entry"], sig["sl"], sig["tp"],
-                                            client_id=f"AB_{trade_id}_{symbol[:3]}{sig['side'][0]}_{str(int(time.time() * 1000))[-8:]}")
+                                            client_id=_auto_client_id(trade_id, symbol, sig["side"]))
     except Exception as e:   # filet de sécurité : ce thread ne doit jamais mourir en silence
         print(f"[{symbol}] exécution MT5 #{trade_id} : erreur inattendue : {e}")
         traceback.print_exc(limit=-3)
@@ -6349,6 +6390,57 @@ class _FakeBE:
                         p["takeProfit"] = take_profit
 
 
+class TestClientId(unittest.TestCase):
+    """clientId MetaApi : 3 blocs alphanumériques ; un id non conforme n'est jamais envoyé (plus de HTTP 400 à chaque ordre)."""
+
+    def test_format_auto_conforme(self):
+        for tid in (3, 42, 12345, 123456):
+            for sym, side in (("BTCUSD", "BUY"), ("XAUUSD", "SELL")):
+                cid = _E._auto_client_id(tid, sym, side)
+                self.assertEqual(_E._sanitize_client_id(cid), cid, cid)   # conforme -> conservé
+                self.assertEqual(cid.count("_"), 2, cid)
+                self.assertLessEqual(len(cid), 30, cid)
+
+    def test_ancien_format_refuse_localement(self):
+        self.assertEqual(_E._sanitize_client_id("AB_3_BTCB_98649045"), "")   # 4 blocs : celui rejeté en HTTP 400
+        self.assertEqual(_E._sanitize_client_id("AB-3-BTCB"), "")
+        self.assertEqual(_E._sanitize_client_id(""), "")
+        self.assertEqual(_E._sanitize_client_id(None), "")
+
+    def test_format_manuel_conforme(self):
+        self.assertEqual(_E._sanitize_client_id("MAN_BTCB_12345678"), "MAN_BTCB_12345678")
+
+    def test_commentaire_tient_dans_30_caracteres(self):
+        cid = _E._auto_client_id(123456, "BTCUSD", "BUY")
+        comment = f"AlphaBot BTCUSD"[:max(30 - len(cid) - 1, 0)]
+        self.assertLessEqual(len(cid) + len(comment), 30)
+
+
+class TestLogVolumeReel(unittest.TestCase):
+    """Après un arrondi de volume (0.059 -> 0.05), le message « Ordre exécuté » affiche le volume réellement exécuté."""
+
+    def test_ordre_execute_affiche_le_volume_broker(self):
+        class Conn:
+            async def get_positions(self):
+                return [{"id": "99", "volume": 0.05, "openPrice": 84385.3, "stopLoss": 84212.89, "takeProfit": 84887.94}]
+
+        async def fake_exec(*a, **k):
+            return {"positionId": "99", "numericCode": 10009}
+        saved = (_E._execute_mt5_order_async, _E.get_ready_connection)
+        _E._execute_mt5_order_async, _E.get_ready_connection = fake_exec, (lambda: Conn())
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                pid = _E.execute_mt5_order("BTCUSD", "BUY", 0.059, 84381.65, 84212.89, 84887.94, client_id="AB_3BTCB_98649045")
+        finally:
+            _E._execute_mt5_order_async, _E.get_ready_connection = saved
+        out = buf.getvalue()
+        self.assertEqual(pid, "99")
+        self.assertIn("Ordre exécuté : BTCUSD BUY lot=0.05 ", out)
+        self.assertNotIn("lot=0.059 entry", out)
+        self.assertIn("Prix d'ouverture réel broker : 84385.3", out)
+
+
 class TestBEDoubleVerif(unittest.TestCase):
     """BE : SL calculé sur l'ouverture et le volume RÉELS du broker (spread inclus), net attendu >= +0.01 $, contrôle
     marché (bid/ask) avant envoi, relecture après envoi, TP conservé, jamais de SL dégradé."""
@@ -6444,7 +6536,7 @@ def _selftest():
     suite, loader = unittest.TestSuite(), unittest.TestLoader()
     for cls in (TestRetracement, TestContinuation, TestInvalidationHTF, TestChop, TestGetExtTf,
                 TestLiquiditePure, TestM1NeDecidePasSeul, TestLogs, TestEntreeM5, TestNonRegression,
-                TestHtfM15, TestBE, TestSignauxSimultanes, TestLectureExtInt, TestModifyPositionGardeSLTP, TestBEDoubleVerif):
+                TestHtfM15, TestBE, TestSignauxSimultanes, TestLectureExtInt, TestModifyPositionGardeSLTP, TestBEDoubleVerif, TestClientId, TestLogVolumeReel):
         suite.addTests(loader.loadTestsFromTestCase(cls))
     return 0 if unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful() else 1
 
