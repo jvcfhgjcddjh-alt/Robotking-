@@ -1112,7 +1112,13 @@ async def _execute_mt5_order_async(symbol, side, lot, entry, sl, tp, client_id=N
         if tp_dist is not None and tp_dist < min_dist:
             raise SLTooCloseError(symbol, broker_symbol, "TP", min_dist, tp_dist)
 
-    slippage = get_mt5_slippage(symbol)
+    slippage = get_mt5_slippage(symbol)   # exprimé en prix brut (ex. 0.5 = 50 cts sur l'or)
+    # MetaApi / MT5 attendent la déviation en POINTS entiers (point=0.001 sur XAUUSDm : 0.5 envoyé tel quel = 0 point).
+    _pt = _spec_get(spec, "point", "tickSize", "tick_size", default=None) if spec else None
+    if not _pt:
+        _pt = 10 ** (-int(_spec_get(spec, "digits", default=SYMBOLS.get(symbol, {}).get("decimals", 2)) if spec
+                          else SYMBOLS.get(symbol, {}).get("decimals", 2)))
+    slippage = max(int(round(float(slippage) / float(_pt))), 1)
     filling_modes = _pick_filling_modes(spec)   # 1/3. jamais IOC forcé si les specs ne le confirment pas
     # MetaApi : longueur totale comment + clientId limitée à 30 caractères si les deux sont
     # fournis (31 sinon) — voir metaapi.cloud/docs/client/clientIdUsage.
@@ -1152,7 +1158,18 @@ async def _execute_mt5_order_async(symbol, side, lot, entry, sl, tp, client_id=N
         print(f"[metaapi] ⚠️ UNKNOWN sans position retrouvée | symbol={broker_symbol} side={side} "
               f"lot={lot} sl={sl} tp={tp} fillingModes={filling_modes} account={acc} "
               f"raw={e.raw_response!r}")
-        raise
+        # Diagnostic : aucune position n'existe (vérifié ci-dessus) -> UN seul essai en payload minimal
+        # (sans slippage ni fillingModes), pour isoler le paramètre fautif. Pas de boucle, pas de 3e envoi.
+        minimal = {k: v for k, v in options.items() if k not in ("slippage", "fillingModes")}
+        try:
+            print("[metaapi] Essai unique en payload minimal (sans slippage, sans fillingModes)...")
+            res = await _place(minimal)
+            print("[metaapi] ✅ Payload minimal ACCEPTÉ -> le paramètre fautif est slippage et/ou fillingModes.")
+            return res
+        except Exception as e2:
+            print(f"[metaapi] Payload minimal refusé aussi : {e2} -> cause hors payload "
+                  f"(marché fermé / trading désactivé sur le compte / droits du mot de passe).")
+        raise e
 
     except Exception as e:
         msg = str(e)
