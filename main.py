@@ -1,6 +1,5 @@
 
 
-
 #!/usr/bin/env python3
 """AlphaBot BOS + CHoCH — Gold & BTC — version en un seul fichier.
 
@@ -337,6 +336,12 @@ LIMIT_ZONES = ("BOTH", "OB", "FVG")
 # Le lot est calculé uniquement à partir du risque $ et de la distance du SL (aucun solde requis).
 DEFAULT_RISK_USD = _env_float("DEFAULT_RISK_USD", 10.0)  # modifiable à tout moment via /risque
 MAX_RISK_USD = 100000.0
+# RISK_STRICT ON (défaut) : le risque réel ne doit JAMAIS dépasser le risque configuré. Si le lot
+# minimum du broker forcerait un risque réel > risque demandé (au-delà de RISK_STRICT_TOLERANCE_PCT
+# de marge), le signal/trade est REFUSÉ plutôt que pris avec un risque plus élevé que prévu.
+# RISK_STRICT OFF : ancien comportement -> lot minimum forcé quand même, risque réel plus élevé toléré.
+RISK_STRICT = _env_bool("RISK_STRICT", True)
+RISK_STRICT_TOLERANCE_PCT = _env_float("RISK_STRICT_TOLERANCE_PCT", 0.0)  # 0 = tolérance nulle (strict pur) ; 0.10 = tolère jusqu'à +10%
 # Garde-fou spread (trading manuel uniquement) : refuse l'ordre si le spread au moment du clic
 # dépasse ce % du prix — vise les moments anormaux (news, ouverture de session, faible liquidité),
 # pas le scalping M1 normal (le spread y reste d'habitude bien sous ce seuil). Réglable par env ;
@@ -1771,7 +1776,8 @@ def _manual_plan(symbol, side, sl_price=None):
 
     lot_info = calc_lot(symbol, get_risk(), sl_distance, price=entry)
     if lot_info["lot"] <= 0:
-        return {"ok": False, "error": "lot calculé nul (risque ou distance SL invalide)"}
+        return {"ok": False, "error": lot_info.get("rejected_reason")
+                or "lot calculé nul (risque ou distance SL invalide)"}
     return {"ok": True, "symbol": symbol, "side": side, "entry": entry, "spread": spread, "sl": sl, "tp": tp,
             "sl_distance": sl_distance, "lot_info": lot_info, "rr": rr, "custom_sl": sl_price is not None}
 
@@ -2073,6 +2079,22 @@ def get_session():
 
 def get_limit_zone():
     return _get_choice("limit_zone", "BOTH", LIMIT_ZONES)
+
+
+SYMBOLS_ON_DEFAULT = {x.strip().upper() for x in os.getenv("SYMBOLS_ON", "XAUUSD,BTCUSD").split(",") if x.strip()}
+
+
+def get_symbol_on(symbol):
+    """Actif activé (nouveaux signaux) ? Dernier choix Telegram (menu « 🌍 ACTIFS »), sinon variable SYMBOLS_ON
+    (défaut : XAUUSD, BTCUSD). Un actif désactivé continue de SUIVRE ses positions déjà ouvertes, sans en ouvrir de nouvelles."""
+    return _get_bool_setting("sym_on_" + symbol, symbol in SYMBOLS_ON_DEFAULT)
+
+
+def set_symbol_on(symbol, on):
+    if symbol not in SYMBOLS:
+        return False
+    set_setting("sym_on_" + symbol, "1" if on else "0")
+    return True
 
 
 def get_qf(key):
@@ -3706,21 +3728,37 @@ def build_signal(c, ev, symbol=None, multi=False):
 def calc_lot(symbol, risk_usd, sl_distance, price=None):
     """Lot = montant risqué / (distance SL en points x valeur du point par lot).
 
-    Arrondi vers le bas au pas du broker ; si le résultat est sous le lot minimum,
-    retourne le lot minimum (le risque réel sera alors plus élevé : voir 'real_risk').
+    Arrondi vers le bas au pas du broker (le risque réel arrondi est donc toujours <= risque
+    demandé, jamais un souci). Cas limite : si même le lot minimum du broker fait dépasser le
+    risque demandé (SL trop serré / risque $ trop petit pour ce symbole) :
+      - RISK_STRICT ON (défaut) : le lot minimum n'est PAS forcé au-delà de RISK_STRICT_TOLERANCE_PCT
+        de dépassement -> lot=0.0, 'rejected_reason' explique pourquoi (le signal est alors ignoré
+        par l'appelant, jamais pris avec un risque plus élevé que prévu).
+      - RISK_STRICT OFF : ancien comportement -> lot minimum forcé quand même, 'raised_to_min'=True
+        et 'real_risk' reflète le risque réel (plus élevé) pour affichage/avertissement.
     """
     cfg = SYMBOLS[symbol]
     vpp = value_per_point(symbol, price)
+    empty = {"lot": 0.0, "real_risk": 0.0, "raised_to_min": False, "rejected_reason": None}
     if sl_distance <= 0 or vpp <= 0 or risk_usd <= 0:
-        return {"lot": 0.0, "real_risk": 0.0, "raised_to_min": False}
+        return empty
     raw = risk_usd / (sl_distance * vpp)
     step, min_lot = cfg["lot_step"], cfg["min_lot"]
     lot = math.floor(raw / step + 1e-9) * step
     raised = False
     if lot < min_lot:
+        min_lot_risk = min_lot * sl_distance * vpp
+        if RISK_STRICT and min_lot_risk > risk_usd * (1.0 + RISK_STRICT_TOLERANCE_PCT):
+            out = dict(empty)
+            out["rejected_reason"] = (
+                f"lot minimum {symbol} ({min_lot}) exigerait un risque réel de {min_lot_risk:.2f}$ "
+                f"> risque configuré {risk_usd:.2f}$ (RISK_STRICT actif) — signal ignoré plutôt que "
+                f"pris avec un risque plus élevé que prévu.")
+            print(f"[risque] {symbol} : {out['rejected_reason']}")
+            return out
         lot, raised = min_lot, True
     lot = round(lot, 6)
-    return {"lot": lot, "real_risk": lot * sl_distance * vpp, "raised_to_min": raised}
+    return {"lot": lot, "real_risk": lot * sl_distance * vpp, "raised_to_min": raised, "rejected_reason": None}
 
 
 def calc_margin(symbol, lot, price, leverage):
@@ -4769,6 +4807,7 @@ def _signal_text():
             f"🛡 SL : {_SL_LBL[get_sl_mode()]} · 🎯 TP : {_TP_LBL[get_tp_mode()]}\n"
             f"🧩 Stratégies : {_strat_txt()}\n"
             f"🔬 Filtres qualité : {_qf_txt()}\n"
+            f"🌍 Actifs : {_syms_txt()}\n"
             f"🕐 Session : {_SESS_LBL[get_session()]} · 🎛 Zone limit : {get_limit_zone()}\n"
             f"📍 Signaux ouverts max par actif : {get_max_positions()}")
 
@@ -4847,7 +4886,7 @@ def _entry_txt():
 
 
 def _signal_entry_text():
-    return (f"📥 Type d'entrée : <b>{_entry_txt()}</b>\n\n"
+    return (f"📥 Type d'entrée : <b>{_entry_txt()}</b> (touche un bouton pour l'activer / le couper ; au moins un reste actif)\n\n"
             f"⚡ Direct : entrée au marché à la clôture du CHoCH.\n"
             f"⏳ Limit : ordre placé à l'entrée de l'OB / FVG créé par le CHoCH (bord proche, pour ne pas rater l'entrée), "
             f"SL derrière la zone. Annulé si le prix repart sans toucher ou après {LIMIT_EXPIRY_CANDLES} bougies.\n"
@@ -4859,11 +4898,27 @@ def _signal_entry_text():
 
 def _signal_entry_keyboard():
     d, l = get_entry_direct(), get_entry_limit()
-    return _signal_back([[
-        {"text": ("✅ " if d and not l else "") + "⚡ Direct", "callback_data": "sent:direct"},
-        {"text": ("✅ " if l and not d else "") + "⏳ Limit", "callback_data": "sent:limit"},
-        {"text": ("✅ " if d and l else "") + "⚡+⏳ Les deux", "callback_data": "sent:both"}],
+    return _signal_back([
+        [_btn("⚡ Entrée directe", "sentd", d), _btn("⏳ Ordre limit", "sentl", l)],
         [_btn(f"Zone {k}", f"szone:{k}", get_limit_zone() == k) for k in LIMIT_ZONES]])
+
+
+def _syms_txt():
+    on = [x for x in SYMBOLS if get_symbol_on(x)]
+    return ", ".join(on) if on else "aucun"
+
+
+def _signal_sym_text():
+    return (f"🌍 <b>ACTIFS</b> : {_syms_txt()}\n\n"
+            f"Touche un actif pour l'activer / le désactiver. Un actif désactivé n'ouvre plus de signal (et n'est plus scanné) ; "
+            f"ses positions déjà ouvertes restent suivies jusqu'au bout.\n"
+            f"Défaut : XAUUSD + BTCUSD (réglable via SYMBOLS_ON). Forex USD/xxx : le lot est grand pour un SL serré, "
+            f"vérifie la marge libre du compte avant de les activer.")
+
+
+def _signal_sym_keyboard():
+    btns = [_btn(x, f"ssym:{x}", get_symbol_on(x)) for x in SYMBOLS]
+    return _signal_back([btns[j:j + 2] for j in range(0, len(btns), 2)])
 
 
 def _qf_txt():
@@ -4896,7 +4951,7 @@ def _signal_keyboard():
         [{"text": "🌐 LIQ. EXTERNE", "callback_data": "sig:ext"}, {"text": "📐 FIBO HTF", "callback_data": "sig:fib"}],
         [{"text": "📥 ENTRÉE", "callback_data": "sig:entry"}, {"text": "🛡 SL / 🎯 TP", "callback_data": "sig:sltp"}],
         [{"text": "🧩 STRATÉGIES (CRT)", "callback_data": "sig:strat"}, {"text": "🕐 SESSION", "callback_data": "sig:sess"}],
-        [{"text": "🔬 FILTRES QUALITÉ", "callback_data": "sig:qf"}],
+        [{"text": "🔬 FILTRES QUALITÉ", "callback_data": "sig:qf"}, {"text": "🌍 ACTIFS", "callback_data": "sig:sym"}],
         [{"text": "🔙 Menu", "callback_data": "menu:home"}]]}
 
 
@@ -5613,10 +5668,17 @@ def _handle_update(u):
                 _edit(cq, _signal_strat_text(), _signal_strat_keyboard())
             elif page == "sess":
                 _edit(cq, _signal_sess_text(), _signal_sess_keyboard())
+            elif page == "sym":
+                _edit(cq, _signal_sym_text(), _signal_sym_keyboard())
             elif page == "qf":
                 _edit(cq, _signal_qf_text(), _signal_qf_keyboard())
             else:
                 _edit(cq, _signal_text(), _signal_keyboard())
+        elif data.startswith("ssym:"):
+            k = data[5:]
+            if set_symbol_on(k, not get_symbol_on(k)):
+                _edit(cq, _signal_sym_text(), _signal_sym_keyboard())
+                ack = f"{k} : {'ON' if get_symbol_on(k) else 'OFF'}"
         elif data.startswith("sqf:"):
             k = data[4:]
             if k in QF_KEYS and set_qf(k, not get_qf(k)):
@@ -5676,6 +5738,13 @@ def _handle_update(u):
             if ok:
                 _edit(cq, _signal_strat_text(), _signal_strat_keyboard())
                 ack = "CRT : " + _strat_txt()
+        elif data in ("sentd", "sentl"):
+            d, l = get_entry_direct(), get_entry_limit()
+            if set_entry_types(not d if data == "sentd" else d, not l if data == "sentl" else l):
+                _edit(cq, _signal_entry_text(), _signal_entry_keyboard())
+                ack = "Entrée : " + _entry_txt()
+            else:
+                ack = "Au moins un type d'entrée doit rester actif"
         elif data.startswith("sent:"):
             arg = data[5:]
             modes = {"direct": (True, False), "limit": (False, True), "both": (True, True)}
@@ -5924,6 +5993,9 @@ def scan_status_lines():
     """Une ligne par actif : dernier prix, dernière bougie, positions ouvertes (pour /statut et les logs)."""
     out = []
     for sym, cfg in SYMBOLS.items():
+        if not get_symbol_on(sym) and count_open(sym) == 0:
+            out.append(f"⏸ {sym} : désactivé (menu ⚙️ Paramètres signal → 🌍 ACTIFS)")
+            continue
         p, t = _last_price.get(sym), _last_candle.get(sym)
         if p is None or t is None:
             out.append(f"⏳ {sym} : en attente des premières données")
@@ -6007,7 +6079,8 @@ def publish_signal(symbol, candles, events, sig, companion=False):
     leverage = get_leverage()
     lot_info = calc_lot(symbol, risk_usd, sig["risk"], price=sig["entry"])
     if lot_info["lot"] <= 0:
-        print(f"[{symbol}] signal ignoré : lot invalide")
+        reason = lot_info.get("rejected_reason") or "lot invalide (risque ou distance SL)"
+        print(f"[{symbol}] signal ignoré : {reason}")
         return False
     margin = calc_margin(symbol, lot_info["lot"], sig["entry"], leverage)
 
@@ -6184,6 +6257,8 @@ def process_symbol(symbol):
     """Un passage pour un actif : suivi des positions ouvertes, puis détection des nouveaux CHoCH."""
     dec = SYMBOLS[symbol]["decimals"]
     meta_key = f"last_t:{symbol}:{TF_LABEL}"  # par timeframe : en changer réinitialise proprement
+    if not get_symbol_on(symbol) and count_open(symbol) == 0:
+        return   # actif désactivé et rien à suivre : aucun appel réseau
     raw = get_meta(meta_key)
     last_seen = int(raw) if raw is not None else None
 
@@ -6225,6 +6300,9 @@ def process_symbol(symbol):
                 _exec_filled_limit(ev["trade"], dec)
 
     # 2) nouveaux signaux : CHoCH survenus sur les bougies clôturées depuis le dernier passage
+    if not get_symbol_on(symbol):   # actif désactivé : le suivi ci-dessus a eu lieu, mais aucun nouveau signal
+        set_meta(meta_key, last_t)
+        return
     n = len(candles)
     for ev in events:
         if ev["t"] <= last_seen or ev["i"] < n - SIGNAL_MAX_AGE:
@@ -7092,7 +7170,7 @@ class TestEntreeOBFVG(unittest.TestCase):
             self.assertTrue(_E.get_entry_direct() and _E.get_entry_limit())
             _E.handle_command("/entree limit")
             self.assertTrue(not _E.get_entry_direct() and _E.get_entry_limit())
-            self.assertIn("sent:both", str(_E._signal_entry_keyboard()))
+            self.assertIn("sentd", str(_E._signal_entry_keyboard())); self.assertIn("sentl", str(_E._signal_entry_keyboard()))
             self.assertIn("sig:entry", str(_E._signal_keyboard()))
         finally:
             _E._q("DELETE FROM settings WHERE key IN ('entry_direct','entry_limit')", commit=True)
@@ -7767,12 +7845,64 @@ class TestFiltresQualite(unittest.TestCase):
             self.assertIn(needle, out)
 
 
+class TestActifsEtEntrees(unittest.TestCase):
+    """Actifs activables par paire (défaut : Gold + BTC) et interrupteurs indépendants entrée directe / ordre limit."""
+
+    def _restore(self, key, old):
+        if old is None:
+            _E._q("DELETE FROM settings WHERE key=?", (key,), commit=True)
+        else:
+            _E.set_setting(key, old)
+
+    def test_defauts_et_interrupteur(self):
+        olds = {x: _E.get_setting("sym_on_" + x) for x in _E.SYMBOLS}
+        try:
+            for x in _E.SYMBOLS:
+                _E._q("DELETE FROM settings WHERE key=?", ("sym_on_" + x,), commit=True)
+            self.assertTrue(_E.get_symbol_on("XAUUSD") and _E.get_symbol_on("BTCUSD"))
+            self.assertFalse(_E.get_symbol_on("USDCAD") or _E.get_symbol_on("USDJPY"), "forex désactivé par défaut")
+            self.assertTrue(_E.set_symbol_on("USDCAD", True) and _E.get_symbol_on("USDCAD"))
+            self.assertFalse(_E.set_symbol_on("INCONNU", True))
+            self.assertIn("ssym:USDJPY", str(_E._signal_sym_keyboard()))
+            self.assertIn("sig:sym", str(_E._signal_keyboard()))
+        finally:
+            for x, v in olds.items():
+                self._restore("sym_on_" + x, v)
+
+    def test_actif_desactive_pas_de_scan(self):
+        old = _E.get_setting("sym_on_USDJPY")
+        try:
+            _E._q("DELETE FROM settings WHERE key='sym_on_USDJPY'", commit=True)
+            _E._q("DELETE FROM trades WHERE symbol='USDJPY'", commit=True)
+            calls = []
+            saved = _E.get_candles
+            _E.get_candles = lambda *a, **k: calls.append(1) or []
+            try:
+                _E.process_symbol("USDJPY")
+            finally:
+                _E.get_candles = saved
+            self.assertEqual(calls, [], "désactivé et sans position : aucun téléchargement")
+            self.assertTrue(any("USDJPY : désactivé" in l for l in _E.scan_status_lines()))
+        finally:
+            self._restore("sym_on_USDJPY", old)
+
+    def test_entrees_independantes(self):
+        old = (_E.get_setting("entry_direct"), _E.get_setting("entry_limit"))
+        try:
+            self.assertTrue(_E.set_entry_types(True, False) and _E.get_entry_direct() and not _E.get_entry_limit())
+            self.assertTrue(_E.set_entry_types(False, True) and _E.get_entry_limit() and not _E.get_entry_direct())
+            self.assertTrue(_E.set_entry_types(True, True))
+            self.assertFalse(_E.set_entry_types(False, False), "au moins un type d'entrée reste actif")
+        finally:
+            self._restore("entry_direct", old[0]); self._restore("entry_limit", old[1])
+
+
 def _selftest():
     _E.HTF_MODE = "FULL"   # les tests historiques (H1 -> M15 -> M5 -> POI) évaluent la cascade complète ; TestHtfM15 passe en mode M15
     suite, loader = unittest.TestSuite(), unittest.TestLoader()
     for cls in (TestRetracement, TestContinuation, TestInvalidationHTF, TestChop, TestGetExtTf,
                 TestLiquiditePure, TestM1NeDecidePasSeul, TestLogs, TestEntreeM5, TestNonRegression,
-                TestHtfM15, TestBE, TestEntreeOBFVG, TestSLTPCRT, TestSignauxSimultanes, TestLectureExtInt, TestModifyPositionGardeSLTP, TestBEDoubleVerif, TestClientId, TestLogVolumeReel, TestFiltresQualite):
+                TestHtfM15, TestBE, TestEntreeOBFVG, TestSLTPCRT, TestSignauxSimultanes, TestLectureExtInt, TestModifyPositionGardeSLTP, TestBEDoubleVerif, TestClientId, TestLogVolumeReel, TestFiltresQualite, TestActifsEtEntrees):
         suite.addTests(loader.loadTestsFromTestCase(cls))
     return 0 if unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful() else 1
 
@@ -7781,3 +7911,4 @@ if __name__ == "__main__":
     if "--selftest" in sys.argv:
         sys.exit(_selftest())
     main()
+
