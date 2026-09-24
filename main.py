@@ -1,5 +1,6 @@
 
 
+
 #!/usr/bin/env python3
 """AlphaBot BOS + CHoCH — Gold & BTC — version en un seul fichier.
 
@@ -110,7 +111,7 @@ TF_LABELS = {1: "M1", 3: "M3", 5: "M5", 15: "M15", 30: "M30", 60: "H1"}
 
 # UT supplémentaire utilisée UNIQUEMENT comme UT de liquidité (jamais une UT d'entrée) : ne pas fusionner dans
 # TF_LABELS, qui est itéré par les boutons /timeframe.
-HTF_ONLY_LABELS = {240: "H4"}
+HTF_ONLY_LABELS = {240: "H4", 1440: "D1"}
 
 
 def _parse_timeframe(txt):
@@ -145,7 +146,37 @@ SYMBOLS = {
         "min_sl_pct": 0.0020,       # plancher SL absolu : ~0.20% (ex. ~160 pts sur du BTC à 80 000) -- plus volatile/mèches larges que le Gold
         "be_fees_buffer": 5.0,      # défaut BE : SL à entrée +/- 5 pts (couvre spread/commission), voir BE_FEES_BUFFER
     },
+    # --- Forex USD/xxx : 1 lot = 100 000 USD. La devise de cotation (CAD, JPY) n'est pas l'USD : la valeur du point
+    # en $ = 100 000 / prix. `vpp_from_price` la recalcule donc au prix réel (voir value_per_point) ;
+    # "value_per_point" ne sert que de repli si aucun prix n'est connu.
+    "USDCAD": {
+        "source": "deriv", "deriv_symbol": "frxUSDCAD",
+        "vpp_from_price": True, "contract_size": 100000.0,
+        "value_per_point": 73000.0,
+        "min_lot": 0.01, "lot_step": 0.01, "decimals": 5,
+        "min_sl_pct": 0.0007,       # ~0.07% (~9.6 pips à 1.37)
+        "be_fees_buffer": 0.00005,  # 0.5 pip
+    },
+    "USDJPY": {
+        "source": "deriv", "deriv_symbol": "frxUSDJPY",
+        "vpp_from_price": True, "contract_size": 100000.0,
+        "value_per_point": 660.0,
+        "min_lot": 0.01, "lot_step": 0.01, "decimals": 3,
+        "min_sl_pct": 0.0007,       # ~0.07% (~10 pips à 150)
+        "be_fees_buffer": 0.005,    # 0.5 pip
+    },
 }
+
+
+def value_per_point(symbol, price=None):
+    """$ par point (1.00 de prix) pour 1 lot. Fixe pour Gold/BTC ; pour USDCAD/USDJPY = taille du contrat / prix
+    (le P&L est en CAD/JPY, converti en USD). Sans prix fourni : dernier prix connu, sinon valeur de repli de SYMBOLS."""
+    cfg = SYMBOLS.get(symbol, {})
+    if cfg.get("vpp_from_price"):
+        px = price or globals().get("_last_price", {}).get(symbol)
+        if px and px > 0:
+            return cfg["contract_size"] / float(px)
+    return cfg.get("value_per_point") or 0.0
 
 
 def get_be_fees_buffer(symbol):
@@ -170,8 +201,7 @@ def _be_price_buffer(symbol, lot):
     minimum de BE_TARGET_USD (défaut +0.01$) sur CE lot précis — remplace l'ancien buffer fixe en
     points (0.05 pt), qui se traduisait par une perte nette sur certains lots (frais/commission non
     couverts). buffer_price = (BE_TARGET_USD + commission_estimée) / (value_per_point x lot)."""
-    cfg = SYMBOLS.get(symbol, {})
-    vpp = cfg.get("value_per_point") or 0.0
+    vpp = value_per_point(symbol)
     lot = float(lot or 0.0)
     if vpp <= 0 or lot <= 0:
         return get_be_fees_buffer(symbol)   # repli sur l'ancien réglage fixe si lot/valeur inconnus
@@ -240,7 +270,7 @@ RR_LEVELS = (1.0, 2.0, 3.0)                # paliers intermédiaires notifiés a
 SIGNAL_RR_CHOICES = (1, 2, 3, 4)     # boutons « RR1 | RR2 | RR3 | RR4 »
 SIGNAL_TF_CHOICES = (1, 5, 15)       # boutons « M1 | M5 | M15 » (timeframe du déclenchement final)
 MAX_POSITIONS = _env_int("MAX_POSITIONS", 1)     # signaux ouverts max par actif (1 = aucun nouveau signal tant que le précédent n'est pas clôturé) ; ensuite /maxpos
-MAX_POSITIONS_CHOICES = (1, 2, 3)               # boutons du menu « signaux simultanés »
+MAX_POSITIONS_CHOICES = (1, 2, 3, 5, 10)               # boutons du menu « signaux simultanés »
 
 # --- Type d'entrée : DIRECT (au marché) ou LIMIT (on attend le retour du prix) ---------------
 # ENTRY_MODE : MARKET = toujours direct (par défaut) | LIMIT = toujours limit | BOTH = le bot choisit et le précise.
@@ -252,6 +282,56 @@ if ENTRY_MODE not in ("MARKET", "LIMIT", "BOTH"):
 LIMIT_EXT_ATR = _env_float("LIMIT_EXT_ATR", 0.6)
 LIMIT_CANCEL_RR = _env_float("LIMIT_CANCEL_RR", 2.0)         # ordre annulé si le prix part de +X R sans toucher la limit
 LIMIT_EXPIRY_CANDLES = _env_int("LIMIT_EXPIRY_CANDLES", 30)  # ordre annulé s'il n'est pas exécuté après N bougies
+
+# --- Types d'entrée activables depuis Telegram (/entree ou ⚙️ Paramètres signal → 📥 ENTRÉE) --------------------------
+#   DIRECT = entrée au marché à la clôture du CHoCH (comportement historique).
+#   LIMIT  = ordre limit sur le bord PROCHE de l'OB / FVG créé par le CHoCH (le prix doit y revenir), SL derrière la zone.
+#   Les deux ensemble = les deux ordres partent (direct + limit) ; le limit ne compte pas dans « signaux max ».
+# Ces valeurs ne sont que le DÉPART : le choix Telegram est mémorisé en base et prime après redémarrage.
+ENTRY_DIRECT = _env_bool("ENTRY_DIRECT", True)
+ENTRY_LIMIT = _env_bool("ENTRY_LIMIT", False)
+POI_LIMIT_DEPTH = _env_float("POI_LIMIT_DEPTH", 0.0)       # 0 = bord proche de la zone (défaut) ; 0.5 = milieu ; 1 = bord lointain
+POI_LIMIT_MAX_ATR = _env_float("POI_LIMIT_MAX_ATR", 3.0)   # zone plus loin que N x ATR du prix : pas d'ordre limit
+LIMIT_MT5_EXEC = _env_bool("LIMIT_MT5_EXEC", True)         # limit touché -> ordre MT5 envoyé au marché (sinon suivi seulement)
+LIMIT_FILL_MAX_DRIFT_R = _env_float("LIMIT_FILL_MAX_DRIFT_R", 0.5)   # pas d'ordre MT5 si le prix a déjà dérivé de plus de N R du limit
+
+# --- Modes de SL / TP et stratégies activables (Telegram : /signal -> 🛡 SL / TP · 🧩 STRATÉGIES) ------------------------
+#   SL (entrée directe) : STRUCT = ligne du BOS opposé (historique) · ZONE = derrière l'OB/FVG créé par le CHoCH ·
+#                         SWEEP  = derrière l'extrême de la jambe du CHoCH (le sweep). Le limit OB/FVG met toujours son SL derrière la zone.
+#   TP : RR = RR fixe (historique) · TARGET = liquidité externe visée · SWING = plus proche swing high/low non cassé.
+#        Cible absente ou plus proche que TP_MIN_RR -> repli sur le RR fixe (loggé).
+#   CRT (Candle Range Theory) : module indépendant, DÉSACTIVÉ par défaut. Bougie HTF de référence (CRH/CRL) balayée d'un côté,
+#        clôture de retour DANS le range, puis CHoCH sur l'UT d'entrée ; SL derrière le sweep ; TP = autre bout du range / 50 %.
+SL_MODES, TP_MODES, CRT_TP_MODES, CRT_REFS = ("STRUCT", "ZONE", "SWEEP"), ("RR", "TARGET", "SWING"), ("RANGE", "MID", "RR"), (60, 240, 1440)
+SL_MODE = os.getenv("SL_MODE", "STRUCT").strip().upper()
+TP_MODE = os.getenv("TP_MODE", "RR").strip().upper()
+TP_MIN_RR = _env_float("TP_MIN_RR", 1.0)
+STRAT_MAIN = _env_bool("STRAT_MAIN", True)      # stratégie actuelle : Sweep -> POI -> mitigation -> CHoCH
+STRAT_CRT = _env_bool("STRAT_CRT", False)       # module CRT
+CRT_REF_TF = _env_int("CRT_REF_TF", 60)         # UT de la bougie de référence : 60 (H1) / 240 (H4) / 1440 (D1)
+CRT_TP = os.getenv("CRT_TP", "RANGE").strip().upper()
+# --- FILTRES QUALITÉ du CHoCH (interrupteurs ON/OFF, menu Telegram « 🔬 FILTRES ») ------------------------------
+# Toujours CALCULÉS et loggés (bloc par signal) ; ils ne REFUSENT un signal que s'ils sont ON. Défaut : tous OFF.
+QF_KEYS = ("swings", "disp", "range", "fvg", "ind")
+QF_LBL = {"swings": "Structure HH/HL", "disp": "Displacement", "range": "Anti-range", "fvg": "FVG strict", "ind": "Inducement"}
+QF_DEFAULT = {k: _env_bool("QF_" + k.upper(), False) for k in QF_KEYS}
+DISP_BODY_ATR = _env_float("DISP_BODY_ATR", 0.8)       # displacement : corps de la bougie cassante >= N x ATR
+DISP_BODY_RATIO = _env_float("DISP_BODY_RATIO", 0.6)   # ... et corps >= N % de sa hauteur (peu de mèches)
+DISP_BREAK_ATR = _env_float("DISP_BREAK_ATR", 0.10)    # vraie cassure : clôture au-delà du niveau d'au moins N x ATR
+RANGE_LOOKBACK = _env_int("RANGE_LOOKBACK", 20)        # anti-range : bougies analysées avant/avec la cassure
+RANGE_MIN_ER = _env_float("RANGE_MIN_ER", 0.15)        # efficience mini (|déplacement net| / chemin parcouru) ; en dessous = chop
+CRT_DUP = _env_bool("CRT_DUP", False)         # CRT autorisé même si la principale a déjà pris ce CHoCH (défaut OFF)
+CRT_HTF = _env_bool("CRT_HTF", False)           # CRT + filtre de tendance HTF (l'inverse d'un retournement : à tester, pas à supposer)
+# Sessions (heures UTC, [début, fin[) : filtre optionnel /session. Londres ~07-16 UTC, New York ~12-21 UTC (recouvrement 12-16).
+def _parse_hours(name, default):
+    try:
+        a, b = os.getenv(name, default).split("-")
+        return int(a), int(b)
+    except Exception:
+        return tuple(int(x) for x in default.split("-"))
+SESSION_LONDON, SESSION_NY = _parse_hours("SESSION_LONDON", "7-16"), _parse_hours("SESSION_NY", "12-21")
+SESSIONS = ("ALL", "LONDON", "NY", "BOTH")
+LIMIT_ZONES = ("BOTH", "OB", "FVG")
 
 # --- Risque & levier --------------------------------------------------------
 # Le lot est calculé uniquement à partir du risque $ et de la distance du SL (aucun solde requis).
@@ -293,16 +373,17 @@ METAAPI_ACCOUNT_ID = os.getenv("METAAPI_ACCOUNT_ID", "") or _DEFAULT_METAAPI_ACC
 # Mappe les symboles internes (XAUUSD, BTCUSD) vers ceux du broker si différents,
 # ex. MT5_SYMBOL_MAP={"XAUUSD":"XAUUSD.m","BTCUSD":"BTCUSDm"}. Vide -> pas de mapping (identité).
 try:
-    MT5_SYMBOL_MAP = json.loads(os.getenv("MT5_SYMBOL_MAP", "") or '{"XAUUSD":"XAUUSDm","BTCUSD":"BTCUSDm"}')
+    MT5_SYMBOL_MAP = {"XAUUSD": "XAUUSDm", "BTCUSD": "BTCUSDm", "USDCAD": "USDCADm", "USDJPY": "USDJPYm"}
+    MT5_SYMBOL_MAP.update(json.loads(os.getenv("MT5_SYMBOL_MAP", "") or "{}"))
 except Exception:
     print("[metaapi] MT5_SYMBOL_MAP invalide (JSON attendu) — mapping ignoré.")
-    MT5_SYMBOL_MAP = {"XAUUSD": "XAUUSDm", "BTCUSD": "BTCUSDm"}
+    MT5_SYMBOL_MAP = {"XAUUSD": "XAUUSDm", "BTCUSD": "BTCUSDm", "USDCAD": "USDCADm", "USDJPY": "USDJPYm"}
 
 # Tolérance de slippage (en points de prix, prix brut) transmise à MetaApi pour chaque ordre
 # MARKET : au-delà de cet écart entre le prix demandé et le prix d'exécution, le broker (Exness)
 # rejette l'ordre plutôt que de l'exécuter à un prix trop éloigné. Réglable par variable d'env
 # MT5_SLIPPAGE_XAUUSD / MT5_SLIPPAGE_BTCUSD (sinon défaut ci-dessous par actif).
-MT5_SLIPPAGE_DEFAULT = {"XAUUSD": 0.5, "BTCUSD": 30.0}
+MT5_SLIPPAGE_DEFAULT = {"XAUUSD": 0.5, "BTCUSD": 30.0, "USDCAD": 0.0002, "USDJPY": 0.02}
 
 
 def get_mt5_slippage(symbol):
@@ -317,7 +398,7 @@ def get_mt5_slippage(symbol):
 
 # Écart (en % du prix) entre sig["entry"] (prix Deriv/Binance) et le prix d'ouverture réel côté
 # Exness au-delà duquel l'admin est notifié (l'ordre reste ouvert : seule une alerte est envoyée).
-MT5_PRICE_GAP_ALERT_PCT = {"XAUUSD": 0.0015, "BTCUSD": 0.0005}
+MT5_PRICE_GAP_ALERT_PCT = {"XAUUSD": 0.0015, "BTCUSD": 0.0005, "USDCAD": 0.0005, "USDJPY": 0.0005}
 
 
 # ============================================================================
@@ -1368,7 +1449,7 @@ def _be_net_usd(symbol, side, open_px, sl_px, volume):
     se ferme sur l'ASK. Le spread payé à l'ouverture est donc DÉJÀ dans le prix d'ouverture réel du broker : le BE doit
     partir de CE prix (openPrice de la position), jamais du prix du signal (Binance/Deriv) qui en diffère.
     Retourne None si la valeur du point du symbole est inconnue (calcul impossible)."""
-    vpp = SYMBOLS.get(symbol, {}).get("value_per_point") or 0.0
+    vpp = value_per_point(symbol, open_px)
     if vpp <= 0:
         return None
     sgn = 1 if side == "BUY" else -1
@@ -1688,7 +1769,7 @@ def _manual_plan(symbol, side, sl_price=None):
     rr = get_tp_rr()
     tp = entry + d * sl_distance * rr
 
-    lot_info = calc_lot(symbol, get_risk(), sl_distance)
+    lot_info = calc_lot(symbol, get_risk(), sl_distance, price=entry)
     if lot_info["lot"] <= 0:
         return {"ok": False, "error": "lot calculé nul (risque ou distance SL invalide)"}
     return {"ok": True, "symbol": symbol, "side": side, "entry": entry, "spread": spread, "sl": sl, "tp": tp,
@@ -1920,6 +2001,128 @@ def set_mtf_fib_filter(on):
     set_setting("mtf_fib_filter", "1" if on else "0")
 
 
+def _get_bool_setting(key, default):
+    v = get_setting(key)
+    if v is None:
+        return bool(default)
+    return str(v).strip().lower() in ("1", "true", "yes", "on")
+
+
+def get_entry_direct():
+    """Entrée directe (marché) active ? Dernier choix Telegram, sinon ENTRY_DIRECT."""
+    return _get_bool_setting("entry_direct", ENTRY_DIRECT)
+
+
+def get_entry_limit():
+    """Ordre limit sur OB / FVG actif ? Dernier choix Telegram, sinon ENTRY_LIMIT."""
+    return _get_bool_setting("entry_limit", ENTRY_LIMIT)
+
+
+def set_entry_types(direct, limit):
+    """Au moins un type d'entrée doit rester actif (sinon plus aucun signal). Retourne True si appliqué."""
+    if not (direct or limit):
+        return False
+    set_setting("entry_direct", "1" if direct else "0")
+    set_setting("entry_limit", "1" if limit else "0")
+    return True
+
+
+def _get_choice(key, default, choices):
+    v = str(get_setting(key) or default).strip().upper()
+    return v if v in choices else (default if default in choices else choices[0])
+
+
+def get_sl_mode():
+    return _get_choice("sl_mode", SL_MODE, SL_MODES)
+
+
+def get_tp_mode():
+    return _get_choice("tp_mode", TP_MODE, TP_MODES)
+
+
+def get_crt_tp():
+    return _get_choice("crt_tp", CRT_TP, CRT_TP_MODES)
+
+
+def get_crt_ref():
+    try:
+        v = int(float(get_setting("crt_ref") or CRT_REF_TF))
+    except (TypeError, ValueError):
+        v = 60
+    return v if v in CRT_REFS else 60
+
+
+def set_choice(key, value, choices):
+    value = str(value).upper()
+    if value not in choices:
+        return False
+    set_setting(key, value)
+    return True
+
+
+def set_crt_ref(v):
+    if int(v) not in CRT_REFS:
+        return False
+    set_setting("crt_ref", int(v))
+    return True
+
+
+def get_session():
+    return _get_choice("session", "ALL", SESSIONS)
+
+
+def get_limit_zone():
+    return _get_choice("limit_zone", "BOTH", LIMIT_ZONES)
+
+
+def get_qf(key):
+    """Filtre qualité `key` actif ? Dernier choix Telegram, sinon variable QF_<KEY> (défaut OFF)."""
+    return _get_bool_setting("qf_" + key, QF_DEFAULT.get(key, False))
+
+
+def set_qf(key, on):
+    if key not in QF_KEYS:
+        return False
+    set_setting("qf_" + key, "1" if on else "0")
+    return True
+
+
+def get_crt_dup():
+    """ON : le CRT tourne aussi quand la stratégie principale a déjà pris le même CHoCH (doublons voulus, phase de test)."""
+    return _get_bool_setting("crt_dup", CRT_DUP)
+
+
+def get_crt_htf():
+    return _get_bool_setting("crt_htf", CRT_HTF)
+
+
+def session_ok(ts):
+    """Le CHoCH (bougie d'ouverture `ts`, epoch) tombe-t-il dans la session choisie ? ALL = toujours."""
+    mode = get_session()
+    if mode == "ALL":
+        return True
+    h = datetime.fromtimestamp(ts, timezone.utc).hour
+    ldn, ny = SESSION_LONDON[0] <= h < SESSION_LONDON[1], SESSION_NY[0] <= h < SESSION_NY[1]
+    return {"LONDON": ldn, "NY": ny, "BOTH": ldn or ny}[mode]
+
+
+def get_strat_main():
+    return _get_bool_setting("strat_main", STRAT_MAIN)
+
+
+def get_strat_crt():
+    return _get_bool_setting("strat_crt", STRAT_CRT)
+
+
+def set_strategies(main, crt):
+    """Au moins une stratégie doit rester active (sinon plus aucun signal). Retourne True si appliqué."""
+    if not (main or crt):
+        return False
+    set_setting("strat_main", "1" if main else "0")
+    set_setting("strat_crt", "1" if crt else "0")
+    return True
+
+
 def get_max_positions():
     """Signaux ouverts max par actif : dernier choix Telegram, sinon MAX_POSITIONS (Render / défaut = 1)."""
     try:
@@ -2123,7 +2326,7 @@ def now_ts():
 
 CLOSE_GRACE_SEC = 2   # marge après la clôture : décalage d'horloge / finalisation de la bougie chez la source
 BINANCE_BASES = ["https://api.binance.com", "https://data-api.binance.vision"]  # 2e = miroir public Binance
-BINANCE_INTERVALS = {1: "1m", 3: "3m", 5: "5m", 15: "15m", 30: "30m", 60: "1h", 240: "4h"}
+BINANCE_INTERVALS = {1: "1m", 3: "3m", 5: "5m", 15: "15m", 30: "30m", 60: "1h", 240: "4h", 1440: "1d"}
 
 
 def _only_closed(candles, tf_sec=None):
@@ -2136,8 +2339,8 @@ def _only_closed(candles, tf_sec=None):
 # --- BTC : Binance (klines) avec BASCULE AUTOMATIQUE vers Bybit puis OKX -----------------------
 # Binance bannit régulièrement les IP partagées des hébergeurs (erreur 418 / 429 / 451). Dans ce cas
 # on met Binance en pause quelques minutes (insister prolonge le ban) et on passe sur Bybit / OKX.
-BYBIT_INTERVALS = {1: "1", 3: "3", 5: "5", 15: "15", 30: "30", 60: "60", 240: "240"}
-OKX_INTERVALS = {1: "1m", 3: "3m", 5: "5m", 15: "15m", 30: "30m", 60: "1H", 240: "4H"}
+BYBIT_INTERVALS = {1: "1", 3: "3", 5: "5", 15: "15", 30: "30", 60: "60", 240: "240", 1440: "D"}
+OKX_INTERVALS = {1: "1m", 3: "3m", 5: "5m", 15: "15m", 30: "30m", 60: "1H", 240: "4H", 1440: "1D"}
 BINANCE_PAUSE_SEC = _env_int("BINANCE_PAUSE_SEC", 300)
 _binance_blocked_until = 0.0
 
@@ -2981,7 +3184,384 @@ def mtf_fib_pd_filter(symbol, ev, trace=None):
     return True, None
 
 
-def build_signal(c, ev, symbol=None):
+def sl_by_mode(c, ev, a, symbol):
+    """SL de l'entrée directe selon le mode réglé. Retourne (sl, étiquette). Un mode indisponible retombe sur STRUCT (loggé)."""
+    d, i = ev["dir"], ev["i"]
+    entry, buf, mode = c[i]["c"], SL_BUFFER_ATR * a, get_sl_mode()
+    if mode == "SWEEP":
+        e = _turn_index(c, ev)
+        return (c[e]["l"] if d == 1 else c[e]["h"]) - d * buf, "SWEEP"
+    if mode == "ZONE":
+        try:
+            pois = [p for p in find_pois(c[:i + 1], TIMEFRAME_MIN, d) if p["f"] > ev["src"]]
+        except Exception:
+            pois = []
+        cand = [(abs((p["lo"] if d == 1 else p["hi"]) - entry), p) for p in pois
+                if ((p["lo"] if d == 1 else p["hi"]) - entry) * d < 0]
+        if cand:
+            p = min(cand, key=lambda x: x[0])[1]
+            return (p["lo"] if d == 1 else p["hi"]) - d * buf, "ZONE"
+        if symbol and DEBUG_CHOCH:
+            print(f"[{symbol}] SL ZONE : aucun OB/FVG exploitable -> SL structure")
+    return ev["sl_level"] - d * buf, "STRUCT"
+
+
+def nearest_swing_target(c, i, d, entry, depth=None):
+    """Plus proche swing low (SELL) / swing high (BUY) NON cassé de `c[:i+1]`, du bon côté de l'entrée. None si aucun."""
+    depth = depth or SWING_DEPTH
+    best = None
+    for p in range(depth, i - depth + 1):
+        if d == -1:
+            lv = c[p]["l"]
+            if lv >= entry or not all(lv < c[k]["l"] for k in list(range(p - depth, p)) + list(range(p + 1, p + depth + 1))):
+                continue
+            if min(x["l"] for x in c[p + 1:i + 1]) <= lv:
+                continue
+            best = lv if best is None or lv > best else best
+        else:
+            lv = c[p]["h"]
+            if lv <= entry or not all(lv > c[k]["h"] for k in list(range(p - depth, p)) + list(range(p + 1, p + depth + 1))):
+                continue
+            if max(x["h"] for x in c[p + 1:i + 1]) >= lv:
+                continue
+            best = lv if best is None or lv < best else best
+    return best
+
+
+def apply_tp_mode(sig, c, ev, symbol, tp_rr):
+    """TP selon le mode réglé (RR fixe / liquidité externe / swing). Met à jour tp, rr, tp_mode ; repli RR si pas de cible."""
+    mode = get_tp_mode()
+    sig["tp_mode"] = None
+    if mode == "RR":
+        return sig
+    d, entry, risk = sig["dir"], sig["entry"], sig["risk"]
+    tgt = lbl = None
+    if mode == "TARGET" and sig.get("ext"):
+        tgt, lbl = sig["ext"]["level"], f"liquidité ext. {_tf_lbl(sig['ext']['tf'])}"
+    elif mode == "SWING":
+        tgt = nearest_swing_target(c, ev["i"], d, entry)
+        lbl = f"swing {TF_LABEL}"
+    if tgt is None or (tgt - entry) * d <= 0:
+        why = "aucune cible exploitable"
+    else:
+        rr = abs(tgt - entry) / risk
+        if rr >= TP_MIN_RR:
+            sig.update(tp=tgt, rr=round(rr, 2), tp_mode=lbl)
+            return sig
+        why = f"cible trop proche (RR {rr:.2f} < {TP_MIN_RR:g})"
+    if symbol and DEBUG_CHOCH:
+        print(f"[{symbol}] TP {mode} : {why} -> RR fixe {tp_rr:g}")
+    return sig
+
+
+def crt_context(symbol, c, ev, ref_tf):
+    """Contexte CRT du CHoCH `ev` : (ctx, None) ou (None, motif). Bougie 1 = dernière bougie HTF CLÔTURÉE avant le CHoCH
+    (CRH / CRL) ; bougie 2 = celle qui suit : elle doit avoir balayé UN côté (sweep) puis le CHoCH doit clôturer de nouveau
+    DANS le range (pas seulement une mèche). Haussier : sweep du CRL, cible CRH ; baissier : sweep du CRH, cible CRL."""
+    if ref_tf <= TIMEFRAME_MIN:
+        return None, f"UT de référence {_tf_lbl(ref_tf)} <= UT d'entrée {TF_LABEL}"
+    h = _ctx_candles(symbol, ref_tf)
+    if not h:
+        return None, f"bougies {_tf_lbl(ref_tf)} indisponibles"
+    i, ref_sec, d = ev["i"], ref_tf * 60, ev["dir"]
+    t_i = c[i]["t"]
+    closed = [x for x in h if x["t"] + ref_sec <= t_i]
+    if not closed:
+        return None, "aucune bougie de référence clôturée avant le CHoCH"
+    r = closed[-1]
+    start = r["t"] + ref_sec
+    if t_i >= start + ref_sec:
+        return None, "CHoCH hors de la bougie qui suit la référence (donnée manquante ou marché fermé)"
+    win = [x for x in c[:i + 1] if x["t"] >= start]
+    if not win:
+        return None, "aucune bougie d'entrée depuis la clôture de la référence"
+    crh, crl = r["h"], r["l"]
+    lo, hi = min(x["l"] for x in win), max(x["h"] for x in win)
+    if d == 1:
+        if lo >= crl:
+            return None, f"CRL {crl:g} non balayé (plus bas {lo:g})"
+        if hi > crh:
+            return None, "les deux côtés du range balayés (bougie englobante) : pas de CRT propre"
+        sweep = lo
+    else:
+        if hi <= crh:
+            return None, f"CRH {crh:g} non balayé (plus haut {hi:g})"
+        if lo < crl:
+            return None, "les deux côtés du range balayés (bougie englobante) : pas de CRT propre"
+        sweep = hi
+    if not (crl < c[i]["c"] < crh):
+        return None, "clôture du CHoCH hors du range CRT : pas de réintégration"
+    return {"ref_tf": ref_tf, "crh": crh, "crl": crl, "mid": (crh + crl) / 2, "sweep": sweep, "ref_t": r["t"]}, None
+
+
+def _crt_apply_tp(sig, ctx, tp_rr, symbol):
+    """TP CRT : autre bout du range (RANGE), 50 % du range (MID) ou RR fixe. Repli RR fixe si la cible est mal placée / trop proche."""
+    mode = get_crt_tp()
+    sig["tp_mode"] = None
+    if mode == "RR":
+        return sig
+    d, entry, risk = sig["dir"], sig["entry"], sig["risk"]
+    tgt = (ctx["crh"] if d == 1 else ctx["crl"]) if mode == "RANGE" else ctx["mid"]
+    if (tgt - entry) * d > 0 and abs(tgt - entry) / risk >= TP_MIN_RR:
+        sig.update(tp=tgt, rr=round(abs(tgt - entry) / risk, 2),
+                   tp_mode="autre bout du range CRT" if mode == "RANGE" else "50 % du range CRT")
+    elif symbol and DEBUG_CHOCH:
+        print(f"[{symbol}] TP CRT {mode} : cible mal placée ou trop proche -> RR fixe {tp_rr:g}")
+    return sig
+
+
+def crt_build(c, ev, symbol):
+    """Signaux du module CRT pour un CHoCH : liste (direct et/ou limit OB/FVG selon 📥 ENTRÉE), [] si refus.
+    Indépendant du filtre de tendance HTF (le CRT est un retournement) ; SL derrière le sweep, TP sur le range."""
+    if ev["kind"] != "CHOCH" or ev["sl_level"] is None:
+        return []
+    side = "BUY" if ev["dir"] == 1 else "SELL"
+    ctx, why = crt_context(symbol, c, ev, get_crt_ref())
+    if not ctx:
+        if DEBUG_CHOCH:
+            print(f"[{symbol}] CRT {side} {ev['type']} ignoré : {why}")
+        return []
+    d, a, i = ev["dir"], ev["atr"], ev["i"]
+    tp_rr, be_rr = get_tp_rr(), get_be_rr()
+    htf_txt = ""
+    if get_crt_htf():   # option : le CRT doit aussi suivre la tendance de fond (même filtre que la stratégie principale)
+        trend, why = htf_trend_check(symbol, ev)
+        if why:
+            if DEBUG_CHOCH:
+                print(f"[{symbol}] CRT {side} {ev['type']} ignoré : {why}")
+            return []
+        htf_txt = f" + tendance {_tf_lbl(htf_ref_tf())} {_dir_txt(trend)}"
+    base = {"htf": False, "htf_mode": "OFF", "setup": f"CRT {_tf_lbl(ctx['ref_tf'])} -> {TF_LABEL}{htf_txt}", "poi": None,
+            "mtf_fib_on": False, "mtf_fib": None, "crt": ctx, "strategy": "CRT"}
+    out = []
+    if get_entry_direct():
+        entry = c[i]["c"]
+        sl = ctx["sweep"] - d * SL_BUFFER_ATR * a
+        risk = abs(entry - sl)
+        if risk > MAX_SL_ATR * a:
+            if DEBUG_CHOCH:
+                print(f"[{symbol}] CRT {side} direct ignoré : SL derrière le sweep trop large ({risk:.2f} pts > {MAX_SL_ATR}xATR)")
+        else:
+            min_pct = SYMBOLS.get(symbol, {}).get("min_sl_pct", MIN_SL_PCT)
+            risk = max(risk, MIN_SL_ATR * a, entry * min_pct)
+            sl = entry - d * risk
+            sig = {"dir": d, "side": side, "type": ev["type"], "order": "MARKET", "ref_price": entry,
+                   "entry": entry, "sl": sl, "risk": risk, "tp": entry + d * risk * tp_rr, "t": ev["t"],
+                   "bos_level": ev["sl_level"], "rr": tp_rr, "be_rr": be_rr, "tf": TF_LABEL, "key_suffix": "crt", "sl_mode": "SWEEP"}
+            sig.update(base)
+            sig["ext"], sig["sweep"] = liquidity_reading(symbol, c, ev, entry)
+            out.append(_crt_apply_tp(sig, ctx, tp_rr, symbol))
+    if get_entry_limit():
+        lim, why = poi_limit_signal(c, ev, symbol, tp_rr, be_rr, base, sl_anchor=ctx["sweep"], apply_tp=False)
+        if lim:
+            lim["key_suffix"], lim["sl_mode"] = "crtpoi", "SWEEP"
+            out.append(_crt_apply_tp(lim, ctx, tp_rr, symbol))
+        elif DEBUG_CHOCH:
+            print(f"[{symbol}] CRT limit OB/FVG non placé : {why}")
+    for sig in out:
+        print(f"[{symbol}] signal ACCEPTÉ : {sig['side']} {sig['type']} -- {base['setup']} "
+              f"(range {ctx['crl']:g}-{ctx['crh']:g}, sweep {ctx['sweep']:g})")
+    return out
+
+
+def poi_limit_signal(c, ev, symbol, tp_rr, be_rr, base, sl_anchor=None, apply_tp=True):
+    """Ordre LIMIT sur le bord PROCHE de l'OB / FVG créé par le CHoCH `ev` (sur l'UT d'entrée).
+
+    Le CHoCH a déjà eu lieu : on attend que le prix REVIENNE dans la zone (SELL : zone d'offre au-dessus, BUY : zone
+    de demande en dessous). Ordre placé à l'entrée de la zone (POI_LIMIT_DEPTH = 0 -> bord proche, pour ne pas rater
+    l'entrée), SL derrière le bord lointain + buffer ATR, TP au RR réglé. Zone la plus proche du prix retenue.
+    Pas de limit si le prix est déjà dans / au-delà de la zone (l'entrée directe couvre ce cas), si la zone est trop
+    loin (POI_LIMIT_MAX_ATR) ou si le SL serait trop large (MAX_SL_ATR).
+    Retourne (signal | None, motif_de_refus | None)."""
+    d, a, i = ev["dir"], ev["atr"], ev["i"]
+    cur = c[i]["c"]
+    try:
+        pois = [p for p in find_pois(c[:i + 1], TIMEFRAME_MIN, d) if p["f"] > ev["src"]]
+    except Exception as e:
+        return None, f"lecture des OB/FVG impossible ({type(e).__name__})"
+    zone_kind = get_limit_zone()
+    if zone_kind != "BOTH":
+        pois = [p for p in pois if p["kind"] == zone_kind]
+    if not pois:
+        return None, f"aucun {'OB / FVG' if zone_kind == 'BOTH' else zone_kind} valide créé par ce CHoCH"
+    cands = []
+    for p in pois:
+        w = p["hi"] - p["lo"]
+        prox = p["hi"] if d == 1 else p["lo"]
+        entry = prox - d * POI_LIMIT_DEPTH * w
+        if (entry - cur) * d >= 0:
+            continue                       # prix déjà dans / au-delà de la zone : rien à attendre
+        if abs(cur - entry) > POI_LIMIT_MAX_ATR * a:
+            continue                       # zone trop loin : le retour est improbable
+        cands.append((abs(cur - entry), entry, p))
+    if not cands:
+        return None, "prix déjà dans la zone, ou zone trop éloignée : pas d'ordre limit"
+    _, entry, p = min(cands, key=lambda x: x[0])
+    dist = sl_anchor if sl_anchor is not None else (p["lo"] if d == 1 else p["hi"])   # bord lointain de la zone (CRT : le sweep)
+    sl = dist - d * SL_BUFFER_ATR * a
+    if (d == 1 and sl >= entry) or (d == -1 and sl <= entry):
+        return None, "SL derrière la zone du mauvais côté de l'entrée"
+    risk = abs(entry - sl)
+    if risk > MAX_SL_ATR * a:
+        return None, f"zone trop large : SL {risk:.2f} pts > {MAX_SL_ATR}xATR"
+    min_pct = SYMBOLS.get(symbol, {}).get("min_sl_pct", MIN_SL_PCT) if symbol else MIN_SL_PCT
+    min_risk = max(MIN_SL_ATR * a, entry * min_pct)
+    if risk < min_risk:                    # zone très fine : mêmes planchers que l'entrée directe
+        risk = min_risk
+        sl = entry - d * risk
+    sig = {
+        "dir": d, "side": "BUY" if d == 1 else "SELL", "type": ev["type"],
+        "order": "LIMIT", "ref_price": cur,
+        "entry": entry, "sl": sl, "risk": risk, "tp": entry + d * risk * tp_rr,
+        "t": ev["t"], "bos_level": ev["sl_level"],
+        "rr": tp_rr, "be_rr": be_rr, "tf": TF_LABEL,
+        "key_suffix": "poi", "zone": p,   # signal_key distinct de l'entrée directe ; zone d'entrée affichée dans le message
+    }
+    sig.update(base)
+    # liquidité : affichage seulement, comme pour l'entrée directe
+    sig["ext"], sig["sweep"] = liquidity_reading(symbol, c, ev, entry) if symbol else (None, None)
+    if apply_tp:
+        apply_tp_mode(sig, c, ev, symbol, tp_rr)
+    return sig, None
+
+
+# ============================================================================
+# FILTRES QUALITÉ DU CHoCH — calculés à chaque CHoCH, appliqués seulement s'ils sont ON (get_qf)
+#   swings : structure d'avant CHoCH cohérente (vente : HH + HL, le CHoCH casse un HL ; achat : LL + LH)
+#   disp   : displacement (corps net >= DISP_BODY_ATR x ATR, peu de mèches) ET vraie cassure (clôture >= DISP_BREAK_ATR x ATR au-delà)
+#   range  : anti-chop (efficience des RANGE_LOOKBACK dernières bougies >= RANGE_MIN_ER)
+#   fvg    : le CHoCH a créé un FVG dans son sens, pas encore entièrement mitigé (états : non mitigé / partiel / mitigé)
+#   ind    : inducement — LIMIT OB/FVG seulement : un pivot mineur de la jambe doit se trouver entre le prix et la zone
+# ============================================================================
+def _confirmed_swings(c, upto, depth=SWING_DEPTH, span=300):
+    """Swings hauts / bas confirmés (même définition que `analyze`) à l'index `upto` : listes de (index, prix)."""
+    hs, ls = [], []
+    for p in range(max(depth, upto - span), upto - depth + 1):
+        wh = [x["h"] for x in c[p - depth:p + depth + 1]]
+        wl = [x["l"] for x in c[p - depth:p + depth + 1]]
+        if c[p]["h"] == max(wh) and all(c[p]["h"] > c[k]["h"] for k in range(p - depth, p)):
+            hs.append((p, c[p]["h"]))
+        if c[p]["l"] == min(wl) and all(c[p]["l"] < c[k]["l"] for k in range(p - depth, p)):
+            ls.append((p, c[p]["l"]))
+    return hs, ls
+
+
+def swing_check(c, ev):
+    d, i, src, lvl = ev["dir"], ev["i"], ev["src"], ev["level"]
+    hs, ls = _confirmed_swings(c, i)
+    if d == -1:   # vente : le CHoCH casse un plus bas (HL) ; avant lui, plus hauts (HH) et plus bas (HL) montants
+        prev = [x for x in ls if x[0] < src]
+        if not prev or len(hs) < 2:
+            return {"ok": False, "txt": "swings insuffisants pour juger la structure"}
+        a_ok, b_ok = prev[-1][1] < lvl, hs[-1][1] > hs[-2][1]
+        lab = ("HH" if b_ok else "HH✗") + "+" + ("HL" if a_ok else "HL✗")
+    else:         # achat : le CHoCH casse un plus haut (LH) ; avant lui, plus bas (LL) et plus hauts (LH) descendants
+        prev = [x for x in hs if x[0] < src]
+        if not prev or len(ls) < 2:
+            return {"ok": False, "txt": "swings insuffisants pour juger la structure"}
+        a_ok, b_ok = prev[-1][1] > lvl, ls[-1][1] < ls[-2][1]
+        lab = ("LL" if b_ok else "LL✗") + "+" + ("LH" if a_ok else "LH✗")
+    return {"ok": bool(a_ok and b_ok), "txt": f"structure avant CHoCH {lab}"}
+
+
+def disp_check(c, ev):
+    d, i, a = ev["dir"], ev["i"], ev["atr"]
+    if not a:
+        return {"ok": False, "txt": "ATR indisponible"}
+    x = c[i]
+    body, rng = (x["c"] - x["o"]) * d, x["h"] - x["l"]
+    brk = (x["c"] - ev["level"]) * d
+    ratio = body / rng if rng > 0 else 0.0
+    ok = body >= DISP_BODY_ATR * a and ratio >= DISP_BODY_RATIO and brk >= DISP_BREAK_ATR * a
+    return {"ok": bool(ok), "txt": f"corps {body / a:.2f}xATR ({ratio:.0%} de la bougie) · cassure +{brk / a:.2f}xATR"}
+
+
+def range_check(c, ev):
+    i, n = ev["i"], RANGE_LOOKBACK
+    if i < n:
+        return {"ok": False, "txt": "historique insuffisant"}
+    w = c[i - n:i + 1]
+    path = sum(abs(w[k]["c"] - w[k - 1]["c"]) for k in range(1, len(w)))
+    er = abs(w[-1]["c"] - w[0]["c"]) / path if path > 0 else 0.0
+    return {"ok": er >= RANGE_MIN_ER, "txt": f"efficience {er:.2f} (min {RANGE_MIN_ER:g}) · chop {round((1 - er) * 100)}/100"}
+
+
+def choch_fvg(c, ev, dec=5):
+    """FVG le plus récent créé PAR la jambe du CHoCH (dans son sens) et son état vis-à-vis des bougies suivantes."""
+    d, i, a = ev["dir"], ev["i"], ev["atr"] or 0.0
+    e = _turn_index(c, ev)
+    best = None
+    for k in range(e + 1, i):
+        lo, hi = (c[k - 1]["h"], c[k + 1]["l"]) if d == 1 else (c[k + 1]["h"], c[k - 1]["l"])
+        if hi > lo and hi - lo >= POI_MIN_ATR * a:
+            best = (k, lo, hi)
+    if not best:
+        return {"ok": False, "state": None, "txt": "aucun FVG créé par le CHoCH"}
+    k, lo, hi = best
+    later = c[k + 2:]
+    if d == 1:    # zone de demande : mitigée quand le prix REDESCEND dedans
+        m = min((x["l"] for x in later), default=None)
+        state = "non mitigé" if m is None or m > hi else ("mitigé" if m <= lo else "partiel")
+    else:         # zone d'offre : mitigée quand le prix REMONTE dedans
+        m = max((x["h"] for x in later), default=None)
+        state = "non mitigé" if m is None or m < lo else ("mitigé" if m >= hi else "partiel")
+    return {"ok": state != "mitigé", "state": state, "zone": (lo, hi),
+            "txt": f"FVG {lo:.{dec}f}-{hi:.{dec}f} {state}"}
+
+
+def ind_check(c, ev, entry):
+    """Inducement d'un LIMIT : pivot mineur (profondeur 1) de la jambe, du côté opposé au trade, situé strictement ENTRE le
+    prix du CHoCH et l'entrée limit — le prix doit le balayer pour atteindre la zone."""
+    d, i = ev["dir"], ev["i"]
+    e, cur = _turn_index(c, ev), c[i]["c"]
+    lv = []
+    for k in range(e + 1, i):
+        if d == -1 and c[k]["h"] > c[k - 1]["h"] and c[k]["h"] > c[k + 1]["h"] and cur < c[k]["h"] < entry:
+            lv.append(c[k]["h"])
+        if d == 1 and c[k]["l"] < c[k - 1]["l"] and c[k]["l"] < c[k + 1]["l"] and entry < c[k]["l"] < cur:
+            lv.append(c[k]["l"])
+    if not lv:
+        return {"ok": False, "txt": "aucun pivot mineur (IND) entre le prix et la zone"}
+    lvl = max(lv) if d == -1 else min(lv)
+    return {"ok": True, "txt": f"IND @ {lvl:.5g} entre le prix et la zone (balayé à l'aller)"}
+
+
+def quality_check(c, ev, dec=5):
+    """Filtres qualité du CHoCH `ev` -> {clé: {"ok", "txt"}}. Ne refuse rien : voir quality_reject."""
+    out = {}
+    for key, fn in (("swings", swing_check), ("disp", disp_check), ("range", range_check)):
+        try:
+            out[key] = fn(c, ev)
+        except Exception as e:
+            out[key] = {"ok": False, "txt": f"calcul impossible ({type(e).__name__})"}
+    try:
+        out["fvg"] = choch_fvg(c, ev, dec)
+    except Exception as e:
+        out["fvg"] = {"ok": False, "state": None, "txt": f"calcul impossible ({type(e).__name__})"}
+    return out
+
+
+def quality_reject(qf):
+    """Motif de refus si un filtre ON échoue (swings / disp / range / fvg ; l'IND se juge sur le limit), sinon None."""
+    for k in ("swings", "disp", "range", "fvg"):
+        if get_qf(k) and k in qf and not qf[k]["ok"]:
+            return f"filtre {QF_LBL[k]} : {qf[k]['txt']}"
+    return None
+
+
+def signal_log_block(symbol, sig, dec):
+    """Un bloc de log par signal : niveaux, cible, RR attendu et résultat de chaque filtre qualité (ON/OFF)."""
+    qf = sig.get("qf") or {}
+    lines = [f"[{symbol}] ── SIGNAL {sig['side']} {sig.get('order', 'MARKET')} {sig['type']} ({_ts_str(sig['t'])}) ──",
+             f"    ENTRY={sig['entry']:.{dec}f} SL={sig['sl']:.{dec}f} TP={sig['tp']:.{dec}f} RISK_PTS={sig['risk']:.{dec}f}",
+             f"    TARGET_TYPE={sig.get('tp_mode') or 'RR fixe'} TARGET_PRICE={sig['tp']:.{dec}f} EXPECTED_RR={sig.get('rr')}"]
+    for k in QF_KEYS:
+        if k in qf:
+            lines.append(f"    {k.upper():7}: {'✅' if qf[k]['ok'] else '❌'} {qf[k]['txt']}  [filtre {'ON' if get_qf(k) else 'OFF'}]")
+    print("\n".join(lines))
+
+
+def build_signal(c, ev, symbol=None, multi=False):
     """Transforme un CHoCH en signal (entrée, SL, TP). None si invalide.
 
     DEBUG_CHOCH=True (par défaut) : chaque CHoCH ignoré est loggé avec la raison, pour ne plus
@@ -2997,10 +3577,11 @@ def build_signal(c, ev, symbol=None):
                 _mtf_block(symbol, trace, f"⛔ REJETÉ -- {reason}")
         return None
 
+    _none = [] if multi else None
     if ev["kind"] != "CHOCH":
-        return None
+        return _none
     if ev["sl_level"] is None:
-        return _rej("pas de niveau de repli valide (sl_level manquant)")
+        return _rej("pas de niveau de repli valide (sl_level manquant)") or _none
     if ev["type"] == "CHOCH1" and not ENTRY_CHOCH1:
         return _rej("ENTRY_CHOCH1 désactivé")
     if ev["type"] == "CHOCH2" and not ENTRY_CHOCH2:
@@ -3027,56 +3608,93 @@ def build_signal(c, ev, symbol=None):
         ok, why = mtf_fib_pd_filter(symbol, ev, trace)
         if not ok:
             return _rej(why)
+    qf = quality_check(c, ev, SYMBOLS[symbol]["decimals"] if symbol else 5)   # filtres qualité : toujours calculés
+    why = quality_reject(qf)                                                    # ... refusent seulement s'ils sont ON
+    if why:
+        return _rej(why)
     d, a = ev["dir"], ev["atr"]
-    entry = c[ev["i"]]["c"]
-    sl = ev["sl_level"] - d * SL_BUFFER_ATR * a
-    if (d == 1 and sl >= entry) or (d == -1 and sl <= entry):
-        return _rej(f"SL structurel du mauvais côté de l'entrée (sl={sl:.2f}, entrée={entry:.2f})")
-    risk = abs(entry - sl)
-    # Le contrôle "BOS trop ancien/éloigné" doit juger la distance STRUCTURELLE d'origine (avant tout plancher) :
-    # sinon, sur une UT basse (M1) où l'ATR est petit, le plancher en % ci-dessous dépasserait quasi toujours
-    # 6xATR et bloquerait TOUS les signaux, même valides (c'est le bug qui a fait disparaître les signaux).
-    if risk > MAX_SL_ATR * a:
-        return _rej(f"SL trop large : {risk:.2f} pts > {MAX_SL_ATR}xATR ({MAX_SL_ATR * a:.2f} pts) "
-                    f"-- niveau de référence trop ancien/éloigné")
-    # Double plancher : ATR (MIN_SL_ATR) ET % du prix (min_sl_pct/MIN_SL_PCT) -- le plus grand des deux gagne.
-    # Sans le plancher en %, un ATR minuscule (marché calme sur une UT basse comme M1) laissait passer des SL de
-    # quelques points, balayés par le moindre bruit/spread : c'est ce plancher absolu qui l'empêche.
-    min_pct = SYMBOLS.get(symbol, {}).get("min_sl_pct", MIN_SL_PCT) if symbol else MIN_SL_PCT
-    min_risk = max(MIN_SL_ATR * a, entry * min_pct)
-    if risk < min_risk:
-        risk = min_risk
-        sl = entry - d * risk
-    sig = {
-        "dir": d, "side": "BUY" if d == 1 else "SELL", "type": ev["type"],
-        "order": "MARKET", "ref_price": entry,
-        "entry": entry, "sl": sl, "risk": risk,
-        "tp": entry + d * risk * tp_rr,
-        "t": ev["t"], "bos_level": ev["sl_level"],
-        "rr": tp_rr, "htf": htf_on, "htf_mode": htf_mode, "be_rr": be_rr, "tf": TF_LABEL,   # affichés sur le signal
-        "setup": setup, "poi": poi,   # CONTINUATION (COMPLET) / TENDANCE M15 ... (M15) ; None si filtre HTF OFF
-        "mtf_fib_on": mtf_fib_on, "mtf_fib": trace.get("mtf_fib"),   # affichage filtre Fibonacci HTF Premium/Discount
-    }
-    # Entrée LIMIT : retest du niveau cassé (la ligne du CHoCH), avec le même SL structurel.
-    lvl = ev["level"]
-    want_limit = ENTRY_MODE == "LIMIT" or (ENTRY_MODE == "BOTH" and abs(entry - lvl) > LIMIT_EXT_ATR * a)
-    if want_limit and ((d == 1 and sl < lvl < entry) or (d == -1 and entry < lvl < sl)):
-        risk_l = abs(lvl - sl)
-        min_risk_l = max(MIN_SL_ATR * a, lvl * min_pct)
-        if risk_l < min_risk_l:
-            risk_l = min_risk_l
-            sl = lvl - d * risk_l
-        # si le prix a déjà dépassé le seuil d'annulation, la limit n'a plus de sens : on reste en DIRECT
-        if (entry - lvl) * d < LIMIT_CANCEL_RR * risk_l:
-            sig.update(order="LIMIT", entry=lvl, sl=sl, risk=risk_l, tp=lvl + d * risk_l * tp_rr)
-    # Lecture liquidité externe / interne : AFFICHAGE (graphique + message), jamais une condition d'acceptation.
-    sig["ext"], sig["sweep"] = liquidity_reading(symbol, c, ev, sig["entry"]) if symbol else (None, None)
-    if setup:   # dernier maillon de la chaîne POI -> mitigation -> réaction -> CHoCH : accepté (les refus passent par _rej)
-        src = f" depuis {_poi_txt(poi, SYMBOLS[symbol]['decimals'])}" if poi else ""
-        print(f"[{symbol}] signal ACCEPTÉ : {sig['side']} {sig['type']} -- {setup}{src}")
-        if trace:
-            _mtf_block(symbol, trace, f"✅ ACCEPTÉ -- {sig['side']} {sig['type']} · {setup}{src}")
-    return sig
+
+    def _direct():
+        entry = c[ev["i"]]["c"]
+        sl, sl_tag = sl_by_mode(c, ev, a, symbol)
+        if (d == 1 and sl >= entry) or (d == -1 and sl <= entry):
+            return _rej(f"SL ({sl_tag}) du mauvais côté de l'entrée (sl={sl:.2f}, entrée={entry:.2f})")
+        risk = abs(entry - sl)
+        # Le contrôle "BOS trop ancien/éloigné" doit juger la distance STRUCTURELLE d'origine (avant tout plancher) :
+        # sinon, sur une UT basse (M1) où l'ATR est petit, le plancher en % ci-dessous dépasserait quasi toujours
+        # 6xATR et bloquerait TOUS les signaux, même valides (c'est le bug qui a fait disparaître les signaux).
+        if risk > MAX_SL_ATR * a:
+            return _rej(f"SL trop large : {risk:.2f} pts > {MAX_SL_ATR}xATR ({MAX_SL_ATR * a:.2f} pts) "
+                        f"-- niveau de référence trop ancien/éloigné")
+        # Double plancher : ATR (MIN_SL_ATR) ET % du prix (min_sl_pct/MIN_SL_PCT) -- le plus grand des deux gagne.
+        # Sans le plancher en %, un ATR minuscule (marché calme sur une UT basse comme M1) laissait passer des SL de
+        # quelques points, balayés par le moindre bruit/spread : c'est ce plancher absolu qui l'empêche.
+        min_pct = SYMBOLS.get(symbol, {}).get("min_sl_pct", MIN_SL_PCT) if symbol else MIN_SL_PCT
+        min_risk = max(MIN_SL_ATR * a, entry * min_pct)
+        if risk < min_risk:
+            risk = min_risk
+            sl = entry - d * risk
+        sig = {
+            "dir": d, "side": "BUY" if d == 1 else "SELL", "type": ev["type"],
+            "order": "MARKET", "ref_price": entry,
+            "entry": entry, "sl": sl, "risk": risk,
+            "tp": entry + d * risk * tp_rr,
+            "t": ev["t"], "bos_level": ev["sl_level"],
+            "rr": tp_rr, "htf": htf_on, "htf_mode": htf_mode, "be_rr": be_rr, "tf": TF_LABEL,   # affichés sur le signal
+            "setup": setup, "poi": poi,   # CONTINUATION (COMPLET) / TENDANCE M15 ... (M15) ; None si filtre HTF OFF
+            "mtf_fib_on": mtf_fib_on, "mtf_fib": trace.get("mtf_fib"),   # affichage filtre Fibonacci HTF Premium/Discount
+            "qf": dict(qf, ind={"ok": True, "txt": "n/a (entrée directe : l'IND se juge sur le limit OB/FVG)"}),
+        }
+        # Entrée LIMIT : retest du niveau cassé (la ligne du CHoCH), avec le même SL structurel.
+        lvl = ev["level"]
+        want_limit = ENTRY_MODE == "LIMIT" or (ENTRY_MODE == "BOTH" and abs(entry - lvl) > LIMIT_EXT_ATR * a)
+        if want_limit and ((d == 1 and sl < lvl < entry) or (d == -1 and entry < lvl < sl)):
+            risk_l = abs(lvl - sl)
+            min_risk_l = max(MIN_SL_ATR * a, lvl * min_pct)
+            if risk_l < min_risk_l:
+                risk_l = min_risk_l
+                sl = lvl - d * risk_l
+            # si le prix a déjà dépassé le seuil d'annulation, la limit n'a plus de sens : on reste en DIRECT
+            if (entry - lvl) * d < LIMIT_CANCEL_RR * risk_l:
+                sig.update(order="LIMIT", entry=lvl, sl=sl, risk=risk_l, tp=lvl + d * risk_l * tp_rr)
+        # Lecture liquidité externe / interne : AFFICHAGE (graphique + message), jamais une condition d'acceptation.
+        sig["ext"], sig["sweep"] = liquidity_reading(symbol, c, ev, sig["entry"]) if symbol else (None, None)
+        sig["sl_mode"] = sl_tag
+        apply_tp_mode(sig, c, ev, symbol, tp_rr)
+        return sig
+
+    def _accept(sig):
+        if setup:   # dernier maillon de la chaîne POI -> mitigation -> réaction -> CHoCH : accepté (les refus passent par _rej)
+            src = f" depuis {_poi_txt(poi, SYMBOLS[symbol]['decimals'])}" if poi else ""
+            print(f"[{symbol}] signal ACCEPTÉ : {sig['side']} {sig['type']} -- {setup}{src}")
+            if trace:
+                _mtf_block(symbol, trace, f"✅ ACCEPTÉ -- {sig['side']} {sig['type']} · {setup}{src}")
+        return sig
+
+    if not multi:   # appel historique (backtests / tests) : un seul signal direct, inchangé
+        sig = _direct()
+        return _accept(sig) if sig else None
+
+    # Mode multi (scan réel) : selon les types d'entrée activés sur Telegram -> [direct] et/ou [limit sur OB / FVG]
+    out = []
+    if get_entry_direct():
+        sig = _direct()
+        if sig:
+            out.append(_accept(sig))
+    if get_entry_limit():
+        lim, why = poi_limit_signal(c, ev, symbol, tp_rr, be_rr, dict(
+            htf=htf_on, htf_mode=htf_mode, setup=setup, poi=poi, mtf_fib_on=mtf_fib_on, mtf_fib=trace.get("mtf_fib")))
+        if lim:
+            ind = ind_check(c, ev, lim["entry"])
+            lim["qf"] = dict(qf, ind=ind)
+            if get_qf("ind") and not ind["ok"]:
+                if symbol and DEBUG_CHOCH:
+                    print(f"[{symbol}] limit OB/FVG non placé : filtre {QF_LBL['ind']} : {ind['txt']}")
+            else:
+                out.append(_accept(lim))
+        elif symbol and DEBUG_CHOCH:
+            print(f"[{symbol}] limit OB/FVG non placé : {why}")
+    return out
 
 
 # ============================================================================
@@ -3085,14 +3703,14 @@ def build_signal(c, ev, symbol=None):
 # Calcul du lot à partir du montant en $ à risquer.
 # ============================================================================
 
-def calc_lot(symbol, risk_usd, sl_distance):
+def calc_lot(symbol, risk_usd, sl_distance, price=None):
     """Lot = montant risqué / (distance SL en points x valeur du point par lot).
 
     Arrondi vers le bas au pas du broker ; si le résultat est sous le lot minimum,
     retourne le lot minimum (le risque réel sera alors plus élevé : voir 'real_risk').
     """
     cfg = SYMBOLS[symbol]
-    vpp = cfg["value_per_point"]
+    vpp = value_per_point(symbol, price)
     if sl_distance <= 0 or vpp <= 0 or risk_usd <= 0:
         return {"lot": 0.0, "real_risk": 0.0, "raised_to_min": False}
     raw = risk_usd / (sl_distance * vpp)
@@ -3113,7 +3731,9 @@ def calc_margin(symbol, lot, price, leverage):
     """
     if leverage <= 0:
         return 0.0
-    notional = lot * SYMBOLS[symbol]["value_per_point"] * price
+    cfg = SYMBOLS[symbol]
+    # USD/xxx : le notionnel est directement la taille du contrat en USD (lot x 100 000)
+    notional = lot * cfg["contract_size"] if cfg.get("vpp_from_price") else lot * cfg["value_per_point"] * price
     return notional / leverage
 
 
@@ -3711,7 +4331,7 @@ def build_fundamental_analysis(symbol):
     if not raw_events:
         return "⚠️ Calendrier économique indisponible pour le moment — réessaie plus tard."
 
-    relevant = {"USD"} | ({"CHF", "JPY"} if symbol == "XAUUSD" else set())
+    relevant = {"USD"} | {"XAUUSD": {"CHF", "JPY"}, "USDCAD": {"CAD"}, "USDJPY": {"JPY"}}.get(symbol, set())
     now = datetime.now(timezone.utc)
     upcoming, recent = [], []
     for e in raw_events:
@@ -3740,6 +4360,9 @@ def build_fundamental_analysis(symbol):
         "Le Gold réagit surtout aux taux réels, au dollar et à l'aversion au risque "
         "(données Fed / inflation / emploi US, tensions géopolitiques, JPY/CHF en valeurs refuge)."
         if symbol == "XAUUSD" else
+        "Ce couple réagit surtout aux écarts de taux USD / devise de cotation (décisions de banque centrale, inflation, emploi)"
+        + (" et au pétrole pour le CAD." if symbol == "USDCAD" else " et à l'aversion au risque pour le JPY.")
+        if symbol in ("USDCAD", "USDJPY") else
         "Le BTC réagit surtout à la liquidité globale et aux données macro USD (taux, inflation, emploi), "
         "ainsi qu'au sentiment risk-on / risk-off des marchés."
     )
@@ -3926,8 +4549,10 @@ def _exec_block(sig, dec):
         ref = sig.get("ref_price")
         now = f" (prix actuel ≈ {_fmt(ref, dec)})" if ref else ""
         mins = LIMIT_EXPIRY_CANDLES * TF_SEC // 60
+        z = sig.get("zone")
+        zone = f"\n📍 Zone d'entrée : {_poi_txt(z, dec)}" if z else ""
         txt = (f"⏳ <b>{sig['side']} LIMIT</b> — <b>N'ENTRE PAS MAINTENANT</b>\n"
-               f"Place un ordre limit à {_fmt(sig['entry'], dec)}{now}, puis attends le retour du prix.\n"
+               f"Place un ordre limit à {_fmt(sig['entry'], dec)}{now}, puis attends le retour du prix.{zone}\n"
                f"❌ Annulé si le prix atteint {_fmt(_limit_cancel_level(sig), dec)} sans toucher la limit, "
                f"ou après {mins} min : je te préviens.")
         return txt, f"Entrée (limit) : <b>{_fmt(sig['entry'], dec)}</b>"
@@ -3959,7 +4584,17 @@ def _params_lines(sig, tf=None):
              f"RR : {_sig_rr(sig):g}\n"
              f"Filtre HTF : {_htf_txt(mode)}")
     fib_line = _mtf_fib_line(sig)
-    return f"{lines}\n{fib_line}" if fib_line else lines
+    if fib_line:
+        lines += f"\n{fib_line}"
+    crt = sig.get("crt")
+    if crt:
+        lines += (f"\n🕯 CRT {_tf_lbl(crt['ref_tf'])} : range {_fmt(crt['crl'], 2)} – {_fmt(crt['crh'], 2)} "
+                  f"· sweep {_fmt(crt['sweep'], 2)}")
+    if sig.get("sl_mode") and sig["sl_mode"] != "STRUCT":
+        lines += f"\nSL : {_SL_LBL.get(sig['sl_mode'], sig['sl_mode'])}"
+    if sig.get("tp_mode"):
+        lines += f"\nTP : {sig['tp_mode']}"
+    return lines
 
 
 def _mtf_fib_line(sig):
@@ -4130,7 +4765,127 @@ def _signal_text():
             f"🧠 Filtre HTF : {_htf_mode_txt()}\n"
             f"📐 Filtre Fibo HTF : {'ON' if get_mtf_fib_filter() else 'OFF'}\n"
             f"🔒 BE à : RR{get_be_rr():g}\n"
+            f"📥 Entrée : {_entry_txt()}\n"
+            f"🛡 SL : {_SL_LBL[get_sl_mode()]} · 🎯 TP : {_TP_LBL[get_tp_mode()]}\n"
+            f"🧩 Stratégies : {_strat_txt()}\n"
+            f"🔬 Filtres qualité : {_qf_txt()}\n"
+            f"🕐 Session : {_SESS_LBL[get_session()]} · 🎛 Zone limit : {get_limit_zone()}\n"
             f"📍 Signaux ouverts max par actif : {get_max_positions()}")
+
+
+_SL_LBL = {"STRUCT": "structure (BOS)", "ZONE": "derrière OB/FVG", "SWEEP": "derrière le sweep"}
+_TP_LBL = {"RR": "RR fixe", "TARGET": "liquidité ext.", "SWING": "swing H/L"}
+_CRT_TP_LBL = {"RANGE": "autre bout du range", "MID": "50 % du range", "RR": "RR fixe"}
+_SESS_LBL = {"ALL": "toutes", "LONDON": "Londres", "NY": "New York", "BOTH": "Londres + New York"}
+
+
+def _signal_sess_text():
+    return (f"🕐 Session : <b>{_SESS_LBL[get_session()]}</b>\n\n"
+            f"Seuls les CHoCH survenus pendant la session choisie donnent un signal (stratégie principale ET CRT).\n"
+            f"Londres {SESSION_LONDON[0]:02d}h–{SESSION_LONDON[1]:02d}h UTC · New York {SESSION_NY[0]:02d}h–{SESSION_NY[1]:02d}h UTC "
+            f"(réglable : SESSION_LONDON / SESSION_NY).\n"
+            f"Le trade déjà ouvert continue normalement hors session. Aussi : /session all|londres|ny|both")
+
+
+def _signal_sess_keyboard():
+    cur = get_session()
+    return _signal_back([[_btn(_SESS_LBL[k], f"ssess:{k}", cur == k) for k in SESSIONS]])
+
+
+def _strat_txt():
+    m, c = get_strat_main(), get_strat_crt()
+    return ("principale + CRT" if m and c else ("CRT seul" if c else "principale seule")) + \
+           (f" ({_tf_lbl(get_crt_ref())}->{TF_LABEL})" if c else "")
+
+
+def _btn(label, data, on=False):
+    return {"text": ("✅ " if on else "") + label, "callback_data": data}
+
+
+def _signal_sltp_text():
+    return (f"🛡 SL (entrée directe) : <b>{_SL_LBL[get_sl_mode()]}</b>\n"
+            f"🎯 TP : <b>{_TP_LBL[get_tp_mode()]}</b>\n\n"
+            f"SL — structure : ligne du BOS opposé · zone : derrière l'OB/FVG du CHoCH · sweep : derrière l'extrême de la jambe. "
+            f"(Le limit OB/FVG et le CRT mettent toujours leur SL derrière la zone / le sweep.)\n"
+            f"TP — RR fixe (réglage RR) · liquidité ext. : cible visée · swing : plus proche swing H/L non cassé. "
+            f"Cible absente ou sous RR{TP_MIN_RR:g} : repli sur le RR fixe.\n"
+            f"Effet immédiat sur les NOUVEAUX signaux. Aussi : /modesl struct|zone|sweep · /modetp rr|target|swing")
+
+
+def _signal_sltp_keyboard():
+    sl, tp = get_sl_mode(), get_tp_mode()
+    return _signal_back([
+        [_btn(_SL_LBL[k].capitalize(), f"ssl:{k}", sl == k) for k in SL_MODES],
+        [_btn(_TP_LBL[k].capitalize(), f"stp:{k}", tp == k) for k in TP_MODES]])
+
+
+def _signal_strat_text():
+    return (f"🧩 Stratégies actives : <b>{_strat_txt()}</b>\n\n"
+            f"• Principale : Sweep → POI → mitigation → CHoCH (filtres HTF de ce menu).\n"
+            f"• CRT : bougie HTF de référence (CRH/CRL) balayée d'un côté, clôture de retour DANS le range, puis CHoCH sur {TF_LABEL}. "
+            f"SL derrière le sweep, TP : {_CRT_TP_LBL[get_crt_tp()]}. Sans filtre de tendance (c'est un retournement). "
+            f"Modèles courants : H4→M15, H1→M5.\n"
+            f"Si les deux sont actives, un CHoCH déjà pris par la principale n'ouvre pas de 2e trade CRT, sauf si « CRT même si… » est ON "
+            f"(doublons : {'ON' if get_crt_dup() else 'OFF'}).\n"
+            f"⚠️ Le CRT n'est pas validé par un backtest : garde-le désactivé en réel tant qu'il n'a pas fait ses preuves.\n"
+            f"Aussi : /strategie main|crt|both · /crt h1|h4|d1|range|mid|rr|htfon|htfoff")
+
+
+def _signal_strat_keyboard():
+    m, c, ref, tp = get_strat_main(), get_strat_crt(), get_crt_ref(), get_crt_tp()
+    return _signal_back([
+        [_btn("Principale", "sstr:main", m), _btn("CRT", "sstr:crt", c)],
+        [_btn(_tf_lbl(k), f"scrt:{k}", ref == k) for k in CRT_REFS],
+        [_btn(_CRT_TP_LBL[k].capitalize(), f"scrtp:{k}", tp == k) for k in CRT_TP_MODES],
+        [_btn("CRT + filtre tendance HTF", "scrthtf", get_crt_htf())],
+        [_btn("CRT même si la principale a pris le CHoCH", "scrtdup", get_crt_dup())]])
+
+
+def _entry_txt():
+    d, l = get_entry_direct(), get_entry_limit()
+    return "⚡ direct + ⏳ limit OB/FVG" if d and l else ("⏳ limit OB/FVG seul" if l else "⚡ direct seul")
+
+
+def _signal_entry_text():
+    return (f"📥 Type d'entrée : <b>{_entry_txt()}</b>\n\n"
+            f"⚡ Direct : entrée au marché à la clôture du CHoCH.\n"
+            f"⏳ Limit : ordre placé à l'entrée de l'OB / FVG créé par le CHoCH (bord proche, pour ne pas rater l'entrée), "
+            f"SL derrière la zone. Annulé si le prix repart sans toucher ou après {LIMIT_EXPIRY_CANDLES} bougies.\n"
+            f"Les deux : les deux ordres partent ; le limit ne compte pas dans « signaux max » (attention : risque doublé "
+            f"si les deux s'exécutent).\n"
+            f"Zone du limit : <b>{get_limit_zone()}</b> (OB seul, FVG seul, ou les deux : la plus proche du prix).\n"
+            f"Effet immédiat sur les NOUVEAUX signaux. Aussi : /entree direct | limit | both · /zone ob|fvg|both")
+
+
+def _signal_entry_keyboard():
+    d, l = get_entry_direct(), get_entry_limit()
+    return _signal_back([[
+        {"text": ("✅ " if d and not l else "") + "⚡ Direct", "callback_data": "sent:direct"},
+        {"text": ("✅ " if l and not d else "") + "⏳ Limit", "callback_data": "sent:limit"},
+        {"text": ("✅ " if d and l else "") + "⚡+⏳ Les deux", "callback_data": "sent:both"}],
+        [_btn(f"Zone {k}", f"szone:{k}", get_limit_zone() == k) for k in LIMIT_ZONES]])
+
+
+def _qf_txt():
+    on = [QF_LBL[k] for k in QF_KEYS if get_qf(k)]
+    return ", ".join(on) if on else "aucun (tous OFF)"
+
+
+def _signal_qf_text():
+    rows = "\n".join(f"{'✅' if get_qf(k) else '⬜'} {QF_LBL[k]}" for k in QF_KEYS)
+    return (f"🔬 <b>FILTRES QUALITÉ</b>\n\n{rows}\n\n"
+            f"Chaque filtre est ON ou OFF (défaut : OFF = plus de signaux). Même OFF, il est calculé et écrit dans le log de chaque signal.\n"
+            f"• Structure : vente = HH+HL avant le CHoCH ; achat = LL+LH.\n"
+            f"• Displacement : corps >= {DISP_BODY_ATR:g}xATR, peu de mèches, clôture >= {DISP_BREAK_ATR:g}xATR au-delà du niveau.\n"
+            f"• Anti-range : efficience des {RANGE_LOOKBACK} dernières bougies >= {RANGE_MIN_ER:g}.\n"
+            f"• FVG strict : le CHoCH doit créer un FVG pas entièrement mitigé.\n"
+            f"• Inducement : limit OB/FVG seulement, un pivot mineur entre le prix et la zone.\n"
+            f"Effet immédiat sur les NOUVEAUX signaux.")
+
+
+def _signal_qf_keyboard():
+    btns = [_btn(QF_LBL[k], f"sqf:{k}", get_qf(k)) for k in QF_KEYS]
+    return _signal_back([btns[j:j + 2] for j in range(0, len(btns), 2)])
 
 
 def _signal_keyboard():
@@ -4139,6 +4894,9 @@ def _signal_keyboard():
          {"text": "🧠 FILTRE HTF", "callback_data": "sig:htf"}],
         [{"text": "🔒 BE", "callback_data": "sig:be"}, {"text": "📍 SIGNAUX MAX", "callback_data": "sig:max"}],
         [{"text": "🌐 LIQ. EXTERNE", "callback_data": "sig:ext"}, {"text": "📐 FIBO HTF", "callback_data": "sig:fib"}],
+        [{"text": "📥 ENTRÉE", "callback_data": "sig:entry"}, {"text": "🛡 SL / 🎯 TP", "callback_data": "sig:sltp"}],
+        [{"text": "🧩 STRATÉGIES (CRT)", "callback_data": "sig:strat"}, {"text": "🕐 SESSION", "callback_data": "sig:sess"}],
+        [{"text": "🔬 FILTRES QUALITÉ", "callback_data": "sig:qf"}],
         [{"text": "🔙 Menu", "callback_data": "menu:home"}]]}
 
 
@@ -4281,7 +5039,7 @@ def _media_from_message(msg):
     return None
 
 
-_ANALYSE_SYMS = {"XAU": "XAUUSD", "BTC": "BTCUSD"}
+_ANALYSE_SYMS = {"XAU": "XAUUSD", "BTC": "BTCUSD", "CAD": "USDCAD", "JPY": "USDJPY"}
 
 
 def _analyse_text():
@@ -4292,6 +5050,7 @@ def _analyse_text():
 def _analyse_keyboard():
     return _with_back({"inline_keyboard": [
         [{"text": "🥇 XAUUSD", "callback_data": "ana:sym:XAU"}, {"text": "₿ BTCUSD", "callback_data": "ana:sym:BTC"}],
+        [{"text": "🇨🇦 USDCAD", "callback_data": "ana:sym:CAD"}, {"text": "🇯🇵 USDJPY", "callback_data": "ana:sym:JPY"}],
     ]})
 
 
@@ -4312,7 +5071,7 @@ def _analyse_symbol_keyboard(symbol):
 # Section isolée, ajoutée sans toucher au moteur de signal automatique. Utilise l'API déjà
 # connectée (MetaApi REST / MT5) — jamais de 2e connexion, jamais de nom de broker codé en dur :
 # le nom réel vient de get_account_information() (voir get_account_summary).
-_MANUAL_SYMS = {"XAU": "XAUUSD", "BTC": "BTCUSD"}
+_MANUAL_SYMS = {"XAU": "XAUUSD", "BTC": "BTCUSD", "CAD": "USDCAD", "JPY": "USDJPY"}
 
 
 def _compte_text():
@@ -4359,7 +5118,8 @@ def _trade_home_text():
 
 def _trade_home_keyboard():
     return _with_back({"inline_keyboard": [
-        [{"text": "🟠 XAUUSD", "callback_data": "mtr:sym:XAU"}, {"text": "₿ BTCUSD", "callback_data": "mtr:sym:BTC"}]]})
+        [{"text": "🟠 XAUUSD", "callback_data": "mtr:sym:XAU"}, {"text": "₿ BTCUSD", "callback_data": "mtr:sym:BTC"}],
+        [{"text": "🇨🇦 USDCAD", "callback_data": "mtr:sym:CAD"}, {"text": "🇯🇵 USDJPY", "callback_data": "mtr:sym:JPY"}]]})
 
 
 def _trade_side_text(symbol):
@@ -4390,9 +5150,12 @@ def _pending_manual_get(chat_id):
     return p
 
 
+_SL_EXAMPLE = {'XAUUSD': '4281.50', 'USDCAD': '1.37250', 'USDJPY': '149.850'}
+
+
 def _trade_sl_prompt_text(symbol, side):
     return (f"✍️ <b>{symbol} {side}</b>\n\n"
-            f"Envoie ton <b>SL</b> (un prix), ex. <code>{'4281.50' if symbol == 'XAUUSD' else '84200'}</code>.\n"
+            f"Envoie ton <b>SL</b> (un prix), ex. <code>{_SL_EXAMPLE.get(symbol, '84200')}</code>.\n"
             f"Le lot sera calculé pour risquer {get_risk():g} $ sur ce SL, avec un TP à RR {get_tp_rr():g}.\n"
             f"Ou touche 🎯 SL au sweep : le SL est placé sous (BUY) / au-dessus (SELL) de la mèche du dernier sweep.\n"
             f"Rien n'est envoyé au broker avant ta validation. ⏱ Valable 5 min.")
@@ -4546,6 +5309,10 @@ def handle_command(text):
                "/signal — paramètres du signal (RR, timeframe, filtre HTF, BE, signaux max)\n"
                "/be [RR] — RR auquel le SL passe à l'entrée (ex. /be 1)\n"
                "/maxpos [n] — signaux ouverts max par actif (1 = pas de doublon)\n"
+               "/entree [direct|limit|both] — type d'entrée : direct, limit sur OB/FVG, ou les deux\n"
+               "/session [all|londres|ny|both] — n'accepter que les CHoCH d'une session · /zone [ob|fvg|both] — zone du limit\n"
+               "/modesl [struct|zone|sweep] — SL de l'entrée directe · /modetp [rr|target|swing] — mode du TP\n"
+               "/strategie [main|crt|both] · /crt [on|off|h1|h4|d1|range|mid|rr] — module CRT (désactivé par défaut)\n"
                "/mtffib [on|off] — filtre Fibonacci HTF Premium/Discount\n"
                "/medias — stickers / images / GIF du groupe (TP, SL, BE, motivation)\n"
                "/analyse — analyse technique / fondamentale à la demande (BTCUSD, XAUUSD)\n"
@@ -4591,6 +5358,55 @@ def handle_command(text):
         return (f"📐 Filtre Fibonacci HTF Premium/Discount : <b>{'ON' if on else 'OFF'}</b>\n"
                 f"UT Fibo : {_tf_lbl(mtf_fib_tf())} (auto selon le timeframe d'entrée {TF_LABEL})\n"
                 f"Change avec /mtffib on ou /mtffib off.", None)
+    if cmd in ("/entree", "/entrée", "/entry"):
+        if len(parts) > 1:
+            modes = {"direct": (True, False), "marche": (True, False), "marché": (True, False),
+                     "limit": (False, True), "limite": (False, True), "both": (True, True),
+                     "les2": (True, True), "deux": (True, True)}
+            m = modes.get(parts[1].lower())
+            if not m:
+                return ("Valeur invalide. Exemple : /entree direct  |  /entree limit  |  /entree both", None)
+            set_entry_types(*m)
+        return (_signal_entry_text(), _signal_entry_keyboard())
+    if cmd == "/session":
+        if len(parts) > 1:
+            names = {"all": "ALL", "toutes": "ALL", "londres": "LONDON", "london": "LONDON", "ny": "NY", "newyork": "NY",
+                     "both": "BOTH", "londres+ny": "BOTH", "les2": "BOTH"}
+            v = names.get(parts[1].lower())
+            if not v:
+                return ("Valeur invalide. Exemple : /session all | londres | ny | both", None)
+            set_choice("session", v, SESSIONS)
+        return (_signal_sess_text(), _signal_sess_keyboard())
+    if cmd == "/zone":
+        if len(parts) > 1 and not set_choice("limit_zone", parts[1], LIMIT_ZONES):
+            return ("Valeur invalide. Exemple : /zone ob | fvg | both", None)
+        return (_signal_entry_text(), _signal_entry_keyboard())
+    if cmd in ("/modesl", "/modetp"):
+        key, choices, lbl = ("sl_mode", SL_MODES, _SL_LBL) if cmd == "/modesl" else ("tp_mode", TP_MODES, _TP_LBL)
+        if len(parts) > 1 and not set_choice(key, parts[1], choices):
+            return (f"Valeur invalide. Choix : {' | '.join(k.lower() for k in choices)}", None)
+        return (_signal_sltp_text(), _signal_sltp_keyboard())
+    if cmd in ("/strategie", "/stratégie", "/crt"):
+        for arg in parts[1:]:
+            a = arg.lower()
+            refs = {"h1": 60, "h4": 240, "d1": 1440}
+            if cmd == "/crt" and a in ("on", "off"):
+                if not set_strategies(get_strat_main(), a == "on"):
+                    return ("Au moins une stratégie doit rester active.", None)
+            elif a in ("htfon", "htfoff"):
+                set_setting("crt_htf", "1" if a == "htfon" else "0")
+            elif a in refs:
+                set_crt_ref(refs[a])
+            elif a.upper() in CRT_TP_MODES:
+                set_choice("crt_tp", a, CRT_TP_MODES)
+            elif a in ("main", "principale"):
+                set_strategies(True, False)
+            elif a in ("crt", "both", "les2", "deux"):
+                if not set_strategies(a != "crt", True):
+                    return ("Au moins une stratégie doit rester active.", None)
+            else:
+                return ("Valeur invalide. Exemples : /strategie main | crt | both  ·  /crt on|off|h1|h4|d1|range|mid|rr", None)
+        return (_signal_strat_text(), _signal_strat_keyboard())
     if cmd in ("/maxpos", "/signauxmax"):
         if len(parts) > 1:
             try:
@@ -4652,6 +5468,8 @@ def handle_command(text):
             _stats_line("🌐", "Global", query_stats()),
             _stats_line("🥇", "XAUUSD", query_stats(symbol="XAUUSD")),
             _stats_line("₿", "BTCUSD", query_stats(symbol="BTCUSD")),
+            _stats_line("🇨🇦", "USDCAD", query_stats(symbol="USDCAD")),
+            _stats_line("🇯🇵", "USDJPY", query_stats(symbol="USDJPY")),
         ]
         tfs = [r["timeframe"] for r in
                _q("SELECT DISTINCT timeframe FROM trades WHERE timeframe IS NOT NULL ORDER BY timeframe").fetchall()]
@@ -4787,8 +5605,23 @@ def _handle_update(u):
                 _edit(cq, _signal_max_text(), _signal_max_keyboard())
             elif page == "fib":
                 _edit(cq, _signal_fib_text(), _signal_fib_keyboard())
+            elif page == "entry":
+                _edit(cq, _signal_entry_text(), _signal_entry_keyboard())
+            elif page == "sltp":
+                _edit(cq, _signal_sltp_text(), _signal_sltp_keyboard())
+            elif page == "strat":
+                _edit(cq, _signal_strat_text(), _signal_strat_keyboard())
+            elif page == "sess":
+                _edit(cq, _signal_sess_text(), _signal_sess_keyboard())
+            elif page == "qf":
+                _edit(cq, _signal_qf_text(), _signal_qf_keyboard())
             else:
                 _edit(cq, _signal_text(), _signal_keyboard())
+        elif data.startswith("sqf:"):
+            k = data[4:]
+            if k in QF_KEYS and set_qf(k, not get_qf(k)):
+                _edit(cq, _signal_qf_text(), _signal_qf_keyboard())
+                ack = f"{QF_LBL[k]} : {'ON' if get_qf(k) else 'OFF'}"
         elif data.startswith("srr:"):
             rr = int(data[4:])
             if rr in SIGNAL_RR_CHOICES:
@@ -4808,6 +5641,47 @@ def _handle_update(u):
                 set_htf_mode(mode)
                 _edit(cq, _signal_text(), _signal_keyboard())
                 ack = "Filtre HTF : " + _htf_txt(mode)
+        elif data.startswith("ssl:") or data.startswith("stp:"):
+            key, choices = ("sl_mode", SL_MODES) if data.startswith("ssl:") else ("tp_mode", TP_MODES)
+            if set_choice(key, data[4:], choices):
+                _edit(cq, _signal_sltp_text(), _signal_sltp_keyboard())
+                ack = f"SL : {_SL_LBL[get_sl_mode()]} · TP : {_TP_LBL[get_tp_mode()]}"
+        elif data.startswith("ssess:"):
+            if set_choice("session", data[6:], SESSIONS):
+                _edit(cq, _signal_sess_text(), _signal_sess_keyboard())
+                ack = "Session : " + _SESS_LBL[get_session()]
+        elif data.startswith("szone:"):
+            if set_choice("limit_zone", data[6:], LIMIT_ZONES):
+                _edit(cq, _signal_entry_text(), _signal_entry_keyboard())
+                ack = "Zone limit : " + get_limit_zone()
+        elif data == "scrtdup":
+            set_setting("crt_dup", "0" if get_crt_dup() else "1")
+            _edit(cq, _signal_strat_text(), _signal_strat_keyboard())
+            ack = "CRT doublons : " + ("ON" if get_crt_dup() else "OFF")
+        elif data == "scrthtf":
+            set_setting("crt_htf", "0" if get_crt_htf() else "1")
+            _edit(cq, _signal_strat_text(), _signal_strat_keyboard())
+            ack = "CRT + filtre tendance : " + ("ON" if get_crt_htf() else "OFF")
+        elif data.startswith("sstr:"):
+            m, c = get_strat_main(), get_strat_crt()
+            arg = data[5:]
+            new = (not m, c) if arg == "main" else (m, not c)
+            if arg in ("main", "crt") and set_strategies(*new):
+                _edit(cq, _signal_strat_text(), _signal_strat_keyboard())
+                ack = "Stratégies : " + _strat_txt()
+            else:
+                ack = "Au moins une stratégie doit rester active"
+        elif data.startswith("scrt:") or data.startswith("scrtp:"):
+            ok = set_crt_ref(data[5:]) if data.startswith("scrt:") else set_choice("crt_tp", data[6:], CRT_TP_MODES)
+            if ok:
+                _edit(cq, _signal_strat_text(), _signal_strat_keyboard())
+                ack = "CRT : " + _strat_txt()
+        elif data.startswith("sent:"):
+            arg = data[5:]
+            modes = {"direct": (True, False), "limit": (False, True), "both": (True, True)}
+            if arg in modes and set_entry_types(*modes[arg]):
+                _edit(cq, _signal_entry_text(), _signal_entry_keyboard())
+                ack = "Entrée : " + _entry_txt()
         elif data.startswith("sfib:"):
             arg = data[5:]
             if arg in ("on", "off"):
@@ -5115,24 +5989,26 @@ def _should_fetch(symbol, last_seen):
     return True
 
 
-def publish_signal(symbol, candles, events, sig):
-    """Enregistre le trade puis envoie : signal (+ image) au groupe, lot en privé à l'admin."""
+def publish_signal(symbol, candles, events, sig, companion=False):
+    """Enregistre le trade puis envoie : signal (+ image) au groupe, lot en privé à l'admin.
+    `companion` : 2e ordre du même CHoCH (limit OB/FVG à côté de l'entrée directe) -> ne compte pas dans « signaux max ».
+    Retourne True si le signal a été enregistré."""
     dec = SYMBOLS[symbol]["decimals"]
-    key = f"{symbol}:{TF_LABEL}:{sig['t']}"
+    key = f"{symbol}:{TF_LABEL}:{sig['t']}" + (f":{sig['key_suffix']}" if sig.get("key_suffix") else "")
     if signal_exists(key):
-        return
+        return False
     n_open = count_open(symbol)
     max_pos = get_max_positions()
-    if n_open >= max_pos:
+    if n_open >= max_pos and not companion:
         print(f"[{symbol}] {sig['side']} {sig['type']} ignoré ({n_open}/{max_pos} signal(s) encore ouvert(s) : pas de doublon)")
-        return
+        return False
 
     risk_usd = get_risk()
     leverage = get_leverage()
-    lot_info = calc_lot(symbol, risk_usd, sig["risk"])
+    lot_info = calc_lot(symbol, risk_usd, sig["risk"], price=sig["entry"])
     if lot_info["lot"] <= 0:
         print(f"[{symbol}] signal ignoré : lot invalide")
-        return
+        return False
     margin = calc_margin(symbol, lot_info["lot"], sig["entry"], leverage)
 
     is_market = sig.get("order", "MARKET") == "MARKET"
@@ -5151,6 +6027,10 @@ def publish_signal(symbol, candles, events, sig):
         risk_usd=lot_info["real_risk"],  # risque réel du lot pris (= risque demandé sauf lot minimum)
         lot=lot_info["lot"], leverage=leverage, opened_ts=now_ts(), last_ts=sig["t"],
         exec_status="PENDING" if (is_market and mt5_enabled) else None)
+    try:
+        signal_log_block(symbol, sig, dec)
+    except Exception as e:   # un souci de log ne doit jamais bloquer un signal
+        print(f"[{symbol}] bloc de log indisponible ({type(e).__name__})")
     print(f"[{symbol}] SIGNAL {sig['side']} {sig.get('order', 'MARKET')} {sig['type']} @ {sig['entry']:.{dec}f} "
           f"(bougie {_ts_str(sig['t'])})")
 
@@ -5175,6 +6055,28 @@ def publish_signal(symbol, candles, events, sig):
     if is_market and mt5_enabled:
         threading.Thread(target=_run_mt5_execution, name=f"mt5-exec-{trade_id}", daemon=True,
                          args=(trade_id, symbol, sig, lot_info["lot"])).start()
+    return True
+
+
+def _exec_filled_limit(t, dec):
+    """Limit touché (suivi bougies) -> ordre MT5 au marché, sauf si le prix a déjà trop dérivé du limit.
+    Avant : un LIMIT n'était jamais envoyé à MT5 (signal + suivi seulement)."""
+    if not (LIMIT_MT5_EXEC and METAAPI_TOKEN and METAAPI_ACCOUNT_ID):
+        return
+    if t.get("mt5_position_id") or t.get("exec_status") in ("PENDING", "OK"):
+        return
+    symbol, entry, sl = t["symbol"], t["entry"], t["sl"]
+    risk = abs(entry - t["sl_initial"]) or abs(entry - sl)
+    px = get_live_price(symbol)
+    if px is not None and risk and abs(px - entry) > LIMIT_FILL_MAX_DRIFT_R * risk:
+        update_trade(t["id"], exec_status="FAILED")
+        to_admin(f"⚠️ {symbol} {t['side']} LIMIT touché @ {_fmt(entry, dec)} mais le prix est déjà à {_fmt(px, dec)} "
+                 f"(> {LIMIT_FILL_MAX_DRIFT_R:g} R du limit) : ordre MT5 NON envoyé. Le suivi continue.")
+        return
+    update_trade(t["id"], exec_status="PENDING")
+    sig = {"side": t["side"], "type": t["kind"], "entry": entry, "sl": sl, "tp": t["tp"]}
+    threading.Thread(target=_run_mt5_execution, name=f"mt5-exec-{t['id']}", daemon=True,
+                     args=(t["id"], symbol, sig, t["lot"])).start()
 
 
 def _run_mt5_execution(trade_id, symbol, sig, lot):
@@ -5266,6 +6168,18 @@ def retry_unsent_signals():
                         group_txt=late + group_signal(sym, sig, None, dec, tf=t["timeframe"]))
 
 
+def _publish_group(symbol, candles, events, sigs):
+    """Publie les signaux d'un même CHoCH : le 1er normalement, les suivants (limit) en companion hors « signaux max »
+    seulement si le 1er est parti. Retourne True si le 1er a été enregistré."""
+    ok = False
+    for k, sig in enumerate(sigs):
+        if k == 0:
+            ok = publish_signal(symbol, candles, events, sig)
+        elif ok:
+            publish_signal(symbol, candles, events, sig, companion=True)
+    return ok
+
+
 def process_symbol(symbol):
     """Un passage pour un actif : suivi des positions ouvertes, puis détection des nouveaux CHoCH."""
     dec = SYMBOLS[symbol]["decimals"]
@@ -5307,15 +6221,27 @@ def process_symbol(symbol):
             txt = admin_event(ev)
             if txt:
                 to_admin(txt)
+            if ev["name"] == "FILLED":
+                _exec_filled_limit(ev["trade"], dec)
 
     # 2) nouveaux signaux : CHoCH survenus sur les bougies clôturées depuis le dernier passage
     n = len(candles)
     for ev in events:
         if ev["t"] <= last_seen or ev["i"] < n - SIGNAL_MAX_AGE:
             continue
-        sig = build_signal(candles, ev, symbol)
-        if sig:
-            publish_signal(symbol, candles, events, sig)
+        if ev["kind"] == "CHOCH" and not session_ok(ev["t"]):
+            if DEBUG_CHOCH:
+                print(f"[{symbol}] CHoCH {'BUY' if ev['dir'] == 1 else 'SELL'} {ev.get('type')} ignoré : hors session ({get_session()})")
+            continue
+        main_ok = False
+        if get_strat_main():
+            main_ok = _publish_group(symbol, candles, events, build_signal(candles, ev, symbol, multi=True) or [])
+        if get_strat_crt() and (not main_ok or get_crt_dup()):   # sauf interrupteur « doublons CRT » : même CHoCH déjà pris = pas de 2e trade
+            try:
+                _publish_group(symbol, candles, events, crt_build(candles, ev, symbol))
+            except Exception:
+                print(f"[{symbol}] module CRT : erreur (signal ignoré)")
+                traceback.print_exc()
 
     set_meta(meta_key, last_t)
 
@@ -6145,6 +7071,209 @@ class TestBE(unittest.TestCase):
             _E._q("DELETE FROM settings WHERE key='be_rr'", commit=True)
 
 
+class TestEntreeOBFVG(unittest.TestCase):
+    """Types d'entrée : direct / limit sur OB-FVG / les deux (réglage Telegram) + limit companion hors « signaux max »."""
+
+    @staticmethod
+    def _candles():
+        path = [100, 102, 104, 106, 104, 102, 101, 103, 106, 109, 112, 110, 108, 106, 105, 107, 110, 113, 116, 119, 122,
+                120, 118, 117, 118, 120, 121, 118, 114, 110, 106, 102, 98, 96, 95]
+        out, prev = [], path[0]
+        for k, cl in enumerate(path):
+            out.append({"t": 1_700_000_000 + k * 60, "o": prev, "h": max(prev, cl) + 0.3, "l": min(prev, cl) - 0.3, "c": cl})
+            prev = cl
+        return out
+
+    def test_reglage_et_commande(self):
+        try:
+            self.assertTrue(_E.get_entry_direct() and not _E.get_entry_limit())          # défaut = comportement historique
+            self.assertFalse(_E.set_entry_types(False, False), "au moins un type doit rester actif")
+            _E.handle_command("/entree both")
+            self.assertTrue(_E.get_entry_direct() and _E.get_entry_limit())
+            _E.handle_command("/entree limit")
+            self.assertTrue(not _E.get_entry_direct() and _E.get_entry_limit())
+            self.assertIn("sent:both", str(_E._signal_entry_keyboard()))
+            self.assertIn("sig:entry", str(_E._signal_keyboard()))
+        finally:
+            _E._q("DELETE FROM settings WHERE key IN ('entry_direct','entry_limit')", commit=True)
+
+    def test_signaux_selon_reglage(self):
+        c = self._candles()
+        ev = next(e for e in _E.analyze(c) if e["kind"] == "CHOCH")
+        saved = _E.TIMEFRAME_MIN
+        try:
+            _E.TIMEFRAME_MIN = 1
+            for d, l, exp in ((True, False, ["MARKET"]), (False, True, ["LIMIT"]), (True, True, ["MARKET", "LIMIT"])):
+                _E.set_entry_types(d, l)
+                self.assertEqual([x["order"] for x in _E.build_signal(c, ev, None, multi=True)], exp)
+            lim = _E.build_signal(c, ev, None, multi=True)[1]
+            z = lim["zone"]
+            self.assertEqual(lim["side"], "SELL")
+            self.assertAlmostEqual(lim["entry"], z["lo"], places=6)          # bord PROCHE de la zone d'offre
+            self.assertGreater(lim["sl"], z["hi"] - 1e-9)                    # SL derrière la zone
+            self.assertLess(lim["tp"], lim["entry"])
+            self.assertEqual(_E.build_signal(c, ev, None)["order"], "MARKET")   # appel historique inchangé
+        finally:
+            _E.TIMEFRAME_MIN = saved
+            _E._q("DELETE FROM settings WHERE key IN ('entry_direct','entry_limit')", commit=True)
+
+    def test_limit_companion_hors_signaux_max(self):
+        c = self._candles()
+        ev = next(e for e in _E.analyze(c) if e["kind"] == "CHOCH")
+        saved = (_E._deliver_signal, _E.make_chart, _E.TIMEFRAME_MIN)
+        try:
+            _E._q("DELETE FROM trades", commit=True)
+            _E._deliver_signal = lambda *a, **k: None
+            _E.make_chart = lambda *a, **k: None
+            _E.TIMEFRAME_MIN = 1
+            _E.set_entry_types(True, True)
+            direct, lim = _E.build_signal(c, ev, None, multi=True)
+            self.assertTrue(_E.publish_signal("XAUUSD", [], [], direct))
+            self.assertFalse(_E.publish_signal("XAUUSD", [], [], lim), "sans companion : bloqué par signaux max = 1")
+            self.assertTrue(_E.publish_signal("XAUUSD", [], [], lim, companion=True))
+            self.assertFalse(_E.publish_signal("XAUUSD", [], [], lim, companion=True), "pas de doublon du limit")
+            rows = _E._q("SELECT order_type, status FROM trades ORDER BY id").fetchall()
+            self.assertEqual([(r["order_type"], r["status"]) for r in rows], [("MARKET", "OPEN"), ("LIMIT", "PENDING")])
+        finally:
+            _E._deliver_signal, _E.make_chart, _E.TIMEFRAME_MIN = saved
+            _E._q("DELETE FROM trades", commit=True)
+            _E._q("DELETE FROM settings WHERE key IN ('entry_direct','entry_limit')", commit=True)
+
+
+class TestSLTPCRT(unittest.TestCase):
+    """Modes SL / TP réglables + module CRT (bougie HTF de référence, sweep, réintégration, CHoCH)."""
+    _KEYS = "('sl_mode','tp_mode','strat_main','strat_crt','crt_ref','crt_tp','entry_direct','entry_limit','session','limit_zone','crt_htf','crt_dup','qf_swings','qf_disp','qf_range','qf_fvg','qf_ind')"
+
+    def setUp(self):
+        self.c = TestEntreeOBFVG._candles()
+        self.ev = next(e for e in _E.analyze(self.c) if e["kind"] == "CHOCH")   # SELL
+        self.saved = (_E.TIMEFRAME_MIN, _E._ctx_candles, _E.liquidity_reading)
+        _E.TIMEFRAME_MIN = 1
+        _E.liquidity_reading = lambda *a, **k: (None, None)
+
+    def tearDown(self):
+        _E.TIMEFRAME_MIN, _E._ctx_candles, _E.liquidity_reading = self.saved
+        _E._q(f"DELETE FROM settings WHERE key IN {self._KEYS}", commit=True)
+
+    def _htf(self, crh, crl):
+        h0 = (self.c[0]["t"] // 3600) * 3600
+        return [{"t": h0 - 3600, "o": (crh + crl) / 2, "h": crh, "l": crl, "c": (crh + crl) / 2}]
+
+    def test_modes_sl(self):
+        leg = self.c[self.ev["src"]:self.ev["i"] + 1]
+        top = max(x["h"] for x in leg)
+        buf = _E.SL_BUFFER_ATR * self.ev["atr"]
+        _E.set_choice("sl_mode", "SWEEP", _E.SL_MODES)
+        sig = _E.build_signal(self.c, self.ev, None, multi=True)[0]
+        self.assertAlmostEqual(sig["sl"], top + buf, places=6)
+        self.assertEqual(sig["sl_mode"], "SWEEP")
+        _E.set_choice("sl_mode", "ZONE", _E.SL_MODES)
+        sig = _E.build_signal(self.c, self.ev, None, multi=True)[0]
+        self.assertEqual(sig["sl_mode"], "ZONE")
+        self.assertGreater(sig["sl"], sig["entry"])
+        _E.set_choice("sl_mode", "STRUCT", _E.SL_MODES)
+        sig = _E.build_signal(self.c, self.ev, None, multi=True)[0]
+        self.assertAlmostEqual(sig["sl"], self.ev["sl_level"] + buf, places=6)
+        self.assertFalse(_E.set_choice("sl_mode", "nimportequoi", _E.SL_MODES))
+
+    def test_modes_tp(self):
+        sig = {"dir": -1, "entry": 100.0, "risk": 2.0, "tp": 92.0, "rr": 4.0, "ext": {"level": 90.0, "tf": 60}}
+        _E.set_choice("tp_mode", "RR", _E.TP_MODES)
+        self.assertEqual(_E.apply_tp_mode(dict(sig), self.c, self.ev, None, 4.0)["tp"], 92.0)
+        _E.set_choice("tp_mode", "TARGET", _E.TP_MODES)
+        r = _E.apply_tp_mode(dict(sig), self.c, self.ev, None, 4.0)
+        self.assertEqual((r["tp"], r["rr"]), (90.0, 5.0))
+        near = dict(sig, ext={"level": 99.0, "tf": 60})            # cible à 0.5R : sous TP_MIN_RR -> repli RR fixe
+        self.assertEqual(_E.apply_tp_mode(near, self.c, self.ev, None, 4.0)["tp"], 92.0)
+        wrong = dict(sig, ext={"level": 105.0, "tf": 60})          # cible du mauvais côté -> repli RR fixe
+        self.assertEqual(_E.apply_tp_mode(wrong, self.c, self.ev, None, 4.0)["tp"], 92.0)
+        _E.set_choice("tp_mode", "SWING", _E.TP_MODES)
+        lows = [_E.nearest_swing_target(self.c, self.ev["i"], -1, 200.0)]
+        self.assertTrue(lows[0] is None or lows[0] < 200.0)
+
+    def test_reglages_strategies(self):
+        self.assertTrue(_E.get_strat_main() and not _E.get_strat_crt())        # défaut : CRT désactivé
+        self.assertFalse(_E.set_strategies(False, False))
+        _E.handle_command("/strategie both")
+        self.assertTrue(_E.get_strat_main() and _E.get_strat_crt())
+        _E.handle_command("/crt h4")
+        _E.handle_command("/crt mid")
+        self.assertEqual((_E.get_crt_ref(), _E.get_crt_tp()), (240, "MID"))
+        _E.handle_command("/modetp target")
+        self.assertEqual(_E.get_tp_mode(), "TARGET")
+        for cb in ("sig:sltp", "sig:strat"):
+            self.assertIn(cb, str(_E._signal_keyboard()))
+        self.assertIn("sstr:crt", str(_E._signal_strat_keyboard()))
+
+    def test_crt_detection_et_signaux(self):
+        _E._ctx_candles = lambda s, tf: self._htf(121.0, 90.0)   # CRH 121 balayé (plus haut 122.3), CRL 90 intact, clôture 114 dans le range
+        _E.set_entry_types(True, True)
+        sigs = _E.crt_build(self.c, self.ev, "XAUUSD")
+        self.assertEqual([x["order"] for x in sigs], ["MARKET", "LIMIT"])
+        d, lim = sigs
+        sweep_sl = 122.3 + _E.SL_BUFFER_ATR * self.ev["atr"]
+        self.assertAlmostEqual(d["sl"], sweep_sl, places=6)               # SL derrière le sweep
+        self.assertAlmostEqual(lim["sl"], sweep_sl, places=6)
+        self.assertEqual((d["tp"], lim["tp"]), (90.0, 90.0))               # TP = autre bout du range (CRL)
+        self.assertEqual((d["key_suffix"], lim["key_suffix"]), ("crt", "crtpoi"))
+        self.assertEqual(d["crt"]["crh"], 121.0)
+        _E.set_choice("crt_tp", "MID", _E.CRT_TP_MODES)
+        fb = _E.crt_build(self.c, self.ev, "XAUUSD")[0]                     # 50 % = RR 0.96 < TP_MIN_RR : repli RR fixe
+        self.assertAlmostEqual(fb["rr"], _E.get_tp_rr())
+        saved_min, _E.TP_MIN_RR = _E.TP_MIN_RR, 0.5
+        try:
+            self.assertAlmostEqual(_E.crt_build(self.c, self.ev, "XAUUSD")[0]["tp"], 105.5, places=6)
+        finally:
+            _E.TP_MIN_RR = saved_min
+        _E.set_choice("crt_tp", "RR", _E.CRT_TP_MODES)
+        self.assertAlmostEqual(_E.crt_build(self.c, self.ev, "XAUUSD")[0]["rr"], _E.get_tp_rr())
+
+    def test_session_zone_et_filtre_htf(self):
+        ts = lambda h: 1_700_000_000 - 1_700_000_000 % 86400 + h * 3600   # jour donné à l'heure UTC h
+        self.assertTrue(_E.session_ok(ts(3)))                                # ALL par défaut
+        _E.handle_command("/session londres")
+        self.assertTrue(_E.session_ok(ts(8)) and not _E.session_ok(ts(3)) and not _E.session_ok(ts(20)))
+        _E.handle_command("/session ny")
+        self.assertTrue(_E.session_ok(ts(14)) and not _E.session_ok(ts(8)))
+        _E.handle_command("/session both")
+        self.assertTrue(_E.session_ok(ts(8)) and _E.session_ok(ts(20)) and not _E.session_ok(ts(3)))
+        self.assertIn("ssess:NY", str(_E._signal_sess_keyboard()))
+        # zone du limit : OB seul / FVG seul / les deux
+        entries = {}
+        for z in ("BOTH", "OB", "FVG"):
+            _E.handle_command(f"/zone {z.lower()}")
+            lim, _ = _E.poi_limit_signal(self.c, self.ev, None, 4.0, 1.0, {})
+            entries[z] = lim["entry"], lim["zone"]["kind"]
+        self.assertEqual(entries["OB"][1], "OB")
+        self.assertEqual(entries["FVG"][1], "FVG")
+        self.assertLess(entries["FVG"][0], entries["OB"][0])                 # SELL : le FVG est plus bas, donc plus proche du prix
+        self.assertEqual(entries["BOTH"], entries["FVG"])                    # la plus proche du prix
+        # CRT + filtre de tendance HTF (option)
+        _E._ctx_candles = lambda s, tf: self._htf(121.0, 90.0)
+        _E.set_entry_types(True, False)
+        self.assertEqual(len(_E.crt_build(self.c, self.ev, "XAUUSD")), 1)
+        _E.handle_command("/crt htfon")
+        saved = _E.htf_trend_check
+        try:
+            _E.htf_trend_check = lambda sym, ev: (1, "tendance H1 haussière : SELL refusé")
+            self.assertEqual(_E.crt_build(self.c, self.ev, "XAUUSD"), [])
+            _E.htf_trend_check = lambda sym, ev: (-1, None)
+            self.assertIn("tendance", _E.crt_build(self.c, self.ev, "XAUUSD")[0]["setup"])
+        finally:
+            _E.htf_trend_check = saved
+
+    def test_crt_refus(self):
+        _E.set_entry_types(True, False)
+        for crh, crl, why in ((125.0, 90.0, "CRH non balayé"), (121.0, 99.9, "deux côtés balayés"), (113.0, 90.0, "clôture hors range")):
+            _E._ctx_candles = lambda s, tf, a=(crh, crl): self._htf(*a)
+            self.assertEqual(_E.crt_build(self.c, self.ev, "XAUUSD"), [], why)
+        _E._ctx_candles = lambda s, tf: []
+        self.assertEqual(_E.crt_build(self.c, self.ev, "XAUUSD"), [])
+        _E._ctx_candles = lambda s, tf: self._htf(121.0, 90.0)
+        _E.TIMEFRAME_MIN = 60                                              # UT d'entrée >= UT de référence : pas de CRT
+        self.assertEqual(_E.crt_build(self.c, self.ev, "XAUUSD"), [])
+
+
 class TestSignauxSimultanes(unittest.TestCase):
     """Un seul signal ouvert par actif par défaut : pas de doublon tant que le précédent n'est pas clôturé."""
 
@@ -6531,12 +7660,119 @@ class TestBEDoubleVerif(unittest.TestCase):
         self.assertAlmostEqual(_E._be_net_usd("BTCUSD", "SELL", 100.0, 99.8, 0.05), 0.01, places=9)
 
 
+class TestFiltresQualite(unittest.TestCase):
+    """Filtres qualité du CHoCH : displacement, anti-range, FVG (états), IND, structure HH/HL, interrupteurs et log."""
+
+    def _c(self, rows):
+        return [{"t": 1_700_000_000 + 60 * k, "o": o, "h": h, "l": l, "c": cl} for k, (o, h, l, cl) in enumerate(rows)]
+
+    def _ev(self, i, d=-1, src=0, level=100.0, atr=1.0):
+        return {"i": i, "t": 0, "dir": d, "kind": "CHOCH", "level": level, "src": src, "atr": atr, "type": "CHOCH1", "sl_level": 101.0}
+
+    def test_displacement_et_vraie_cassure(self):
+        fort = self._c([(100.5, 100.6, 99.9, 100.2), (100.5, 100.6, 98.9, 99.0)])
+        self.assertTrue(_E.disp_check(fort, self._ev(1))["ok"])
+        faible = self._c([(100.5, 100.6, 99.9, 100.2), (100.10, 100.6, 99.4, 99.95)])   # corps 0.15 ATR : pas un displacement
+        self.assertFalse(_E.disp_check(faible, self._ev(1))["ok"])
+        mince = self._c([(100.5, 100.6, 99.9, 100.2), (100.5, 103.0, 98.9, 99.95)])     # mèche énorme, cassure de 0.05 ATR
+        self.assertFalse(_E.disp_check(mince, self._ev(1))["ok"])
+        self.assertFalse(_E.disp_check(fort, self._ev(1, atr=None))["ok"])
+
+    def test_anti_range(self):
+        zig = self._c([(100, 100.6, 99.5, 100.4 if k % 2 else 99.6) for k in range(25)])
+        tend = self._c([(100 - k * .3, 100.1 - k * .3, 99.7 - k * .3, 99.8 - k * .3) for k in range(25)])
+        self.assertFalse(_E.range_check(zig, self._ev(24))["ok"])
+        self.assertTrue(_E.range_check(tend, self._ev(24))["ok"])
+        self.assertFalse(_E.range_check(zig, self._ev(5))["ok"], "historique insuffisant")
+
+    def test_fvg_etats(self):
+        base = [(102, 103, 101, 101.5), (101.5, 101.6, 99.0, 99.2), (99.2, 99.6, 98.6, 98.8), (98.8, 98.9, 98.0, 98.1)]
+        ev = self._ev(3)
+        r = _E.choch_fvg(self._c(base), ev)
+        self.assertEqual((r["state"], r["ok"]), ("non mitigé", True))
+        self.assertAlmostEqual(r["zone"][0], 99.6); self.assertAlmostEqual(r["zone"][1], 101.0)
+        r = _E.choch_fvg(self._c(base + [(98.1, 100.2, 98.0, 99.0)]), ev)     # le prix remonte dans la zone
+        self.assertEqual((r["state"], r["ok"]), ("partiel", True))
+        r = _E.choch_fvg(self._c(base + [(98.1, 101.2, 98.0, 99.0)]), ev)     # traverse toute la zone
+        self.assertEqual((r["state"], r["ok"]), ("mitigé", False))
+        nofvg = [(102, 103, 101, 101.5), (101.5, 101.6, 100.0, 100.2), (100.2, 101.2, 99.5, 99.7), (99.7, 100.5, 99.0, 99.2)]
+        self.assertFalse(_E.choch_fvg(self._c(nofvg), ev)["ok"])
+
+    def test_fvg_haussier(self):
+        rows = [(98, 99, 97, 98.5), (98.5, 101.0, 98.4, 100.8), (100.8, 101.6, 100.5, 101.4), (101.4, 102, 100.9, 101.8)]
+        r = _E.choch_fvg(self._c(rows), self._ev(3, d=1, level=99.0))
+        self.assertEqual(r["state"], "non mitigé")
+        r = _E.choch_fvg(self._c(rows + [(101.8, 101.9, 99.7, 100.0)]), self._ev(3, d=1, level=99.0))
+        self.assertEqual(r["state"], "partiel")
+
+    def test_ind_entre_prix_et_zone(self):
+        rows = [(109, 110, 108, 108.5), (106.0, 106.0, 105.0, 105.2), (105.2, 107.5, 105.1, 107.0),
+                (106.8, 106.9, 104.0, 104.5), (104.5, 104.6, 102.5, 103.0)]
+        c, ev = self._c(rows), self._ev(4, src=0)
+        self.assertTrue(_E.ind_check(c, ev, 108.5)["ok"])       # pivot 107.5 entre le prix (103) et l'entrée (108.5)
+        self.assertFalse(_E.ind_check(c, ev, 107.0)["ok"])      # limit sous le pivot : pas d'inducement à balayer
+
+    def test_structure_hh_hl(self):
+        def path(pts):
+            out = []
+            for (a, b) in zip(pts, pts[1:]):
+                for k in range(10):
+                    o = a + (b - a) * k / 10
+                    cl = a + (b - a) * (k + 1) / 10
+                    out.append((o, max(o, cl) + 0.05, min(o, cl) - 0.05, cl))
+            return out
+        # hausse (HH, HL) puis cassure du dernier HL -> CHoCH vendeur qui suit une structure HH+HL
+        up = self._c(path([100, 110, 105, 115, 108, 120, 112, 100]))
+        evs = [e for e in _E.analyze(up) if e["kind"] == "CHOCH" and e["dir"] == -1]
+        self.assertTrue(evs, "un CHoCH vendeur doit exister")
+        r = _E.swing_check(up, evs[0])
+        self.assertTrue(r["ok"], r["txt"])
+        self.assertIn("HH+HL", r["txt"])
+        # chute (LL, LH) puis cassure du dernier LH -> CHoCH acheteur
+        dn = self._c(path([120, 110, 115, 105, 112, 100, 108, 122]))
+        evb = [e for e in _E.analyze(dn) if e["kind"] == "CHOCH" and e["dir"] == 1]
+        self.assertTrue(evb, "un CHoCH acheteur doit exister")
+        self.assertTrue(_E.swing_check(dn, evb[0])["ok"], _E.swing_check(dn, evb[0])["txt"])
+
+    def test_interrupteurs(self):
+        keys = _E.QF_KEYS
+        saved = {k: _E.get_setting("qf_" + k) for k in keys}
+        try:
+            for k in keys:
+                _E.set_setting("qf_" + k, "0")
+            qf = {"swings": {"ok": False, "txt": "x"}, "disp": {"ok": False, "txt": "y"}, "range": {"ok": True, "txt": "z"},
+                  "fvg": {"ok": False, "txt": "w"}}
+            self.assertIsNone(_E.quality_reject(qf), "tout OFF : rien n'est refusé")
+            self.assertTrue(_E.set_qf("disp", True))
+            self.assertIn("Displacement", _E.quality_reject(qf))
+            _E.set_qf("disp", False); _E.set_qf("range", True)
+            self.assertIsNone(_E.quality_reject(qf), "filtre ON mais réussi")
+            self.assertFalse(_E.set_qf("inconnu", True))
+            self.assertIn("aucun", (_E._qf_txt() if not _E.get_qf("range") else "aucun"))
+            self.assertIn("sqf:fvg", str(_E._signal_qf_keyboard()))
+            self.assertIn("sig:qf", str(_E._signal_keyboard()))
+        finally:
+            for k, v in saved.items():
+                _E._q("DELETE FROM settings WHERE key=?", ("qf_" + k,), commit=True) if v is None else _E.set_setting("qf_" + k, v)
+
+    def test_bloc_log(self):
+        sig = {"side": "SELL", "order": "MARKET", "type": "CHOCH1", "t": 1_700_000_000, "entry": 100.0, "sl": 101.0, "tp": 96.0,
+               "risk": 1.0, "rr": 4.0, "tp_mode": None,
+               "qf": {"disp": {"ok": True, "txt": "corps 1.20xATR"}, "range": {"ok": False, "txt": "chop"}}}
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            _E.signal_log_block("XAUUSD", sig, 2)
+        out = buf.getvalue()
+        for needle in ("TARGET_TYPE=RR fixe", "TARGET_PRICE=96.00", "EXPECTED_RR=4.0", "DISP", "RANGE", "filtre OFF"):
+            self.assertIn(needle, out)
+
+
 def _selftest():
     _E.HTF_MODE = "FULL"   # les tests historiques (H1 -> M15 -> M5 -> POI) évaluent la cascade complète ; TestHtfM15 passe en mode M15
     suite, loader = unittest.TestSuite(), unittest.TestLoader()
     for cls in (TestRetracement, TestContinuation, TestInvalidationHTF, TestChop, TestGetExtTf,
                 TestLiquiditePure, TestM1NeDecidePasSeul, TestLogs, TestEntreeM5, TestNonRegression,
-                TestHtfM15, TestBE, TestSignauxSimultanes, TestLectureExtInt, TestModifyPositionGardeSLTP, TestBEDoubleVerif, TestClientId, TestLogVolumeReel):
+                TestHtfM15, TestBE, TestEntreeOBFVG, TestSLTPCRT, TestSignauxSimultanes, TestLectureExtInt, TestModifyPositionGardeSLTP, TestBEDoubleVerif, TestClientId, TestLogVolumeReel, TestFiltresQualite):
         suite.addTests(loader.loadTestsFromTestCase(cls))
     return 0 if unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful() else 1
 
