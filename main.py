@@ -1,5 +1,6 @@
 
 
+
 #!/usr/bin/env python3
 """AlphaBot BOS + CHoCH — Gold & BTC — version en un seul fichier.
 
@@ -252,6 +253,7 @@ EXT_DEPTH = _env_int("EXT_DEPTH", 5)   # profondeur (bougies de chaque côté) p
 EQ_TOL_ATR = 0.1                       # tolérance EQH/EQL : 2 pivots à moins de EQ_TOL_ATR ATR sont considérés au même niveau
 POI_MAX_AGE = _env_int("POI_MAX_AGE", 60)                  # âge max d'un POI (OB / FVG), en bougies de sa propre UT
 POI_MIN_ATR = _env_float("POI_MIN_ATR", 0.15)              # taille mini d'un POI, en ATR de son UT (écarte les micro-gaps)
+POC_BINS = _env_int("POC_BINS", 20)                         # POC proxy (pas de volume réel) : nb de paliers de prix sur la jambe impulsive
 SWEEP_LOOKBACK = _env_int("SWEEP_LOOKBACK", 10)            # bougies d'entrée comparées pour détecter un balayage de liquidité
 SL_BUFFER_ATR = _env_float("SL_BUFFER_ATR", 0.2)   # buffer au-delà de la ligne du BOS (0.1 laissait le SL pile sur la mèche -> balayé par le bruit)
 MIN_SL_ATR = _env_float("MIN_SL_ATR", 0.8)         # SL minimum (en ATR) -- 0.3 donnait des SL de quelques points sur BTC en M1/M5, balayés par le spread/bruit
@@ -311,14 +313,22 @@ CRT_REF_TF = _env_int("CRT_REF_TF", 60)         # UT de la bougie de référence
 CRT_TP = os.getenv("CRT_TP", "RANGE").strip().upper()
 # --- FILTRES QUALITÉ du CHoCH (interrupteurs ON/OFF, menu Telegram « 🔬 FILTRES ») ------------------------------
 # Toujours CALCULÉS et loggés (bloc par signal) ; ils ne REFUSENT un signal que s'ils sont ON. Défaut : tous OFF.
-QF_KEYS = ("swings", "disp", "range", "fvg", "ind")
-QF_LBL = {"swings": "Structure HH/HL", "disp": "Displacement", "range": "Anti-range", "fvg": "FVG strict", "ind": "Inducement"}
+QF_KEYS = ("swings", "disp", "range", "fvg", "ind", "leg")
+QF_LBL = {"swings": "Structure HH/HL", "disp": "Displacement", "range": "Anti-range", "fvg": "FVG strict", "ind": "Inducement",
+          "leg": "Qualité jambe"}
 QF_DEFAULT = {k: _env_bool("QF_" + k.upper(), False) for k in QF_KEYS}
 DISP_BODY_ATR = _env_float("DISP_BODY_ATR", 0.8)       # displacement : corps de la bougie cassante >= N x ATR
 DISP_BODY_RATIO = _env_float("DISP_BODY_RATIO", 0.6)   # ... et corps >= N % de sa hauteur (peu de mèches)
 DISP_BREAK_ATR = _env_float("DISP_BREAK_ATR", 0.10)    # vraie cassure : clôture au-delà du niveau d'au moins N x ATR
 RANGE_LOOKBACK = _env_int("RANGE_LOOKBACK", 20)        # anti-range : bougies analysées avant/avec la cassure
 RANGE_MIN_ER = _env_float("RANGE_MIN_ER", 0.15)        # efficience mini (|déplacement net| / chemin parcouru) ; en dessous = chop
+LEG_MIN_CANDLES = _env_int("LEG_MIN_CANDLES", 2)           # jambe (filtre "leg") : trop courte -> non jugeable, rejetée
+LEG_MIN_BODY_ATR = _env_float("LEG_MIN_BODY_ATR", 0.35)    # corps moyen des bougies de la jambe >= N x ATR
+LEG_MIN_BODY_RATIO = _env_float("LEG_MIN_BODY_RATIO", 0.40)  # ... et corps moyen >= N % du range moyen (peu de mèches en moyenne)
+LEG_MIN_DIR_RATIO = _env_float("LEG_MIN_DIR_RATIO", 0.55)  # part mini de bougies dans le sens de la jambe (le reste = bruit/contre-mouvement)
+LEG_MIN_NET_EFF = _env_float("LEG_MIN_NET_EFF", 0.35)      # efficience de la jambe = déplacement net / somme des ranges (chemin parcouru)
+LEG_MICRO_BODY_ATR = _env_float("LEG_MICRO_BODY_ATR", 0.15)  # une bougie est "micro" si son corps < N x ATR
+LEG_MAX_MICRO_RATIO = _env_float("LEG_MAX_MICRO_RATIO", 0.50)  # part max de micro-bougies tolérée dans la jambe
 CRT_DUP = _env_bool("CRT_DUP", False)         # CRT autorisé même si la principale a déjà pris ce CHoCH (défaut OFF)
 CRT_HTF = _env_bool("CRT_HTF", False)           # CRT + filtre de tendance HTF (l'inverse d'un retournement : à tester, pas à supposer)
 # Sessions (heures UTC, [début, fin[) : filtre optionnel /session. Londres ~07-16 UTC, New York ~12-21 UTC (recouvrement 12-16).
@@ -601,6 +611,12 @@ class _MetaApiRestConnection:
     async def get_positions(self):
         return await self._acall("GET", "/positions") or []
 
+    async def get_symbols(self):
+        """Liste des symboles réellement disponibles chez CE broker (ex. 'BTCUSD', 'BTCUSDm', 'BTCUSD.a'...) --
+        sert à l'auto-détection du nom exact (voir _auto_resolve_symbols), pour ne plus dépendre d'un mapping
+        codé en dur (MT5_SYMBOL_MAP) qui suppose un broker précis (Exness)."""
+        return await self._acall("GET", "/symbols") or []
+
     async def get_deals_by_position(self, position_id):
         return await self._acall("GET", f"/history-deals/position/{position_id}")
 
@@ -725,6 +741,7 @@ def _metaapi_rest_background_loop():
                 if down_since is not None:
                     _notify_mt5_recovered(down_since)
                     down_since = None
+            _auto_resolve_symbols()    # corrige le nommage des symboles si besoin (broker différent d'Exness)
             _prefetch_symbol_specs()   # specs symbole en cache AVANT le prochain signal (évite le Read timed out)
         except Exception as e:
             fails += 1
@@ -995,6 +1012,50 @@ async def _get_symbol_spec(connection, broker_symbol):
         return stale
     print(f"[metaapi] Impossible de récupérer les specs de {broker_symbol} : {last_err} — vérif stop-level ignorée.")
     return None
+
+
+def _clean_symbol_name(name):
+    return re.sub(r"[^A-Za-z0-9]", "", name or "").upper()
+
+
+_symbols_auto_resolved = False   # une seule tentative par démarrage (broker/nommage fixes tant que le process tourne)
+
+
+def _auto_resolve_symbols():
+    """Corrige MT5_SYMBOL_MAP tout seul si le nom mappé (défaut codé en dur pour Exness, ou MT5_SYMBOL_MAP env)
+    n'existe pas chez le broker RÉELLEMENT connecté (ex. compte FTMO/FundedNext au lieu d'Exness) : compare aux
+    symboles réels du compte (get_symbols) et reprend le plus proche (même nom de base + suffixe broker en plus,
+    ex. BTCUSD -> BTCUSDm / BTCUSD.a / BTCUSD1). Ne fait RIEN si le mapping actuel est déjà valide chez ce broker
+    (respecte un MT5_SYMBOL_MAP choisi à la main). Plus besoin de changer une variable Render en changeant de broker."""
+    global _symbols_auto_resolved
+    if _symbols_auto_resolved:
+        return
+    try:
+        raw = _run_mt5(_rest_connection.get_symbols(), timeout=60)
+    except Exception as e:
+        print(f"[metaapi-rest] Auto-détection des symboles impossible ({e}) — MT5_SYMBOL_MAP actuel conservé tel quel.")
+        return
+    names = [n if isinstance(n, str) else (n.get("symbol") or n.get("name")) for n in (raw or [])]
+    names = [n for n in names if n]
+    if not names:
+        print("[metaapi-rest] Auto-détection des symboles : liste vide côté broker -- MT5_SYMBOL_MAP conservé tel quel.")
+        _symbols_auto_resolved = True
+        return
+    for sym in SYMBOLS:
+        current = MT5_SYMBOL_MAP.get(sym, sym)
+        if current in names:
+            continue   # le mapping actuel (env ou défaut) existe chez ce broker : on n'y touche pas
+        base = _clean_symbol_name(sym)
+        candidates = [n for n in names if _clean_symbol_name(n).startswith(base)]
+        if not candidates:
+            print(f"[metaapi] Auto-détection : aucun symbole de ce broker ne correspond à {sym} (cherché « {current} »). "
+                  f"Ce marché ne sera pas tradable ici tant qu'aucun symbole équivalent n'existe côté broker.")
+            continue
+        best = min(candidates, key=len)   # nom le plus court = suffixe le plus court = correspondance la plus probable
+        MT5_SYMBOL_MAP[sym] = best
+        REV_MT5_SYMBOL_MAP[best] = sym
+        print(f"[metaapi] Auto-détection : {sym} -> « {best} » (« {current} » introuvable chez ce broker).")
+    _symbols_auto_resolved = True
 
 
 def _prefetch_symbol_specs():
@@ -2012,6 +2073,17 @@ def _get_bool_setting(key, default):
     if v is None:
         return bool(default)
     return str(v).strip().lower() in ("1", "true", "yes", "on")
+
+
+def get_poc_entry():
+    """POC proxy (niveau d'entrée limit supplémentaire, voir poc_proxy) : OFF par défaut -> comportement inchangé
+    (limit uniquement sur OB/FVG créé par le CHoCH). ON -> le POC proxy de la même jambe impulsive devient un
+    niveau d'entrée limit supplémentaire (pas une condition obligatoire en plus de l'OB/FVG)."""
+    return _get_bool_setting("poc_entry", False)
+
+
+def set_poc_entry(on):
+    set_setting("poc_entry", "1" if on else "0")
 
 
 def get_entry_direct():
@@ -3404,7 +3476,8 @@ def poi_limit_signal(c, ev, symbol, tp_rr, be_rr, base, sl_anchor=None, apply_tp
     zone_kind = get_limit_zone()
     if zone_kind != "BOTH":
         pois = [p for p in pois if p["kind"] == zone_kind]
-    if not pois:
+    poc_on = get_poc_entry()   # POC proxy : niveau d'entrée SUPPLÉMENTAIRE (jamais une condition obligatoire en plus)
+    if not pois and not poc_on:
         return None, f"aucun {'OB / FVG' if zone_kind == 'BOTH' else zone_kind} valide créé par ce CHoCH"
     cands = []
     for p in pois:
@@ -3416,8 +3489,13 @@ def poi_limit_signal(c, ev, symbol, tp_rr, be_rr, base, sl_anchor=None, apply_tp
         if abs(cur - entry) > POI_LIMIT_MAX_ATR * a:
             continue                       # zone trop loin : le retour est improbable
         cands.append((abs(cur - entry), entry, p))
+    if poc_on:
+        poc = poc_proxy(c, ev)
+        if poc is not None and (poc - cur) * d < 0 and abs(cur - poc) <= POI_LIMIT_MAX_ATR * a:
+            cands.append((abs(cur - poc), poc, {"kind": "POC", "tf": TIMEFRAME_MIN, "d": d,
+                                                 "lo": poc, "hi": poc, "f": i, "t_valid": c[i]["t"]}))
     if not cands:
-        return None, "prix déjà dans la zone, ou zone trop éloignée : pas d'ordre limit"
+        return None, "prix déjà dans la zone (ou le POC), ou zone trop éloignée : pas d'ordre limit"
     _, entry, p = min(cands, key=lambda x: x[0])
     dist = sl_anchor if sl_anchor is not None else (p["lo"] if d == 1 else p["hi"])   # bord lointain de la zone (CRT : le sweep)
     sl = dist - d * SL_BUFFER_ATR * a
@@ -3508,6 +3586,40 @@ def range_check(c, ev):
     return {"ok": er >= RANGE_MIN_ER, "txt": f"efficience {er:.2f} (min {RANGE_MIN_ER:g}) · chop {round((1 - er) * 100)}/100"}
 
 
+def leg_check(c, ev):
+    """Qualité de la JAMBE IMPULSIVE (du point de retournement à la bougie du CHoCH, comme `choch_fvg`/`poc_proxy`) —
+    différent de `disp_check` qui ne juge que la bougie du CHoCH elle-même. Rejette le schéma « petite bougie x N ->
+    CHoCH final propre » même quand ce dernier passerait le filtre displacement.
+    Ne compte pas les bougies (pas de seuil « N bougies mini »), juge la jambe entière sur 4 axes :
+      - corps moyen (>= LEG_MIN_BODY_ATR x ATR) et corps/range moyen (>= LEG_MIN_BODY_RATIO) : peu de mèches en moyenne
+      - part de bougies dans le sens de la jambe (>= LEG_MIN_DIR_RATIO) : peu de contre-mouvement
+      - efficience nette (déplacement net / chemin parcouru, >= LEG_MIN_NET_EFF) : peu de bruit/aller-retour
+      - part de micro-bougies -- corps < LEG_MICRO_BODY_ATR x ATR -- (<= LEG_MAX_MICRO_RATIO)
+    """
+    d, i, a = ev["dir"], ev["i"], ev["atr"]
+    if not a:
+        return {"ok": False, "txt": "ATR indisponible"}
+    e = _turn_index(c, ev)
+    leg = c[e:i + 1]
+    if len(leg) < LEG_MIN_CANDLES:
+        return {"ok": False, "txt": f"jambe trop courte ({len(leg)} bougie(s) < {LEG_MIN_CANDLES})"}
+    bodies = [abs(x["c"] - x["o"]) for x in leg]
+    ranges = [x["h"] - x["l"] for x in leg]
+    avg_body = sum(bodies) / len(bodies)
+    ratios = [b / r for b, r in zip(bodies, ranges) if r > 0]
+    avg_ratio = sum(ratios) / len(ratios) if ratios else 0.0
+    directional = sum(1 for x in leg if (x["c"] - x["o"]) * d > 0) / len(leg)
+    path = sum(ranges)
+    net_eff = abs(leg[-1]["c"] - leg[0]["o"]) / path if path > 0 else 0.0
+    micro_ratio = sum(1 for b in bodies if b < LEG_MICRO_BODY_ATR * a) / len(leg)
+    ok = (avg_body >= LEG_MIN_BODY_ATR * a and avg_ratio >= LEG_MIN_BODY_RATIO
+          and directional >= LEG_MIN_DIR_RATIO and net_eff >= LEG_MIN_NET_EFF
+          and micro_ratio <= LEG_MAX_MICRO_RATIO)
+    txt = (f"corps moy {avg_body / a:.2f}xATR ({avg_ratio:.0%} du range) · directionnel {directional:.0%} · "
+           f"efficience {net_eff:.2f} · micro-bougies {micro_ratio:.0%} (sur {len(leg)} bougies)")
+    return {"ok": bool(ok), "txt": txt}
+
+
 def choch_fvg(c, ev, dec=5):
     """FVG le plus récent créé PAR la jambe du CHoCH (dans son sens) et son état vis-à-vis des bougies suivantes."""
     d, i, a = ev["dir"], ev["i"], ev["atr"] or 0.0
@@ -3531,6 +3643,41 @@ def choch_fvg(c, ev, dec=5):
             "txt": f"FVG {lo:.{dec}f}-{hi:.{dec}f} {state}"}
 
 
+def poc_proxy(c, ev, bins=None):
+    """POC PROXY (« POC de temps », pas un vrai POC volume — aucune source de volume réel n'est disponible ici :
+    Deriv/Binance ne fournissent pas de volume exploitable pour ce bot).
+
+    Calculé UNIQUEMENT sur la jambe impulsive qui a créé le CHoCH `ev` (du point de retournement à la bougie du
+    CHoCH inclus, comme `choch_fvg`) :
+      1) plage low -> high de cette jambe,
+      2) découpée en `POC_BINS` paliers de prix,
+      3) chaque bougie de la jambe "vote" pour tous les paliers que couvre son low -> high,
+      4) le palier le plus voté = POC proxy (son centre) ; égalité -> palier le plus proche du centre de la jambe.
+
+    Retourne un prix (float), ou None si la jambe est trop courte / plate pour être découpée."""
+    i = ev["i"]
+    e = _turn_index(c, ev)
+    leg = c[e:i + 1]
+    if len(leg) < 2:
+        return None
+    lo = min(x["l"] for x in leg)
+    hi = max(x["h"] for x in leg)
+    if hi <= lo:
+        return None
+    n = bins or POC_BINS
+    step = (hi - lo) / n
+    counts = [0] * n
+    for x in leg:
+        b_lo = max(0, min(n - 1, int((x["l"] - lo) / step)))
+        b_hi = max(0, min(n - 1, int((x["h"] - lo) / step)))
+        for b in range(b_lo, b_hi + 1):
+            counts[b] += 1
+    best = max(counts)
+    center = (n - 1) / 2
+    idx = min((k for k, v in enumerate(counts) if v == best), key=lambda k: abs(k - center))
+    return lo + (idx + 0.5) * step
+
+
 def ind_check(c, ev, entry):
     """Inducement d'un LIMIT : pivot mineur (profondeur 1) de la jambe, du côté opposé au trade, situé strictement ENTRE le
     prix du CHoCH et l'entrée limit — le prix doit le balayer pour atteindre la zone."""
@@ -3551,7 +3698,7 @@ def ind_check(c, ev, entry):
 def quality_check(c, ev, dec=5):
     """Filtres qualité du CHoCH `ev` -> {clé: {"ok", "txt"}}. Ne refuse rien : voir quality_reject."""
     out = {}
-    for key, fn in (("swings", swing_check), ("disp", disp_check), ("range", range_check)):
+    for key, fn in (("swings", swing_check), ("disp", disp_check), ("range", range_check), ("leg", leg_check)):
         try:
             out[key] = fn(c, ev)
         except Exception as e:
@@ -3565,7 +3712,7 @@ def quality_check(c, ev, dec=5):
 
 def quality_reject(qf):
     """Motif de refus si un filtre ON échoue (swings / disp / range / fvg ; l'IND se juge sur le limit), sinon None."""
-    for k in ("swings", "disp", "range", "fvg"):
+    for k in ("swings", "disp", "range", "fvg", "leg"):
         if get_qf(k) and k in qf and not qf[k]["ok"]:
             return f"filtre {QF_LBL[k]} : {qf[k]['txt']}"
     return None
@@ -4893,6 +5040,9 @@ def _signal_entry_text():
             f"Les deux : les deux ordres partent ; le limit ne compte pas dans « signaux max » (attention : risque doublé "
             f"si les deux s'exécutent).\n"
             f"Zone du limit : <b>{get_limit_zone()}</b> (OB seul, FVG seul, ou les deux : la plus proche du prix).\n"
+            f"🎯 POC proxy : {'ON' if get_poc_entry() else 'OFF'} — niveau d'entrée limit SUPPLÉMENTAIRE (jamais obligatoire "
+            f"en plus de l'OB/FVG), calculé uniquement sur la jambe impulsive du CHoCH (paliers de prix les plus "
+            f"traversés, sans volume réel — voir /pocinfo). OFF = comportement inchangé (limit sur OB/FVG seul).\n"
             f"Effet immédiat sur les NOUVEAUX signaux. Aussi : /entree direct | limit | both · /zone ob|fvg|both")
 
 
@@ -4900,7 +5050,8 @@ def _signal_entry_keyboard():
     d, l = get_entry_direct(), get_entry_limit()
     return _signal_back([
         [_btn("⚡ Entrée directe", "sentd", d), _btn("⏳ Ordre limit", "sentl", l)],
-        [_btn(f"Zone {k}", f"szone:{k}", get_limit_zone() == k) for k in LIMIT_ZONES]])
+        [_btn(f"Zone {k}", f"szone:{k}", get_limit_zone() == k) for k in LIMIT_ZONES],
+        [_btn("🎯 POC proxy", "sentpoc", get_poc_entry())]])
 
 
 def _syms_txt():
@@ -5745,6 +5896,10 @@ def _handle_update(u):
                 ack = "Entrée : " + _entry_txt()
             else:
                 ack = "Au moins un type d'entrée doit rester actif"
+        elif data == "sentpoc":
+            set_poc_entry(not get_poc_entry())
+            _edit(cq, _signal_entry_text(), _signal_entry_keyboard())
+            ack = "POC proxy : " + ("ON" if get_poc_entry() else "OFF")
         elif data.startswith("sent:"):
             arg = data[5:]
             modes = {"direct": (True, False), "limit": (False, True), "both": (True, True)}
@@ -7911,4 +8066,3 @@ if __name__ == "__main__":
     if "--selftest" in sys.argv:
         sys.exit(_selftest())
     main()
-
