@@ -1,6 +1,5 @@
 
 
-
 #!/usr/bin/env python3
 """AlphaBot BOS + CHoCH — Gold & BTC — version en un seul fichier.
 
@@ -29,7 +28,7 @@ ni au groupe ni en privé Leader — uniquement des R et des taux de réussite p
 Réglages : section 1 (CONFIGURATION) ou fichier .env (voir README) — ex. TIMEFRAME=M15.
 Le timeframe se change aussi à chaud depuis Telegram (/timeframe) : le dernier choix est mémorisé, sauf si la
 variable TIMEFRAME est modifiée sur Render (elle reprend alors la main au démarrage suivant).
-RR (RR1-RR4), timeframe d'entrée (M1/M5/M15), filtre HTF (OFF / M15 / COMPLET), niveau du BE et nombre de signaux
+RR (RR1-RR4), timeframe d'entrée (M1/M5/M15), filtre HTF (OFF / M15 / POI M15 / COMPLET), niveau du BE et nombre de signaux
 simultanés par actif se règlent aussi à chaud depuis le menu
 Telegram « ⚙️ Paramètres signal » (/signal) : mémorisés en base, ils survivent aux redémarrages Render.
 Stickers / images / GIF du groupe (TP, SL, BE, motivation) : envoyer le média au bot en privé, puis choisir la
@@ -223,9 +222,9 @@ HTF_MINUTES = _env_int("HTF_MINUTES", 60)    # unité de temps de référence po
 HTF_MODE = os.getenv("HTF_MODE", "M15").strip().upper()   # mode utilisé quand le filtre est ON et qu'aucun choix Telegram n'existe
 if HTF_MODE == "COMPLET":
     HTF_MODE = "FULL"
-if HTF_MODE not in ("M15", "FULL"):
+if HTF_MODE not in ("M15", "FULL", "POI_M15"):
     HTF_MODE = "M15"
-HTF_MODES = ("OFF", "M15", "FULL")
+HTF_MODES = ("OFF", "M15", "POI_M15", "FULL")
 HTF_REF_TF = {1: 15, 3: 15, 5: 15, 15: 60, 30: 60, 60: 240}   # UT d'entrée -> UT de la tendance de fond (mode M15)
 # Cascade du filtre HTF : H1 (biais + liquidité externe) -> M15 (confirmation du contexte) -> M5 (retracement, liquidité interne,
 # fin du mouvement) -> UT d'entrée (trigger final uniquement). Seules les UT > UT d'entrée portent des POI.
@@ -574,15 +573,45 @@ class _MetaApiRestConnection:
     """Même interface que la connexion RPC du SDK (get_positions, create_market_*_order, modify_position, ...) mais en
     HTTPS pur : le reste du bot n'a rien à changer. Chaque appel est indépendant (aucun état de connexion)."""
 
-    def _call(self, method, path, body=None):
+    def __init__(self):
+        self._positions_cache = None    # (timestamp, positions) -- voir get_positions()
+        self._positions_lock = threading.Lock()
+
+    def _call(self, method, path, body=None, retry_429=True):
         url = f"{_metaapi_rest_base()}/users/current/accounts/{METAAPI_ACCOUNT_ID}{path}"
         if path == "/trade" and isinstance(body, dict):
             # Log de diagnostic temporaire (aucun secret : ni token ni account ID ici) — permet de
             # voir EXACTEMENT ce qui part sur le fil avant tout envoi, sans deviner.
             types = {k: type(v).__name__ for k, v in body.items()}
             print(f"[metaapi-trade] -> {method} {path} | payload={json.dumps(body, default=str)} | types={types}")
-        r = requests.request(method, url, json=body, timeout=METAAPI_REST_TIMEOUT_SEC,
-                             headers={"auth-token": METAAPI_TOKEN, "Accept": "application/json"})
+        # Retry/backoff UNIQUEMENT sur GET (idempotent -- jamais sur /trade : rejouer un POST pourrait
+        # dupliquer un ordre). 429 = rate-limit MetaApi (ex. "too many unexisting/undeployed accounts") ;
+        # 502/503/504 = indisponibilité passagère côté MetaApi. 3 essais, backoff exponentiel + jitter.
+        attempts = 4 if (retry_429 and method == "GET") else 1
+        last_exc = None
+        for attempt in range(attempts):
+            try:
+                r = requests.request(method, url, json=body, timeout=METAAPI_REST_TIMEOUT_SEC,
+                                     headers={"auth-token": METAAPI_TOKEN, "Accept": "application/json"})
+            except requests.RequestException as e:
+                last_exc = e
+                if attempt == attempts - 1:
+                    raise
+                wait = (2 ** attempt) + random.uniform(0, 0.5)
+                print(f"[metaapi-rest] {method} {path} : erreur réseau ({e}) -- retry dans {wait:.1f}s "
+                      f"({attempt + 1}/{attempts}).")
+                time.sleep(wait)
+                continue
+            if r.status_code in (429, 502, 503, 504) and attempt < attempts - 1:
+                wait = (2 ** attempt) + random.uniform(0, 0.5)
+                print(f"[metaapi-rest] {method} {path} -> HTTP {r.status_code} -- retry dans {wait:.1f}s "
+                      f"({attempt + 1}/{attempts}).")
+                time.sleep(wait)
+                continue
+            break
+        else:
+            if last_exc:
+                raise last_exc
         if path == "/trade":
             print(f"[metaapi-trade] <- HTTP {r.status_code} | raw={r.text[:2000]}")
         try:
@@ -608,8 +637,24 @@ class _MetaApiRestConnection:
     async def get_symbol_specification(self, symbol):
         return await self._acall("GET", f"/symbols/{symbol}/specification")
 
-    async def get_positions(self):
-        return await self._acall("GET", "/positions") or []
+    POSITIONS_CACHE_TTL = _env_float("METAAPI_POSITIONS_CACHE_TTL", 3.0)   # secondes -- voir get_positions()
+
+    async def get_positions(self, fresh=False):
+        """Liste des positions ouvertes côté broker, avec un court cache partagé (TTL ci-dessus) : plusieurs
+        endroits du bot (be-check, modify_position, réconciliation périodique) peuvent tous demander les
+        positions dans la même seconde -- sans ce cache, chacun fait son propre GET /positions, ce qui
+        multiplie les appels et alimente le rate-limit 429 de MetaApi. `fresh=True` force un appel réseau
+        (ex. juste après l'ouverture d'un ordre, où on veut la position toute nouvelle)."""
+        now = time.monotonic()
+        with self._positions_lock:
+            if not fresh and self._positions_cache and now - self._positions_cache[0] < self.POSITIONS_CACHE_TTL:
+                return self._positions_cache[1]
+        positions = await self._acall("GET", "/positions") or []
+        with self._positions_lock:
+            self._positions_cache = (now, positions)
+        return positions
+
+
 
     async def get_symbols(self):
         """Liste des symboles réellement disponibles chez CE broker (ex. 'BTCUSD', 'BTCUSDm', 'BTCUSD.a'...) --
@@ -1232,7 +1277,7 @@ async def _find_position_by_signature(connection, symbol, side, client_id):
     if not client_id:
         return None
     try:
-        positions = await connection.get_positions()
+        positions = await connection.get_positions(fresh=True)   # jamais le cache ici : on vérifie un ordre qu'on vient de tenter
     except Exception as e:
         print(f"[metaapi] Vérif anti-doublon impossible (get_positions a échoué) : {e}")
         return None
@@ -1398,7 +1443,7 @@ async def _confirm_position_async(connection, position_id):
     if not position_id:
         return False, "pas d'identifiant de position renvoyé par MetaApi", None
     try:
-        positions = await connection.get_positions()
+        positions = await connection.get_positions(fresh=True)   # jamais le cache ici : on vérifie l'existence réelle d'une position tout juste créée
     except Exception as e:
         return None, f"vérification impossible ({e})", None
     pos = next((p for p in positions or [] if str(p.get("id")) == str(position_id)), None)
@@ -1960,6 +2005,251 @@ _ensure_column("trades", "exec_status", "TEXT")
 # message_id Telegram du signal d'ouverture dans le groupe : toutes les notifications de suivi (RR1/RR2/
 # BE/TP/SL) répondent (reply_to_message_id) à CE message précis, jamais au dernier message du groupe.
 _ensure_column("trades", "signal_message_id", "INTEGER")
+
+# ============================================================================
+# GESTION TP/BE — TP liquidité, clôtures partielles configurables, BE ON/OFF
+# N'affecte jamais l'entrée/CHoCH/BOS/SL initial : uniquement la sortie.
+# ============================================================================
+_ensure_column("trades", "tp1_done", "INTEGER DEFAULT 0")
+_ensure_column("trades", "tp2_done", "INTEGER DEFAULT 0")
+_ensure_column("trades", "tp3_done", "INTEGER DEFAULT 0")
+_ensure_column("trades", "tp_plan_json", "TEXT")
+
+DEFAULT_TP_CONFIG = {
+    "partial_enabled": True,
+    "be_enabled": True,
+    "tp1": {"on": True, "rr": 1.0, "pct": 50},
+    "tp2": {"on": True, "rr": 2.0, "pct": 25},
+    "tp3": {"on": True, "pct": 25, "buffer": 10.0},   # TP3 = liquidité - buffer (BUY) / + buffer (SELL)
+}
+
+
+def get_tp_config():
+    """Config clôture partielle + BE, modifiable à chaud depuis Telegram (/gestion). Repli sur les
+    valeurs par défaut si absente/invalide — ne lève jamais."""
+    raw = get_setting("tp_partial_config")
+    base = json.loads(json.dumps(DEFAULT_TP_CONFIG))
+    if not raw:
+        return base
+    try:
+        cfg = json.loads(raw)
+        base.update({k: v for k, v in cfg.items() if k in ("partial_enabled", "be_enabled")})
+        for tier in ("tp1", "tp2", "tp3"):
+            if tier in cfg:
+                base[tier].update(cfg[tier])
+        return base
+    except Exception:
+        return json.loads(json.dumps(DEFAULT_TP_CONFIG))
+
+
+def set_tp_config(cfg):
+    set_setting("tp_partial_config", json.dumps(cfg))
+
+
+def update_tp_config(**patch):
+    """update_tp_config(be_enabled=False) ou update_tp_config(tp1={'rr': 1.5})."""
+    cfg = get_tp_config()
+    for k, v in patch.items():
+        if k in ("tp1", "tp2", "tp3") and isinstance(v, dict):
+            cfg[k].update(v)
+        else:
+            cfg[k] = v
+    set_tp_config(cfg)
+    return cfg
+
+
+def is_be_enabled():
+    """BE global ON/OFF (/be_toggle). OFF -> check_be_realtime()/track_trade() n'arment plus jamais
+    le BE, même si le RR d'armement est atteint. Le SL/CHoCH d'origine ne sont jamais affectés."""
+    return get_tp_config().get("be_enabled", True)
+
+
+def liquidity_tp_price(symbol, side, buffer_amount):
+    """TP basé sur la liquidité externe non balayée (ext_map) : BUY -> plus proche BSL - buffer ;
+    SELL -> plus proche SSL + buffer. Jamais pile sur le niveau. None si aucune liquidité dispo."""
+    m = ext_map(symbol)
+    if side == "BUY":
+        pool = m.get("highs") or []
+        return (pool[0]["level"] - abs(buffer_amount)) if pool else None
+    pool = m.get("lows") or []
+    return (pool[0]["level"] + abs(buffer_amount)) if pool else None
+
+
+def build_partial_tp_plan(symbol, side, entry, sl, cfg=None):
+    """Paliers de sortie pour un trade, à partir de la config donnée (ou courante). Retourne
+    {"tp1"|"tp2"|"tp3": {"price","pct","rr"?} | None}."""
+    cfg = cfg or get_tp_config()
+    d = 1 if side == "BUY" else -1
+    risk = abs(entry - sl)
+    plan = {"tp1": None, "tp2": None, "tp3": None}
+    for tier in ("tp1", "tp2"):
+        t = cfg[tier]
+        if t.get("on") and risk > 0:
+            price = entry + d * risk * float(t["rr"])
+            plan[tier] = {"price": price, "pct": float(t["pct"]), "rr": float(t["rr"])}
+    t3 = cfg["tp3"]
+    if t3.get("on"):
+        price = liquidity_tp_price(symbol, side, float(t3.get("buffer", 10.0)))
+        if price is not None:
+            plan["tp3"] = {"price": price, "pct": float(t3["pct"])}
+    return plan
+
+
+def freeze_trade_tp_plan(symbol, side, entry, sl, signal_key):
+    """Fige le plan de sortie à L'OUVERTURE du trade (comme be_rr/htf_mode) : un changement de
+    config Telegram après coup n'affecte jamais un trade déjà ouvert."""
+    plan = build_partial_tp_plan(symbol, side, entry, sl)
+    _q("UPDATE trades SET tp_plan_json=? WHERE signal_key=?", (json.dumps(plan), signal_key), commit=True)
+    return plan
+
+
+def trade_tp_plan(trade):
+    """Relit le plan figé d'un trade ; si absent (trade ouvert avant ce patch), recalcule avec la
+    config ACTUELLE en repli (ne fige rien)."""
+    raw = trade["tp_plan_json"] if "tp_plan_json" in trade.keys() else None
+    if raw:
+        try:
+            return json.loads(raw)
+        except Exception:
+            pass
+    return build_partial_tp_plan(trade["symbol"], trade["side"], trade["entry"], trade["sl_initial"] or trade["sl"])
+
+
+async def _close_position_partial_async(position_id, volume):
+    connection = await get_metaapi_connection()
+    if connection is None:
+        raise RuntimeError("connexion MetaApi indisponible")
+    return await connection.close_position_partially(position_id, volume)
+
+
+def close_mt5_position_partial(position_id, volume):
+    """Clôture partielle MT5 (volume en lots). Ne lève jamais : (True, None) si acceptée,
+    (False, message) sinon — même convention que close_mt5_position()."""
+    try:
+        _run_mt5(_close_position_partial_async(position_id, round(float(volume), 2)))
+    except Exception as e:
+        print(f"[metaapi] Échec clôture partielle position {position_id} vol={volume:g} : {e}")
+        traceback.print_exc(limit=-3)
+        return False, str(e)
+    return True, None
+
+
+async def _mt5_position_volume_async(position_id):
+    connection = await get_metaapi_connection()
+    if connection is None:
+        return None
+    for p in (await connection.get_positions() or []):
+        if str(p.get("id")) == str(position_id):
+            return float(p.get("volume") or 0)
+    return None
+
+
+def _current_broker_volume(trade):
+    """Volume RÉEL restant sur la position côté broker (pas le lot théorique du bot) — pour ne
+    jamais demander à clôturer plus que ce qu'il reste après des TP partiels déjà passés."""
+    try:
+        vol = _run_mt5(_mt5_position_volume_async(trade["mt5_position_id"]))
+    except Exception as e:
+        print(f"[metaapi] volume broker introuvable pour position {trade['mt5_position_id']} : {e}")
+        vol = None
+    return vol if vol is not None else float(trade["lot"] or 0)
+
+
+def close_broker_position_percent(position_id, pct):
+    """Clôture partielle directe d'une position broker par son ticket (utilisé depuis /mpositions,
+    y compris pour une position ouverte manuellement, pas seulement un trade suivi en base)."""
+    if pct >= 100:
+        return close_mt5_position(position_id)
+    try:
+        vol = _run_mt5(_mt5_position_volume_async(position_id))
+    except Exception as e:
+        return False, f"volume broker introuvable ({e})"
+    if not vol or vol <= 0:
+        return False, "volume broker introuvable ou nul"
+    return close_mt5_position_partial(position_id, vol * (pct / 100.0))
+
+
+def close_percent(trade, pct):
+    """Clôture manuelle ou automatique d'un % de la position ouverte (volume réellement
+    disponible côté broker). pct>=100 -> clôture totale (close_mt5_position)."""
+    position_id = trade["mt5_position_id"]
+    if not position_id:
+        return False, "position sans identifiant broker (non exécutée réellement côté MT5)"
+    if pct >= 100:
+        return close_mt5_position(position_id)
+    current_vol = _current_broker_volume(trade)
+    if current_vol <= 0:
+        return False, "volume broker introuvable ou nul"
+    return close_mt5_position_partial(position_id, current_vol * (pct / 100.0))
+
+
+def _fmt_onoff(flag):
+    return "✅ ON" if flag else "⬜ OFF"
+
+
+def gestion_position_text():
+    cfg = get_tp_config()
+    lines = [
+        "📊 <b>Gestion position</b>", "",
+        f"Clôture partielle : {_fmt_onoff(cfg['partial_enabled'])}",
+        f"BE (break-even) : {_fmt_onoff(cfg['be_enabled'])}", "",
+        f"TP1 : {_fmt_onoff(cfg['tp1']['on'])} · RR {cfg['tp1']['rr']:g} · {cfg['tp1']['pct']:g}%",
+        f"TP2 : {_fmt_onoff(cfg['tp2']['on'])} · RR {cfg['tp2']['rr']:g} · {cfg['tp2']['pct']:g}%",
+        f"TP3 (liquidité) : {_fmt_onoff(cfg['tp3']['on'])} · buffer {cfg['tp3']['buffer']:g} · {cfg['tp3']['pct']:g}%",
+    ]
+    total = sum(cfg[t]["pct"] for t in ("tp1", "tp2", "tp3") if cfg[t]["on"])
+    if cfg["partial_enabled"] and total != 100:
+        lines.append(f"\n⚠️ Somme des % actifs = {total:g}% (≠100% — le reliquat reste ouvert sans TP géré).")
+    return "\n".join(lines)
+
+
+def gestion_position_keyboard():
+    cfg = get_tp_config()
+    return {"inline_keyboard": [
+        [{"text": f"Clôture partielle : {_fmt_onoff(cfg['partial_enabled'])}", "callback_data": "gp:toggle:partial"}],
+        [{"text": f"BE : {_fmt_onoff(cfg['be_enabled'])}", "callback_data": "gp:toggle:be"}],
+        [{"text": f"TP1 {_fmt_onoff(cfg['tp1']['on'])} RR{cfg['tp1']['rr']:g} {cfg['tp1']['pct']:g}%", "callback_data": "gp:edit:tp1"}],
+        [{"text": f"TP2 {_fmt_onoff(cfg['tp2']['on'])} RR{cfg['tp2']['rr']:g} {cfg['tp2']['pct']:g}%", "callback_data": "gp:edit:tp2"}],
+        [{"text": f"TP3 {_fmt_onoff(cfg['tp3']['on'])} liq-{cfg['tp3']['buffer']:g} {cfg['tp3']['pct']:g}%", "callback_data": "gp:edit:tp3"}],
+        [{"text": "⬅️ Menu", "callback_data": "menu:home"}],
+    ]}
+
+
+def _tp_edit_text(tier):
+    cfg = get_tp_config()
+    t = cfg[tier]
+    label = {"tp1": "TP1", "tp2": "TP2", "tp3": "TP3 (liquidité)"}[tier]
+    lines = [f"⚙️ <b>{label}</b> — {_fmt_onoff(t['on'])}"]
+    if tier in ("tp1", "tp2"):
+        lines.append(f"RR : <b>{t['rr']:g}</b>")
+    else:
+        lines.append(f"Buffer : <b>{t['buffer']:g}</b> (BUY: BSL−buffer · SELL: SSL+buffer)")
+    lines.append(f"Volume : <b>{t['pct']:g}%</b>")
+    return "\n".join(lines)
+
+
+def _tp_edit_keyboard(tier):
+    rows = [[{"text": "✅ ON" if get_tp_config()[tier]["on"] else "⬜ OFF", "callback_data": f"gp:toggle:{tier}"}]]
+    if tier in ("tp1", "tp2"):
+        rows.append([{"text": "RR −0.5", "callback_data": f"gp:{tier}:rr:-0.5"},
+                     {"text": "RR +0.5", "callback_data": f"gp:{tier}:rr:+0.5"}])
+    else:
+        rows.append([{"text": "Buffer −5", "callback_data": f"gp:{tier}:buffer:-5"},
+                     {"text": "Buffer +5", "callback_data": f"gp:{tier}:buffer:+5"}])
+    rows.append([{"text": "Vol −5%", "callback_data": f"gp:{tier}:pct:-5"},
+                 {"text": "Vol +5%", "callback_data": f"gp:{tier}:pct:+5"}])
+    rows.append([{"text": "⬅️ Gestion position", "callback_data": "menu:gestion"}])
+    return {"inline_keyboard": rows}
+
+
+def manual_close_keyboard(signal_key):
+    """Clavier à attacher au message du signal (groupe ou admin) pour la clôture manuelle."""
+    return {"inline_keyboard": [[
+        {"text": "🔴 25%", "callback_data": f"gpc:{signal_key}:25"},
+        {"text": "🟠 50%", "callback_data": f"gpc:{signal_key}:50"},
+        {"text": "🟡 75%", "callback_data": f"gpc:{signal_key}:75"},
+        {"text": "🔴 100%", "callback_data": f"gpc:{signal_key}:100"},
+    ]]}
 
 
 # --- paramètres / méta -------------------------------------------------------
@@ -3181,6 +3471,53 @@ def htf_poi_setup(symbol, c, ev, trace=None):
     return setup, poi, None
 
 
+def htf_poi_m15_setup(symbol, c, ev, trace=None):
+    """Mode POI_M15 : UNIQUEMENT M15 → POI (OB/FVG) → mitigation réelle → réaction → CHoCH M1 = trigger.
+
+    Volontairement dépourvu de tout ce qu'ajoute htf_poi_setup() (mode FULL) :
+      - pas de biais H1 obligatoire, pas d'exigence d'alignement H1/M15
+      - pas d'étape M5 (ni retracement, ni POI M5)
+      - pas de cascade multi-UT : seul M15 est scruté pour les POI (tfs = [15])
+      - le CHoCH M1 peut aller dans n'importe quel sens : seul compte le POI M15 mitigé + réaction, dans le
+        SENS du CHoCH lui-même (pas un sens imposé par un biais H1/M15 externe).
+    Retourne (setup, poi, motif_de_refus) ; motif_de_refus vaut None quand le signal est accepté."""
+    tr = trace if trace is not None else {}
+    d, dec = ev["dir"], SYMBOLS[symbol]["decimals"]
+    setup = "POI M15"
+    tr["trigger"] = (f"{ev['type']} {_dir_txt(d)} · clôture {c[ev['i']]['c']:.{dec}f} "
+                     f"{'>' if d == 1 else '<'} {ev['level']:.{dec}f}")
+    tr["htf"] = "non applicable (mode POI_M15 : pas de biais H1/M15 imposé)"
+    tr["retr"] = "non applicable (mode POI_M15 : pas d'étape M5)"
+    tr["choch5"] = "—"
+
+    if TIMEFRAME_MIN >= 15:   # aucune UT M15 au-dessus de l'entrée -> POI M15 impossible à évaluer
+        tr["poi"] = "non applicable (UT d'entrée >= M15)"
+        return setup, None, "mode POI_M15 inutilisable : l'UT d'entrée n'est pas sous M15"
+
+    pois = find_pois(_ctx_candles(symbol, 15), 15, d)
+    if pois:
+        _poi_log(symbol, "POI M15 détecté : " + " | ".join(_poi_txt(p, dec) for p in pois[:3])
+                 + (f" (+{len(pois) - 3})" if len(pois) > 3 else ""))
+    if not pois:
+        tr["poi"] = "aucun"
+        return setup, None, (f"aucun POI M15 {'bullish' if d == 1 else 'bearish'} valide "
+                             f"-- un CHoCH M1 seul ne suffit pas en mode POI_M15")
+
+    touched = [(p, r) for p in pois for m, r in [poi_reaction(c, ev, p)] if m]
+    if not touched:
+        tr["poi"] = f"{len(pois)} POI M15 détecté(s), aucun mitigé"
+        return setup, None, "aucune mitigation réelle : le point de retournement n'a touché aucun POI M15"
+    poi, react = next(((p, r) for p, r in touched if r), touched[0])
+    _poi_log(symbol, f"mitigation M15 {_poi_txt(poi, dec)} : le point de retournement est entré dans la zone")
+    if not react:
+        tr["poi"] = f"{_poi_txt(poi, dec)} mitigé, sans réaction"
+        return setup, None, f"POI M15 {_poi_txt(poi, dec)} mitigé mais ni réaction ni balayage de liquidité"
+    tr["poi"] = f"{_poi_txt(poi, dec)} mitigé · {react}"
+    _poi_log(symbol, f"réaction M15 : {react}")
+    _poi_log(symbol, f"CHoCH M1 confirmé ({ev['type']}) : clôture {c[ev['i']]['c']:.{dec}f} au-delà de {ev['level']:.{dec}f}")
+    return setup, poi, None
+
+
 def htf_ref_tf(entry_tf=None):
     """UT de la tendance de fond utilisée par le mode M15 : M15 pour une entrée M1/M3/M5, H1 pour M15/M30, H4 pour H1."""
     return HTF_REF_TF.get(entry_tf or TIMEFRAME_MIN, 15)
@@ -3764,6 +4101,11 @@ def build_signal(c, ev, symbol=None, multi=False):
             setup, poi, why = htf_poi_setup(symbol, c, ev, trace)
             if why:
                 return _rej(why)
+        elif htf_mode == "POI_M15":
+            # POI M15 uniquement (pas de biais H1, pas de M5) : mitigation + réaction sur M15, CHoCH M1 = trigger
+            setup, poi, why = htf_poi_m15_setup(symbol, c, ev, trace)
+            if why:
+                return _rej(why)
         else:   # M15 : le CHoCH doit suivre la tendance de fond, rien d'autre
             trend, why = htf_trend_check(symbol, ev)
             if why:
@@ -4044,8 +4386,30 @@ def track_trade(trade, candles):
 
         # 2) progression : BE (armé au RR propre au trade), paliers RR1/RR2/RR3 (notification groupe), TP finale
         r_fav = (favorable - entry) * side / risk
+
+        # 1bis) clôtures partielles TP1/TP2/TP3 configurées (/gestion) — indépendantes du SL/CHoCH
+        # et de la TP finale ci-dessous ; plan figé à l'ouverture (freeze_trade_tp_plan), donc un
+        # changement de réglage après coup n'affecte jamais ce trade déjà ouvert.
+        if trade["status"] == "OPEN":
+            plan = trade_tp_plan(trade)
+            for tier in ("tp1", "tp2", "tp3"):
+                leg = plan.get(tier)
+                if not leg or trade.get(f"{tier}_done"):
+                    continue
+                hit = (favorable >= leg["price"]) if side == 1 else (favorable <= leg["price"])
+                if not hit:
+                    continue
+                trade[f"{tier}_done"] = 1
+                pos_id = trade.get("mt5_position_id")
+                if pos_id:
+                    ok, err = close_percent(trade, leg["pct"])
+                    if not ok:
+                        print(f"[{trade['symbol']}] clôture partielle {tier} échouée : {err}")
+                update_trade(trade["id"], **{f"{tier}_done": 1})
+                events.append({"name": tier.upper(), "trade": dict(trade), "pct": leg["pct"]})
+
         be_arm = False    # le BE vient d'être armé sur CETTE bougie
-        if not trade["be_hit"] and be_rr < tp_rr and r_fav >= be_rr:
+        if is_be_enabled() and not trade["be_hit"] and be_rr < tp_rr and r_fav >= be_rr:
             trade["be_hit"], trade["sl"] = 1, entry
             be_arm = True
             pos_id = trade.get("mt5_position_id")
@@ -4075,7 +4439,8 @@ def track_trade(trade, candles):
     trade["last_ts"] = last_ts
     fields = {k: trade[k] for k in ("sl", "be_hit", "status", "last_ts", "closed_ts", "filled_ts",
                                     "result_r", "pnl_usd", "outcome",
-                                    "rr1_hit", "rr2_hit", "rr3_hit")}
+                                    "rr1_hit", "rr2_hit", "rr3_hit",
+                                    "tp1_done", "tp2_done", "tp3_done")}
     update_trade(trade["id"], **fields)
     return events
 
@@ -4085,7 +4450,9 @@ def track_trade(trade, candles):
 # vérifie juste, côté broker, qu'une position censée être ouverte l'est toujours. Utile si le SL/TP
 # a été exécuté par MT5 entre deux bougies, ou en cas de clôture manuelle/autre côté broker — cas
 # que track_trade (qui ne regarde que les bougies) ne peut pas voir de lui-même.
-MT5_SYNC_INTERVAL = _env_int("MT5_SYNC_INTERVAL", 60)   # secondes entre 2 réconciliations MetaApi
+MT5_SYNC_INTERVAL = _env_int("MT5_SYNC_INTERVAL", 20)   # secondes entre 2 réconciliations MetaApi -- abaissé de 60 à 20 s
+# pour signaler un SL/TP/BE exécuté par MT5 entre deux bougies plus vite ("direct"), sans surcharger l'API :
+# le cache + retry/backoff de get_positions() (voir _MetaApiRestConnection) absorbent la fréquence plus élevée.
 
 
 def _mt5_close_outcome(trade, deals):
@@ -4753,10 +5120,14 @@ def _sig_rr(sig):
 
 
 def _htf_txt(mode):
-    """Libellé du mode HTF : OFF / ON (M15) / ON (complet)."""
+    """Libellé du mode HTF : OFF / ON (M15) / ON (POI M15) / ON (complet)."""
     if mode == "OFF":
         return "OFF"
-    return "ON (complet)" if mode == "FULL" else f"ON ({_tf_lbl(htf_ref_tf())})"
+    if mode == "FULL":
+        return "ON (complet)"
+    if mode == "POI_M15":
+        return "ON (POI M15)"
+    return f"ON ({_tf_lbl(htf_ref_tf())})"
 
 
 def _params_lines(sig, tf=None):
@@ -4854,6 +5225,10 @@ def group_event(ev, dec):
         return f"❌ <b>LIMIT annulé</b> — {head}"
     if name == "BE_MOVED":
         return f"🔒 <b>BE armé</b> — {head} · SL → entrée"
+    if name in ("TP1", "TP2", "TP3"):
+        pct = ev.get("pct")
+        pct_txt = f" ({pct:g}%)" if pct is not None else ""
+        return f"🎯 <b>{name} ✅</b>{pct_txt} — {head}"
     r = t.get("result_r")
     r_txt = f" ({r:+.1f}R)" if r is not None else ""
     if name == "TP":
@@ -4869,6 +5244,8 @@ def admin_event(ev):
         return f"✅ {t['symbol']} {t['side']} LIMIT exécuté @ {t['entry']:g} — position ouverte."
     if ev["name"] == "CANCELLED":
         return f"❌ {t['symbol']} {t['side']} LIMIT annulé — {ev['reason']} Retire l'ordre."
+    if ev["name"] in ("TP1", "TP2", "TP3"):
+        return f"📒 {t['symbol']} {t['side']} clôture partielle {ev['name']} ({ev.get('pct', '?')}%)."
     if ev["name"] in ("TP", "SL", "BE"):
         return f"📒 {t['symbol']} {t['side']} clôturé ({ev['name']}) : <b>{t['result_r']:+.2f} R</b>"
     return None
@@ -4940,7 +5317,8 @@ def _tf_text():
 # --- ⚙️ PARAMÈTRES SIGNAL : RR / timeframe d'entrée / filtre HTF / BE / signaux simultanés -----------
 def _htf_mode_txt(mode=None):
     mode = mode or get_htf_mode()
-    return {"OFF": "🔴 OFF", "M15": f"🟢 ON — tendance {_tf_lbl(htf_ref_tf())}", "FULL": "🟣 ON — complet"}[mode]
+    return {"OFF": "🔴 OFF", "M15": f"🟢 ON — tendance {_tf_lbl(htf_ref_tf())}",
+            "POI_M15": "🟡 ON — POI M15", "FULL": "🟣 ON — complet"}[mode]
 
 
 def _signal_text():
@@ -5140,6 +5518,9 @@ def _signal_htf_text():
             f"🟢 {ref} : le CHoCH d'entrée doit suivre la tendance de fond {ref} (dernière cassure de structure {ref}). "
             f"{ref} baissier = uniquement des SELL, {ref} haussier = uniquement des BUY, rien d'autre n'est exigé. "
             f"(Entrée M1/M5 → M15 · entrée M15/M30 → H1 · entrée H1 → H4.)\n\n"
+            f"🟡 POI M15 : uniquement M15 → POI (OB / FVG) détecté → mitigation réelle du POI → réaction confirmée → "
+            f"CHoCH M1 = trigger. Aucun biais H1 imposé, aucune étape M5, aucune cascade -- seul le POI M15 filtre "
+            f"le CHoCH M1, dans le sens du CHoCH lui-même.\n\n"
             f"🟣 COMPLET : H{HTF_MINUTES // 60 or 1} = biais, M15 = confirmation du contexte, M5 = fin du retracement, "
             f"POI (OB / FVG) mitigé = zone de réaction, CHoCH d'entrée = trigger final.\n\n"
             f"🔴 OFF : aucun filtre, tout CHoCH valide devient un signal (BUY ou SELL). Effet immédiat.")
@@ -5149,7 +5530,8 @@ def _signal_htf_keyboard():
     cur = get_htf_mode()
     return _signal_back([[
         {"text": ("✅ " if cur == "M15" else "") + f"🟢 {_tf_lbl(htf_ref_tf())}", "callback_data": "shtf:M15"},
-        {"text": ("✅ " if cur == "FULL" else "") + "🟣 COMPLET", "callback_data": "shtf:FULL"},
+        {"text": ("✅ " if cur == "POI_M15" else "") + "🟡 POI M15", "callback_data": "shtf:POI_M15"}],
+        [{"text": ("✅ " if cur == "FULL" else "") + "🟣 COMPLET", "callback_data": "shtf:FULL"},
         {"text": ("✅ " if cur == "OFF" else "") + "🔴 OFF", "callback_data": "shtf:OFF"}]])
 
 
@@ -5466,6 +5848,9 @@ def _mpositions_keyboard():
         sym = _internal_symbol(p.get("symbol", ""))
         rows.append([{"text": f"🟢 BE+frais {sym} #{pid}", "callback_data": f"mpos:be:{pid}"},
                      {"text": f"🛑 Fermer #{pid}", "callback_data": f"mpos:close:{pid}"}])
+        rows.append([{"text": "🔴 25%", "callback_data": f"mpos:pc:{pid}:25"},
+                     {"text": "🟠 50%", "callback_data": f"mpos:pc:{pid}:50"},
+                     {"text": "🟡 75%", "callback_data": f"mpos:pc:{pid}:75"}])
     rows.append([{"text": "🔄 Actualiser", "callback_data": "mpos:home"}])
     return _with_back({"inline_keyboard": rows})
 
@@ -5476,7 +5861,7 @@ def _menu_keyboard():
         [{"text": "⏱ Timeframe", "callback_data": "menu:timeframe"}, {"text": "🎭 Médias", "callback_data": "menu:medias"}],
         [{"text": "📊 Stats", "callback_data": "menu:stats"}, {"text": "📈 Positions", "callback_data": "menu:trades"}],
         [{"text": "📊 Analyse", "callback_data": "ana:home"}],
-        [{"text": "⚙️ Paramètres signal", "callback_data": "menu:signal"}],
+        [{"text": "⚙️ Paramètres signal", "callback_data": "menu:signal"}, {"text": "📊 Gestion position", "callback_data": "menu:gestion"}],
         [{"text": "🏦 Compte", "callback_data": "acc:home"}, {"text": "👤 Manuel", "callback_data": "man:home"}],
         [{"text": "📈 Trade", "callback_data": "mtr:home"}, {"text": "📌 Positions broker", "callback_data": "mpos:home"}],
         [{"text": "🔄 Actualiser", "callback_data": "menu:home"}],
@@ -5514,6 +5899,7 @@ def handle_command(text):
                "/timeframe [M1|M3|M5|M15|M30|H1] — change le timeframe à chaud\n"
                "/signal — paramètres du signal (RR, timeframe, filtre HTF, BE, signaux max)\n"
                "/be [RR] — RR auquel le SL passe à l'entrée (ex. /be 1)\n"
+               "/gestion — clôture partielle TP1/TP2/TP3 (RR + %) + TP liquidité (buffer) + BE ON/OFF (menu à boutons ±)\n"
                "/maxpos [n] — signaux ouverts max par actif (1 = pas de doublon)\n"
                "/entree [direct|limit|both] — type d'entrée : direct, limit sur OB/FVG, ou les deux\n"
                "/session [all|londres|ny|both] — n'accepter que les CHoCH d'une session · /zone [ob|fvg|both] — zone du limit\n"
@@ -5541,6 +5927,8 @@ def handle_command(text):
         return (_home_text(), _menu_keyboard())
     if cmd in ("/signal", "/parametres", "/paramètres"):
         return (_signal_text(), _signal_keyboard())
+    if cmd in ("/gestion", "/tp"):
+        return (gestion_position_text(), gestion_position_keyboard())
     if cmd == "/be":
         if len(parts) > 1:
             try:
@@ -5761,7 +6149,7 @@ def handle_command(text):
 
 _MENU_ACTIONS = {
     "risque": "/risque", "levier": "/levier", "stats": "/stats", "trades": "/trades",
-    "timeframe": "/timeframe", "medias": "/medias", "signal": "/signal",
+    "timeframe": "/timeframe", "medias": "/medias", "signal": "/signal", "gestion": "/gestion",
 }
 
 
@@ -6077,11 +6465,61 @@ def _handle_update(u):
             ok, err = close_mt5_position(pid)
             ack = "✅ Position fermée" if ok else f"❌ {err}"
             _edit(cq, _mpositions_text(), _mpositions_keyboard())
+        elif data.startswith("mpos:pc:"):
+            _, _, pid, pct = data.split(":", 3)
+            ok, err = close_broker_position_percent(pid, int(pct))
+            ack = f"✅ {pct}% clôturé" if ok else f"❌ {err}"[:180]
+            _edit(cq, _mpositions_text(), _mpositions_keyboard())
         elif data == "menu:home":
             _edit(cq, _home_text(), _menu_keyboard())
         elif data.startswith("menu:") and data[5:] in _MENU_ACTIONS:
             reply, kb = handle_command(_MENU_ACTIONS[data[5:]])
             _edit(cq, reply, kb or _back_keyboard())
+        elif data.startswith("gp:toggle:"):
+            what = data[len("gp:toggle:"):]
+            cfg = get_tp_config()
+            if what == "partial":
+                update_tp_config(partial_enabled=not cfg["partial_enabled"])
+            elif what == "be":
+                update_tp_config(be_enabled=not cfg["be_enabled"])
+            elif what in ("tp1", "tp2", "tp3"):
+                update_tp_config(**{what: {"on": not cfg[what]["on"]}})
+                _edit(cq, _tp_edit_text(what), _tp_edit_keyboard(what))
+                ack = "✅ mis à jour"
+                _post("answerCallbackQuery", {"callback_query_id": cq["id"], "text": ack})
+                return
+            _edit(cq, gestion_position_text(), gestion_position_keyboard())
+            ack = "✅ mis à jour"
+        elif data.startswith("gp:edit:"):
+            tier = data[len("gp:edit:"):]
+            if tier in ("tp1", "tp2", "tp3"):
+                _edit(cq, _tp_edit_text(tier), _tp_edit_keyboard(tier))
+        elif data.count(":") == 3 and data.startswith("gp:tp") and data.split(":")[1] in ("tp1", "tp2", "tp3"):
+            _, tier, field, delta = data.split(":")
+            cfg = get_tp_config()
+            try:
+                d = float(delta)
+            except ValueError:
+                d = 0.0
+            if field == "pct":
+                new_v = max(0.0, min(100.0, cfg[tier]["pct"] + d))
+                update_tp_config(**{tier: {"pct": new_v}})
+            elif field == "rr" and tier in ("tp1", "tp2"):
+                new_v = max(0.1, cfg[tier]["rr"] + d)
+                update_tp_config(**{tier: {"rr": new_v}})
+            elif field == "buffer" and tier == "tp3":
+                new_v = max(0.0, cfg[tier]["buffer"] + d)
+                update_tp_config(**{tier: {"buffer": new_v}})
+            _edit(cq, _tp_edit_text(tier), _tp_edit_keyboard(tier))
+            ack = "✅ mis à jour"
+        elif data.startswith("gpc:"):
+            _, signal_key, pct = data.split(":", 2)
+            trade = _q("SELECT * FROM trades WHERE signal_key=?", (signal_key,)).fetchone()
+            if trade is None:
+                ack = "❌ trade introuvable"
+            else:
+                ok, err = close_percent(trade, int(pct))
+                ack = f"✅ {pct}% clôturé" if ok else f"❌ {err}"[:180]
         _post("answerCallbackQuery", {"callback_query_id": cq["id"], "text": ack})
         return
     msg = u.get("message")
@@ -6255,6 +6693,7 @@ def publish_signal(symbol, candles, events, sig, companion=False):
         risk_usd=lot_info["real_risk"],  # risque réel du lot pris (= risque demandé sauf lot minimum)
         lot=lot_info["lot"], leverage=leverage, opened_ts=now_ts(), last_ts=sig["t"],
         exec_status="PENDING" if (is_market and mt5_enabled) else None)
+    freeze_trade_tp_plan(symbol, sig["side"], sig["entry"], sig["sl"], key)   # gèle TP1/TP2/TP3 pour ce trade
     try:
         signal_log_block(symbol, sig, dec)
     except Exception as e:   # un souci de log ne doit jamais bloquer un signal
@@ -6502,6 +6941,8 @@ def check_be_realtime():
     Ne duplique jamais track_trade : ne touche que be_hit/sl (et rr{N}_hit si le palier coïncide),
     jamais TP/SL final (une clôture ne peut être décidée qu'à la clôture de bougie, avec l'historique
     complet — ici on n'a qu'un tick isolé). Notifie Telegram immédiatement (pas d'attente du scan)."""
+    if not is_be_enabled():
+        return
     dec_by_symbol = {s: SYMBOLS[s]["decimals"] for s in SYMBOLS}
     for trade in open_trades():
         if trade["status"] != "OPEN" or trade["be_hit"]:
@@ -7180,6 +7621,38 @@ class TestHtfM15(unittest.TestCase):
         finally:
             _E._q("DELETE FROM settings WHERE key='htf_mode'", commit=True)
 
+    def test_poi_m15_signaux_marques(self):
+        """Mode POI_M15 : les signaux acceptés portent bien htf_mode=POI_M15 et setup='POI M15' (pas de blocage
+        artificiel par un biais H1/M15 -- BUY et SELL doivent tous deux pouvoir passer)."""
+        old = _E.HTF_MODE
+        try:
+            _E.HTF_MODE = "POI_M15"
+            seen = set()
+            for name, m1 in (("bull", _StScenarios.bull()[0]), ("bear", _StScenarios.bear()[0])):
+                for ev, sig, log in _st_eval(_E, m1):
+                    if sig:
+                        self.assertEqual(sig["htf_mode"], "POI_M15")
+                        self.assertEqual(sig["setup"], "POI M15")
+                        seen.add(sig["side"])
+                    else:
+                        # tout refus doit venir du POI M15 (aucun ni H1 ni M5 ni "contexte" dans ce mode)
+                        reason = _st_reason(log)
+                        self.assertNotIn("biais H", reason)
+                        self.assertNotIn("contexte non confirmé", reason)
+                        self.assertNotIn("retracement M5", reason)
+            print(f"\n  POI_M15 : sens acceptés {sorted(seen)}")
+        finally:
+            _E.HTF_MODE = old
+
+    def test_poi_m15_sans_poi_refuse(self):
+        old = _E.HTF_MODE
+        try:
+            _E.HTF_MODE = "POI_M15"
+            res = _st_eval(_E, _StScenarios.bull()[0], only_m1=True)   # M15 indisponible -> aucun POI trouvable
+            self.assertEqual([r for r in res if r[1]], [])
+        finally:
+            _E.HTF_MODE = old
+
     def test_reglage_et_migration(self):
         try:
             for k in ("htf_mode", "htf_filter"):
@@ -7551,7 +8024,7 @@ class TestSignauxSimultanes(unittest.TestCase):
 
     def test_menu_htf(self):
         kb = str(_E._signal_htf_keyboard())
-        for cb in ("shtf:M15", "shtf:FULL", "shtf:OFF"):
+        for cb in ("shtf:M15", "shtf:POI_M15", "shtf:FULL", "shtf:OFF"):
             self.assertIn(cb, kb)
 
 
@@ -7730,7 +8203,7 @@ class _FakeBE:
         self.pos, self.bid, self.ask, self.apply, self.calls = positions, bid, ask, apply_modify, []
         self.spec = spec if spec is not None else {"digits": 2, "point": 0.01, "stopsLevel": 0}
 
-    async def get_positions(self):
+    async def get_positions(self, fresh=False):
         return [dict(p) for p in self.pos]
 
     async def get_symbol_specification(self, symbol):
@@ -7783,7 +8256,7 @@ class TestLogVolumeReel(unittest.TestCase):
 
     def test_ordre_execute_affiche_le_volume_broker(self):
         class Conn:
-            async def get_positions(self):
+            async def get_positions(self, fresh=False):
                 return [{"id": "99", "volume": 0.05, "openPrice": 84385.3, "stopLoss": 84212.89, "takeProfit": 84887.94}]
 
         async def fake_exec(*a, **k):
@@ -8066,3 +8539,4 @@ if __name__ == "__main__":
     if "--selftest" in sys.argv:
         sys.exit(_selftest())
     main()
+
