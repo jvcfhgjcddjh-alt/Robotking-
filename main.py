@@ -16,7 +16,7 @@ pendant que la boucle de trading et le polling Telegram tournent en arrière-pla
 Variables utiles : TELEGRAM_TOKEN, CHAT_ID_GROUPE, CHAT_ID_ADMIN, TIMEFRAME,
 DEFAULT_RISK_USD, DEFAULT_LEVERAGE, PORT, METAAPI_TOKEN, METAAPI_ACCOUNT_ID.
 
-Le bot tourne en permanence (pas de /start /stop) : scan continu, une analyse à chaque
+Le bot tourne en permanence ; /stop et /start (ou le bouton du menu) coupent / rétablissent les NOUVEAUX signaux, le suivi des positions ne s'arrête jamais : scan continu, une analyse à chaque
 nouvelle bougie clôturée du timeframe choisi.
 
 Risque : le lot est calculé à partir du risque $ choisi + SL, SANS solde de compte.
@@ -36,7 +36,7 @@ catégorie (gestion via /medias). Optionnel : variables MEDIA_TP, MEDIA_SL, MEDI
 Auto-tests du moteur H1 -> M15 -> M5 -> M1 (sans réseau ni base de prod) :  python main.py --selftest
 Sommaire : 1 Configuration · 2 Base de données · 3 Données de prix · 4 Signaux
            5 Risque · 6 Suivi des positions · 7 Graphique · 8 Telegram · 9 Boucle principale
-           10 Serveur web (Render) · 11 Auto-tests
+           10 Serveur web (Render) · 11 Auto-tests · 12 Module QML (Quasimodo)
 """
 import json
 import math
@@ -49,7 +49,7 @@ import sys
 import threading
 import time
 import traceback
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import requests
 
@@ -164,6 +164,28 @@ SYMBOLS = {
         "min_sl_pct": 0.0007,       # ~0.07% (~10 pips à 150)
         "be_fees_buffer": 0.005,    # 0.5 pip
     },
+    # --- marchés ajoutés pour le module QML (désactivés par défaut : voir SYMBOLS_ON / menu 🌍 ACTIFS) ---
+    "EURUSD": {"source": "deriv", "deriv_symbol": "frxEURUSD", "value_per_point": 100000.0,
+               "min_lot": 0.01, "lot_step": 0.01, "decimals": 5, "min_sl_pct": 0.0007, "be_fees_buffer": 0.00005},
+    "GBPUSD": {"source": "deriv", "deriv_symbol": "frxGBPUSD", "value_per_point": 100000.0,
+               "min_lot": 0.01, "lot_step": 0.01, "decimals": 5, "min_sl_pct": 0.0007, "be_fees_buffer": 0.00005},
+    "AUDUSD": {"source": "deriv", "deriv_symbol": "frxAUDUSD", "value_per_point": 100000.0,
+               "min_lot": 0.01, "lot_step": 0.01, "decimals": 5, "min_sl_pct": 0.0007, "be_fees_buffer": 0.00005},
+    "NZDUSD": {"source": "deriv", "deriv_symbol": "frxNZDUSD", "value_per_point": 100000.0,
+               "min_lot": 0.01, "lot_step": 0.01, "decimals": 5, "min_sl_pct": 0.0007, "be_fees_buffer": 0.00005},
+    "USDCHF": {"source": "deriv", "deriv_symbol": "frxUSDCHF", "vpp_from_price": True, "contract_size": 100000.0,
+               "value_per_point": 113000.0, "min_lot": 0.01, "lot_step": 0.01, "decimals": 5,
+               "min_sl_pct": 0.0007, "be_fees_buffer": 0.00005},
+    # croisés JPY : le P&L est en JPY -> converti avec le cours USDJPY (vpp_ref), pas avec leur propre prix
+    "EURJPY": {"source": "deriv", "deriv_symbol": "frxEURJPY", "vpp_from_price": True, "vpp_ref": "USDJPY",
+               "contract_size": 100000.0, "value_per_point": 660.0, "min_lot": 0.01, "lot_step": 0.01,
+               "decimals": 3, "min_sl_pct": 0.0007, "be_fees_buffer": 0.005},
+    "GBPJPY": {"source": "deriv", "deriv_symbol": "frxGBPJPY", "vpp_from_price": True, "vpp_ref": "USDJPY",
+               "contract_size": 100000.0, "value_per_point": 660.0, "min_lot": 0.01, "lot_step": 0.01,
+               "decimals": 3, "min_sl_pct": 0.0008, "be_fees_buffer": 0.005},
+    # indice Dow Jones : 1 lot = 1 $ par point (À VÉRIFIER chez ton broker : contract size, min/step lot, nom du symbole)
+    "US30": {"source": "deriv", "deriv_symbol": "OTC_DJI", "value_per_point": 1.0,
+             "min_lot": 0.01, "lot_step": 0.01, "decimals": 2, "min_sl_pct": 0.0008, "be_fees_buffer": 2.0},
 }
 
 
@@ -172,7 +194,11 @@ def value_per_point(symbol, price=None):
     (le P&L est en CAD/JPY, converti en USD). Sans prix fourni : dernier prix connu, sinon valeur de repli de SYMBOLS."""
     cfg = SYMBOLS.get(symbol, {})
     if cfg.get("vpp_from_price"):
-        px = price or globals().get("_last_price", {}).get(symbol)
+        if cfg.get("vpp_ref"):   # croisé : cours de la paire de conversion (ex. USDJPY), pas le prix du croisé
+            price = None
+            px = globals().get("_last_price", {}).get(cfg["vpp_ref"]) or globals().get("_qml_ref_px", {}).get(cfg["vpp_ref"])
+        else:
+            px = price or globals().get("_last_price", {}).get(symbol)
         if px and px > 0:
             return cfg["contract_size"] / float(px)
     return cfg.get("value_per_point") or 0.0
@@ -387,17 +413,17 @@ METAAPI_ACCOUNT_ID = os.getenv("METAAPI_ACCOUNT_ID", "") or _DEFAULT_METAAPI_ACC
 # Mappe les symboles internes (XAUUSD, BTCUSD) vers ceux du broker si différents,
 # ex. MT5_SYMBOL_MAP={"XAUUSD":"XAUUSD.m","BTCUSD":"BTCUSDm"}. Vide -> pas de mapping (identité).
 try:
-    MT5_SYMBOL_MAP = {"XAUUSD": "XAUUSDm", "BTCUSD": "BTCUSDm", "USDCAD": "USDCADm", "USDJPY": "USDJPYm"}
+    MT5_SYMBOL_MAP = {"XAUUSD": "XAUUSDm", "BTCUSD": "BTCUSDm", "USDCAD": "USDCADm", "USDJPY": "USDJPYm", "US30": "US30m"}
     MT5_SYMBOL_MAP.update(json.loads(os.getenv("MT5_SYMBOL_MAP", "") or "{}"))
 except Exception:
     print("[metaapi] MT5_SYMBOL_MAP invalide (JSON attendu) — mapping ignoré.")
-    MT5_SYMBOL_MAP = {"XAUUSD": "XAUUSDm", "BTCUSD": "BTCUSDm", "USDCAD": "USDCADm", "USDJPY": "USDJPYm"}
+    MT5_SYMBOL_MAP = {"XAUUSD": "XAUUSDm", "BTCUSD": "BTCUSDm", "USDCAD": "USDCADm", "USDJPY": "USDJPYm", "US30": "US30m"}
 
 # Tolérance de slippage (en points de prix, prix brut) transmise à MetaApi pour chaque ordre
 # MARKET : au-delà de cet écart entre le prix demandé et le prix d'exécution, le broker (Exness)
 # rejette l'ordre plutôt que de l'exécuter à un prix trop éloigné. Réglable par variable d'env
 # MT5_SLIPPAGE_XAUUSD / MT5_SLIPPAGE_BTCUSD (sinon défaut ci-dessous par actif).
-MT5_SLIPPAGE_DEFAULT = {"XAUUSD": 0.5, "BTCUSD": 30.0, "USDCAD": 0.0002, "USDJPY": 0.02}
+MT5_SLIPPAGE_DEFAULT = {"XAUUSD": 0.5, "BTCUSD": 30.0, "USDCAD": 0.0002, "USDJPY": 0.02, "US30": 3.0}
 
 
 def get_mt5_slippage(symbol):
@@ -412,7 +438,7 @@ def get_mt5_slippage(symbol):
 
 # Écart (en % du prix) entre sig["entry"] (prix Deriv/Binance) et le prix d'ouverture réel côté
 # Exness au-delà duquel l'admin est notifié (l'ordre reste ouvert : seule une alerte est envoyée).
-MT5_PRICE_GAP_ALERT_PCT = {"XAUUSD": 0.0015, "BTCUSD": 0.0005, "USDCAD": 0.0005, "USDJPY": 0.0005}
+MT5_PRICE_GAP_ALERT_PCT = {"XAUUSD": 0.0015, "BTCUSD": 0.0005, "USDCAD": 0.0005, "USDJPY": 0.0005, "US30": 0.0005}
 
 
 # ============================================================================
@@ -693,6 +719,11 @@ class _MetaApiRestConnection:
         """Ferme intégralement une position ouverte (POSITION_CLOSE_ID) — utilisé par le mode
         trading manuel Telegram (bouton 🛑 Fermer)."""
         body = {"actionType": "POSITION_CLOSE_ID", "positionId": str(position_id)}
+        return await self._trade(body)
+
+    async def close_position_partially(self, position_id, volume, options=None):
+        """Clôture partielle (POSITION_PARTIAL) d'une position ouverte."""
+        body = {"actionType": "POSITION_PARTIAL", "positionId": str(position_id), "volume": float(volume)}
         return await self._trade(body)
 
     async def get_symbol_price(self, symbol):
@@ -1734,6 +1765,32 @@ def close_mt5_position(position_id):
     return True, None
 
 
+async def _partial_close_async(position_id, volume):
+    connection = await get_metaapi_connection()
+    if connection is None:
+        raise RuntimeError("connexion MetaApi indisponible")
+    return await connection.close_position_partially(position_id, volume)
+
+
+def partial_close_mt5(position_id, symbol, lot, fraction):
+    """Clôture `fraction` (0-1) du lot d'une position MT5, arrondie au pas de lot du symbole. Ne lève jamais :
+    True si envoyée, False sinon (loggé) -- le suivi du signal continue de toute façon."""
+    cfg = SYMBOLS.get(symbol, {})
+    step, min_lot = cfg.get("lot_step", 0.01), cfg.get("min_lot", 0.01)
+    vol = math.floor(float(lot) * float(fraction) / step + 1e-9) * step
+    vol = round(vol, 8)
+    if vol < min_lot or float(lot) - vol < min_lot - 1e-12:
+        print(f"[metaapi] partiel ignoré {symbol} #{position_id} : volume {vol:g} / lot {lot:g} sous le lot minimum")
+        return False
+    try:
+        _run_mt5(_partial_close_async(position_id, vol))
+    except Exception as e:
+        print(f"[metaapi] Échec clôture partielle position {position_id} : {e}")
+        traceback.print_exc(limit=-3)
+        return False
+    return True
+
+
 async def _account_summary_async():
     connection = await get_metaapi_connection()
     if connection is None:
@@ -1959,6 +2016,12 @@ _ensure_column("trades", "exec_status", "TEXT")
 # message_id Telegram du signal d'ouverture dans le groupe : toutes les notifications de suivi (RR1/RR2/
 # BE/TP/SL) répondent (reply_to_message_id) à CE message précis, jamais au dernier message du groupe.
 _ensure_column("trades", "signal_message_id", "INTEGER")
+# Clôtures partielles : niveaux FIGÉS à la création du signal (JSON [[rr, fraction], ...]), nb de niveaux déjà pris,
+# R déjà réalisé et fraction déjà clôturée. NULL / 0 = aucun partiel (comportement historique inchangé).
+_ensure_column("trades", "part_cfg", "TEXT")
+_ensure_column("trades", "part_done", "INTEGER DEFAULT 0")
+_ensure_column("trades", "part_r", "REAL DEFAULT 0")
+_ensure_column("trades", "part_pct", "REAL DEFAULT 0")
 
 
 # --- paramètres / méta -------------------------------------------------------
@@ -3994,6 +4057,8 @@ def track_trade(trade, candles):
       - "TP"       : take-profit finale touchée (+TP_RR R).
       - "SL"       : stop initial touché (-1 R).
     Si SL et TP sont touchés dans la même bougie, le SL est compté en premier (prudent).
+    Clôtures partielles (optionnelles, section 12 « Module QML ») : événement "PARTIAL" à chaque niveau figé dans
+    trade["part_cfg"] ; le résultat final = R déjà encaissé + reste de la position (SL / BE / TP).
     """
     events = []
     side = 1 if trade["side"] == "BUY" else -1
@@ -4033,7 +4098,8 @@ def track_trade(trade, candles):
         # 1) stop touché (initial ou déplacé à l'entrée) ?
         if (side == 1 and adverse <= trade["sl"]) or (side == -1 and adverse >= trade["sl"]):
             at_be = bool(trade["be_hit"]) and abs(trade["sl"] - entry) < 1e-9
-            r = 0.0 if at_be else -1.0
+            _pr, _pp = float(trade.get("part_r") or 0), float(trade.get("part_pct") or 0)
+            r = _pr + (1 - _pp) * (0.0 if at_be else -1.0)   # partiels déjà encaissés + reste de la position
             trade.update(status="CLOSED", closed_ts=c["t"], result_r=r,
                          pnl_usd=r * trade["risk_usd"], outcome="BE" if at_be else "SL")
             events.append({"name": "BE" if at_be else "SL", "trade": dict(trade)})
@@ -4065,9 +4131,26 @@ def track_trade(trade, candles):
         # BE armé à un RR qui n'est pas un palier annoncé (ex. 0.5, 1.5) : message dédié
         if be_arm and not be_told and r_fav < tp_rr:
             events.append({"name": "BE_MOVED", "trade": dict(trade)})
+        # clôtures partielles (optionnelles, niveaux figés à la création du trade) : TP1 / TP2 ... avant la TP finale
+        for _lv in _partial_levels_of(trade):
+            _idx = int(trade.get("part_done") or 0)
+            if _idx >= len(_partial_levels_of(trade)):
+                break
+            _rr, _pct = _partial_levels_of(trade)[_idx]
+            if _rr >= tp_rr or r_fav < _rr:
+                break
+            trade["part_done"] = _idx + 1
+            trade["part_r"] = float(trade.get("part_r") or 0) + _pct * _rr
+            trade["part_pct"] = float(trade.get("part_pct") or 0) + _pct
+            _pos = trade.get("mt5_position_id")
+            if _pos:   # position réellement ouverte chez le broker : on clôture la fraction correspondante
+                partial_close_mt5(_pos, trade["symbol"], trade["lot"], _pct)
+            events.append({"name": "PARTIAL", "level": _idx + 1, "rr": _rr, "pct": _pct, "trade": dict(trade)})
         if r_fav >= tp_rr:
-            trade.update(status="CLOSED", closed_ts=c["t"], result_r=tp_rr,
-                         pnl_usd=tp_rr * trade["risk_usd"], outcome="TP")
+            _pr, _pp = float(trade.get("part_r") or 0), float(trade.get("part_pct") or 0)
+            r_tp = _pr + (1 - _pp) * tp_rr
+            trade.update(status="CLOSED", closed_ts=c["t"], result_r=r_tp,
+                         pnl_usd=r_tp * trade["risk_usd"], outcome="TP")
             events.append({"name": "TP", "trade": dict(trade)})
             break
 
@@ -4075,6 +4158,8 @@ def track_trade(trade, candles):
     fields = {k: trade[k] for k in ("sl", "be_hit", "status", "last_ts", "closed_ts", "filled_ts",
                                     "result_r", "pnl_usd", "outcome",
                                     "rr1_hit", "rr2_hit", "rr3_hit")}
+    for k in ("part_done", "part_r", "part_pct"):
+        fields[k] = trade.get(k) or 0
     update_trade(trade["id"], **fields)
     return events
 
@@ -4505,6 +4590,67 @@ def _forexfactory_events():
     return events
 
 
+NEWS_BEFORE_MIN = _env_int("NEWS_BEFORE_MIN", 30)   # pas de nouveau signal N min AVANT une news
+NEWS_AFTER_MIN = _env_int("NEWS_AFTER_MIN", 30)     # ... et N min APRÈS
+
+
+def get_news_filter_on():
+    """Filtre news : ON par défaut (interrupteur Telegram 📰 News). Ne bloque QUE les nouveaux signaux."""
+    return _get_bool_setting("news_filter", True)
+
+
+def get_news_medium():
+    """OFF = news à fort impact (rouge) seulement ; ON = + impact moyen (orange)."""
+    return _get_bool_setting("news_medium", False)
+
+
+def get_bot_on():
+    """Bot démarré ? OFF = plus aucun NOUVEAU signal (les positions déjà ouvertes restent suivies : BE / TP / SL)."""
+    return _get_bool_setting("bot_on", True)
+
+
+def set_bot_on(v):
+    set_setting("bot_on", "1" if v else "0")
+
+
+def _news_currencies(symbol):
+    if len(symbol) == 6 and symbol.isalpha() and symbol not in ("XAUUSD", "BTCUSD"):
+        return {symbol[:3], symbol[3:]}
+    return {"USD"}   # Gold, BTC, US30 : pilotés par le dollar / les news US
+
+
+def news_block_info(symbol, now=None):
+    """Retourne la news qui bloque `symbol` maintenant (dict) ou None. Calendrier ForexFactory public.
+    Si le calendrier est indisponible : None (on ne bloque pas, on ne coupe pas le bot pour ça)."""
+    if not get_news_filter_on():
+        return None
+    try:
+        events = _forexfactory_events()
+    except Exception:
+        return None
+    now = now or datetime.now(timezone.utc)
+    curs = _news_currencies(symbol)
+    impacts = {"High"} | ({"Medium"} if get_news_medium() else set())
+    for e in events or []:
+        cur = e.get("country") or e.get("currency")
+        if cur not in curs or str(e.get("impact", "")).strip() not in impacts:
+            continue
+        try:
+            dt = datetime.fromisoformat(str(e.get("date", "")).replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        delta_min = (dt - now).total_seconds() / 60.0
+        if -NEWS_AFTER_MIN <= delta_min <= NEWS_BEFORE_MIN:
+            return {"title": e.get("title", "?"), "cur": cur, "impact": e.get("impact", ""), "dt": dt}
+    return None
+
+
+def _news_line(nb):
+    return f"{'🔴' if nb['impact'] == 'High' else '🟠'} {nb['cur']} {nb['title']} ({nb['dt'].strftime('%H:%M UTC')})"
+
+
 def build_fundamental_analysis(symbol):
     """Résumé du calendrier économique public (ForexFactory, sans clé) pertinent pour l'actif.
     Aucune génération de texte libre : uniquement des événements réels du calendrier, sans invention."""
@@ -4515,7 +4661,7 @@ def build_fundamental_analysis(symbol):
     if not raw_events:
         return "⚠️ Calendrier économique indisponible pour le moment — réessaie plus tard."
 
-    relevant = {"USD"} | {"XAUUSD": {"CHF", "JPY"}, "USDCAD": {"CAD"}, "USDJPY": {"JPY"}}.get(symbol, set())
+    relevant = {"USD"} | {"XAUUSD": {"CHF", "JPY"}, "USDCAD": {"CAD"}, "USDJPY": {"JPY"}}.get(symbol, _news_currencies(symbol))
     now = datetime.now(timezone.utc)
     upcoming, recent = [], []
     for e in raw_events:
@@ -4550,6 +4696,11 @@ def build_fundamental_analysis(symbol):
         "Le BTC réagit surtout à la liquidité globale et aux données macro USD (taux, inflation, emploi), "
         "ainsi qu'au sentiment risk-on / risk-off des marchés."
     )
+    if symbol == "US30":
+        watch_note = ("Le Dow Jones réagit surtout aux données macro US (emploi, inflation, Fed), aux taux "
+                      "et aux résultats d'entreprises.")
+    elif symbol not in ("XAUUSD", "BTCUSD", "USDCAD", "USDJPY"):
+        watch_note = "Ce marché réagit aux décisions de banques centrales, à l'inflation et à l'emploi des devises concernées."
     return (
         f"📰 <b>ANALYSE FONDAMENTALE — {symbol}</b>\n\n"
         f"<b>À surveiller (prochains jours)</b>\n" + "\n".join(lines_up) + "\n\n"
@@ -4800,7 +4951,7 @@ def group_signal(symbol, sig, position_n, dec, tf=None):
     limit = sig.get("order") == "LIMIT"
     label = f"{sig['side']} LIMIT" if limit else sig["side"]
     return (
-        f"{icon} <b>{label} {symbol}</b> · {tf or TF_LABEL}\n"
+        f"{icon} <b>{label} {symbol}</b> · {tf or (sig.get('tf') if sig.get('type') == 'QML' else None) or TF_LABEL}\n"
         f"Entrée : {'limit ' if limit else '≈ '}{_fmt(sig['entry'], dec)}\n"
         f"🛡 SL : {_fmt(sig['sl'], dec)}\n"
         f"🎯 TP : {_fmt(sig['tp'], dec)}\n"
@@ -4847,6 +4998,9 @@ def group_event(ev, dec):
     head = f"{t['symbol']} {t['side']}"
     if name.startswith("RR"):
         return f"🟡 <b>{name} ✅</b> — {head}" + (" · SL → BE 🔒" if ev.get("be_moved") else "")
+    if name == "PARTIAL":
+        return (f"💰 <b>Partiel TP{ev['level']}</b> — {head} · {ev['pct'] * 100:g} % clôturé à {ev['rr']:g}R "
+                f"(+{t.get('part_r') or 0:.2f}R encaissé)")
     if name == "FILLED":
         return f"✅ <b>LIMIT exécuté</b> — {head} @ {_fmt(t['entry'], dec)}"
     if name == "CANCELLED":
@@ -4858,7 +5012,7 @@ def group_event(ev, dec):
     if name == "TP":
         return f"🎯 <b>TP ✅</b> — {head}{r_txt}"
     if name == "BE":
-        return f"🟰 <b>BE touché</b> — {head} (0R)"
+        return f"🟰 <b>BE touché</b> — {head} ({(r if r is not None else 0.0):+.1f}R)"
     return f"🔴 <b>SL ❌</b> — {head}{r_txt}"
 
 
@@ -4868,6 +5022,8 @@ def admin_event(ev):
         return f"✅ {t['symbol']} {t['side']} LIMIT exécuté @ {t['entry']:g} — position ouverte."
     if ev["name"] == "CANCELLED":
         return f"❌ {t['symbol']} {t['side']} LIMIT annulé — {ev['reason']} Retire l'ordre."
+    if ev["name"] == "PARTIAL":
+        return f"💰 {t['symbol']} {t['side']} : partiel TP{ev['level']} ({ev['pct'] * 100:g} % à {ev['rr']:g}R)."
     if ev["name"] in ("TP", "SL", "BE"):
         return f"📒 {t['symbol']} {t['side']} clôturé ({ev['name']}) : <b>{t['result_r']:+.2f} R</b>"
     return None
@@ -5102,6 +5258,7 @@ def _signal_keyboard():
         [{"text": "📥 ENTRÉE", "callback_data": "sig:entry"}, {"text": "🛡 SL / 🎯 TP", "callback_data": "sig:sltp"}],
         [{"text": "🧩 STRATÉGIES (CRT)", "callback_data": "sig:strat"}, {"text": "🕐 SESSION", "callback_data": "sig:sess"}],
         [{"text": "🔬 FILTRES QUALITÉ", "callback_data": "sig:qf"}, {"text": "🌍 ACTIFS", "callback_data": "sig:sym"}],
+        [{"text": "⚙️ QML", "callback_data": "qml:home"}],
         [{"text": "🔙 Menu", "callback_data": "menu:home"}]]}
 
 
@@ -5244,7 +5401,9 @@ def _media_from_message(msg):
     return None
 
 
-_ANALYSE_SYMS = {"XAU": "XAUUSD", "BTC": "BTCUSD", "CAD": "USDCAD", "JPY": "USDJPY"}
+_ANALYSE_SYMS = {"XAU": "XAUUSD", "BTC": "BTCUSD", "CAD": "USDCAD", "JPY": "USDJPY",
+                 "EUR": "EURUSD", "GBP": "GBPUSD", "CHF": "USDCHF", "AUD": "AUDUSD", "NZD": "NZDUSD",
+                 "EJ": "EURJPY", "GJ": "GBPJPY", "US30": "US30"}   # + marchés du module QML (jusqu'à 10, voir QML_MARKETS)
 
 
 def _analyse_text():
@@ -5253,10 +5412,11 @@ def _analyse_text():
 
 
 def _analyse_keyboard():
-    return _with_back({"inline_keyboard": [
-        [{"text": "🥇 XAUUSD", "callback_data": "ana:sym:XAU"}, {"text": "₿ BTCUSD", "callback_data": "ana:sym:BTC"}],
-        [{"text": "🇨🇦 USDCAD", "callback_data": "ana:sym:CAD"}, {"text": "🇯🇵 USDJPY", "callback_data": "ana:sym:JPY"}],
-    ]})
+    codes = {v: k for k, v in _ANALYSE_SYMS.items()}
+    icons = {"XAUUSD": "🥇", "BTCUSD": "₿"}
+    shown = ["XAUUSD", "BTCUSD", "USDCAD", "USDJPY"] + [m for m in SYMBOLS if m not in ("XAUUSD", "BTCUSD", "USDCAD", "USDJPY")]
+    btns = [{"text": f"{icons.get(m, '💵')} {m}", "callback_data": f"ana:sym:{codes[m]}"} for m in shown if m in codes]
+    return _with_back({"inline_keyboard": [btns[i:i + 2] for i in range(0, len(btns), 2)]})
 
 
 def _analyse_symbol_text(symbol):
@@ -5268,6 +5428,9 @@ def _analyse_symbol_keyboard(symbol):
     return {"inline_keyboard": [
         [{"text": "📈 TECHNIQUE", "callback_data": f"ana:tech:{code}"},
          {"text": "📰 FONDAMENTAL", "callback_data": f"ana:fond:{code}"}],
+        [{"text": "🎯 BOS/CHoCH", "callback_data": f"ana:str:{code}:main"}, {"text": "🕯 CRT", "callback_data": f"ana:str:{code}:crt"}],
+        [{"text": f"🎯 QML {_tf_lbl(t)}", "callback_data": f"ana:qml:{code}:{t}"} for t in QML_ANALYSE_TFS],
+        [{"text": "🔎 TOUTES LES STRATÉGIES", "callback_data": f"ana:all:{code}"}],
         [{"text": "🔙 Analyse", "callback_data": "ana:home"}, {"text": "🔙 Menu", "callback_data": "menu:home"}],
     ]}
 
@@ -5471,10 +5634,13 @@ def _mpositions_keyboard():
 
 def _menu_keyboard():
     return {"inline_keyboard": [
+        [{"text": "🧩 Stratégies", "callback_data": "str:home"}],
+        [{"text": "⏸ ARRÊTER LE BOT", "callback_data": "bot:stop"} if get_bot_on()
+         else {"text": "▶️ DÉMARRER LE BOT", "callback_data": "bot:start"}],
         [{"text": "💰 Risque", "callback_data": "menu:risque"}, {"text": "⚙️ Levier", "callback_data": "menu:levier"}],
         [{"text": "⏱ Timeframe", "callback_data": "menu:timeframe"}, {"text": "🎭 Médias", "callback_data": "menu:medias"}],
         [{"text": "📊 Stats", "callback_data": "menu:stats"}, {"text": "📈 Positions", "callback_data": "menu:trades"}],
-        [{"text": "📊 Analyse", "callback_data": "ana:home"}],
+        [{"text": "📊 Analyse", "callback_data": "ana:home"}, {"text": "📰 News", "callback_data": "news:home"}],
         [{"text": "⚙️ Paramètres signal", "callback_data": "menu:signal"}],
         [{"text": "🏦 Compte", "callback_data": "acc:home"}, {"text": "👤 Manuel", "callback_data": "man:home"}],
         [{"text": "📈 Trade", "callback_data": "mtr:home"}, {"text": "📌 Positions broker", "callback_data": "mpos:home"}],
@@ -5487,10 +5653,51 @@ def _back_keyboard():
 
 
 def _home_text():
-    return (f"🤖 <b>ALPHABOT</b>\n\n"
+    return (f"🤖 <b>ALPHABOT</b> — " + ("🟢 ACTIF" if get_bot_on() else "⏸ ARRÊTÉ (aucun nouveau signal)") + "\n\n"
             f"💰 Risque : {get_risk():g} $\n"
             f"⚙️ Levier : {get_leverage():g}x\n"
             f"⏱ Timeframe : {TF_LABEL}")
+
+
+def _strategies_text():
+    on = lambda b: "🟢 ON" if b else "🔴 OFF"
+    live = [n for n, b in (("BOS/CHoCH", get_strat_main()), ("CRT", get_strat_crt()), ("QML", get_qml_on())) if b]
+    return (f"🧩 <b>STRATÉGIES</b>\n\n"
+            f"BOS / CHoCH : {on(get_strat_main())}\nCRT : {on(get_strat_crt())}\nQML : {on(get_qml_on())}"
+            f" · publication auto : {on(get_qml_auto())}\n\n"
+            f"Actives : {', '.join(live) if live else 'aucune ⚠️ (plus aucun signal automatique)'}\n"
+            f"Bot : {'🟢 ACTIF' if get_bot_on() else '⏸ ARRÊTÉ'}\n\n"
+            f"Chaque stratégie ON scanne tous les actifs activés (🌍 ACTIFS) et publie / exécute automatiquement. "
+            f"OFF = plus de signal pour elle, mais le bouton 📊 Analyse te donne toujours son point d'entrée potentiel.\n"
+            f"QML sans « auto » : proposition envoyée à l'admin seulement.")
+
+
+def _strategies_keyboard():
+    return _with_back({"inline_keyboard": [
+        [_btn("BOS / CHoCH", "str:main", get_strat_main()), _btn("CRT", "str:crt", get_strat_crt())],
+        [_btn("QML", "str:qml", get_qml_on()), _btn("QML auto (signal)", "str:qmlauto", get_qml_auto())],
+        [{"text": "📊 Analyse (point potentiel)", "callback_data": "ana:home"}, {"text": "⚙️ QML", "callback_data": "qml:home"}],
+    ]})
+
+
+def _news_text():
+    nb = None
+    try:
+        nb = news_block_info("XAUUSD")
+    except Exception:
+        pass
+    return (f"📰 <b>FILTRE NEWS</b> : {'🟢 ON' if get_news_filter_on() else '🔴 OFF'}\n"
+            f"Impact : {'fort + moyen' if get_news_medium() else 'fort (rouge) seulement'}\n"
+            f"Fenêtre : {NEWS_BEFORE_MIN} min avant / {NEWS_AFTER_MIN} min après (variables NEWS_BEFORE_MIN / NEWS_AFTER_MIN)\n\n"
+            f"Pendant une news de la devise concernée (USD pour Gold / BTC / US30 ; les 2 devises pour une paire forex), "
+            f"aucun NOUVEAU signal n'est ouvert. Les positions déjà ouvertes continuent d'être suivies.\n"
+            + (f"\n⚠️ En ce moment (USD) : {_news_line(nb)}" if nb else "\nAucune news USD dans la fenêtre actuelle.") +
+            "\n\nSource : calendrier ForexFactory public (sans clé). Indisponible = pas de blocage.")
+
+
+def _news_keyboard():
+    return _with_back({"inline_keyboard": [[_btn("Filtre news", "news:on", get_news_filter_on()),
+                                            _btn("+ impact moyen", "news:med", get_news_medium())]]})
 
 
 def _is_admin(user_id):
@@ -5520,6 +5727,7 @@ def handle_command(text):
                "/strategie [main|crt|both] · /crt [on|off|h1|h4|d1|range|mid|rr] — module CRT (désactivé par défaut)\n"
                "/mtffib [on|off] — filtre Fibonacci HTF Premium/Discount\n"
                "/medias — stickers / images / GIF du groupe (TP, SL, BE, motivation)\n"
+               "/qml [on|off] — module QML (TF M5/M15, filtre H1 optionnel, M1 avalement) et clôtures partielles\n"
                "/analyse — analyse technique / fondamentale à la demande (BTCUSD, XAUUSD)\n"
                "/compte — statut API/broker, balance, equity, marge\n"
                "/manuel [on|off] — active/désactive le trading manuel Telegram\n"
@@ -5538,6 +5746,15 @@ def handle_command(text):
         return ("📡 <b>Scan en cours</b> — " + TF_LABEL + "\n" + "\n".join(scan_status_lines()), None)
     if cmd == "/menu":
         return (_home_text(), _menu_keyboard())
+    if cmd in ("/strategies", "/stratégies", "/strat"):
+        return (_strategies_text(), _strategies_keyboard())
+    if cmd in ("/stop", "/arreter", "/arrêter"):
+        set_bot_on(False)
+        return ("⏸ <b>Bot ARRÊTÉ</b> : plus aucun nouveau signal (BOS/CHoCH, CRT, QML). "
+                "Les positions déjà ouvertes restent suivies (BE / TP / SL). /start pour redémarrer.", _menu_keyboard())
+    if cmd in ("/start", "/demarrer", "/démarrer"):
+        set_bot_on(True)
+        return ("▶️ <b>Bot DÉMARRÉ</b> : les nouveaux signaux sont de nouveau actifs.", _menu_keyboard())
     if cmd in ("/signal", "/parametres", "/paramètres"):
         return (_signal_text(), _signal_keyboard())
     if cmd == "/be":
@@ -5650,6 +5867,10 @@ def handle_command(text):
                         + "\nExemple : /timeframe M15", None)
             set_timeframe(tf)
         return (_tf_text(), _tf_keyboard())
+    if cmd == "/qml":
+        if len(parts) > 1 and parts[1].lower() in ("on", "off"):
+            set_setting("qml_on", "1" if parts[1].lower() == "on" else "0")
+        return (_qml_text(), _qml_keyboard())
     if cmd == "/medias":
         if len(parts) > 1 and parts[1].lower() == "export":
             lines = [f"<code>MEDIA_{c}={','.join(get_media(c))}</code>" for c in MEDIA_CATS if get_media(c)]
@@ -5958,6 +6179,50 @@ def _handle_update(u):
                     send(chat_id, f"📊 {sym} — zones actuelles (H{HTF_MINUTES // 60 or 1}/M15/M5/M1)", photo=chart)
                 send(chat_id, txt, reply_markup=_analyse_symbol_keyboard(sym))
                 ack = "Analyse envoyée"
+        elif data.startswith("ana:str:") or data.startswith("ana:all:"):
+            is_all = data.startswith("ana:all:")
+            parts_ = data.split(":")
+            sym = _ANALYSE_SYMS.get(parts_[2]) if len(parts_) > 2 else None
+            if sym and (is_all or (len(parts_) > 3 and parts_[3] in ("main", "crt"))):
+                chat_id = cq["message"]["chat"]["id"]
+                _edit(cq, f"⏳ Analyse {sym} en cours…", None)
+                try:
+                    results = analyse_all(sym) if is_all else [strategy_preview(sym, parts_[3])]
+                except Exception as e:
+                    traceback.print_exc(limit=-3)
+                    results = [(f"📊 <b>{sym}</b>\n\n⚠️ Analyse impossible ({type(e).__name__}) — réessaie dans un instant.", None)]
+                for i_, (txt, chart) in enumerate(results):
+                    if chart:
+                        send(chat_id, f"🎯 {sym}", photo=chart)
+                    send(chat_id, txt, reply_markup=_analyse_symbol_keyboard(sym) if i_ == len(results) - 1 else None)
+                ack = "Analyse envoyée"
+        elif data.startswith("ana:qml:"):
+            code, _, tfs = data[8:].partition(":")
+            sym = _ANALYSE_SYMS.get(code)
+            if sym:
+                a_tf = int(tfs) if tfs.isdigit() and int(tfs) in QML_ANALYSE_TFS else get_qml_tf()
+                chat_id = cq["message"]["chat"]["id"]
+                _edit(cq, f"⏳ Analyse QML {sym} ({_tf_lbl(a_tf)}) en cours…", None)
+                chart = None
+                try:
+                    res = qml_analyze(sym, force=True, tf=a_tf)
+                    txt = qml_analysis_text(res)
+                    nb = news_block_info(sym)
+                    if nb:
+                        txt += f"\n\n📰 ⚠️ News en cours : {_news_line(nb)} — aucun signal ne sera ouvert pendant la fenêtre."
+                    try:
+                        chart = make_qml_chart(sym, a_tf, res)
+                    except Exception:
+                        traceback.print_exc(limit=-3)
+                except Exception as e:   # réseau / données : jamais de crash du polling
+                    txt = f"📊 <b>ANALYSE QML — {sym}</b>\n\n⚠️ Analyse impossible ({type(e).__name__}) — réessaie dans un instant."
+                    traceback.print_exc(limit=-3)
+                if chart:
+                    send(chat_id, f"🎯 {sym} — zones QML {_tf_lbl(a_tf)}", photo=chart)
+                send(chat_id, txt, reply_markup=_analyse_symbol_keyboard(sym))
+                ack = "Analyse envoyée"
+        elif data.startswith("qml:"):
+            ack = _qml_callback(cq, data[4:])
         elif data.startswith("ana:fond:"):
             sym = _ANALYSE_SYMS.get(data[9:])
             if sym:
@@ -6078,6 +6343,29 @@ def _handle_update(u):
             _edit(cq, _mpositions_text(), _mpositions_keyboard())
         elif data == "menu:home":
             _edit(cq, _home_text(), _menu_keyboard())
+        elif data in ("bot:stop", "bot:start"):
+            set_bot_on(data == "bot:start")
+            _edit(cq, _home_text(), _menu_keyboard())
+            ack = "Bot démarré" if get_bot_on() else "Bot arrêté (positions toujours suivies)"
+        elif data.startswith("str:"):
+            a_ = data[4:]
+            if a_ == "main":
+                set_setting("strat_main", "0" if get_strat_main() else "1"); ack = "BOS/CHoCH : " + ("ON" if get_strat_main() else "OFF")
+            elif a_ == "crt":
+                set_setting("strat_crt", "0" if get_strat_crt() else "1"); ack = "CRT : " + ("ON" if get_strat_crt() else "OFF")
+            elif a_ == "qml":
+                set_setting("qml_on", "0" if get_qml_on() else "1"); ack = "QML : " + ("ON" if get_qml_on() else "OFF")
+            elif a_ == "qmlauto":
+                set_setting("qml_auto", "0" if get_qml_auto() else "1"); ack = "QML auto : " + ("ON" if get_qml_auto() else "OFF")
+            _edit(cq, _strategies_text(), _strategies_keyboard())
+        elif data.startswith("news:"):
+            if data == "news:on":
+                set_setting("news_filter", "0" if get_news_filter_on() else "1")
+                ack = "Filtre news : " + ("ON" if get_news_filter_on() else "OFF")
+            elif data == "news:med":
+                set_setting("news_medium", "0" if get_news_medium() else "1")
+                ack = "Impact moyen : " + ("ON" if get_news_medium() else "OFF")
+            _edit(cq, _news_text(), _news_keyboard())
         elif data.startswith("menu:") and data[5:] in _MENU_ACTIONS:
             reply, kb = handle_command(_MENU_ACTIONS[data[5:]])
             _edit(cq, reply, kb or _back_keyboard())
@@ -6223,6 +6511,17 @@ def publish_signal(symbol, candles, events, sig, companion=False):
     key = f"{symbol}:{TF_LABEL}:{sig['t']}" + (f":{sig['key_suffix']}" if sig.get("key_suffix") else "")
     if signal_exists(key):
         return False
+    if not get_bot_on():   # bot arrêté depuis Telegram : aucun nouveau signal (le suivi des positions continue)
+        return False
+    nb = news_block_info(symbol)
+    if nb:   # filtre news : pas de nouveau signal autour d'une news (un seul message admin par news et par actif)
+        print(f"[{symbol}] {sig['side']} {sig['type']} ignoré : news {_news_line(nb)}")
+        nkey = f"news_blk:{symbol}:{nb['dt'].strftime('%Y%m%d%H%M')}:{nb['title']}"[:180]
+        if not get_meta(nkey):
+            set_meta(nkey, 1)
+            to_admin(f"📰 Signal {symbol} {sig['side']} ignoré (filtre news) : {_news_line(nb)}\n"
+                     f"Fenêtre : {NEWS_BEFORE_MIN} min avant / {NEWS_AFTER_MIN} min après.")
+        return False
     n_open = count_open(symbol)
     max_pos = get_max_positions()
     if n_open >= max_pos and not companion:
@@ -6253,7 +6552,8 @@ def publish_signal(symbol, candles, events, sig, companion=False):
         be_rr=sig.get("be_rr"), htf_mode=sig.get("htf_mode"),
         risk_usd=lot_info["real_risk"],  # risque réel du lot pris (= risque demandé sauf lot minimum)
         lot=lot_info["lot"], leverage=leverage, opened_ts=now_ts(), last_ts=sig["t"],
-        exec_status="PENDING" if (is_market and mt5_enabled) else None)
+        exec_status="PENDING" if (is_market and mt5_enabled) else None,
+        part_cfg=_partial_cfg_json())   # niveaux partiels figés (None = partiels OFF)
     try:
         signal_log_block(symbol, sig, dec)
     except Exception as e:   # un souci de log ne doit jamais bloquer un signal
@@ -6574,6 +6874,11 @@ def _trading_loop():
                 except Exception:
                     print(f"[{symbol}] erreur :")
                     traceback.print_exc()
+                try:
+                    qml_process_symbol(symbol)   # stratégie QML séparée (OFF par défaut) : jamais bloquante
+                except Exception:
+                    print(f"[{symbol}] module QML : erreur (ignorée)")
+                    traceback.print_exc(limit=-3)
             if time.time() - last_mt5_sync >= MT5_SYNC_INTERVAL:   # réconciliation broker, indépendante du scan par symbole
                 last_mt5_sync = time.time()
                 try:
@@ -7237,7 +7542,8 @@ class TestBE(unittest.TestCase):
         t = _st_trade("BUY", be_rr=0.5)
         ev = _E.track_trade(t, [_st_c(1, 100.6, 100.1)])
         self.assertEqual(_st_names(ev), ["BE_MOVED"])
-        self.assertIn("RR0.5", _E.group_event(ev[0], 2))
+        self.assertIn("BE armé", _E.group_event(ev[0], 2))   # message groupe minimal (le RR du BE n'y figure plus)
+        self.assertEqual(t["be_rr"], 0.5)
         ev = _E.track_trade(t, [_st_c(2, 100.4, 99.9)])
         self.assertEqual((_st_names(ev), t["result_r"]), (["BE"], 0.0))
 
@@ -7529,7 +7835,7 @@ class TestSignauxSimultanes(unittest.TestCase):
             self.assertEqual(len(sent), 1)
             self.assertNotIn("Position ", sent[0][1], "avec max = 1 la ligne « Position n/m » n'a pas de sens")
             self.assertIn("BE → RR1", sent[0][1])
-            self.assertIn("Filtre HTF : ON (M15)", sent[0][1])
+            self.assertNotIn("Filtre HTF", sent[0][1], "message groupe ultra court : pas de ligne paramètres")
             row = _E._q("SELECT be_rr, htf_mode FROM trades").fetchone()
             self.assertEqual((row["be_rr"], row["htf_mode"]), (1.0, "M15"))
             _E.publish_signal("BTCUSD", [], [], self._sig(1000))   # un autre actif reste libre
@@ -7542,7 +7848,7 @@ class TestSignauxSimultanes(unittest.TestCase):
             self.assertEqual(_E.get_max_positions(), 2)
             _E.publish_signal("XAUUSD", [], [], self._sig(1180))
             self.assertEqual(_E.count_open("XAUUSD"), 2)
-            self.assertIn("Position 2/2", sent[-1][1])
+            self.assertEqual(len(sent), 4, "avec max = 2, le 2e signal ouvert est bien publié")   # (message groupe minimal : plus de ligne « Position n/m »)
         finally:
             _E._deliver_signal, _E.make_chart = saved
             _E._q("DELETE FROM trades", commit=True)
@@ -7613,13 +7919,14 @@ class TestLectureExtInt(unittest.TestCase):
         sw = {"tf": "M1", "side": "haut", "level": 80780.0, "swept": True, "eq": True, "t": 1, "i": 1}
         sig = self._fake_sig(ext=ext, sweep=sw)
         lot = {"lot": 0.01, "real_risk": 10.0, "raised_to_min": False}
-        for txt in (_E.group_signal("BTCUSD", sig, 1, 0), _E.admin_signal("BTCUSD", sig, 10.0, 100.0, lot, 5.0, 0)):
-            self.assertIn("Ext. : M15 EQL 80 500 (à 266 pts)", txt)
-            self.assertIn("Int. : M1 EQH 80 780 balayé", txt)
-            self.assertLess(txt.index("Ext. :"), txt.index("Int. :"))
-            self.assertLess(txt.index("Int. :"), txt.index("SL :"), "les lignes Ext./Int. précèdent SL/TP")
+        txt = _E._liq_lines(sig, 0)   # les messages groupe / admin sont désormais minimaux : on teste le formateur
+        self.assertIn("Ext. : M15 EQL 80 500 (à 266 pts)", txt)
+        self.assertIn("Int. : M1 EQH 80 780 balayé", txt)
+        self.assertLess(txt.index("Ext. :"), txt.index("Int. :"))
+        for msg in (_E.group_signal("BTCUSD", sig, 1, 0), _E.admin_signal("BTCUSD", sig, 10.0, 100.0, lot, 5.0, 0)):
+            self.assertIn("SL", msg)
         sig = self._fake_sig(ext={**ext, "eq": False, "side": "haut"}, sweep={**sw, "swept": False, "eq": False})
-        txt = _E.group_signal("BTCUSD", sig, 1, 0)
+        txt = _E._liq_lines(sig, 0)
         self.assertIn("Ext. : M15 haut 80 500", txt)
         self.assertIn("Int. : M1 haut 80 780 non balayé", txt)
 
@@ -7629,9 +7936,9 @@ class TestLectureExtInt(unittest.TestCase):
         for txt in (_E.group_signal("BTCUSD", sig, None, 0), _E.admin_signal("BTCUSD", sig, 10.0, 100.0, lot, 5.0, 0)):
             self.assertNotIn("Ext. :", txt)
             self.assertNotIn("Int. :", txt)
-            self.assertIn("SL :", txt)
+            self.assertIn("SL", txt)
         sig = self._fake_sig(ext=None, sweep={"tf": "M1", "side": "haut", "level": None, "swept": False, "eq": False})
-        self.assertNotIn("Int. :", _E.group_signal("BTCUSD", sig, None, 0))
+        self.assertEqual(_E._liq_lines(sig, 0), "")
 
     @unittest.skipUnless(importlib.util.find_spec("matplotlib"), "matplotlib absent")
     def test_graphiques(self):
@@ -7999,6 +8306,100 @@ class TestFiltresQualite(unittest.TestCase):
             self.assertIn(needle, out)
 
 
+class TestAjoutsNewsStopUS30(unittest.TestCase):
+    """US30, filtre news, bot arrêté / démarré, point potentiel par stratégie."""
+    _KEYS = "('news_filter','news_medium','bot_on','strat_main','strat_crt','qml_on','qml_auto')"
+
+    def tearDown(self):
+        _E._ff_cache.clear()
+        _E._q(f"DELETE FROM settings WHERE key IN {self._KEYS}", commit=True)
+
+    def _ev(self, cur, mins, impact="High", title="NFP"):
+        now = datetime.now(timezone.utc)
+        _E._ff_cache.update(data=[{"country": cur, "impact": impact, "title": title,
+                                   "date": (now + timedelta(minutes=mins)).isoformat()}], ts=time.time())
+
+    def test_us30_present(self):
+        self.assertIn("US30", _E.SYMBOLS)
+        self.assertEqual(_E.value_per_point("US30", 42000), 1.0)
+        self.assertGreater(_E.calc_lot("US30", 10, 50.0, price=42000)["lot"], 0)
+        self.assertIn("US30", _E._ANALYSE_SYMS.values())
+        self.assertFalse(_E.get_symbol_on("US30"), "nouveaux marchés OFF par défaut")
+
+    def test_news_fenetre_et_devises(self):
+        self._ev("USD", 10)
+        self.assertIsNotNone(_E.news_block_info("XAUUSD"))
+        self.assertIsNotNone(_E.news_block_info("US30"))
+        self.assertIsNotNone(_E.news_block_info("USDJPY"))
+        self.assertIsNone(_E.news_block_info("EURGBP" if "EURGBP" in _E.SYMBOLS else "EURJPY"))   # aucune devise USD
+        self._ev("USD", 90)
+        self.assertIsNone(_E.news_block_info("XAUUSD"), "hors fenêtre")
+        self._ev("USD", -10)
+        self.assertIsNotNone(_E.news_block_info("XAUUSD"), "juste après la news")
+        self._ev("USD", 5, impact="Medium")
+        self.assertIsNone(_E.news_block_info("XAUUSD"), "impact moyen ignoré par défaut")
+        _E.set_setting("news_medium", "1")
+        self.assertIsNotNone(_E.news_block_info("XAUUSD"))
+        _E.set_setting("news_filter", "0")
+        self.assertIsNone(_E.news_block_info("XAUUSD"), "filtre OFF")
+
+    def test_calendrier_indisponible_ne_bloque_pas(self):
+        saved = _E._forexfactory_events
+        _E._forexfactory_events = lambda: (_ for _ in ()).throw(RuntimeError("réseau"))
+        try:
+            self.assertIsNone(_E.news_block_info("XAUUSD"))
+        finally:
+            _E._forexfactory_events = saved
+
+    def _publish(self):
+        sent = []
+        saved = (_E._deliver_signal, _E.make_chart, _E.to_admin)
+        _E._deliver_signal = lambda *a, **k: sent.append(1)
+        _E.make_chart = lambda *a, **k: None
+        _E.to_admin = lambda *a, **k: None
+        try:
+            _E._q("DELETE FROM trades", commit=True)
+            sig = TestSignauxSimultanes._sig(TestSignauxSimultanes, int(time.time()))
+            ok = _E.publish_signal("XAUUSD", [], [], sig)
+        finally:
+            _E._deliver_signal, _E.make_chart, _E.to_admin = saved
+            _E._q("DELETE FROM trades", commit=True)
+        return ok, sent
+
+    def test_bot_arrete_et_news_bloquent_publication(self):
+        _E.set_setting("bot_on", "0")
+        self.assertEqual(self._publish()[0], False)
+        _E.set_setting("bot_on", "1")
+        self._ev("USD", 5)
+        self.assertEqual(self._publish()[0], False)
+        _E._ff_cache.clear()
+        _E.set_setting("news_filter", "0")
+        self.assertEqual(self._publish()[0], True)
+
+    def test_menu_strategies(self):
+        kb = _E._strategies_keyboard()["inline_keyboard"]
+        datas = {b["callback_data"] for r in kb for b in r}
+        self.assertTrue({"str:main", "str:crt", "str:qml", "str:qmlauto"} <= datas)
+        self.assertIn("BOS / CHoCH", _E._strategies_text())
+        ana = {b["callback_data"] for r in _E._analyse_symbol_keyboard("XAUUSD")["inline_keyboard"] for b in r}
+        self.assertTrue({"ana:str:XAU:main", "ana:str:XAU:crt", "ana:all:XAU", "ana:qml:XAU:15"} <= ana)
+
+    def test_point_potentiel_main_et_crt(self):
+        c = TestEntreeOBFVG._candles()
+        saved = (_E.get_candles, _E.TIMEFRAME_MIN, _E.PREVIEW_MAX_AGE, _E.liquidity_reading)
+        _E.get_candles = lambda s, tf=None: c
+        _E.TIMEFRAME_MIN, _E.PREVIEW_MAX_AGE = 1, 10 ** 6
+        _E.liquidity_reading = lambda *a, **k: (None, None)
+        try:
+            for strat in ("main", "crt"):
+                txt, _chart = _E.strategy_preview("XAUUSD", strat)
+                self.assertIn("XAUUSD", txt)
+                self.assertTrue("Entrée" in txt or "Pas de point" in txt, txt)
+                self.assertNotIn("Traceback", txt)
+        finally:
+            _E.get_candles, _E.TIMEFRAME_MIN, _E.PREVIEW_MAX_AGE, _E.liquidity_reading = saved
+
+
 class TestActifsEtEntrees(unittest.TestCase):
     """Actifs activables par paire (défaut : Gold + BTC) et interrupteurs indépendants entrée directe / ordre limit."""
 
@@ -8056,13 +8457,914 @@ def _selftest():
     suite, loader = unittest.TestSuite(), unittest.TestLoader()
     for cls in (TestRetracement, TestContinuation, TestInvalidationHTF, TestChop, TestGetExtTf,
                 TestLiquiditePure, TestM1NeDecidePasSeul, TestLogs, TestEntreeM5, TestNonRegression,
-                TestHtfM15, TestBE, TestEntreeOBFVG, TestSLTPCRT, TestSignauxSimultanes, TestLectureExtInt, TestModifyPositionGardeSLTP, TestBEDoubleVerif, TestClientId, TestLogVolumeReel, TestFiltresQualite, TestActifsEtEntrees):
+                TestHtfM15, TestBE, TestEntreeOBFVG, TestSLTPCRT, TestSignauxSimultanes, TestLectureExtInt, TestModifyPositionGardeSLTP, TestBEDoubleVerif, TestClientId, TestLogVolumeReel, TestFiltresQualite, TestActifsEtEntrees, TestAjoutsNewsStopUS30):
         suite.addTests(loader.loadTestsFromTestCase(cls))
     return 0 if unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful() else 1
+
+
+# ============================================================================
+# 12. MODULE QML (Quasimodo) + SWEEP EQH/EQL  — ex « qml_signals.py »
+#
+# QML (Quasimodo) + sweep EQH/EQL + retour en zone  --  détection de signaux SANS look-ahead.
+#
+# Entrée : DataFrame indexé en temps UTC (heure d'OUVERTURE de la bougie) avec open, high, low, close
+#          (+ colonne optionnelle 'spread' en unités de prix).
+# Toutes les décisions à la bougie i n'utilisent que les bougies <= i (clôturées).
+# Entrée supposée à l'OUVERTURE de la bougie i+1.
+#
+# Le côté BUY est obtenu en inversant les prix (miroir) puis en relançant la logique SELL :
+# une seule logique à maintenir.
+#
+# Module autonome : n'est pas encore branché sur la boucle principale (section 9).
+# Nécessite numpy + pandas (optionnels : le reste du bot fonctionne sans).
+# ============================================================================
+from dataclasses import dataclass
+
+try:
+    import numpy as np
+    import pandas as pd
+except ImportError:  # numpy / pandas absents : seul le module QML est indisponible
+    np = pd = None
+
+
+@dataclass
+class Params:
+    # --- structure
+    swing_k: int = 3              # pivot = extrême sur k bougies de chaque côté (plage 2-6)
+    atr_n: int = 14
+    # --- EQH / EQL
+    eq_atr: float = 0.15          # tolérance d'égalité = eq_atr * ATR (0.05-0.30)
+    eq_lookback: int = 120        # fenêtre de recherche des pivots égaux (60-250)
+    eq_min_gap: int = 5           # écart mini entre les 2 pivots égaux, en bougies (3-10)
+    require_eqh: bool = True      # False => balayer un simple swing high suffit
+    min_sweep_atr: float = 0.0    # pénétration mini de la mèche au-delà du niveau (0-0.3)
+    # --- QML
+    require_hl: bool = True       # exige L1 > L0 (structure HH+HL avant la cassure)
+    max_choch_bars: int = 30      # délai max entre la tête H2 et la cassure de L1 (10-60)
+    disp_atr: float = 0.8         # corps mini de la bougie de cassure (0.5-1.5 * ATR)
+    # --- zone
+    zone_mode: str = "level"      # "level": [L1, L1+zone_atr*ATR] | "head": [corps bas de la tête, haut de la tête]
+    zone_atr: float = 0.5         # (0.25-1.0) utilisé si zone_mode == "level"
+    max_wait: int = 20            # bougies max pour revenir en zone après la cassure (10-40)
+    first_touch_only: bool = True
+    # --- SL / TP
+    sl_buf_atr: float = 0.2       # marge au-delà de la tête (0.1-0.5)
+    tp_mode: str = "rr"           # "rr" | "liq"
+    rr: float = 2.0               # (1.5-4)
+    min_rr: float = 1.5           # RR mini accepté (surtout pour tp_mode "liq")
+    min_risk_atr: float = 0.5     # distance SL min / ATR
+    max_risk_atr: float = 4.0     # distance SL max / ATR
+    # --- filtres
+    atr_pctl_lo: float = 0.0      # percentile ATR mini sur atr_pctl_win bougies passées (0-0.4)
+    atr_pctl_hi: float = 1.0      # (0.7-1.0)
+    atr_pctl_win: int = 500
+    max_bar_range_atr: float = 0.0   # 0 = off ; ex. 4.0 : ignore si une bougie du pattern > 4*ATR (indices Jump)
+    max_spread_atr: float = 0.0      # 0 = off ; ex. 0.15
+    sessions_utc: tuple = ()         # ((7, 16),) = 07h-16h UTC ; () = 24h
+    bar_minutes: int = 15
+    htf_rule: str = "1h"
+    htf_ema: int = 200
+    htf_mode: str = "off"         # "off" | "align" (SELL si HTF sous EMA) | "counter" (SELL si HTF au-dessus EMA)
+
+
+# ----------------------------------------------------------------------------- outils
+def atr_wilder(h, l, c, n):
+    tr = np.empty(len(c))
+    tr[0] = h[0] - l[0]
+    tr[1:] = np.maximum.reduce([h[1:] - l[1:], np.abs(h[1:] - c[:-1]), np.abs(l[1:] - c[:-1])])
+    out = np.full(len(c), np.nan)
+    if len(c) >= n:
+        out[n - 1] = tr[:n].mean()
+        for i in range(n, len(c)):
+            out[i] = (out[i - 1] * (n - 1) + tr[i]) / n
+    return out
+
+
+def _scan_sell(o, h, l, c, atr, P, zones=None):
+    """Logique SELL (tête balaye EQH, cassure de L1, retour en zone). Retourne une liste de signaux bruts."""
+    k, n = P.swing_k, len(c)
+    highs, lows, pending, out = [], [], [], []
+    warm = max(P.atr_n, 2 * k + 1)
+
+    def make_zone(s, a):
+        if P.zone_mode == "head":
+            return min(o[s["p"]], c[s["p"]]), h[s["p"]]
+        return s["L1"], s["L1"] + P.zone_atr * a
+
+    def body_ok(j):
+        return (o[j] - c[j]) >= P.disp_atr * atr[j]
+
+    for i in range(warm, n):
+        if np.isnan(atr[i]):
+            continue
+        # 1) confirmation des pivots à p = i-k (utilise les bougies p-k .. i, toutes clôturées)
+        p = i - k
+        new_high = False
+        if p >= k:
+            if h[p] > h[p - k:p].max() and h[p] >= h[p + 1:i + 1].max():
+                highs.append((p, h[p]))
+                new_high = True
+            if l[p] < l[p - k:p].min() and l[p] <= l[p + 1:i + 1].min():
+                lows.append((p, l[p]))
+
+        # 2) avancer les setups déjà armés (bougies > armed)
+        for s in pending[:]:
+            if c[i] > s["h2"]:
+                pending.remove(s); continue
+            if s["state"] == "CHOCH":
+                if i - s["p"] > P.max_choch_bars:
+                    pending.remove(s)
+                elif c[i] < s["L1"] and body_ok(i):
+                    s["zlo"], s["zhi"] = make_zone(s, atr[i]); s["state"] = "ZONE"; s["j"] = i
+                    if zones is not None:
+                        zones.append(s)
+                continue
+            # state == ZONE
+            if i - s["j"] > P.max_wait or c[i] > s["zhi"]:
+                pending.remove(s); continue
+            if h[i] >= s["zlo"]:
+                conf = c[i] < o[i] and c[i] <= (s["zlo"] + s["zhi"]) / 2
+                if conf:
+                    sig = _emit(s, i, o, h, l, c, atr, lows, P)
+                    pending.remove(s)
+                    if sig:
+                        out.append(sig)
+                elif P.first_touch_only:
+                    pending.remove(s)
+
+        # 3) armer un nouveau setup quand une nouvelle tête H2 vient d'être confirmée
+        if not new_high or len(highs) < 2:
+            continue
+        (p1, H1), (p2, H2) = highs[-2], highs[-1]
+        if H2 <= H1:
+            continue
+        seg = l[p1:p2 + 1]
+        l1i = p1 + int(np.argmin(seg))
+        if l1i <= p1:
+            continue
+        L1 = l[l1i]
+        if P.require_hl:
+            prev = [x for x in lows if x[0] < p1]
+            if not prev or L1 <= prev[-1][1]:
+                continue
+        # sweep : la bougie-tête p2 dépasse un niveau de liquidité et clôture dessous
+        tol, Q = P.eq_atr * atr[i], None
+        hs = [x for x in highs[:-1] if p2 - x[0] <= P.eq_lookback]
+        for ia in range(len(hs)):
+            for ib in range(ia + 1, len(hs)):
+                (a, pa), (b, pb) = hs[ia], hs[ib]
+                if b - a < P.eq_min_gap or abs(pa - pb) > tol:
+                    continue
+                q = max(pa, pb)
+                if h[a:p2].max() > q:
+                    continue
+                if h[p2] - q > 0 and h[p2] - q >= P.min_sweep_atr * atr[p2] and c[p2] < q:
+                    Q = q
+        if Q is None and not P.require_eqh:
+            if h[p2] - H1 >= max(P.min_sweep_atr * atr[p2], 1e-12) and c[p2] < H1 and h[p1:p2].max() <= H1:
+                Q = H1
+        if Q is None:
+            continue
+        s = dict(p=p2, h2=H2, H1i=p1, L1=L1, Q=Q, state="CHOCH", armed=i, zlo=None, zhi=None, j=None)
+        # rejouer (p2, i] : cassure éventuelle déjà survenue ; aucun signal n'est émis avant i
+        dead = False
+        for j in range(p2 + 1, i + 1):
+            if c[j] > H2 or (s["state"] == "CHOCH" and j - p2 > P.max_choch_bars):
+                dead = True; break
+            if s["state"] == "CHOCH":
+                if c[j] < L1 and body_ok(j):
+                    s["zlo"], s["zhi"] = make_zone(s, atr[j]); s["state"] = "ZONE"; s["j"] = j
+                    if zones is not None:
+                        zones.append(s)
+            else:
+                if c[j] > s["zhi"] or (P.first_touch_only and h[j] >= s["zlo"]):
+                    dead = True; break   # zone touchée/mitigée avant qu'on puisse la trader
+        if not dead:
+            pending.append(s)
+    return out
+
+
+def _emit(s, i, o, h, l, c, atr, lows, P):
+    entry = c[i]                                   # référence ; l'exécution réelle = open[i+1]
+    sl = max(s["h2"], s["zhi"]) + P.sl_buf_atr * atr[i]
+    risk = sl - entry
+    if risk <= 0 or not (P.min_risk_atr <= risk / atr[i] <= P.max_risk_atr):
+        return None
+    if P.tp_mode == "rr":
+        tp = entry - P.rr * risk
+    else:  # prochaine liquidité : swing low non balayé le plus proche sous l'entrée
+        cands = [pr for (ix, pr) in lows if pr < entry and l[ix + 1:i + 1].min() >= pr]
+        if not cands:
+            return None
+        tp = max(cands)
+    rr = (entry - tp) / risk
+    if rr < P.min_rr:
+        return None
+    return dict(i=i, entry=entry, sl=sl, tp=tp, rr=rr, risk=risk, atr=atr[i], Q=s["Q"], h2=s["h2"], L1=s["L1"],
+                zlo=s["zlo"], zhi=s["zhi"], start=s["H1i"], head_i=s["p"])
+
+
+# ----------------------------------------------------------------------------- API
+def detect_signals(df: "pd.DataFrame", P: Params = Params()) -> "pd.DataFrame":
+    o, h, l, c = (df[x].to_numpy(float) for x in ("open", "high", "low", "close"))
+    atr = atr_wilder(h, l, c, P.atr_n)
+    sells = _scan_sell(o, h, l, c, atr, P)
+    buys = _scan_sell(-o, -l, -h, -c, atr, P)          # miroir
+    rows = []
+    for s in sells:
+        rows.append({**s, "side": "SELL"})
+    for s in buys:
+        rows.append({**s, "side": "BUY", "entry": -s["entry"], "sl": -s["sl"], "tp": -s["tp"], "Q": -s["Q"],
+                     "h2": -s["h2"], "L1": -s["L1"], "zlo": -s["zhi"], "zhi": -s["zlo"]})
+    if not rows:
+        return pd.DataFrame()
+    sig = pd.DataFrame(rows).sort_values(["i", "side", "head_i"], ascending=[True, True, False], kind="stable")
+    sig = sig.drop_duplicates(["i", "side"]).reset_index(drop=True)   # 1 signal max par bougie et par sens (tête la plus récente)
+    idx = df.index
+    sig["time"] = idx[sig["i"].to_numpy()]
+    sig["entry_time"] = sig["time"] + pd.Timedelta(minutes=P.bar_minutes)
+
+    keep = np.ones(len(sig), bool)
+    if P.sessions_utc:                                   # session évaluée à l'heure d'entrée
+        hr = sig["entry_time"].dt.hour.to_numpy()
+        keep &= np.array([any(a <= x < b for a, b in P.sessions_utc) for x in hr])
+    if P.max_spread_atr > 0 and "spread" in df:
+        sp = df["spread"].to_numpy(float)[sig["i"].to_numpy()]
+        keep &= sp <= P.max_spread_atr * sig["atr"].to_numpy()
+    if P.max_bar_range_atr > 0:
+        rng = h - l
+        keep &= np.array([rng[r.start:r.i + 1].max() <= P.max_bar_range_atr * r.atr for r in sig.itertuples()])
+    if P.atr_pctl_lo > 0 or P.atr_pctl_hi < 1:
+        ok = []
+        for r in sig.itertuples():
+            w = atr[max(0, r.i - P.atr_pctl_win):r.i]
+            w = w[~np.isnan(w)]
+            q = (w < r.atr).mean() if len(w) > 50 else 0.5
+            ok.append(P.atr_pctl_lo <= q <= P.atr_pctl_hi)
+        keep &= np.array(ok)
+    if P.htf_mode != "off":
+        htf = df["close"].resample(P.htf_rule).last().dropna()
+        ema = htf.ewm(span=P.htf_ema, adjust=False).mean().shift(1)     # shift(1): barre HTF CLÔTURÉE uniquement
+        prev_close = htf.shift(1)
+        bias = (prev_close - ema).reindex(df.index, method="ffill").to_numpy()[sig["i"].to_numpy()]
+        up = bias > 0
+        if P.htf_mode == "align":
+            keep &= np.where(sig["side"] == "SELL", ~up, up) & ~np.isnan(bias)
+        else:
+            keep &= np.where(sig["side"] == "SELL", up, ~up) & ~np.isnan(bias)
+    return sig[keep].reset_index(drop=True)
+
+
+# ----------------------------------------------------------------------------- mini-backtest
+def backtest(df, sig, cost=0.0, max_hold=200):
+    """1 position à la fois, entrée open[i+1], SL prioritaire si SL et TP dans la même bougie. cost = spread+comm (prix)."""
+    o, h, l, c = (df[x].to_numpy(float) for x in ("open", "high", "low", "close"))
+    res, free_at = [], -1
+    for r in sig.itertuples():
+        e = r.i + 1
+        if e >= len(df) or e <= free_at:
+            continue
+        ent, sell = o[e], r.side == "SELL"
+        risk = (r.sl - ent) if sell else (ent - r.sl)
+        if risk <= 0:
+            continue
+        exit_px, exit_i = c[min(e + max_hold, len(c) - 1)], min(e + max_hold, len(c) - 1)
+        for j in range(e, min(e + max_hold, len(c) - 1) + 1):
+            hit_sl = h[j] >= r.sl if sell else l[j] <= r.sl
+            hit_tp = l[j] <= r.tp if sell else h[j] >= r.tp
+            if hit_sl or hit_tp:
+                exit_px, exit_i = (r.sl if hit_sl else r.tp), j
+                break
+        pnl = (ent - exit_px) if sell else (exit_px - ent)
+        res.append(dict(time=df.index[e], side=r.side, R=(pnl - cost) / risk, bars=exit_i - e))
+        free_at = exit_i
+    return pd.DataFrame(res)
+
+
+def metrics(t):
+    if len(t) == 0:
+        return {}
+    R = t["R"].to_numpy()
+    w, lo = R[R > 0], R[R <= 0]
+    eq = np.cumsum(R)
+    dd = (np.maximum.accumulate(np.r_[0, eq])[1:] - eq).max()
+    return dict(n=len(R), winrate=round((R > 0).mean(), 3), avg_win_R=round(w.mean(), 2) if len(w) else 0,
+                avg_loss_R=round(lo.mean(), 2) if len(lo) else 0, expectancy_R=round(R.mean(), 3),
+                profit_factor=round(w.sum() / abs(lo.sum()), 2) if lo.sum() else np.inf,
+                max_dd_R=round(dd, 2), t_stat=round(R.mean() / (R.std(ddof=1) / np.sqrt(len(R))), 2) if len(R) > 2 else 0)
+
+
+def split_is_oos(df, oos_start):
+    """Découpe stricte : le jeu OOS ne sert qu'UNE fois, à la fin."""
+    return df[df.index < oos_start], df[df.index >= oos_start]
+
+
+# ----------------------------------------------------------------------------- 12b. INTÉGRATION AU BOT
+# Stratégie QML SÉPARÉE : M15 = zone (POI), M1 = réaction (avalement par défaut), entrée directe proposée.
+# N'affecte ni le moteur BOS/CHoCH, ni le CRT, ni ENTRY_MODE, ni MetaApi : OFF par défaut (menu ⚙️ QML / commande /qml).
+def _env_on(name, default=False):
+    v = os.getenv(name, "").strip().lower()
+    return default if not v else v in ("1", "on", "true", "yes", "oui")
+
+
+QML_MARKETS = [x for x in (y.strip().upper() for y in os.getenv(
+    "QML_MARKETS", "XAUUSD,BTCUSD,EURUSD,GBPUSD,USDJPY,USDCHF,USDCAD,AUDUSD,NZDUSD,EURJPY,US30").split(",")) if x in SYMBOLS][:12]
+QML_ZONE_MAX_BARS = _env_int("QML_ZONE_MAX_BARS", 40)     # âge max d'une zone, en bougies du TF QML
+QML_NEAR_ATR = _env_float("QML_NEAR_ATR", 1.0)            # M1 n'est analysé que si le prix est à < N x ATR(TF QML) de la zone
+QML_TF_CHOICES = (5, 15)                                  # TF de recherche du QML (minutes) ; M1 reste le TF de réaction
+QML_HTF_MINUTES = _env_int("QML_HTF_MINUTES", 60)         # TF du filtre supérieur (H1) : contexte uniquement, jamais déclencheur
+QML_HTF_EMA = _env_int("QML_HTF_EMA", 200)                # biais HTF : clôture H1 vs EMA(200) des bougies H1 clôturées
+QML_SCAN_SEC = _env_int("QML_SCAN_SEC", 15)               # pas minimal entre 2 analyses d'un même actif
+QML_ANALYSE_TFS = (5, 15, 30, 60)                         # TF proposés au bouton Analyse (le scan auto reste sur QML_TF_CHOICES)
+QML_CONF_MODES = ("ENGULFING", "CHOCH", "ENGULFING_OR_CHOCH")
+QML_PARAMS = Params(first_touch_only=False) if "Params" in globals() else None   # la zone reste valable tant que le M15 ne la traverse pas
+_qml_cache, _qml_last_scan = {}, {}
+_qml_ref_px = {}
+
+
+def _f_setting(key, default):
+    try:
+        return float(get_setting(key, default))
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def get_qml_on():
+    return _get_bool_setting("qml_on", _env_on("QML_ENABLED", False))
+
+
+def get_qml_tf():
+    """TF de recherche du QML (5 ou 15), indépendant du TIMEFRAME du moteur BOS/CHoCH. Défaut M15."""
+    try:
+        v = int(float(get_setting("qml_tf", os.getenv("QML_TF", "15").strip().upper().lstrip("M") or 15)))
+    except (TypeError, ValueError):
+        v = 15
+    return v if v in QML_TF_CHOICES else 15
+
+
+def get_qml_htf_on():
+    """Filtre Higher Time Frame (H1) : OFF par défaut -> aucun appel H1, le QML tourne seul sur son TF."""
+    return _get_bool_setting("qml_htf", _env_on("QML_HTF_FILTER", False))
+
+
+def get_qml_direct():
+    """DIRECT ENTRY : ON = le module peut proposer / publier une entrée directe ; OFF = analyse seule (zone + confirmation)."""
+    return _get_bool_setting("qml_direct", True)
+
+
+def get_qml_react():
+    """DIRECT_REACTION (réaction M1 forte sans avalement) : OFF par défaut."""
+    return _get_bool_setting("qml_react", False)
+
+
+def get_qml_auto():
+    """ON : une proposition validée est publiée comme vrai signal (suivi + exécution existante). OFF : proposition seule."""
+    return _get_bool_setting("qml_auto", False)
+
+
+def get_qml_conf():
+    return _get_choice("qml_conf", "ENGULFING", QML_CONF_MODES)
+
+
+def get_partial_on():
+    return _get_bool_setting("part_on", False)
+
+
+_PART_DEFAULTS = {"p1_rr": 1.0, "p1_pct": 30.0, "p2_rr": 2.0, "p2_pct": 30.0, "p3_rr": 3.0}
+
+
+def get_partial_cfg():
+    return {k: _f_setting("part_" + k, v) for k, v in _PART_DEFAULTS.items()}
+
+
+def set_partial_value(key, v):
+    """Valide puis enregistre un réglage de clôture partielle. Retourne (ok, message)."""
+    if key not in _PART_DEFAULTS:
+        return False, "réglage inconnu"
+    cfg = get_partial_cfg()
+    cfg[key] = float(v)
+    if not (0 < cfg["p1_rr"] < cfg["p2_rr"] < cfg["p3_rr"]):
+        return False, "il faut TP1 < TP2 < TP3"
+    if not (0 <= cfg["p1_pct"] <= 90 and 0 <= cfg["p2_pct"] <= 90 and cfg["p1_pct"] + cfg["p2_pct"] <= 90):
+        return False, "TP1 % + TP2 % doivent rester ≤ 90 % (il faut un reste pour TP3)"
+    set_setting("part_" + key, float(v))
+    return True, ""
+
+
+def _partial_cfg_json():
+    """Niveaux partiels à figer dans un NOUVEAU trade ([[rr, fraction], ...]) ; None si OFF."""
+    if not get_partial_on():
+        return None
+    c = get_partial_cfg()
+    lv = [[c["p1_rr"], c["p1_pct"] / 100.0], [c["p2_rr"], c["p2_pct"] / 100.0]]
+    lv = [x for x in lv if x[1] > 0]
+    return json.dumps(lv) if lv else None
+
+
+def _partial_levels_of(trade):
+    try:
+        raw = trade.get("part_cfg")
+        return [(float(a), float(b)) for a, b in json.loads(raw)] if raw else []
+    except (TypeError, ValueError):
+        return []
+
+
+# --- M15 : zones QML actives ---------------------------------------------------------------
+def _qml_df(candles):
+    return pd.DataFrame({"open": [x["o"] for x in candles], "high": [x["h"] for x in candles],
+                         "low": [x["l"] for x in candles], "close": [x["c"] for x in candles]},
+                        index=pd.to_datetime([x["t"] for x in candles], unit="s", utc=True))
+
+
+def qml_zones(candles, P=None):
+    """Zones QML M15 encore valides sur `candles` (bougies clôturées), en PRIX RÉELS, la plus récente d'abord.
+    Valide = créée (cassure de L1 confirmée) et jamais traversée par une CLÔTURE M15 (ni au-delà de la tête H2), âge <= QML_ZONE_MAX_BARS."""
+    P = P or QML_PARAMS
+    if np is None or pd is None or len(candles) < 80:
+        return []   # (le TF des bougies est celui du TF QML : les indices j / head_i sont en bougies de ce TF)
+    df = _qml_df(candles)
+    o, h, l, c = (df[x].to_numpy(float) for x in ("open", "high", "low", "close"))
+    atr = atr_wilder(h, l, c, P.atr_n)
+    n, out = len(c), []
+    for side, (oo, hh, ll, cc), sg in (("SELL", (o, h, l, c), 1), ("BUY", (-o, -l, -h, -c), -1)):
+        zs = []
+        _scan_sell(oo, hh, ll, cc, atr, P, zs)
+        for s in zs:
+            if s["zlo"] is None or n - 1 - s["j"] > QML_ZONE_MAX_BARS:
+                continue
+            if sg == 1:
+                zlo, zhi, head, L1, Q = s["zlo"], s["zhi"], s["h2"], s["L1"], s["Q"]
+            else:
+                zlo, zhi, head, L1, Q = -s["zhi"], -s["zlo"], -s["h2"], -s["L1"], -s["Q"]
+            after = c[s["j"] + 1:]
+            dead = bool((after > min(zhi, head)).any()) if side == "SELL" else bool((after < max(zlo, head)).any())
+            if dead:
+                continue
+            out.append(dict(side=side, zlo=float(zlo), zhi=float(zhi), head=float(head), L1=float(L1), Q=float(Q),
+                            j=int(s["j"]), head_i=int(s["p"]), t=candles[s["j"]]["t"], t_head=candles[s["p"]]["t"]))
+    out.sort(key=lambda z: -z["j"])
+    return out
+
+
+def _qml_load_m15(symbol, force=False, tf=None):
+    """Zones QML du TF choisi (nom historique conservé ; le cache est séparé par TF)."""
+    tf = tf or get_qml_tf()
+    st = _qml_cache.setdefault((symbol, tf), {"t": None, "zones": [], "atr": None, "close": None, "try": 0.0})
+    now = time.time()
+    tf_sec = tf * 60
+    expected = int((now - CLOSE_GRACE_SEC) // tf_sec) * tf_sec - tf_sec   # ouverture de la dernière bougie du TF censée être clôturée
+    if not force and st["t"] is not None and st["t"] >= expected:
+        return st
+    if not force and now - st["try"] < 20:
+        return st
+    st["try"] = now
+    m15 = get_candles(symbol, tf)
+    if len(m15) >= 80:
+        st.update(t=m15[-1]["t"], zones=qml_zones(m15), atr=atr_series(m15)[-1], close=m15[-1]["c"])
+    return st
+
+
+def qml_htf_bias(symbol):
+    """Biais du filtre HTF (H1) : +1 si la dernière clôture H1 est au-dessus de son EMA, -1 en dessous, None si indisponible.
+    Bougies H1 CLÔTURÉES uniquement (pas de look-ahead). Contexte seulement : ne déclenche jamais une entrée."""
+    c = get_candles(symbol, QML_HTF_MINUTES)
+    if len(c) < QML_HTF_EMA // 2 + 20:
+        return None
+    k, e = 2.0 / (QML_HTF_EMA + 1), c[0]["c"]
+    for x in c[1:]:
+        e = x["c"] * k + e * (1 - k)
+    return 1 if c[-1]["c"] > e else (-1 if c[-1]["c"] < e else None)
+
+
+# --- M1 : réaction dans la zone ------------------------------------------------------------
+def _qml_engulf(c, side):
+    """Avalement : bougie M1 clôturée de sens `side` dont le corps avale celui de la bougie précédente (de sens opposé)."""
+    if len(c) < 2:
+        return False
+    p, k = c[-2], c[-1]
+    if side == "BUY":
+        return p["c"] < p["o"] and k["c"] > k["o"] and k["o"] <= p["c"] and k["c"] >= p["o"]
+    return p["c"] > p["o"] and k["c"] < k["o"] and k["o"] >= p["c"] and k["c"] <= p["o"]
+
+
+def _qml_reaction(c, side, a1):
+    """Réaction forte sans avalement : corps >= 0.5 ATR(M1) et clôture au-delà de l'extrême de la bougie précédente."""
+    if len(c) < 2:
+        return False
+    p, k = c[-2], c[-1]
+    if abs(k["c"] - k["o"]) < 0.5 * a1:
+        return False
+    return (k["c"] > k["o"] and k["c"] > p["h"]) if side == "BUY" else (k["c"] < k["o"] and k["c"] < p["l"])
+
+
+def _qml_m1_check(m1, z):
+    d = 1 if z["side"] == "BUY" else -1
+    in_zone = any(x["l"] <= z["zhi"] and x["h"] >= z["zlo"] for x in m1[-3:])
+    out = {"in_zone": in_zone, "engulf": False, "reaction": False, "choch": False, "ok": False, "label": None}
+    if not in_zone or len(m1) < 30:
+        return out
+    a1 = atr_series(m1)[-1]
+    out["engulf"] = _qml_engulf(m1, z["side"])
+    out["reaction"] = get_qml_react() and _qml_reaction(m1, z["side"], a1)
+    mode = get_qml_conf()
+    if mode in ("CHOCH", "ENGULFING_OR_CHOCH"):
+        out["choch"] = any(e["kind"] == "CHOCH" and e["dir"] == d and e["i"] >= len(m1) - 3 for e in analyze(m1))
+    use_eng = mode in ("ENGULFING", "ENGULFING_OR_CHOCH")
+    use_ch = mode in ("CHOCH", "ENGULFING_OR_CHOCH")
+    if use_eng and out["engulf"]:
+        out["ok"], out["label"] = True, "ENGULFING"
+    elif use_ch and out["choch"]:
+        out["ok"], out["label"] = True, "CHoCH M1"
+    elif out["reaction"]:
+        out["ok"], out["label"] = True, "RÉACTION M1"
+    return out
+
+
+# --- analyse complète d'un marché ------------------------------------------------------------
+def qml_analyze(symbol, force=False, tf=None):
+    """Analyse QML d'un marché (lecture seule). `status` : NO_QML | FAR | WAIT | SKIP | PROPOSAL | SL_EXCESSIF | SL_INVALIDE.
+    Une PROPOSITION n'est jamais un ordre exécuté."""
+    if np is None or pd is None:
+        return {"symbol": symbol, "status": "ERREUR", "msg": "numpy / pandas requis pour le module QML"}
+    dec = SYMBOLS[symbol]["decimals"]
+    tf = tf or get_qml_tf()
+    htf_on = get_qml_htf_on()
+    r = {"symbol": symbol, "status": "NO_QML", "dec": dec, "tf": tf, "htf_on": htf_on}
+    st = _qml_load_m15(symbol, force, tf)
+    zones, atr = st["zones"], st["atr"]
+    if not zones or not atr:
+        return r
+    if htf_on:   # H1 = filtre : seulement les QML dans le sens du biais ; HTF OFF -> aucune requête H1
+        bias = qml_htf_bias(symbol)
+        r["htf_bias"] = bias
+        if bias is None:
+            r["status"] = "HTF_INDISPO"
+            return r
+        ok = [z for z in zones if (z["side"] == "BUY") == (bias == 1)]
+        if not ok:
+            r.update(status="HTF", zone=zones[0], side=zones[0]["side"], price=st["close"], atr15=atr)
+            return r
+        zones = ok
+    px = get_live_price(symbol) or st["close"]
+    _qml_ref_px[symbol] = px
+
+    def dist(z):
+        return 0.0 if z["zlo"] <= px <= z["zhi"] else min(abs(px - z["zlo"]), abs(px - z["zhi"]))
+    z = min(zones, key=lambda x: (dist(x), -x["j"]))
+    side, d = z["side"], (1 if z["side"] == "BUY" else -1)
+    r.update(side=side, zone=z, price=px, atr15=atr, direction=side, type=f"QML {side}")
+    if dist(z) > QML_NEAR_ATR * atr:
+        r["status"] = "FAR"
+        return r
+    m1 = get_candles(symbol, 1)   # M1 seulement quand le prix est proche de la zone
+    chk = _qml_m1_check(m1, z) if len(m1) >= 30 else {"in_zone": False, "ok": False}
+    r["m1"], r["m1_candles"] = chk, m1
+    if not chk["in_zone"]:
+        r["status"] = "WAIT"
+        return r
+    if not chk["ok"]:
+        r["status"] = "SKIP"
+        return r
+    entry = m1[-1]["c"]
+    if not get_qml_direct():   # DIRECT ENTRY OFF : on s'arrête à la confirmation, aucune entrée proposée
+        r.update(status="DIRECT_OFF", confirm=chk["label"], entry=entry, t=m1[-1]["t"])
+        return r
+    buf = QML_PARAMS.sl_buf_atr * atr
+    sl = (max(z["head"], z["zhi"]) + buf) if side == "SELL" else (min(z["head"], z["zlo"]) - buf)
+    risk = (sl - entry) * -d
+    r.update(entry=entry, t=m1[-1]["t"], confirm=chk["label"])
+    if risk <= 0:
+        r["status"] = "SL_INVALIDE"
+        return r
+    if risk > MAX_SL_ATR * atr:
+        r.update(status="SL_EXCESSIF", sl=sl, risk=risk)
+        return r
+    min_pct = SYMBOLS[symbol].get("min_sl_pct", MIN_SL_PCT)
+    min_risk = max(MIN_SL_ATR * atr, entry * min_pct)
+    if risk < min_risk:   # mêmes planchers que le moteur existant
+        risk = min_risk
+        sl = entry - d * risk
+    rr = get_partial_cfg()["p3_rr"] if get_partial_on() else get_tp_rr()
+    r.update(status="PROPOSAL", sl=sl, risk=risk, rr=rr, tp=entry + d * risk * rr)
+    return r
+
+
+def make_qml_chart(symbol, tf, r=None, n_show=120, extend=25):
+    """Graphique QML (lecture seule) : bougies du TF, zones QML valides (la plus proche en plein, les autres atténuées),
+    tête / liquidité balayée, ligne de cassure BOS/CHoCH (L1), et si une entrée est proposée : entrée, SL, TP."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from matplotlib.patches import Rectangle
+    except ImportError:
+        return None
+    candles = get_candles(symbol, tf)
+    if len(candles) < 30:
+        return None
+    zones = _qml_load_m15(symbol, False, tf)["zones"][:3]
+    dec = SYMBOLS[symbol]["decimals"]
+    main_z = (r or {}).get("zone")
+    os.makedirs(CHART_DIR, exist_ok=True)
+    files = sorted((os.path.join(CHART_DIR, f) for f in os.listdir(CHART_DIR)), key=os.path.getmtime)
+    for f in files[:-40]:
+        try:
+            os.remove(f)
+        except OSError:
+            pass
+    view = candles[-n_show:]
+    pos = {c["t"]: k for k, c in enumerate(view)}
+    fig, ax = plt.subplots(figsize=(9, 5.5), dpi=110)
+    fig.patch.set_facecolor("#0e1117")
+    ax.set_facecolor("#0e1117")
+    for k, c in enumerate(view):
+        col = "#26a69a" if c["c"] >= c["o"] else "#ef5350"
+        ax.plot([k, k], [c["l"], c["h"]], color=col, lw=0.8)
+        ax.add_patch(Rectangle((k - 0.3, min(c["o"], c["c"])), 0.6, max(abs(c["c"] - c["o"]), 1e-9), color=col))
+    x_end = len(view) - 1 + extend
+    lows, highs = [c["l"] for c in view], [c["h"] for c in view]
+    for z in zones:
+        col = "#26a69a" if z["side"] == "BUY" else "#ef5350"
+        is_main = bool(main_z) and z["t"] == main_z["t"] and z["side"] == main_z["side"]
+        alpha = 0.32 if is_main else 0.14
+        xj, xh = pos.get(z["t"]), pos.get(z["t_head"])
+        x_from = xj if xj is not None else 0
+        ax.add_patch(Rectangle((x_from, z["zlo"]), x_end - x_from, z["zhi"] - z["zlo"], color=col, alpha=alpha))
+        ax.text(x_end + 0.5, (z["zlo"] + z["zhi"]) / 2, f"ZONE QML {z['side']}", color=col, fontsize=7, va="center")
+        if xh is not None:   # tête = liquidité balayée (EQH pour un SELL, EQL pour un BUY)
+            ax.plot([max(xh - 4, 0), xh + 4], [z["head"]] * 2, color="#f5c542", lw=1.2)
+            ax.text(xh, z["head"], "Liquidité (tête)", color="#f5c542", fontsize=7, ha="center",
+                    va="bottom" if z["side"] == "SELL" else "top")
+            if xj is not None:   # cassure de L1 = BOS / CHoCH qui valide le QML
+                ax.plot([xh, xj], [z["L1"]] * 2, color=col, lw=0.9, ls="--")
+                ax.text((xh + xj) / 2, z["L1"], "BOS/CHoCH (L1)", color=col, fontsize=7, ha="center",
+                        va="top" if z["side"] == "SELL" else "bottom")
+        lows += [z["zlo"], z["head"], z["L1"]]
+        highs += [z["zhi"], z["head"], z["L1"]]
+    price = (r or {}).get("price") or view[-1]["c"]
+    ax.axhline(price, color="#ffffff", lw=0.7, ls=":")
+    if not (r and r.get("status") == "PROPOSAL"):   # (en cas de proposition, l'étiquette ENTRÉE tient lieu de prix)
+        ax.text(x_end + 0.5, price, f"PRIX {price:.{dec}f}", color="#ffffff", fontsize=8, va="center")
+    lows.append(price)
+    highs.append(price)
+    if r and r.get("status") == "PROPOSAL":   # entrée / SL / TP potentiels (proposition, pas un ordre)
+        x0 = len(view) - 1
+        ax.add_patch(Rectangle((x0, min(r["entry"], r["sl"])), extend, abs(r["entry"] - r["sl"]), color="#ef5350", alpha=0.22))
+        ax.add_patch(Rectangle((x0, min(r["entry"], r["tp"])), extend, abs(r["tp"] - r["entry"]), color="#26a69a", alpha=0.22))
+        for lbl, v, col in (("ENTRÉE", r["entry"], "#ffffff"), ("SL", r["sl"], "#ef5350"), ("TP", r["tp"], "#26a69a")):
+            ax.plot([x0, x0 + extend], [v, v], color=col, lw=1.0)
+            ax.text(x_end + 0.5, v, f"{lbl} {v:.{dec}f}", color=col, fontsize=7, va="center")
+        lows += [r["sl"], r["entry"], r["tp"]]
+        highs += [r["sl"], r["entry"], r["tp"]]
+    ax.set_xlim(-1, x_end + 22)
+    lo, hi = min(lows), max(highs)
+    pad = (hi - lo) * 0.05 or 1
+    ax.set_ylim(lo - pad, hi + pad)
+    title = f"{symbol} {_tf_lbl(tf)} — QML" + ("" if zones else " : aucune zone valide")
+    ax.set_title(title, color="white", fontsize=11)
+    ax.tick_params(colors="#888888", labelsize=7)
+    ax.set_xticks([])
+    for sp in ax.spines.values():
+        sp.set_color("#333333")
+    path = os.path.join(CHART_DIR, f"{symbol}_qml_{int(time.time())}.png")
+    fig.savefig(path, facecolor=fig.get_facecolor(), bbox_inches="tight")
+    plt.close(fig)
+    return path
+
+
+PREVIEW_MAX_AGE = 60   # « point potentiel » : un CHoCH vieux de plus de N bougies n'est plus proposé
+
+
+def strategy_preview(symbol, strat):
+    """Point d'entrée POTENTIEL d'une stratégie ("main" = BOS/CHoCH, "crt" = CRT), sans rien publier ni exécuter.
+    Retourne (texte, chemin_image|None). Utilise les mêmes règles / filtres que le signal automatique."""
+    name = {"main": "BOS / CHoCH", "crt": "CRT"}[strat]
+    head = f"🎯 <b>{name} — {symbol}</b> · {TF_LABEL}\n"
+    dec = SYMBOLS[symbol]["decimals"]
+    candles = get_candles(symbol)
+    if len(candles) < 2 * SWING_DEPTH + 5:
+        return head + "\n⚠️ Données insuffisantes pour le moment.", None
+    events = analyze(candles)
+    n = len(candles)
+    on_txt = "🟢 ON" if (get_strat_main() if strat == "main" else get_strat_crt()) else "🔴 OFF (analyse seule, aucun signal automatique)"
+    head += f"Stratégie : {on_txt}\n"
+    chochs = [e for e in events if e["kind"] == "CHOCH" and e["i"] >= n - PREVIEW_MAX_AGE]
+    found = None
+    for ev in reversed(chochs):   # le plus récent d'abord
+        try:
+            sigs = (build_signal(candles, ev, symbol, multi=True) if strat == "main" else crt_build(candles, ev, symbol)) or []
+        except Exception:
+            traceback.print_exc(limit=-3)
+            sigs = []
+        if sigs:
+            found = (ev, sigs)
+            break
+    if not found:
+        why = "aucun CHoCH récent" if not chochs else f"{len(chochs)} CHoCH récent(s) mais aucun ne passe les filtres"
+        return head + f"\nPas de point d'entrée potentiel : {why}.\n\nAction : ⏸ attendre", None
+    ev, sigs = found
+    age = n - 1 - ev["i"]
+    lines = []
+    for sg in sigs:
+        icon = "🟢" if sg["side"] == "BUY" else "🔴"
+        lbl = f"{sg['side']} LIMIT" if sg.get("order") == "LIMIT" else f"{sg['side']} (direct)"
+        lines.append(f"{icon} <b>{lbl}</b> · {sg.get('type', '')}\nEntrée : {_fmt(sg['entry'], dec)}\n"
+                     f"SL : {_fmt(sg['sl'], dec)}\nTP : {_fmt(sg['tp'], dec)} (RR{_sig_rr(sg):g})")
+    notes = []
+    if not session_ok(ev["t"]):
+        notes.append(f"⏸ hors session ({get_session()})")
+    nb = news_block_info(symbol)
+    if nb:
+        notes.append(f"📰 news en cours : {_news_line(nb)}")
+    if not get_symbol_on(symbol):
+        notes.append("🌍 actif désactivé (pas de signal automatique)")
+    if not get_bot_on():
+        notes.append("⏸ bot arrêté")
+    status = ("✅ serait publié maintenant" if not notes else "⚠️ ne serait pas publié : " + " ; ".join(notes))
+    text = (head + f"\nCHoCH {_dir_txt(ev['dir'])} il y a {age} bougie(s)\n\n" + "\n\n".join(lines)
+            + f"\n\nStatut : {status}\n⚠️ PROPOSITION — pas un ordre exécuté.")
+    chart = None
+    try:
+        chart = make_chart(symbol, candles, events, sigs[0], dec)
+    except Exception:
+        traceback.print_exc(limit=-3)
+    return text, chart
+
+
+def analyse_all(symbol):
+    """Les 3 stratégies d'un actif : liste de (texte, image|None). Lecture seule."""
+    out = []
+    for strat in ("main", "crt"):
+        try:
+            out.append(strategy_preview(symbol, strat))
+        except Exception as e:
+            traceback.print_exc(limit=-3)
+            out.append((f"🎯 <b>{strat.upper()} — {symbol}</b>\n\n⚠️ Analyse impossible ({type(e).__name__}).", None))
+    try:
+        res = qml_analyze(symbol, force=True)
+        txt = qml_analysis_text(res)
+        chart = None
+        try:
+            chart = make_qml_chart(symbol, res.get("tf") or get_qml_tf(), res)
+        except Exception:
+            traceback.print_exc(limit=-3)
+        out.append((txt, chart))
+    except Exception as e:
+        traceback.print_exc(limit=-3)
+        out.append((f"📊 <b>ANALYSE QML — {symbol}</b>\n\n⚠️ Analyse impossible ({type(e).__name__}).", None))
+    return out
+
+
+def qml_analysis_text(r):
+    s, dec = r["symbol"], r.get("dec", 2)
+    tf = r.get("tf") or get_qml_tf()
+    htf_txt = (f"HTF : {_tf_lbl(QML_HTF_MINUTES)} (filtre ON)" if r.get("htf_on", get_qml_htf_on()) else "HTF : OFF")
+    head = f"📊 <b>ANALYSE QML — {s}</b>\n\nTF QML : {_tf_lbl(tf)} · {htf_txt}\n"
+    st = r["status"]
+    if st == "ERREUR":
+        return head + f"\n⚠️ {r.get('msg')}"
+    if st == "NO_QML":
+        return head + f"\nAucun QML valide sur {_tf_lbl(tf)} pour le moment.\n\nAction : ⏸ attendre"
+    if st == "HTF_INDISPO":
+        return head + f"\nBiais {_tf_lbl(QML_HTF_MINUTES)} indisponible (données insuffisantes).\n\nAction : ⏸ SKIP"
+    z = r["zone"]
+    zone = f"{_fmt(z['zlo'], dec)} — {_fmt(z['zhi'], dec)}"
+    base = f"\nDirection : {r['side']}\nType : QML {r['side']}\n\nZONE QML :\n{zone}\n"
+    if st == "HTF":
+        bias = "haussier" if r.get("htf_bias") == 1 else "baissier"
+        return head + base + (f"\nFiltre {_tf_lbl(QML_HTF_MINUTES)} : ❌ biais {bias}, QML {r['side']} contre le contexte\n\n"
+                              f"Action : ⏸ SKIP — filtre HTF (désactive-le dans ⚙️ QML pour trader ce QML pur)")
+    if st == "FAR":
+        return head + base + f"\nPrix actuel : {_fmt(r['price'], dec)} (zone éloignée)\n\nAction : ⏸ SKIP — attendre que le prix approche"
+    if st == "WAIT":
+        return head + base + "\nPrix dans la zone : ❌ pas encore\n\nAction : ⏸ attendre"
+    if st == "SKIP":
+        m = r["m1"]
+        why = "Aucun avalement" if get_qml_conf() == "ENGULFING" else "Aucune confirmation (" + get_qml_conf() + ")"
+        return head + base + f"\nPrix dans la zone : ✅\n\nM1 :\n❌ {why}\n\nAction :\n⏸ SKIP — attendre une réaction"
+    if st == "DIRECT_OFF":
+        return head + base + f"\nConfirmation M1 : 🟢 {r['confirm']}\n\nEntrée directe : 🔴 OFF — analyse seule\nStatut : aucune entrée proposée"
+    if st in ("SL_EXCESSIF", "SL_INVALIDE"):
+        why = "SL excessif" if st == "SL_EXCESSIF" else "SL invalide"
+        extra = f" ({r['risk'] / r['atr15']:.1f} x ATR M15 > {MAX_SL_ATR:g})" if st == "SL_EXCESSIF" else ""
+        return head + base + f"\nConfirmation M1 : 🟢 {r['confirm']}\n\n⛔ {why}{extra}\nStatut : SKIP (proposition refusée)"
+    icon = "🟢" if r["side"] == "BUY" else "🔴"
+    htf_line = f"\nContexte {_tf_lbl(QML_HTF_MINUTES)} : ✅ {'haussier' if r.get('htf_bias') == 1 else 'baissier'}, aligné\n" if r.get("htf_on") else ""
+    return (head + base + htf_line + f"\nEntrée potentielle :\n{_fmt(r['entry'], dec)}\n\nConfirmation M1 :\n🟢 {r['confirm']}\n\n"
+            f"Type d'entrée :\nDIRECT\n\nSL potentiel :\n{_fmt(r['sl'], dec)}\n\nTP potentiel : {_fmt(r['tp'], dec)} (RR{r['rr']:g})\n"
+            f"Risque structurel :\n{_fmt(r['risk'], dec)} pts\n\nStatut :\n✅ ENTRÉE PROPOSÉE\n\n"
+            f"{icon} <b>{r['side']} POTENTIEL</b> · QML + M1 {r['confirm']}\n⚠️ PROPOSITION — pas un ordre exécuté.")
+
+
+def qml_build_signal(r):
+    """Signal compatible avec publish_signal (même format que build_signal ; sig["zone"] = {tf, kind, d, lo, hi})."""
+    d = 1 if r["side"] == "BUY" else -1
+    z = r["zone"]
+    return {
+        "dir": d, "side": r["side"], "type": "QML", "order": "MARKET", "ref_price": r["entry"],
+        "entry": r["entry"], "sl": r["sl"], "risk": r["risk"], "tp": r["tp"], "t": r["t"], "bos_level": z["L1"],
+        "rr": r["rr"], "htf": bool(r.get("htf_on")), "htf_mode": "OFF", "be_rr": get_be_rr(),
+        "tf": f"{_tf_lbl(r['tf'])}→M1",
+        "setup": f"QML {_tf_lbl(r['tf'])}" + (f" + {_tf_lbl(QML_HTF_MINUTES)}" if r.get("htf_on") else "") + f" + M1 {r['confirm']}", "poi": None, "mtf_fib_on": False, "mtf_fib": None,
+        "qf": {}, "ext": None, "sweep": None, "sl_mode": "STRUCT", "key_suffix": "qml",
+        "zone": {"tf": r["tf"], "kind": "QML", "d": d, "lo": z["zlo"], "hi": z["zhi"]},
+    }
+
+
+def qml_process_symbol(symbol):
+    """Scan M15 -> surveillance de la zone -> M1 seulement quand le prix y entre. Une proposition par zone."""
+    if not get_qml_on() or not get_symbol_on(symbol) or not get_bot_on():
+        return
+    now = time.time()
+    if now - _qml_last_scan.get(symbol, 0.0) < QML_SCAN_SEC:
+        return
+    _qml_last_scan[symbol] = now
+    r = qml_analyze(symbol)
+    if r["status"] != "PROPOSAL":
+        return
+    z = r["zone"]
+    key = f"qml_sent:{symbol}:{r['tf']}:{r['side']}:{z['t_head']}"
+    if get_meta(key) or not session_ok(r["t"]) or news_block_info(symbol):
+        return   # (news : la zone reste valable, la proposition pourra partir après la fenêtre)
+    set_meta(key, 1)
+    if get_qml_auto():
+        m1 = r["m1_candles"]
+        if publish_signal(symbol, m1, analyze(m1), qml_build_signal(r)):
+            return   # signal publié (groupe + admin + exécution existante)
+    to_admin(qml_analysis_text(r))
+
+
+# --- Telegram : menu ⚙️ QML ----------------------------------------------------------------------
+def _qml_text():
+    c = get_partial_cfg()
+    on = lambda b: "🟢 ON" if b else "🔴 OFF"
+    htf = f"{on(get_qml_htf_on())}" + (f" · HTF = {_tf_lbl(QML_HTF_MINUTES)}" if get_qml_htf_on() else "")
+    return (f"⚙️ <b>QML</b>\n\nQML : {on(get_qml_on())}\nTF QML : {_tf_lbl(get_qml_tf())}\nHTF FILTER : {htf}\n"
+            f"Confirmation M1 : {get_qml_conf().replace('_', ' ')}\nEntrée directe : {on(get_qml_direct())}\n"
+            f"Réaction sans engulfing : {on(get_qml_react())}\nPublier comme signal (auto) : {on(get_qml_auto())}\n\n"
+            f"Clôtures partielles : {on(get_partial_on())}\n"
+            f"TP1 : {c['p1_rr']:g}R → {c['p1_pct']:g} %\nTP2 : {c['p2_rr']:g}R → {c['p2_pct']:g} %\n"
+            f"TP3 : {c['p3_rr']:g}R → reste ({100 - c['p1_pct'] - c['p2_pct']:g} %)\n\n"
+            f"Marchés : {', '.join(QML_MARKETS)} (variable QML_MARKETS). Le scan ne couvre que les actifs ON du menu 🌍 ACTIFS.\n"
+            f"OFF / proposition : le bot n'envoie qu'un message à l'admin, aucun ordre. « Auto » = signal publié + exécution existante.")
+
+
+def _qml_keyboard():
+    c = get_partial_cfg()
+
+    def row(lbl, key, vals, fmt="{:g}"):
+        return [_btn(f"{lbl} " + fmt.format(v), f"qml:set:{key}:{v:g}", abs(c[key] - v) < 1e-9) for v in vals]
+    return _with_back({"inline_keyboard": [
+        [_btn("QML", "qml:on", get_qml_on()), _btn("Auto (signal)", "qml:auto", get_qml_auto())],
+        [_btn(_tf_lbl(t), f"qml:tf:{t}", get_qml_tf() == t) for t in QML_TF_CHOICES]
+        + [_btn(f"Filtre {_tf_lbl(QML_HTF_MINUTES)}", "qml:htf", get_qml_htf_on())],
+        [_btn("Entrée directe", "qml:direct", get_qml_direct())],
+        [_btn("Avalement", "qml:conf:ENGULFING", get_qml_conf() == "ENGULFING"),
+         _btn("CHoCH M1", "qml:conf:CHOCH", get_qml_conf() == "CHOCH"),
+         _btn("Les deux", "qml:conf:ENGULFING_OR_CHOCH", get_qml_conf() == "ENGULFING_OR_CHOCH")],
+        [_btn("Réaction sans engulfing", "qml:react", get_qml_react())],
+        [_btn("Clôtures partielles", "qml:part", get_partial_on())],
+        row("TP1 RR", "p1_rr", (0.5, 1, 1.5)), row("TP1 %", "p1_pct", (20, 30, 40, 50)),
+        row("TP2 RR", "p2_rr", (1.5, 2, 2.5)), row("TP2 %", "p2_pct", (20, 30, 40, 50)),
+        row("TP3 RR", "p3_rr", (2, 3, 4)),
+    ]})
+
+
+def _qml_callback(cq, arg):
+    """Gère les boutons « qml:... ». Retourne le texte de confirmation (toast)."""
+    ack = ""
+    if arg == "home":
+        pass
+    elif arg == "on":
+        set_setting("qml_on", "0" if get_qml_on() else "1"); ack = "QML : " + ("ON" if get_qml_on() else "OFF")
+    elif arg == "auto":
+        set_setting("qml_auto", "0" if get_qml_auto() else "1"); ack = "Auto : " + ("ON" if get_qml_auto() else "OFF")
+    elif arg.startswith("tf:") and arg[3:].isdigit() and int(arg[3:]) in QML_TF_CHOICES:
+        set_setting("qml_tf", int(arg[3:])); ack = "TF QML : " + _tf_lbl(get_qml_tf())
+    elif arg == "htf":
+        set_setting("qml_htf", "0" if get_qml_htf_on() else "1"); ack = "Filtre HTF : " + ("ON" if get_qml_htf_on() else "OFF")
+    elif arg == "direct":
+        set_setting("qml_direct", "0" if get_qml_direct() else "1"); ack = "Entrée directe : " + ("ON" if get_qml_direct() else "OFF")
+    elif arg == "react":
+        set_setting("qml_react", "0" if get_qml_react() else "1"); ack = "Réaction : " + ("ON" if get_qml_react() else "OFF")
+    elif arg == "part":
+        set_setting("part_on", "0" if get_partial_on() else "1"); ack = "Partiels : " + ("ON" if get_partial_on() else "OFF")
+    elif arg.startswith("conf:") and arg[5:] in QML_CONF_MODES:
+        set_setting("qml_conf", arg[5:]); ack = arg[5:].replace("_", " ")
+    elif arg.startswith("set:"):
+        try:
+            _, key, val = arg.split(":")
+            ok, msg = set_partial_value(key, float(val))
+        except ValueError:
+            ok, msg = False, "valeur invalide"
+        ack = "OK" if ok else msg
+    _edit(cq, _qml_text(), _qml_keyboard())
+    return ack
 
 
 if __name__ == "__main__":
     if "--selftest" in sys.argv:
         sys.exit(_selftest())
     main()
+
 
