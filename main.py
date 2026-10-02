@@ -139,7 +139,7 @@ SYMBOLS = {
         "be_fees_buffer": 0.05,     # défaut BE : SL à entrée +/- 0.05 pt (couvre spread/commission), voir BE_FEES_BUFFER
     },
     "BTCUSD": {
-        "source": "binance", "binance_symbol": "BTCUSDT",
+        "source": "binance", "binance_symbol": "BTCUSDT", "deriv_symbol": "cryBTCUSD",   # deriv_symbol : historique LONG seulement
         "value_per_point": 1.0,     # $ par point pour 1 lot (1 BTC) - à ajuster selon le broker
         "min_lot": 0.001, "lot_step": 0.001, "decimals": 0,
         "min_sl_pct": 0.0020,       # plancher SL absolu : ~0.20% (ex. ~160 pts sur du BTC à 80 000) -- plus volatile/mèches larges que le Gold
@@ -370,7 +370,8 @@ LIMIT_ZONES = ("BOTH", "OB", "FVG")
 # --- Risque & levier --------------------------------------------------------
 # Le lot est calculé uniquement à partir du risque $ et de la distance du SL (aucun solde requis).
 DEFAULT_RISK_USD = _env_float("DEFAULT_RISK_USD", 10.0)  # modifiable à tout moment via /risque
-MAX_RISK_USD = 100000.0
+MAX_RISK_USD_TELEGRAM = 100000.0  # borne de saisie pour /risque uniquement (renommé pour ne pas entrer en conflit
+                                   # avec MAX_RISK_USD du Risk Gate, section 5bis, sans changer son comportement)
 # RISK_STRICT ON (défaut) : le risque réel ne doit JAMAIS dépasser le risque configuré. Si le lot
 # minimum du broker forcerait un risque réel > risque demandé (au-delà de RISK_STRICT_TOLERANCE_PCT
 # de marge), le signal/trade est REFUSÉ plutôt que pris avec un risque plus élevé que prévu.
@@ -1317,6 +1318,12 @@ async def _execute_mt5_order_async(symbol, side, lot, entry, sl, tp, client_id=N
     sl = _normalize_price(spec, symbol, sl)
     tp = _normalize_price(spec, symbol, tp)
 
+    # DERNIER VERROU Risk Gate : risque réel du volume FINAL (specs réelles du broker) et du SL envoyé, commun à toutes
+    # les stratégies. Jamais de SL modifié, jamais de volume forcé : au-delà de MAX_RISK_USD l'ordre ne part pas.
+    _ok, _rr = risk_gate_verify(symbol, lot, entry, sl, strategy=_RISK_CTX.get(client_id, "?"))
+    if not _ok:
+        raise RiskGateBlocked(symbol, lot, _rr if _rr is not None else float("nan"))
+
     _check_trade_geometry(symbol, side, entry, sl, tp)   # 5. rejet net si géométrie incohérente
 
     min_dist = _min_stop_distance(spec, symbol)          # 6. stopsLevel + freezeLevel
@@ -1435,7 +1442,7 @@ async def _confirm_position_async(connection, position_id):
     return (pos is not None), None, pos
 
 
-def execute_mt5_order(symbol, side, lot, entry, sl, tp, client_id=None):
+def execute_mt5_order(symbol, side, lot, entry, sl, tp, client_id=None, strategy=None):
     """Wrapper sync : exécute un ordre MARKET côté MT5 avec le lot/SL/TP déjà calculés par le
     moteur de signal, puis confirme réellement l'existence de la position créée (positionId/
     orderId) avant de la considérer comme ouverte. Laisse remonter SLTooCloseError telle quelle (à
@@ -1443,8 +1450,16 @@ def execute_mt5_order(symbol, side, lot, entry, sl, tp, client_id=None):
     retourne le position_id (str) en cas de succès confirmé, ou None en cas d'échec (loggé +
     admin notifié par l'appelant). `client_id` (ex. l'id du trade en base) sert à la déduplication
     lors d'une éventuelle retentative — voir _execute_mt5_order_async."""
+    if client_id and strategy:
+        _RISK_CTX[client_id] = strategy   # nom de stratégie pour les logs du dernier verrou Risk Gate
     try:
         result = _run_mt5(_execute_mt5_order_async(symbol, side, lot, entry, sl, tp, client_id))
+    except RiskGateBlocked as e:
+        # Dernier verrou : risque réel > MAX_RISK_USD avec le volume final -> aucun ordre, SL inchangé.
+        print(f"[metaapi] {e}")
+        if client_id:
+            _RISK_BLOCKED.add(client_id)
+        return None
     except SLTooCloseError as e:
         # Rare : le prix a bougé entre la pré-vérif (publish_signal) et l'exécution, faisant
         # basculer le SL sous le stopsLevel entre-temps. Jamais de déplacement automatique du
@@ -1895,6 +1910,12 @@ def _manual_plan(symbol, side, sl_price=None):
     if lot_info["lot"] <= 0:
         return {"ok": False, "error": lot_info.get("rejected_reason")
                 or "lot calculé nul (risque ou distance SL invalide)"}
+    if RISK_ENABLED:   # Risk Gate commun : même verrou que les signaux automatiques (QML / CRT / CHS+BOS)
+        g_ok, g_lot, g_risk = risk_gate_check(symbol, entry, sl, strategy="MANUAL")
+        if not g_ok:
+            return {"ok": False, "error": f"Risk Gate : risque minimum > {MAX_RISK_USD:.2f}$ pour ce SL "
+                                          f"(ordre bloqué, SL inchangé)."}
+        lot_info = dict(lot_info, lot=g_lot, real_risk=g_risk, raised_to_min=False)
     return {"ok": True, "symbol": symbol, "side": side, "entry": entry, "spread": spread, "sl": sl, "tp": tp,
             "sl_distance": sl_distance, "lot_info": lot_info, "rr": rr, "custom_sl": sl_price is not None}
 
@@ -1916,8 +1937,12 @@ def place_manual_order(symbol, side, sl_price=None):
     code = next(k for k, v in _MANUAL_SYMS.items() if v == symbol) if symbol in _MANUAL_SYMS.values() \
         else symbol[:3].upper()
     client_id = f"MAN_{code}{side[0]}_{str(int(time.time() * 1000))[-8:]}"
-    position_id = execute_mt5_order(symbol, side, lot_info["lot"], entry, sl, tp, client_id=client_id)
+    position_id = execute_mt5_order(symbol, side, lot_info["lot"], entry, sl, tp, client_id=client_id,
+                                    strategy="MANUAL")
     if not position_id:
+        if client_id in _RISK_BLOCKED:
+            return {"ok": False, "error": f"Risk Gate : ordre bloqué (risque réel > {MAX_RISK_USD:.2f}$ avec le volume "
+                                          f"final du broker). SL inchangé."}
         return {"ok": False, "error": "ordre refusé par le broker (voir logs serveur pour le détail exact)"}
 
     return {"ok": True, "position_id": position_id, "symbol": symbol, "side": side,
@@ -2621,16 +2646,31 @@ def _deriv_request(payload):
     raise RuntimeError(f"Deriv indisponible : {last_err}")
 
 
-def _deriv(deriv_symbol, minutes=None):
-    """Bougies du timeframe demandé, construites par Deriv (ticks_history, style candles)."""
+def _deriv(deriv_symbol, minutes=None, count=None):
+    """Bougies du timeframe demandé, construites par Deriv (ticks_history, style candles).
+    count > 5000 : pages successives vers le passé (5000 bougies par requête) ; une page en échec rend ce qu'on a déjà."""
     sec = (minutes or TIMEFRAME_MIN) * 60
-    msg = _deriv_request({
-        "ticks_history": deriv_symbol, "style": "candles", "granularity": sec,
-        "count": CANDLES_LIMIT, "end": "latest",
-        "adjust_start_time": 1,   # marché fermé (week-end) : recule jusqu'aux dernières bougies dispo
-    })
-    return [{"t": int(k["epoch"]), "o": float(k["open"]), "h": float(k["high"]),
-             "l": float(k["low"]), "c": float(k["close"])} for k in msg["candles"]]
+    want = count or CANDLES_LIMIT
+    got, end = {}, "latest"
+    for page_no in range(max(1, -(-want // 5000))):
+        try:
+            msg = _deriv_request({
+                "ticks_history": deriv_symbol, "style": "candles", "granularity": sec,
+                "count": min(want - len(got), 5000), "end": end,
+                "adjust_start_time": 1,   # marché fermé (week-end) : recule jusqu'aux dernières bougies dispo
+            })
+        except Exception:
+            if page_no == 0:
+                raise
+            break   # historique plus ancien indisponible : on garde les pages déjà reçues
+        page = {int(k["epoch"]): k for k in msg.get("candles") or []}
+        before = len(got)
+        got.update(page)
+        if not page or len(got) == before or len(got) >= want:
+            break
+        end = min(page) - 1
+    return [{"t": e, "o": float(k["open"]), "h": float(k["high"]), "l": float(k["low"]), "c": float(k["close"])}
+            for e, k in sorted(got.items())]
 
 
 def get_live_price(symbol):
@@ -2677,16 +2717,64 @@ def get_live_price(symbol):
         return None
 
 
-def get_candles(symbol, minutes=None):
+def _binance_long(symbol, minutes, count):
+    """Historique long Binance par pages de 1000 bougies (du plus récent vers le plus ancien). Lève si indisponible."""
+    interval = BINANCE_INTERVALS[minutes or TIMEFRAME_MIN]
+    out, end = [], None
+    while len(out) < count:
+        last_err, page = None, None
+        for base in BINANCE_BASES:
+            try:
+                prm = {"symbol": symbol, "interval": interval, "limit": min(1000, count - len(out))}
+                if end is not None:
+                    prm["endTime"] = end
+                r = requests.get(base + "/api/v3/klines", params=prm, timeout=15)
+                r.raise_for_status()
+                page = r.json()
+                break
+            except Exception as e:
+                last_err = e
+                _binance_ban(e)
+        if page is None:
+            raise RuntimeError(f"Binance indisponible : {last_err}")
+        if not page:
+            break
+        out = [{"t": int(k[0] // 1000), "o": float(k[1]), "h": float(k[2]), "l": float(k[3]), "c": float(k[4])}
+               for k in page] + out
+        end = int(page[0][0]) - 1
+        if len(page) < 2:
+            break
+    return out
+
+
+def get_candles(symbol, minutes=None, count=None):
     """Retourne la liste des bougies clôturées (plus ancienne -> plus récente).
+    count : historique long (analyse QML) ; absent = CANDLES_LIMIT comme avant. Si l'historique long est
+    indisponible, repli automatique sur l'historique normal (le bot n'est jamais bloqué).
 
     minutes=None -> timeframe actuellement sélectionné (M1/M5/...) ; sinon un autre timeframe fixe
     (ex. HTF_MINUTES) sans toucher au suivi des positions ni aux signaux en cours."""
     cfg = SYMBOLS[symbol]
+    raw = None
     if cfg["source"] == "deriv":
-        raw = _deriv(cfg["deriv_symbol"], minutes)
+        raw = _deriv(cfg["deriv_symbol"], minutes, count)
     elif cfg["source"] == "binance":
-        raw = _binance(cfg["binance_symbol"], minutes)
+        if count and count > CANDLES_LIMIT:
+            order = ["deriv", "binance"] if os.getenv("LONG_HISTORY_BTC", "deriv").strip().lower() != "binance" else ["binance", "deriv"]
+            for src in order:   # historique long : Deriv (5000 / page, sans blocage d'IP) puis Binance ; sinon historique normal
+                try:
+                    if src == "deriv" and cfg.get("deriv_symbol"):
+                        raw = _deriv(cfg["deriv_symbol"], minutes, count)
+                    elif src == "binance" and time.time() >= _binance_blocked_until:
+                        raw = _binance_long(cfg["binance_symbol"], minutes, count)
+                except Exception as e:
+                    print(f"[{symbol}] historique long {src} indisponible ({e})")
+                    raw = None
+                if raw and len(raw) > CANDLES_LIMIT:
+                    break
+                raw = None
+        if not raw:
+            raw = _binance(cfg["binance_symbol"], minutes)
     else:
         raise ValueError(f"Source de prix inconnue pour {symbol} : {cfg['source']}")
     return _only_closed(raw, (minutes or TIMEFRAME_MIN) * 60)
@@ -3982,6 +4070,119 @@ def calc_margin(symbol, lot, price, leverage):
     # USD/xxx : le notionnel est directement la taille du contrat en USD (lot x 100 000)
     notional = lot * cfg["contract_size"] if cfg.get("vpp_from_price") else lot * cfg["value_per_point"] * price
     return notional / leverage
+
+
+# ============================================================================
+# 5bis. RISK GATE — garde-fou exécuté juste avant l'ENVOI DE L'ORDRE au broker.
+#
+# Totalement indépendant du calcul de lot "stratégie" ci-dessus (calc_lot / get_risk) et des
+# conditions de signal (QML, CRT, CHoCH+BOS) : il ne touche ni n'altère ces logiques. Il ne fait
+# que recalculer, pour chaque signal déjà validé, un volume d'ordre visant RISK_TARGET_USD (sans
+# jamais dépasser MAX_RISK_USD une fois arrondi au pas du broker), puis autorise ou bloque l'envoi
+# de l'ordre MT5. Il ne modifie jamais le SL et ne force jamais un ordre au-delà de MAX_RISK_USD.
+# ============================================================================
+RISK_ENABLED = _env_bool("RISK_ENABLED", True)
+RISK_TARGET_USD = _env_float("RISK_TARGET_USD", 0.70)
+MAX_RISK_USD = _env_float("MAX_RISK_USD", 0.70)
+MIN_LOT = _env_float("MIN_LOT", 0.01)
+_RISK_EPS = 1e-6   # tolérance numérique (bruit flottant) uniquement : 0.70 passe, 0.71 est rejeté
+
+
+class RiskGateBlocked(Exception):
+    """Levée par le dernier verrou (juste avant l'envoi broker) : le risque réel du volume FINAL dépasse MAX_RISK_USD."""
+
+    def __init__(self, symbol, lot, risk):
+        self.symbol, self.lot, self.risk = symbol, lot, risk
+        super().__init__(f"Risk Gate : {symbol} lot={lot:g} -> risque réel {risk:.2f}$ > max {MAX_RISK_USD:.2f}$")
+
+
+_RISK_CTX = {}   # client_id -> nom de stratégie (pour les logs du dernier verrou)
+_RISK_BLOCKED = set()   # client_id des ordres bloqués par le dernier verrou (message admin précis)
+
+
+def risk_strategy_label(sig):
+    """Nom de stratégie pour les logs du Risk Gate : QML / CRT / CHS+BOS (+ type de signal, ex. CHOCH1). Lecture seule."""
+    if not isinstance(sig, dict):
+        return str(sig or "?")
+    typ = sig.get("type")
+    if sig.get("strategy") == "CRT" or sig.get("key_suffix") == "crt":
+        base = "CRT"
+    elif typ == "QML" or sig.get("key_suffix") == "qml":
+        base = "QML"
+    elif typ == "MANUAL":
+        base = "MANUAL"
+    else:
+        base = "CHS+BOS"
+    return f"{base}/{typ}" if typ and typ != base else base
+
+
+def _risk_log(strategy, entry, sl, lot, risk, approved):
+    """Log unique du Risk Gate (même format pour toutes les stratégies)."""
+    lot_txt = f"{lot:g}" if lot is not None else "-"
+    risk_txt = f"{risk:.2f}" if risk is not None else "-"
+    print(f"[RISK GATE] Strategy={strategy} Entry={entry} SL={sl} Lot={lot_txt} Risk=${risk_txt} "
+          f"MAX=${MAX_RISK_USD:.2f} → {'APPROVED' if approved else 'REJECTED'}")
+    if not approved:
+        print("[RISK GATE] ORDER BLOCKED — risk exceeds maximum")
+
+
+def risk_gate_check(symbol, entry, sl, strategy="?", target_usd=None):
+    """Risk Gate UNIQUE et COMMUN à toutes les stratégies (QML, CRT, CHS+BOS, manuel...) : calcule le
+    volume d'ordre final et dit si l'ordre peut partir. Indépendant du signal : il ne modifie ni ENTRY ni SL.
+
+    Flux : ENTRY + SL -> volume -> risque réel (volume final x distance réelle ENTRY/SL) -> décision.
+    1) Plus grand volume dont le risque reste <= min(RISK_TARGET_USD, MAX_RISK_USD), arrondi VERS LE BAS au lot_step.
+    2) Plancher MIN_LOT (et min_lot du symbole) : si 0.01 respecte le max -> autorisé (0.55$, 0.70$ ok).
+    3) Si même le lot minimum dépasse MAX_RISK_USD (0.71$, 0.90$...) -> ordre refusé : SL inchangé, volume jamais forcé.
+
+    Retourne (approved: bool, lot: float|None, real_risk: float|None).
+    """
+    if not RISK_ENABLED:
+        return True, None, None  # Risk Gate désactivé : comportement existant inchangé
+
+    cfg = SYMBOLS.get(symbol, {})
+    lot_step = cfg.get("lot_step", MIN_LOT) or MIN_LOT
+    min_lot = max(cfg.get("min_lot", MIN_LOT) or MIN_LOT, MIN_LOT)
+
+    try:
+        sl_distance = abs(float(entry) - float(sl))
+        vpp = value_per_point(symbol, entry)
+    except Exception:
+        sl_distance, vpp = 0.0, 0.0
+
+    if sl_distance <= 0 or vpp <= 0:
+        _risk_log(strategy, entry, sl, None, None, False)
+        return False, None, None
+
+    # 1) plus grand volume possible sans dépasser la limite (arrondi vers le bas au pas du broker)
+    _tgt = target_usd if (target_usd and target_usd > 0) else RISK_TARGET_USD   # target_usd : seulement fourni quand /mm est ON
+    ceiling = min(_tgt, MAX_RISK_USD) if _tgt > 0 else MAX_RISK_USD
+    raw_lot = ceiling / (sl_distance * vpp)
+    lot = math.floor(raw_lot / lot_step + 1e-9) * lot_step
+    lot = max(round(lot, 6), min_lot)
+
+    # 2) risque réel du volume retenu (volume final x distance réelle ENTRY/SL)
+    real_risk = lot * sl_distance * vpp
+
+    # 3) décision finale : jamais de volume forcé au-delà de MAX_RISK_USD
+    approved = real_risk <= MAX_RISK_USD + _RISK_EPS
+    _risk_log(strategy, entry, sl, lot, real_risk, approved)
+    return approved, round(lot, 6), real_risk
+
+
+def risk_gate_verify(symbol, lot, entry, sl, strategy="?"):
+    """DERNIER VERROU (vérification seule, ne redimensionne jamais) : risque réel du volume FINAL (après arrondi
+    aux specs réelles du broker) et du SL réellement envoyé. Retourne (approved, real_risk)."""
+    if not RISK_ENABLED:
+        return True, None
+    try:
+        real_risk = float(lot) * abs(float(entry) - float(sl)) * value_per_point(symbol, entry)
+    except Exception:
+        _risk_log(strategy, entry, sl, lot, None, False)
+        return False, None
+    approved = real_risk <= MAX_RISK_USD + _RISK_EPS
+    _risk_log(strategy, entry, sl, lot, real_risk, approved)
+    return approved, real_risk
 
 
 def manual_sl_distance(symbol, entry):
@@ -5712,6 +5913,7 @@ def handle_command(text):
     if cmd in ("/aide", "/help"):
         txt = (_home_text() + "\n\n"
                "/risque [montant] — montant à risquer par trade ($)\n"
+               "/mm — money management : compounding, réduction après SL / drawdown, objectif et perte du jour, limites de trades (OFF par défaut)\n"
                "/levier [valeur] — levier (indicatif, calcul de marge)\n"
                "/stats — statistiques (jour / semaine + taux par RR)\n"
                "/statut — prix BTC / Gold et dernière bougie scannée\n"
@@ -5839,11 +6041,13 @@ def handle_command(text):
             except ValueError:
                 return ("Valeur invalide (1 à 10). Exemple : /maxpos 1", None)
         return (_signal_max_text(), _signal_max_keyboard())
+    if cmd == "/mm":
+        return (mm_command(parts[1:]), None)
     if cmd == "/risque":
         if len(parts) > 1:
             try:
                 v = float(parts[1].replace(",", "."))
-                if not 0 < v <= MAX_RISK_USD:
+                if not 0 < v <= MAX_RISK_USD_TELEGRAM:
                     raise ValueError
                 set_risk(v)
             except ValueError:
@@ -6207,6 +6411,10 @@ def _handle_update(u):
                 try:
                     res = qml_analyze(sym, force=True, tf=a_tf)
                     txt = qml_analysis_text(res)
+                    try:
+                        txt += qml_context_text(res)   # contexte FVG/OB : information seulement
+                    except Exception:
+                        traceback.print_exc(limit=-3)
                     nb = news_block_info(sym)
                     if nb:
                         txt += f"\n\n📰 ⚠️ News en cours : {_news_line(nb)} — aucun signal ne sera ouvert pendant la fenêtre."
@@ -6503,6 +6711,370 @@ def _should_fetch(symbol, last_seen):
     return True
 
 
+# ============================================================================
+# MONEY MANAGEMENT — /mm  (compounding, réduction du risque, objectif / perte journalière, limites de trades)
+#
+# DÉSACTIVÉ PAR DÉFAUT : tant que `/mm on` n'est pas tapé, le bot se comporte exactement comme avant.
+# Toutes les valeurs se tapent à la main (ex. /mm sl 4 2) ; « 0 » désactive une règle.
+# Sans état : tout est recalculé à la demande depuis les trades CLÔTURÉS de la base (aucun compteur à désynchroniser).
+# Seul le P&L RÉALISÉ compte (les trades encore ouverts ne comptent pas). Le jour = jour UTC (comme les rapports).
+# Un BE (P&L nul) est neutre : il n'interrompt ni ne prolonge une série de TP ou de SL.
+# Le Risk Gate (MAX_RISK_USD) reste le plafond DUR : le compounding ne peut jamais le dépasser.
+# ============================================================================
+_mm_cap_cache = {}
+MM_HELP = (
+    "⚙️ <b>/mm — money management</b> (valeur 0 = règle désactivée ; montants : 10 ou 10$ = dollars, 2% = pourcentage)\n\n"
+    "/mm on | off — active / coupe tout le module\n"
+    "/mm capital 1000 | auto — capital de référence pour les % (auto = solde MetaApi)\n"
+    "/mm hausse 2 10% — après 2 TP de suite, +10 % du risque de base par palier (ou +2$)\n"
+    "/mm gain 100$ 5% — par tranche de 100 $ (ou 2%) de gain net, +5 % (ou +1$) de risque\n"
+    "/mm perte 50$ 5% — par tranche de 50 $ (ou 2%) de perte nette, −5 % (ou −1$) de risque\n"
+    "/mm sl 4 2 — après 4 SL de suite, risque ÷ 2\n"
+    "/mm dd 5% 2 — drawdown ≥ 5 % (ou 50$) depuis le sommet, risque ÷ 2\n"
+    "/mm max 20 — plafond de risque du module ($) · /mm min 1 — plancher ($)\n"
+    "/mm obj 2% — objectif journalier (ou 100$) · /mm perte_jour 3% — perte journalière max\n"
+    "/mm action pause | stop — à l'objectif / à la perte max : pause jusqu'à demain UTC, ou bot arrêté\n"
+    "/mm trades_jour 5 — nb max de trades ouverts par jour · /mm ouverts 2 — nb max de trades ouverts en même temps (tous actifs)\n"
+    "/mm reset — repart de zéro pour hausse / gain / perte / drawdown (n'efface rien)"
+)
+
+
+def mm_on():
+    return _get_bool_setting("mm_on", False)
+
+
+def _mm_load(s):
+    """'pct:2' / 'usd:100' -> (kind, valeur) | None."""
+    try:
+        kind, v = str(s).split(":")
+        v = float(v)
+        return (kind, v) if kind in ("pct", "usd") and v > 0 else None
+    except (ValueError, AttributeError):
+        return None
+
+
+def _mm_parse_amt(tok):
+    """'10' / '10$' -> 'usd:10' ; '2%' -> 'pct:2' ; '0' -> '' (règle off). ValueError si invalide."""
+    t = str(tok).strip().replace(",", ".").replace(" ", "")
+    kind = "usd"
+    if t.endswith("%"):
+        kind, t = "pct", t[:-1]
+    elif t.endswith("$"):
+        t = t[:-1]
+    v = float(t)
+    if v < 0 or (kind == "pct" and v > 100):
+        raise ValueError
+    return "" if v == 0 else f"{kind}:{v:g}"
+
+
+def _mm_fmt(a):
+    return "OFF" if not a else f"{a[1]:g} {'%' if a[0] == 'pct' else '$'}"
+
+
+def _mm_usd(a, capital):
+    """Montant en $ : un pourcentage est pris sur le capital de référence (None si le capital est inconnu)."""
+    if not a:
+        return None
+    if a[0] == "usd":
+        return a[1]
+    return capital * a[1] / 100.0 if capital and capital > 0 else None
+
+
+def _mm_step(a, base):
+    """Pas de risque en $ : un pourcentage est pris sur le risque de BASE (/risque)."""
+    return base * a[1] / 100.0 if a[0] == "pct" else a[1]
+
+
+def mm_cfg():
+    g = lambda k, d="": get_setting("mm_" + k, d)
+
+    def num(k, d=0.0):
+        try:
+            return float(g(k, d))
+        except (TypeError, ValueError):
+            return float(d)
+    return {"capital": str(g("capital", "")).strip().lower(), "max": num("max"), "min": num("min"),
+            "up_n": int(num("up_n")), "up_step": _mm_load(g("up_step")),
+            "gain_x": _mm_load(g("gain_x")), "gain_step": _mm_load(g("gain_step")),
+            "loss_x": _mm_load(g("loss_x")), "loss_step": _mm_load(g("loss_step")),
+            "sl_n": int(num("sl_n")), "sl_div": num("sl_div", 2),
+            "dd_x": _mm_load(g("dd_x")), "dd_div": num("dd_div", 2),
+            "day_goal": _mm_load(g("day_goal")), "day_loss": _mm_load(g("day_loss")),
+            "action": "stop" if str(g("action", "pause")).lower() == "stop" else "pause",
+            "max_day": int(num("max_day")), "max_open": int(num("max_open")), "reset_ts": int(num("reset_ts"))}
+
+
+def _mm_needs_capital(cfg):
+    return any(a and a[0] == "pct" for a in (cfg["gain_x"], cfg["loss_x"], cfg["dd_x"], cfg["day_goal"], cfg["day_loss"]))
+
+
+def _mm_capital(cfg):
+    c = cfg["capital"]
+    if c == "auto":
+        hit = _mm_cap_cache.get("v")
+        if hit and time.time() - hit[0] < 120:
+            return hit[1]
+        try:
+            bal = float((get_account_summary() or {}).get("balance") or 0)
+        except Exception:
+            bal = 0.0
+        if bal > 0:
+            _mm_cap_cache["v"] = (time.time(), bal)
+            set_setting("mm_capital_last", bal)
+            return bal
+        try:   # solde indisponible : dernier solde connu
+            v = float(get_setting("mm_capital_last"))
+            return v if v > 0 else None
+        except (TypeError, ValueError):
+            return None
+    try:
+        v = float(c.replace(",", "."))
+        return v if v > 0 else None
+    except ValueError:
+        return None
+
+
+def _mm_pnl(r):
+    p = r.get("pnl_usd")
+    if p is None:
+        p = (r.get("result_r") or 0) * (r.get("risk_usd") or 0)
+    return float(p)
+
+
+def _mm_rows(since_ts):
+    cur = _q("SELECT outcome,result_r,risk_usd,pnl_usd,closed_ts FROM trades WHERE status='CLOSED' AND closed_ts>=? "
+             "ORDER BY closed_ts,id", (int(since_ts),))
+    return [dict(x) for x in cur.fetchall()]
+
+
+def mm_compute(rows, cfg, base, capital):
+    """PUR (sans base de données ni réseau) : série en cours, P&L net, drawdown et risque effectif à partir des trades clôturés."""
+    pnls = [_mm_pnl(r) for r in rows]
+    wins = losses = 0
+    for p in reversed(pnls):   # série en cours en fin d'historique ; un BE est neutre
+        if abs(p) < 1e-9:
+            continue
+        if p > 0:
+            if losses:
+                break
+            wins += 1
+        else:
+            if wins:
+                break
+            losses += 1
+    net = sum(pnls)
+    eq = peak = 0.0
+    for p in pnls:
+        eq += p
+        peak = max(peak, eq)
+    dd = peak - eq
+    risk, notes, ignored = float(base), [], []
+
+    def usd(a, label):
+        v = _mm_usd(a, capital)
+        if v is None:
+            ignored.append(label)
+        return v
+    if cfg["up_n"] > 0 and cfg["up_step"] and wins >= cfg["up_n"]:
+        lvl, st = wins // cfg["up_n"], _mm_step(cfg["up_step"], base)
+        risk += lvl * st
+        notes.append(f"{wins} TP de suite → +{lvl * st:g} $")
+    if cfg["gain_x"] and cfg["gain_step"] and net > 0:
+        x = usd(cfg["gain_x"], "gain")
+        if x and int(net // x) > 0:
+            lvl, st = int(net // x), _mm_step(cfg["gain_step"], base)
+            risk += lvl * st
+            notes.append(f"gain net {net:.2f} $ → +{lvl * st:g} $")
+    if cfg["loss_x"] and cfg["loss_step"] and net < 0:
+        x = usd(cfg["loss_x"], "perte")
+        if x and int((-net) // x) > 0:
+            lvl, st = int((-net) // x), _mm_step(cfg["loss_step"], base)
+            risk -= lvl * st
+            notes.append(f"perte nette {-net:.2f} $ → −{lvl * st:g} $")
+    if cfg["sl_n"] > 0 and cfg["sl_div"] > 1 and losses >= cfg["sl_n"]:
+        risk /= cfg["sl_div"]
+        notes.append(f"{losses} SL de suite → ÷ {cfg['sl_div']:g}")
+    if cfg["dd_x"] and cfg["dd_div"] > 1:
+        thr = usd(cfg["dd_x"], "drawdown")
+        if thr and dd >= thr:
+            risk /= cfg["dd_div"]
+            notes.append(f"drawdown {dd:.2f} $ → ÷ {cfg['dd_div']:g}")
+    if cfg["max"] > 0 and risk > cfg["max"]:
+        risk = cfg["max"]
+        notes.append(f"plafond MM {cfg['max']:g} $")
+    risk = max(risk, cfg["min"] if cfg["min"] > 0 else 0.01)
+    return {"risk": round(risk, 2), "notes": notes, "ignored": ignored, "wins": wins, "losses": losses,
+            "net": net, "dd": dd, "n": len(pnls)}
+
+
+def mm_state(cfg=None):
+    cfg = cfg or mm_cfg()
+    now = time.time()
+    day0 = int(now - now % 86400)
+    capital = _mm_capital(cfg) if _mm_needs_capital(cfg) else None
+    res = mm_compute(_mm_rows(cfg["reset_ts"]), cfg, get_risk(), capital)
+    res["today"] = sum(_mm_pnl(r) for r in _mm_rows(day0))
+    res["opened_today"] = _q("SELECT COUNT(*) n FROM trades WHERE opened_ts>=? AND status!='CANCELLED'", (day0,)).fetchone()["n"]
+    res["open_now"] = _q("SELECT COUNT(*) n FROM trades WHERE status IN ('OPEN','PENDING','EXECUTING')").fetchone()["n"]
+    res["capital"], res["day0"] = capital, day0
+    return res
+
+
+def mm_effective_risk():
+    """(risque $ à utiliser pour un NOUVEAU signal, note admin). Module OFF ou erreur -> risque de base inchangé (/risque)."""
+    base = get_risk()
+    if not mm_on():
+        return base, ""
+    try:
+        res = mm_state()
+    except Exception:
+        traceback.print_exc(limit=-3)
+        return base, ""
+    risk = res["risk"]
+    if abs(risk - base) < 1e-9:
+        return base, ""
+    return risk, f"\n📈 MM : risque {risk:g} $ (base {base:g} $ — {' ; '.join(res['notes']) or 'bornes MM'})"
+
+
+def mm_block_reason(companion=False):
+    """Raison de refus d'un NOUVEAU signal (objectif / perte du jour, limites de trades), sinon None. Ne touche jamais
+    aux trades déjà ouverts (ils restent suivis). `companion` (2e ordre du même CHoCH) échappe aux limites de nombre,
+    comme pour « signaux max »."""
+    if not mm_on():
+        return None
+    try:
+        cfg = mm_cfg()
+        st = mm_state(cfg)
+    except Exception:
+        traceback.print_exc(limit=-3)
+        return None
+    cap, today = st["capital"], st["today"]
+    goal, lim = _mm_usd(cfg["day_goal"], cap), _mm_usd(cfg["day_loss"], cap)
+    why, kind = None, None
+    if goal and today >= goal:
+        why, kind = f"objectif journalier atteint ({today:+.2f} $ ≥ {goal:.2f} $)", "goal"
+    elif lim and today <= -lim:
+        why, kind = f"perte journalière max atteinte ({today:+.2f} $ ≤ −{lim:.2f} $)", "loss"
+    elif not companion and cfg["max_day"] and st["opened_today"] >= cfg["max_day"]:
+        why = f"{st['opened_today']}/{cfg['max_day']} trades déjà ouverts aujourd'hui"
+    elif not companion and cfg["max_open"] and st["open_now"] >= cfg["max_open"]:
+        why = f"{st['open_now']}/{cfg['max_open']} trades déjà ouverts en même temps"
+    if kind:
+        nkey = f"mm_notify:{st['day0']}:{kind}"
+        if not get_meta(nkey):
+            set_meta(nkey, 1)
+            stop = cfg["action"] == "stop"
+            if stop and get_bot_on():
+                set_bot_on(False)
+            to_admin(f"💰 <b>Money management</b> : {why}.\n" + (
+                "⏸ Bot ARRÊTÉ (aucun nouveau signal) — relance-le avec le bouton Démarrer. Les trades ouverts restent suivis."
+                if stop else "⏸ Pause : aucun nouveau signal jusqu'à demain (UTC). Les trades ouverts restent suivis."))
+    return why
+
+
+def mm_status_text():
+    cfg = mm_cfg()
+    try:
+        st = mm_state(cfg)
+    except Exception:
+        traceback.print_exc(limit=-3)
+        return "⚠️ /mm : état indisponible pour le moment."
+    onoff = "🟢 ON" if mm_on() else "🔴 OFF (comportement d'avant : risque fixe /risque)"
+    cap = st["capital"]
+    lines = [f"💰 <b>Money management</b> : {onoff}", f"Risque de base (/risque) : {get_risk():g} $",
+             f"Capital de référence : {f'{cap:,.2f} $'.replace(',', ' ') if cap else '—'}"
+             + (f" ({cfg['capital']})" if cfg["capital"] else ""), "",
+             f"Hausse : {'après ' + str(cfg['up_n']) + ' TP → +' + _mm_fmt(cfg['up_step']) if cfg['up_n'] and cfg['up_step'] else 'OFF'}",
+             f"Gain : {'chaque ' + _mm_fmt(cfg['gain_x']) + ' → +' + _mm_fmt(cfg['gain_step']) if cfg['gain_x'] and cfg['gain_step'] else 'OFF'}",
+             f"Perte : {'chaque ' + _mm_fmt(cfg['loss_x']) + ' → −' + _mm_fmt(cfg['loss_step']) if cfg['loss_x'] and cfg['loss_step'] else 'OFF'}",
+             f"SL de suite : {'après ' + str(cfg['sl_n']) + ' → ÷ ' + format(cfg['sl_div'], 'g') if cfg['sl_n'] else 'OFF'}",
+             f"Drawdown : {'≥ ' + _mm_fmt(cfg['dd_x']) + ' → ÷ ' + format(cfg['dd_div'], 'g') if cfg['dd_x'] else 'OFF'}",
+             f"Bornes : plafond {cfg['max']:g} $ · plancher {cfg['min']:g} $" if cfg["max"] or cfg["min"] else "Bornes : OFF",
+             f"Objectif jour : {_mm_fmt(cfg['day_goal'])} · perte jour max : {_mm_fmt(cfg['day_loss'])} → {cfg['action']}",
+             f"Trades : max {cfg['max_day'] or 'OFF'} / jour · max {cfg['max_open'] or 'OFF'} ouverts en même temps", "",
+             f"<b>État</b> : série {st['wins']} TP / {st['losses']} SL · net {st['net']:+.2f} $ · drawdown {st['dd']:.2f} $ "
+             f"({st['n']} trades clôturés depuis le dernier reset)",
+             f"Aujourd'hui (UTC) : {st['today']:+.2f} $ · {st['opened_today']} trade(s) ouvert(s) · {st['open_now']} en cours",
+             f"➡️ Risque effectif pour le prochain signal : <b>{st['risk']:g} $</b>"
+             + (f" ({' ; '.join(st['notes'])})" if st["notes"] else "")]
+    if st["ignored"]:
+        lines.append(f"⚠️ Règle(s) en % ignorée(s) ({', '.join(st['ignored'])}) : capital inconnu → /mm capital 1000 ou auto.")
+    eff = max(st["risk"], 0)
+    if RISK_ENABLED and eff > MAX_RISK_USD + 1e-9:
+        lines.append(f"⚠️ Risk Gate : MAX_RISK_USD = {MAX_RISK_USD:g} $ (variable Render). Les ordres MT5 ne dépasseront pas ce plafond "
+                     f"tant que tu ne le relèves pas toi-même.")
+    return "\n".join(lines)
+
+
+def mm_command(args):
+    """Traite « /mm ... » (admin). Retourne le texte de réponse."""
+    if not args:
+        return mm_status_text()
+    sub, rest = args[0].lower(), args[1:]
+    bad = "Valeur invalide.\n\n" + MM_HELP
+
+    def need(n):
+        return len(rest) >= n
+
+    try:
+        if sub in ("aide", "help"):
+            return MM_HELP
+        if sub in ("on", "off"):
+            set_setting("mm_on", "1" if sub == "on" else "0")
+        elif sub == "capital" and need(1):
+            if rest[0].lower() == "auto":
+                set_setting("mm_capital", "auto")
+            else:
+                v = float(rest[0].replace(",", ".").rstrip("$"))
+                if v < 0:
+                    raise ValueError
+                set_setting("mm_capital", f"{v:g}" if v else "")
+        elif sub == "hausse" and need(2):
+            n = int(rest[0])
+            if not 0 <= n <= 100:
+                raise ValueError
+            set_setting("mm_up_n", n)
+            set_setting("mm_up_step", _mm_parse_amt(rest[1]))
+        elif sub in ("gain", "perte") and need(2):
+            k = "gain" if sub == "gain" else "loss"
+            set_setting(f"mm_{k}_x", _mm_parse_amt(rest[0]))
+            set_setting(f"mm_{k}_step", _mm_parse_amt(rest[1]))
+        elif sub == "sl" and need(1):
+            n = int(rest[0])
+            d = float(rest[1].replace(",", ".")) if need(2) else 2.0
+            if not 0 <= n <= 100 or not 1 < d <= 20:
+                raise ValueError
+            set_setting("mm_sl_n", n)
+            set_setting("mm_sl_div", d)
+        elif sub == "dd" and need(1):
+            d = float(rest[1].replace(",", ".")) if need(2) else 2.0
+            if not 1 < d <= 20:
+                raise ValueError
+            set_setting("mm_dd_x", _mm_parse_amt(rest[0]))
+            set_setting("mm_dd_div", d)
+        elif sub in ("max", "min") and need(1):
+            v = float(rest[0].replace(",", ".").rstrip("$"))
+            if v < 0:
+                raise ValueError
+            set_setting(f"mm_{sub}", v)
+        elif sub in ("obj", "perte_jour") and need(1):
+            set_setting("mm_day_goal" if sub == "obj" else "mm_day_loss", _mm_parse_amt(rest[0]))
+        elif sub == "action" and need(1) and rest[0].lower() in ("pause", "stop"):
+            set_setting("mm_action", rest[0].lower())
+        elif sub in ("trades_jour", "ouverts") and need(1):
+            n = int(rest[0])
+            if not 0 <= n <= 1000:
+                raise ValueError
+            set_setting("mm_max_day" if sub == "trades_jour" else "mm_max_open", n)
+        elif sub == "reset":
+            set_setting("mm_reset_ts", int(time.time()))
+        else:
+            return bad
+    except ValueError:
+        return bad
+    return mm_status_text()
+
+
 def publish_signal(symbol, candles, events, sig, companion=False):
     """Enregistre le trade puis envoie : signal (+ image) au groupe, lot en privé à l'admin.
     `companion` : 2e ordre du même CHoCH (limit OB/FVG à côté de l'entrée directe) -> ne compte pas dans « signaux max ».
@@ -6512,6 +7084,10 @@ def publish_signal(symbol, candles, events, sig, companion=False):
     if signal_exists(key):
         return False
     if not get_bot_on():   # bot arrêté depuis Telegram : aucun nouveau signal (le suivi des positions continue)
+        return False
+    mm_why = mm_block_reason(companion)   # /mm : objectif / perte du jour, limites de trades (module OFF -> None)
+    if mm_why:
+        print(f"[{symbol}] {sig['side']} {sig['type']} ignoré : money management — {mm_why}")
         return False
     nb = news_block_info(symbol)
     if nb:   # filtre news : pas de nouveau signal autour d'une news (un seul message admin par news et par actif)
@@ -6528,7 +7104,8 @@ def publish_signal(symbol, candles, events, sig, companion=False):
         print(f"[{symbol}] {sig['side']} {sig['type']} ignoré ({n_open}/{max_pos} signal(s) encore ouvert(s) : pas de doublon)")
         return False
 
-    risk_usd = get_risk()
+    risk_usd, mm_note = mm_effective_risk()   # = get_risk() tant que /mm est OFF
+    mm_target = risk_usd if mm_on() else None
     leverage = get_leverage()
     lot_info = calc_lot(symbol, risk_usd, sig["risk"], price=sig["entry"])
     if lot_info["lot"] <= 0:
@@ -6573,15 +7150,32 @@ def publish_signal(symbol, candles, events, sig, companion=False):
         chart = None
 
     _deliver_signal(trade_id, symbol,
-                    admin_txt=admin_signal(symbol, sig, risk_usd, leverage, lot_info, margin, dec),
+                    admin_txt=admin_signal(symbol, sig, risk_usd, leverage, lot_info, margin, dec) + mm_note,
                     group_txt=group_signal(symbol, sig, n_open + 1, dec),
                     chart=chart)
 
     # 2) Exécution MT5 ensuite, dans un thread dédié : n'interrompt ni le scan ni le suivi des autres trades.
     #    Un échec est notifié à l'admin mais n'arrête JAMAIS le suivi TP / SL / BE du signal.
     if is_market and mt5_enabled:
-        threading.Thread(target=_run_mt5_execution, name=f"mt5-exec-{trade_id}", daemon=True,
-                         args=(trade_id, symbol, sig, lot_info["lot"])).start()
+        exec_lot = lot_info["lot"]
+        gate_ok = True
+        if RISK_ENABLED:
+            gate_ok, gate_lot, gate_risk = risk_gate_check(symbol, sig["entry"], sig["sl"],
+                                                           strategy=risk_strategy_label(sig), target_usd=mm_target)
+            if gate_ok:
+                exec_lot = gate_lot
+                if gate_lot != lot_info["lot"]:   # le suivi (partiels, BE, PnL) doit refléter le volume réellement envoyé
+                    update_trade(trade_id, lot=gate_lot, risk_usd=gate_risk)
+        if gate_ok:
+            threading.Thread(target=_run_mt5_execution, name=f"mt5-exec-{trade_id}", daemon=True,
+                             args=(trade_id, symbol, sig, exec_lot)).start()
+        else:
+            # Risk Gate : ordre bloqué (même MIN_LOT dépasse MAX_RISK_USD). Le signal reste publié et
+            # suivi (RR/BE/TP/SL) normalement ; seul l'envoi de l'ordre broker est annulé, SL inchangé.
+            update_trade(trade_id, exec_status="FAILED")
+            to_admin(f"⛔ {symbol} {sig['side']} {sig['type']} (trade #{trade_id})\n"
+                     f"[RISK GATE] ORDER BLOCKED — risk exceeds maximum ({MAX_RISK_USD:.2f}$).\n"
+                     f"Le suivi RR / BE / TP / SL continue normalement sur le groupe et ici.")
     return True
 
 
@@ -6600,17 +7194,34 @@ def _exec_filled_limit(t, dec):
         to_admin(f"⚠️ {symbol} {t['side']} LIMIT touché @ {_fmt(entry, dec)} mais le prix est déjà à {_fmt(px, dec)} "
                  f"(> {LIMIT_FILL_MAX_DRIFT_R:g} R du limit) : ordre MT5 NON envoyé. Le suivi continue.")
         return
-    update_trade(t["id"], exec_status="PENDING")
     sig = {"side": t["side"], "type": t["kind"], "entry": entry, "sl": sl, "tp": t["tp"]}
+    exec_lot = t["lot"]
+    gate_ok = True
+    if RISK_ENABLED:
+        gate_ok, gate_lot, gate_risk = risk_gate_check(symbol, entry, sl, strategy=risk_strategy_label(
+            dict(sig, key_suffix=("qml" if t["kind"] == "QML" else None))),
+            target_usd=((t.get("risk_usd") or None) if mm_on() else None))
+        if gate_ok:
+            exec_lot = gate_lot
+            if gate_lot != t["lot"]:
+                update_trade(t["id"], lot=gate_lot, risk_usd=gate_risk)
+    if not gate_ok:
+        update_trade(t["id"], exec_status="FAILED")
+        to_admin(f"⛔ {symbol} {t['side']} LIMIT touché @ {_fmt(entry, dec)}\n"
+                 f"[RISK GATE] ORDER BLOCKED — risk exceeds maximum ({MAX_RISK_USD:.2f}$).\n"
+                 f"Le suivi RR / BE / TP / SL continue normalement.")
+        return
+    update_trade(t["id"], exec_status="PENDING")
     threading.Thread(target=_run_mt5_execution, name=f"mt5-exec-{t['id']}", daemon=True,
-                     args=(t["id"], symbol, sig, t["lot"])).start()
+                     args=(t["id"], symbol, sig, exec_lot)).start()
 
 
 def _run_mt5_execution(trade_id, symbol, sig, lot):
     """Exécute l'ordre MT5 d'un signal déjà publié et suivi. Ne modifie jamais le statut de suivi (OPEN)."""
+    cid = _auto_client_id(trade_id, symbol, sig["side"])
     try:
         mt5_position_id = execute_mt5_order(symbol, sig["side"], lot, sig["entry"], sig["sl"], sig["tp"],
-                                            client_id=_auto_client_id(trade_id, symbol, sig["side"]))
+                                            client_id=cid, strategy=risk_strategy_label(sig))
     except Exception as e:   # filet de sécurité : ce thread ne doit jamais mourir en silence
         print(f"[{symbol}] exécution MT5 #{trade_id} : erreur inattendue : {e}")
         traceback.print_exc(limit=-3)
@@ -6626,6 +7237,11 @@ def _run_mt5_execution(trade_id, symbol, sig, lot):
         return
 
     update_trade(trade_id, exec_status="FAILED")
+    if cid in _RISK_BLOCKED:
+        to_admin(f"⛔ {symbol} {sig['side']} {sig['type']} (trade #{trade_id})\n"
+                 f"[RISK GATE] ORDER BLOCKED — risk exceeds maximum ({MAX_RISK_USD:.2f}$) avec le volume final du broker.\n"
+                 f"SL inchangé, rien n'est forcé. Le suivi RR / BE / TP / SL continue normalement.")
+        return
     if not _metaapi_ready.is_set():
         why = "MetaApi indisponible au moment du signal (API injoignable / compte MT5 non connecté)."
     else:
@@ -7055,7 +7671,7 @@ class _StFeed:
         mod.get_candles = self._get
         mod._apply_timeframe(1)
 
-    def _get(self, symbol, minutes=None):
+    def _get(self, symbol, minutes=None, count=None):
         tf = minutes or self.mod.TIMEFRAME_MIN
         if self.only_m1 and tf != 1:
             raise RuntimeError("UT supérieures indisponibles (test « M1 seul »)")
@@ -8109,6 +8725,110 @@ class TestLogVolumeReel(unittest.TestCase):
         self.assertIn("Prix d'ouverture réel broker : 84385.3", out)
 
 
+class TestRiskGateUniversel(unittest.TestCase):
+    """Risk Gate unique : 0.01 lot <= MAX_RISK_USD -> ok (0.55 / 0.70) ; > MAX (0.71 / 0.90) -> refusé, SL jamais modifié ;
+    plus grand volume possible au pas du broker ; dernier verrou sur le volume FINAL ; commun à toutes les stratégies."""
+
+    SYM, ENTRY = "XAUUSD", 2000.0
+
+    def setUp(self):
+        self.saved = (_E.RISK_ENABLED, _E.MAX_RISK_USD, _E.RISK_TARGET_USD, _E.MIN_LOT)
+        _E.RISK_ENABLED, _E.MAX_RISK_USD, _E.RISK_TARGET_USD, _E.MIN_LOT = True, 0.70, 0.70, 0.01
+        self.vpp = _E.value_per_point(self.SYM, self.ENTRY)
+
+    def tearDown(self):
+        _E.RISK_ENABLED, _E.MAX_RISK_USD, _E.RISK_TARGET_USD, _E.MIN_LOT = self.saved
+
+    def _gate(self, risk_at_min_lot, strategy="QML"):
+        dist = risk_at_min_lot / (0.01 * self.vpp)   # distance SL pour que 0.01 lot risque exactement ce montant
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            res = _E.risk_gate_check(self.SYM, self.ENTRY, self.ENTRY - dist, strategy=strategy)
+        return res, buf.getvalue()
+
+    def test_lot_minimum_respecte_le_max(self):
+        for r in (0.55, 0.70):
+            (ok, lot, risk), out = self._gate(r)
+            self.assertTrue(ok, r)
+            self.assertAlmostEqual(lot, 0.01)
+            self.assertAlmostEqual(risk, r, places=6)
+            self.assertIn("→ APPROVED", out)
+
+    def test_lot_minimum_depasse_le_max_est_refuse(self):
+        for r in (0.71, 0.90):
+            (ok, lot, risk), out = self._gate(r)
+            self.assertFalse(ok, r)
+            self.assertAlmostEqual(lot, 0.01)   # jamais forcé plus haut, jamais modifié
+            self.assertIn("→ REJECTED", out)
+            self.assertIn("[RISK GATE] ORDER BLOCKED — risk exceeds maximum", out)
+
+    def test_plus_grand_volume_possible_au_pas_du_broker(self):
+        # distance telle que 0.035 lot = 0.70$ -> lot 0.03 (0.60$), jamais 0.04 (0.80$)
+        dist = 0.70 / (0.035 * self.vpp)
+        with contextlib.redirect_stdout(io.StringIO()):
+            ok, lot, risk = _E.risk_gate_check(self.SYM, self.ENTRY, self.ENTRY + dist, strategy="CRT")
+        self.assertTrue(ok)
+        self.assertAlmostEqual(lot, 0.03)
+        self.assertLessEqual(risk, 0.70 + 1e-9)
+
+    def test_format_du_log_et_strategie(self):
+        (_, _, _), out = self._gate(0.55, strategy="CHS+BOS/CHOCH1")
+        self.assertIn("[RISK GATE] Strategy=CHS+BOS/CHOCH1 Entry=2000.0 SL=", out)
+        self.assertIn("Lot=0.01 Risk=$0.55 MAX=$0.70 → APPROVED", out)
+
+    def test_libelle_strategie_commun(self):
+        self.assertEqual(_E.risk_strategy_label({"type": "QML", "key_suffix": "qml"}), "QML")
+        self.assertEqual(_E.risk_strategy_label({"type": "CHOCH1", "strategy": "CRT", "key_suffix": "crt"}), "CRT/CHOCH1")
+        self.assertEqual(_E.risk_strategy_label({"type": "CHOCH2"}), "CHS+BOS/CHOCH2")
+
+    def test_risk_desactive_comportement_inchange(self):
+        _E.RISK_ENABLED = False
+        self.assertEqual(_E.risk_gate_check(self.SYM, 2000.0, 1990.0), (True, None, None))
+        self.assertEqual(_E.risk_gate_verify(self.SYM, 5.0, 2000.0, 1990.0), (True, None))
+
+    def test_sl_jamais_modifie_et_entry_sl_invalide_refuse(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(_E.risk_gate_check(self.SYM, 2000.0, 2000.0), (False, None, None))
+
+    def test_dernier_verrou_sur_le_volume_final(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            ok, risk = _E.risk_gate_verify(self.SYM, 0.10, 2000.0, 1999.5, strategy="QML")   # 0.10 x 0.5 x 100 = 5$
+        self.assertFalse(ok)
+        self.assertAlmostEqual(risk, 5.0)
+
+    def test_volume_broker_arrondi_au_dessus_bloque_avant_envoi(self):
+        """minVolume broker 0.10 > lot du gate 0.01 : _normalize_volume remonte à 0.10 -> risque > max -> AUCUN ordre envoyé."""
+        sent = []
+
+        class Conn:
+            async def create_market_buy_order(self, *a, **k):
+                sent.append(a)
+                return {"positionId": "1"}
+            create_market_sell_order = create_market_buy_order
+
+        async def fake_ready():
+            return Conn()
+
+        async def fake_spec(conn, sym):
+            return {"minVolume": 0.10, "volumeStep": 0.01, "maxVolume": 100, "digits": 2, "point": 0.01}
+        saved = (_E._ensure_terminal_ready, _E._get_symbol_spec, _E._log_symbol_diag)
+        _E._ensure_terminal_ready, _E._get_symbol_spec, _E._log_symbol_diag = fake_ready, fake_spec, (lambda *a, **k: None)
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                pid = _E.execute_mt5_order(self.SYM, "BUY", 0.01, 2000.0, 1999.7, 2001.0,
+                                           client_id="AB_9XAUB_11112222", strategy="CRT")
+        finally:
+            _E._ensure_terminal_ready, _E._get_symbol_spec, _E._log_symbol_diag = saved
+        self.assertIsNone(pid)
+        self.assertEqual(sent, [])   # rien n'est parti vers le broker
+        self.assertIn("AB_9XAUB_11112222", _E._RISK_BLOCKED)
+        out = buf.getvalue()
+        self.assertIn("[RISK GATE] Strategy=CRT", out)
+        self.assertIn("→ REJECTED", out)
+        self.assertIn("[RISK GATE] ORDER BLOCKED — risk exceeds maximum", out)
+
+
 class TestBEDoubleVerif(unittest.TestCase):
     """BE : SL calculé sur l'ouverture et le volume RÉELS du broker (spread inclus), net attendu >= +0.01 $, contrôle
     marché (bid/ask) avant envoi, relecture après envoi, TP conservé, jamais de SL dégradé."""
@@ -8400,6 +9120,151 @@ class TestAjoutsNewsStopUS30(unittest.TestCase):
             _E.get_candles, _E.TIMEFRAME_MIN, _E.PREVIEW_MAX_AGE, _E.liquidity_reading = saved
 
 
+class TestQmlSansLimiteAge(unittest.TestCase):
+    """L'âge d'un QML ne l'invalide pas : seule l'invalidation structurelle compte."""
+    _REAL_GET_CANDLES = staticmethod(_E.get_candles)   # (d'autres tests remplacent _E.get_candles par un faux flux)
+
+    @staticmethod
+    def _walk(seed, n=5000, tf=900):
+        import random
+        rnd, px, cs = random.Random(seed), 100.0, []
+        for i in range(n):
+            o = px
+            c = o + rnd.gauss(0, 0.35)
+            cs.append({"t": 1_700_000_000 + i * tf, "o": o, "h": max(o, c) + abs(rnd.gauss(0, 0.2)),
+                       "l": min(o, c) - abs(rnd.gauss(0, 0.2)), "c": c})
+            px = c
+        return cs
+
+    def setUp(self):
+        self._saved = _E.QML_ZONE_MAX_BARS
+
+    def tearDown(self):
+        _E.QML_ZONE_MAX_BARS = self._saved
+
+    def test_zone_ancienne_conservee_sans_limite(self):
+        if _E.np is None:
+            self.skipTest("numpy / pandas absents")
+        cs = self._walk(2)
+        _E.QML_ZONE_MAX_BARS = 0
+        zs = _E.qml_zones(cs)
+        n = len(cs)
+        old = [z for z in zs if n - 1 - z["j"] > 40]
+        self.assertTrue(old, "une zone vieille de plus de 40 bougies doit rester valide")
+        _E.QML_ZONE_MAX_BARS = 40   # ancienne limite, encore activable par variable d'environnement
+        zs40 = _E.qml_zones(cs)
+        self.assertFalse([z for z in zs40 if n - 1 - z["j"] > 40])
+        self.assertTrue(all(z in zs for z in zs40), "les zones récentes sont identiques avec ou sans limite")
+
+    def test_invalidation_structurelle_toujours_active(self):
+        if _E.np is None:
+            self.skipTest("numpy / pandas absents")
+        cs = self._walk(2)
+        _E.QML_ZONE_MAX_BARS = 0
+        z = [z for z in _E.qml_zones(cs) if len(cs) - 1 - z["j"] > 40][0]
+        k = z["j"] + 5   # une CLÔTURE traverse la zone après sa création => zone morte
+        px = (z["head"] + 1.0) if z["side"] == "SELL" else (z["head"] - 1.0)
+        cs2 = [dict(c) for c in cs]
+        cs2[k].update(c=px, h=max(cs2[k]["h"], px), l=min(cs2[k]["l"], px))
+        self.assertFalse([w for w in _E.qml_zones(cs2) if w["t"] == z["t"] and w["side"] == z["side"]])
+
+    def test_get_candles_historique_long_et_repli(self):
+        calls = []
+        saved = (_E._deriv, _E._only_closed)
+        _E._deriv = lambda sym, minutes=None, count=None: calls.append(count) or [{"t": 1, "o": 1, "h": 1, "l": 1, "c": 1}]
+        _E._only_closed = lambda raw, sec: raw
+        try:
+            self._REAL_GET_CANDLES("XAUUSD", 15, 5000)
+            self._REAL_GET_CANDLES("XAUUSD", 15)
+        finally:
+            _E._deriv, _E._only_closed = saved
+        self.assertEqual(calls, [5000, None], "historique long demandé pour le QML, inchangé pour le reste")
+
+
+class TestQmlMemoireEtHistoriqueProfond(TestQmlSansLimiteAge):
+    """Mémoire persistante des zones QML, pagination Deriv au-delà de 5000 bougies, historique long BTC."""
+
+    def test_memoire_garde_la_zone_hors_fenetre_puis_l_invalide(self):
+        if _E.np is None:
+            self.skipTest("numpy / pandas absents")
+        sym, cs = "TST_QML", self._walk(2)
+        _E.QML_ZONE_MAX_BARS = 0
+        _E._qml_store_init()
+        _E._q("DELETE FROM qml_zone_store WHERE symbol=?", (sym,), commit=True)
+        try:
+            fresh = _E.qml_zones(cs)
+            z_old = [z for z in fresh if len(cs) - 1 - z["j"] > 300][0]
+            _E.qml_merge_store(sym, 15, cs, fresh)
+            win = cs[-250:]   # fenêtre COURTE : la zone est plus ancienne que l'historique chargé
+            out = _E.qml_merge_store(sym, 15, win, _E.qml_zones(win))
+            same = lambda w: w["t"] == z_old["t"] and w["side"] == z_old["side"]
+            self.assertTrue(any(same(w) for w in out), "zone hors fenêtre conservée par la mémoire")
+            px = z_old["head"] + (1.0 if z_old["side"] == "SELL" else -1.0)
+            win2 = win + [{"t": win[-1]["t"] + 900, "o": px, "h": px + .1, "l": px - .1, "c": px}]
+            out2 = _E.qml_merge_store(sym, 15, win2, _E.qml_zones(win2))
+            self.assertFalse(any(same(w) for w in out2), "une clôture au-delà de la tête invalide la zone mémorisée")
+            out3 = _E.qml_merge_store(sym, 15, win2, _E.qml_zones(win2))
+            self.assertFalse(any(same(w) for w in out3), "une zone invalidée ne revient pas")
+        finally:
+            _E._q("DELETE FROM qml_zone_store WHERE symbol=?", (sym,), commit=True)
+
+    def test_deriv_pagination(self):
+        import bisect
+        epochs = [1_700_000_000 + i * 900 for i in range(12000)]
+        calls = []
+
+        def fake(payload):
+            calls.append(payload["end"])
+            e = len(epochs) if payload["end"] == "latest" else bisect.bisect_right(epochs, payload["end"])
+            sl = epochs[max(0, e - payload["count"]):e]
+            return {"candles": [{"epoch": t, "open": 1, "high": 2, "low": 0.5, "close": 1.5} for t in sl]}
+        saved = _E._deriv_request
+        _E._deriv_request = fake
+        try:
+            got = _E._deriv("frxXAUUSD", 15, 12000)
+            self.assertEqual(len(got), 12000)
+            self.assertEqual([c["t"] for c in got], sorted({c["t"] for c in got}))
+            self.assertEqual(len(calls), 3, "3 pages de 5000 max")
+            n = {"i": 0}
+
+            def flaky(payload):
+                n["i"] += 1
+                if n["i"] == 2:
+                    raise RuntimeError("page 2 indisponible")
+                return fake(payload)
+            _E._deriv_request = flaky
+            self.assertEqual(len(_E._deriv("frxXAUUSD", 15, 12000)), 5000, "page 2 en échec : on garde la page 1")
+            self.assertEqual(len(_E._deriv("frxXAUUSD", 15)), _E.CANDLES_LIMIT, "sans count : comportement inchangé")
+        finally:
+            _E._deriv_request = saved
+
+    def test_btc_historique_long_deriv_binance_repli(self):
+        big = [{"t": i, "o": 1, "h": 1, "l": 1, "c": 1} for i in range(6000)]
+        small = big[:300]
+        saved = (_E._deriv, _E._binance_long, _E._binance, _E._only_closed)
+        used = []
+        _E._only_closed = lambda raw, sec: raw
+        _E._binance = lambda sym, minutes=None: used.append("normal") or small
+        try:
+            _E._deriv = lambda sym, minutes=None, count=None: used.append("deriv:" + sym) or big
+            _E._binance_long = lambda *a: used.append("binance") or big
+            self.assertEqual(len(self._REAL_GET_CANDLES("BTCUSD", 15, 5000)), 6000)
+            self.assertEqual(used, ["deriv:cryBTCUSD"], "Deriv d'abord pour l'historique long")
+            used.clear()
+            _E._deriv = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("Deriv HS"))
+            self.assertEqual(len(self._REAL_GET_CANDLES("BTCUSD", 15, 5000)), 6000)
+            self.assertEqual(used, ["binance"], "repli Binance")
+            used.clear()
+            _E._binance_long = lambda *a: (_ for _ in ()).throw(RuntimeError("Binance HS"))
+            self.assertEqual(len(self._REAL_GET_CANDLES("BTCUSD", 15, 5000)), 300)
+            self.assertEqual(used, ["normal"], "dernier repli : historique normal")
+            used.clear()
+            self.assertEqual(len(self._REAL_GET_CANDLES("BTCUSD", 15)), 300)
+            self.assertEqual(used, ["normal"], "sans count : inchangé")
+        finally:
+            _E._deriv, _E._binance_long, _E._binance, _E._only_closed = saved
+
+
 class TestActifsEtEntrees(unittest.TestCase):
     """Actifs activables par paire (défaut : Gold + BTC) et interrupteurs indépendants entrée directe / ordre limit."""
 
@@ -8457,7 +9322,7 @@ def _selftest():
     suite, loader = unittest.TestSuite(), unittest.TestLoader()
     for cls in (TestRetracement, TestContinuation, TestInvalidationHTF, TestChop, TestGetExtTf,
                 TestLiquiditePure, TestM1NeDecidePasSeul, TestLogs, TestEntreeM5, TestNonRegression,
-                TestHtfM15, TestBE, TestEntreeOBFVG, TestSLTPCRT, TestSignauxSimultanes, TestLectureExtInt, TestModifyPositionGardeSLTP, TestBEDoubleVerif, TestClientId, TestLogVolumeReel, TestFiltresQualite, TestActifsEtEntrees, TestAjoutsNewsStopUS30):
+                TestHtfM15, TestBE, TestEntreeOBFVG, TestSLTPCRT, TestSignauxSimultanes, TestLectureExtInt, TestModifyPositionGardeSLTP, TestBEDoubleVerif, TestClientId, TestLogVolumeReel, TestRiskGateUniversel, TestFiltresQualite, TestActifsEtEntrees, TestAjoutsNewsStopUS30, TestQmlSansLimiteAge, TestQmlMemoireEtHistoriqueProfond):
         suite.addTests(loader.loadTestsFromTestCase(cls))
     return 0 if unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful() else 1
 
@@ -8769,7 +9634,9 @@ def _env_on(name, default=False):
 
 QML_MARKETS = [x for x in (y.strip().upper() for y in os.getenv(
     "QML_MARKETS", "XAUUSD,BTCUSD,EURUSD,GBPUSD,USDJPY,USDCHF,USDCAD,AUDUSD,NZDUSD,EURJPY,US30").split(",")) if x in SYMBOLS][:12]
-QML_ZONE_MAX_BARS = _env_int("QML_ZONE_MAX_BARS", 40)     # âge max d'une zone, en bougies du TF QML
+QML_ZONE_MAX_BARS = _env_int("QML_ZONE_MAX_BARS", 0)      # 0 = AUCUNE limite d'âge (défaut) : seule l'invalidation structurelle compte
+QML_HISTORY_BARS = _env_int("QML_HISTORY_BARS", 5000)     # fenêtre analysée à chaque nouvelle bougie (M15 ≈ 7 semaines)
+QML_DEEP_BARS = _env_int("QML_DEEP_BARS", 20000)          # balayage PROFOND au démarrage, par pages de 5000 (M15 ≈ 7 mois) ; les zones trouvées sont ensuite mémorisées
 QML_NEAR_ATR = _env_float("QML_NEAR_ATR", 1.0)            # M1 n'est analysé que si le prix est à < N x ATR(TF QML) de la zone
 QML_TF_CHOICES = (5, 15)                                  # TF de recherche du QML (minutes) ; M1 reste le TF de réaction
 QML_HTF_MINUTES = _env_int("QML_HTF_MINUTES", 60)         # TF du filtre supérieur (H1) : contexte uniquement, jamais déclencheur
@@ -8878,7 +9745,8 @@ def _qml_df(candles):
 
 def qml_zones(candles, P=None):
     """Zones QML M15 encore valides sur `candles` (bougies clôturées), en PRIX RÉELS, la plus récente d'abord.
-    Valide = créée (cassure de L1 confirmée) et jamais traversée par une CLÔTURE M15 (ni au-delà de la tête H2), âge <= QML_ZONE_MAX_BARS."""
+    Valide = créée (cassure de L1 confirmée) et jamais traversée par une CLÔTURE du TF QML (ni au-delà de la tête H2).
+    L'ÂGE n'invalide pas un QML (QML_ZONE_MAX_BARS = 0) ; la profondeur d'historique (QML_HISTORY_BARS) ne sert qu'à le trouver."""
     P = P or QML_PARAMS
     if np is None or pd is None or len(candles) < 80:
         return []   # (le TF des bougies est celui du TF QML : les indices j / head_i sont en bougies de ce TF)
@@ -8890,7 +9758,7 @@ def qml_zones(candles, P=None):
         zs = []
         _scan_sell(oo, hh, ll, cc, atr, P, zs)
         for s in zs:
-            if s["zlo"] is None or n - 1 - s["j"] > QML_ZONE_MAX_BARS:
+            if s["zlo"] is None or (QML_ZONE_MAX_BARS > 0 and n - 1 - s["j"] > QML_ZONE_MAX_BARS):
                 continue
             if sg == 1:
                 zlo, zhi, head, L1, Q = s["zlo"], s["zhi"], s["h2"], s["L1"], s["Q"]
@@ -8902,6 +9770,58 @@ def qml_zones(candles, P=None):
                 continue
             out.append(dict(side=side, zlo=float(zlo), zhi=float(zhi), head=float(head), L1=float(L1), Q=float(Q),
                             j=int(s["j"]), head_i=int(s["p"]), t=candles[s["j"]]["t"], t_head=candles[s["p"]]["t"]))
+    out.sort(key=lambda z: -z["j"])
+    return out
+
+
+_qml_store_ready = False
+
+
+def _qml_store_init():
+    global _qml_store_ready
+    if not _qml_store_ready:
+        _q("""CREATE TABLE IF NOT EXISTS qml_zone_store (
+            symbol TEXT, tf INTEGER, side TEXT, t INTEGER, t_head INTEGER,
+            zlo REAL, zhi REAL, head REAL, l1 REAL, q REAL, alive INTEGER, checked_t INTEGER,
+            PRIMARY KEY (symbol, tf, side, t, t_head))""", commit=True)
+        _qml_store_ready = True
+
+
+def qml_merge_store(symbol, tf, candles, fresh):
+    """Fusionne les zones détectées sur la fenêtre d'historique (`fresh`) avec la mémoire persistante.
+    - toute zone valide trouvée est enregistrée ; elle reste valide tant qu'une CLÔTURE ne la traverse pas ;
+    - une zone plus ancienne que la fenêtre est revalidée seulement avec les bougies postérieures à sa dernière vérification ;
+    - une zone encore dans la fenêtre mais plus détectée est invalidée.
+    Retourne la liste complète des zones valides (indices j / head_i virtuels pour les zones hors fenêtre)."""
+    _qml_store_init()
+    n, tf_sec = len(candles), tf * 60
+    t0, tl = candles[0]["t"], candles[-1]["t"]
+    key = lambda z: (z["side"], z["t"], z["t_head"])
+    fresh_keys = {key(z) for z in fresh}
+    for z in fresh:
+        _q("INSERT OR REPLACE INTO qml_zone_store VALUES (?,?,?,?,?,?,?,?,?,?,1,?)",
+           (symbol, tf, z["side"], z["t"], z["t_head"], z["zlo"], z["zhi"], z["head"], z["L1"], z["Q"], tl))
+    out = list(fresh)
+    for r in _q("SELECT * FROM qml_zone_store WHERE symbol=? AND tf=? AND alive=1", (symbol, tf)).fetchall():
+        if (r["side"], r["t"], r["t_head"]) in fresh_keys:
+            continue
+        where = (symbol, tf, r["side"], r["t"], r["t_head"])
+        if r["t"] >= t0:   # dans la fenêtre analysée mais non détectée => invalidée (ou conditions plus remplies)
+            _q("UPDATE qml_zone_store SET alive=0 WHERE symbol=? AND tf=? AND side=? AND t=? AND t_head=?", where, commit=True)
+            continue
+        start = max(r["checked_t"] or 0, r["t"])
+        after = [c["c"] for c in candles if c["t"] > start]
+        lvl = min(r["zhi"], r["head"]) if r["side"] == "SELL" else max(r["zlo"], r["head"])
+        dead = any(x > lvl for x in after) if r["side"] == "SELL" else any(x < lvl for x in after)
+        if dead:
+            _q("UPDATE qml_zone_store SET alive=0 WHERE symbol=? AND tf=? AND side=? AND t=? AND t_head=?", where, commit=True)
+            continue
+        _q("UPDATE qml_zone_store SET checked_t=? WHERE symbol=? AND tf=? AND side=? AND t=? AND t_head=?", (tl,) + where, commit=True)
+        vj = n - 1 - int(round((tl - r["t"]) / tf_sec))   # indice virtuel (négatif = avant la fenêtre) : sert au tri seulement
+        vh = n - 1 - int(round((tl - r["t_head"]) / tf_sec))
+        out.append(dict(side=r["side"], zlo=r["zlo"], zhi=r["zhi"], head=r["head"], L1=r["l1"], Q=r["q"],
+                        j=vj, head_i=vh, t=r["t"], t_head=r["t_head"]))
+    _q("DELETE FROM qml_zone_store WHERE alive=0 AND checked_t < ?", (tl - 90 * 86400,), commit=True)
     out.sort(key=lambda z: -z["j"])
     return out
 
@@ -8918,9 +9838,22 @@ def _qml_load_m15(symbol, force=False, tf=None):
     if not force and now - st["try"] < 20:
         return st
     st["try"] = now
-    m15 = get_candles(symbol, tf)
+    deep = not st.get("deep_done")   # 1er chargement du processus : balayage profond ; ensuite fenêtre normale + mémoire
+    want = QML_DEEP_BARS if deep else QML_HISTORY_BARS
+    try:
+        m15 = get_candles(symbol, tf, want)
+        if deep:
+            st["deep_done"] = True
+    except Exception:
+        m15 = get_candles(symbol, tf)   # historique long refusé : on garde au moins l'historique normal
     if len(m15) >= 80:
-        st.update(t=m15[-1]["t"], zones=qml_zones(m15), atr=atr_series(m15)[-1], close=m15[-1]["c"])
+        fresh = qml_zones(m15)
+        try:
+            zones = qml_merge_store(symbol, tf, m15, fresh)
+        except Exception:
+            traceback.print_exc(limit=-3)
+            zones = fresh   # mémoire indisponible : on garde au moins les zones de la fenêtre
+        st.update(t=m15[-1]["t"], zones=zones, atr=atr_series(m15)[-1], close=m15[-1]["c"])
     return st
 
 
@@ -8985,7 +9918,7 @@ def qml_analyze(symbol, force=False, tf=None):
     """Analyse QML d'un marché (lecture seule). `status` : NO_QML | FAR | WAIT | SKIP | PROPOSAL | SL_EXCESSIF | SL_INVALIDE.
     Une PROPOSITION n'est jamais un ordre exécuté."""
     if np is None or pd is None:
-        return {"symbol": symbol, "status": "ERREUR", "msg": "numpy / pandas requis pour le module QML"}
+        return {"symbol": symbol, "status": "ERREUR", "msg": "numpy / pandas manquent sur le serveur : ajoute « numpy » et « pandas » dans requirements.txt puis redéploie"}
     dec = SYMBOLS[symbol]["decimals"]
     tf = tf or get_qml_tf()
     htf_on = get_qml_htf_on()
@@ -9049,6 +9982,60 @@ def qml_analyze(symbol, force=False, tf=None):
     return r
 
 
+QML_CTX_SHOW = _env_on("QML_CTX_SHOW", True)              # AFFICHAGE SEUL : FVG/OB de contexte sur le graphique / texte d'analyse QML
+QML_CTX_NEAR_ATR = _env_float("QML_CTX_NEAR_ATR", 1.5)    # un FVG/OB est montré s'il est à < N x ATR(TF QML) de la zone QML
+QML_CTX_MAX = 3                                           # nombre max de FVG/OB dessinés
+
+
+def qml_context(symbol, tf, zone, atr=None):
+    """Contexte VISUEL d'une zone QML : FVG / OB déjà produits par `find_pois` (même source que 📈 Analyse technique),
+    de même sens que la zone, formés APRÈS la tête (liquidité) et proches de la zone.
+    LECTURE SEULE : ne modifie ni `r`, ni la zone, ni aucun état ; n'est lu par aucune condition de signal."""
+    out = {"pois": []}
+    if not zone:
+        return out
+    d = 1 if zone["side"] == "BUY" else -1
+    tol = QML_CTX_NEAR_ATR * (atr or 0)
+    found = {}
+    for ptf in dict.fromkeys((tf, QML_HTF_MINUTES)):
+        try:
+            raw = _ctx_candles(symbol, ptf)
+            pois = find_pois(raw, ptf, d) if len(raw) > 2 * SWING_DEPTH + 1 else []
+        except Exception:
+            continue
+        for q in pois:
+            t_f = q["t_valid"] - ptf * 60            # heure de la bougie qui valide le POI
+            gap = max(q["lo"] - zone["zhi"], zone["zlo"] - q["hi"], 0.0)
+            if t_f < zone["t_head"] or (atr and gap > tol):
+                continue
+            found[(ptf, q["kind"], q["lo"], q["hi"])] = dict(q, t_f=t_f, gap=gap)
+    out["pois"] = sorted(found.values(), key=lambda q: (q["gap"], -q["t_f"]))[:QML_CTX_MAX]
+    return out
+
+
+def qml_context_text(r):
+    """Bloc texte « séquence » ajouté aux analyses MANUELLES uniquement (jamais au message de proposition live)."""
+    if not QML_CTX_SHOW or not r or not r.get("zone"):
+        return ""
+    z, dec, tf = r["zone"], r.get("dec", 2), r.get("tf") or get_qml_tf()
+    ctx = qml_context(r["symbol"], tf, z, r.get("atr15"))
+    if ctx["pois"]:
+        poi = " · ".join(f"{_tf_lbl(q['tf'])} {q['kind']} {_fmt(q['lo'], dec)}-{_fmt(q['hi'], dec)}" for q in ctx["pois"])
+    else:
+        poi = "aucun à proximité"
+    m1 = r.get("m1")
+    if m1 is None:
+        m1_txt = "non lu (prix éloigné)"
+    elif not m1.get("in_zone"):
+        m1_txt = "prix pas encore dans la zone"
+    else:
+        m1_txt = ("✅ " + str(m1.get("label"))) if m1.get("ok") else "❌ pas de confirmation"
+    return ("\n\n<b>Séquence (contexte visuel)</b>\n"
+            f"✅ Liquidité balayée · ✅ Cassure L1 · FVG/OB : {poi}\n"
+            f"✅ Zone QML · M1 : {m1_txt}\n"
+            "ℹ️ FVG/OB = information seulement, aucun effet sur le signal.")
+
+
 def make_qml_chart(symbol, tf, r=None, n_show=120, extend=25):
     """Graphique QML (lecture seule) : bougies du TF, zones QML valides (la plus proche en plein, les autres atténuées),
     tête / liquidité balayée, ligne de cassure BOS/CHoCH (L1), et si une entrée est proposée : entrée, SL, TP."""
@@ -9059,12 +10046,23 @@ def make_qml_chart(symbol, tf, r=None, n_show=120, extend=25):
         from matplotlib.patches import Rectangle
     except ImportError:
         return None
-    candles = get_candles(symbol, tf)
+    try:
+        candles = get_candles(symbol, tf, QML_HISTORY_BARS)
+    except Exception:
+        candles = get_candles(symbol, tf)
     if len(candles) < 30:
         return None
-    zones = _qml_load_m15(symbol, False, tf)["zones"][:3]
-    dec = SYMBOLS[symbol]["decimals"]
+    px0 = (r or {}).get("price") or candles[-1]["c"]
+    all_z = _qml_load_m15(symbol, False, tf)["zones"]
     main_z = (r or {}).get("zone")
+    dist = lambda z: 0.0 if z["zlo"] <= px0 <= z["zhi"] else min(abs(px0 - z["zlo"]), abs(px0 - z["zhi"]))
+    zones = sorted(all_z, key=lambda z: (dist(z), -z["j"]))[:3]   # les 3 plus proches du prix (anciennes incluses)
+    if main_z and not any(z["t"] == main_z["t"] and z["side"] == main_z["side"] for z in zones):
+        zones = [main_z] + zones[:2]
+    dec = SYMBOLS[symbol]["decimals"]
+    oldest = min([z["t_head"] for z in zones] or [candles[-1]["t"]])
+    idx_old = next((k for k, c in enumerate(candles) if c["t"] >= oldest), len(candles) - n_show)
+    n_show = min(max(n_show, len(candles) - idx_old + 15), 700)   # la vue remonte jusqu'à la tête de la zone la plus ancienne
     os.makedirs(CHART_DIR, exist_ok=True)
     files = sorted((os.path.join(CHART_DIR, f) for f in os.listdir(CHART_DIR)), key=os.path.getmtime)
     for f in files[:-40]:
@@ -9101,6 +10099,20 @@ def make_qml_chart(symbol, tf, r=None, n_show=120, extend=25):
                         va="top" if z["side"] == "SELL" else "bottom")
         lows += [z["zlo"], z["head"], z["L1"]]
         highs += [z["zhi"], z["head"], z["L1"]]
+    ctx_pois = []
+    if QML_CTX_SHOW and zones:   # FVG/OB de contexte de la zone principale (affichage seul, aucune décision)
+        try:
+            ctx_pois = qml_context(symbol, tf, main_z or zones[0], (r or {}).get("atr15") or atr_series(candles)[-1])["pois"]
+        except Exception:
+            traceback.print_exc(limit=-3)
+        for q in ctx_pois:
+            col = "#26a69a" if q["d"] == 1 else "#ef5350"
+            xf = pos.get(q["t_f"], 0)
+            ax.add_patch(Rectangle((xf, q["lo"]), x_end - xf, q["hi"] - q["lo"], facecolor=col, alpha=0.10,
+                                   edgecolor=col, lw=0.8, ls=":"))
+            ax.text(xf + 0.5, q["hi"], f"{_tf_lbl(q['tf'])} {q['kind']}", color=col, fontsize=6, va="bottom")
+            lows.append(q["lo"])
+            highs.append(q["hi"])
     price = (r or {}).get("price") or view[-1]["c"]
     ax.axhline(price, color="#ffffff", lw=0.7, ls=":")
     if not (r and r.get("status") == "PROPOSAL"):   # (en cas de proposition, l'étiquette ENTRÉE tient lieu de prix)
@@ -9120,7 +10132,7 @@ def make_qml_chart(symbol, tf, r=None, n_show=120, extend=25):
     lo, hi = min(lows), max(highs)
     pad = (hi - lo) * 0.05 or 1
     ax.set_ylim(lo - pad, hi + pad)
-    title = f"{symbol} {_tf_lbl(tf)} — QML" + ("" if zones else " : aucune zone valide")
+    title = f"{symbol} {_tf_lbl(tf)} — QML" + ("" if zones else " : aucune zone valide") + (" + FVG/OB" if ctx_pois else "")
     ax.set_title(title, color="white", fontsize=11)
     ax.tick_params(colors="#888888", labelsize=7)
     ax.set_xticks([])
@@ -9203,6 +10215,10 @@ def analyse_all(symbol):
     try:
         res = qml_analyze(symbol, force=True)
         txt = qml_analysis_text(res)
+        try:
+            txt += qml_context_text(res)   # contexte FVG/OB : information seulement
+        except Exception:
+            traceback.print_exc(limit=-3)
         chart = None
         try:
             chart = make_qml_chart(symbol, res.get("tf") or get_qml_tf(), res)
@@ -9213,6 +10229,16 @@ def analyse_all(symbol):
         traceback.print_exc(limit=-3)
         out.append((f"📊 <b>ANALYSE QML — {symbol}</b>\n\n⚠️ Analyse impossible ({type(e).__name__}).", None))
     return out
+
+
+def _qml_age_txt(z):
+    """Âge de la zone, à titre INFORMATIF (ne rend jamais la zone invalide)."""
+    mins = max(0, int((time.time() - z["t"]) // 60))
+    if mins < 120:
+        return f"{mins} min"
+    if mins < 2880:
+        return f"{mins // 60} h"
+    return f"{mins // 1440} j"
 
 
 def qml_analysis_text(r):
@@ -9229,7 +10255,7 @@ def qml_analysis_text(r):
         return head + f"\nBiais {_tf_lbl(QML_HTF_MINUTES)} indisponible (données insuffisantes).\n\nAction : ⏸ SKIP"
     z = r["zone"]
     zone = f"{_fmt(z['zlo'], dec)} — {_fmt(z['zhi'], dec)}"
-    base = f"\nDirection : {r['side']}\nType : QML {r['side']}\n\nZONE QML :\n{zone}\n"
+    base = f"\nDirection : {r['side']}\nType : QML {r['side']}\n\nZONE QML :\n{zone}\nCréée il y a {_qml_age_txt(z)} · toujours valide (non invalidée)\n"
     if st == "HTF":
         bias = "haussier" if r.get("htf_bias") == 1 else "baissier"
         return head + base + (f"\nFiltre {_tf_lbl(QML_HTF_MINUTES)} : ❌ biais {bias}, QML {r['side']} contre le contexte\n\n"
@@ -9256,7 +10282,7 @@ def qml_analysis_text(r):
             f"{icon} <b>{r['side']} POTENTIEL</b> · QML + M1 {r['confirm']}\n⚠️ PROPOSITION — pas un ordre exécuté.")
 
 
-def qml_build_signal(r):
+def qml_build_signal(r):  # noqa: E302
     """Signal compatible avec publish_signal (même format que build_signal ; sig["zone"] = {tf, kind, d, lo, hi})."""
     d = 1 if r["side"] == "BUY" else -1
     z = r["zone"]
