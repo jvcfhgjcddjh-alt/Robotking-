@@ -5,3 +5,5 @@ websocket-client>=1.8
 python-dotenv>=1.0
 matplotlib>=3.10.8
 metaapi-cloud-sdk
+numpy
+pandas
