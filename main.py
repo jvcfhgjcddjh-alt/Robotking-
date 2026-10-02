@@ -1,5 +1,6 @@
 
 
+
 #!/usr/bin/env python3
 """AlphaBot BOS + CHoCH — Gold & BTC — version en un seul fichier.
 
@@ -5842,7 +5843,7 @@ def _menu_keyboard():
         [{"text": "⏱ Timeframe", "callback_data": "menu:timeframe"}, {"text": "🎭 Médias", "callback_data": "menu:medias"}],
         [{"text": "📊 Stats", "callback_data": "menu:stats"}, {"text": "📈 Positions", "callback_data": "menu:trades"}],
         [{"text": "📊 Analyse", "callback_data": "ana:home"}, {"text": "📰 News", "callback_data": "news:home"}],
-        [{"text": "⚙️ Paramètres signal", "callback_data": "menu:signal"}],
+        [{"text": "⚙️ Paramètres signal", "callback_data": "menu:signal"}, {"text": "💰 Money management", "callback_data": "mm:home"}],
         [{"text": "🏦 Compte", "callback_data": "acc:home"}, {"text": "👤 Manuel", "callback_data": "man:home"}],
         [{"text": "📈 Trade", "callback_data": "mtr:home"}, {"text": "📌 Positions broker", "callback_data": "mpos:home"}],
         [{"text": "🔄 Actualiser", "callback_data": "menu:home"}],
@@ -6412,7 +6413,7 @@ def _handle_update(u):
                     res = qml_analyze(sym, force=True, tf=a_tf)
                     txt = qml_analysis_text(res)
                     try:
-                        txt += qml_context_text(res)   # contexte FVG/OB : information seulement
+                        txt += qml_context_text(res) + qml_history_text(res)   # contexte FVG/OB + historique analysé : information seulement
                     except Exception:
                         traceback.print_exc(limit=-3)
                     nb = news_block_info(sym)
@@ -6431,6 +6432,8 @@ def _handle_update(u):
                 ack = "Analyse envoyée"
         elif data.startswith("qml:"):
             ack = _qml_callback(cq, data[4:])
+        elif data.startswith("mm:"):
+            ack = _mm_callback(cq, data[3:])
         elif data.startswith("ana:fond:"):
             sym = _ANALYSE_SYMS.get(data[9:])
             if sym:
@@ -7004,6 +7007,31 @@ def mm_status_text():
         lines.append(f"⚠️ Risk Gate : MAX_RISK_USD = {MAX_RISK_USD:g} $ (variable Render). Les ordres MT5 ne dépasseront pas ce plafond "
                      f"tant que tu ne le relèves pas toi-même.")
     return "\n".join(lines)
+
+
+def _mm_keyboard():
+    return _with_back({"inline_keyboard": [
+        [{"text": "🔴 Désactiver /mm" if mm_on() else "🟢 Activer /mm", "callback_data": "mm:toggle"}],
+        [{"text": "🛑 À l'objectif : STOP" if mm_cfg()["action"] == "stop" else "⏸ À l'objectif : PAUSE", "callback_data": "mm:action"}],
+        [{"text": "📖 Comment régler (commandes)", "callback_data": "mm:help"}, {"text": "🔄 Actualiser", "callback_data": "mm:home"}],
+        [{"text": "♻️ Reset séries / gains", "callback_data": "mm:reset"}],
+    ]})
+
+
+def _mm_callback(cq, arg):
+    """Boutons « mm:... » du menu 💰 Money management. Les VALEURS se tapent avec /mm (voir l'aide)."""
+    ack = ""
+    if arg == "toggle":
+        set_setting("mm_on", "0" if mm_on() else "1"); ack = "MM : " + ("ON" if mm_on() else "OFF")
+    elif arg == "action":
+        set_setting("mm_action", "pause" if mm_cfg()["action"] == "stop" else "stop"); ack = "Action : " + mm_cfg()["action"]
+    elif arg == "reset":
+        set_setting("mm_reset_ts", int(time.time())); ack = "Remis à zéro"
+    if arg == "help":
+        _edit(cq, MM_HELP, _with_back({"inline_keyboard": [[{"text": "◀️ Retour", "callback_data": "mm:home"}]]}))
+    else:
+        _edit(cq, mm_status_text() + "\n\n✍️ Pour changer une valeur, tape la commande (ex. <code>/mm sl 4 2</code>) — bouton 📖 pour la liste.", _mm_keyboard())
+    return ack
 
 
 def mm_command(args):
@@ -9743,7 +9771,7 @@ def _qml_df(candles):
                         index=pd.to_datetime([x["t"] for x in candles], unit="s", utc=True))
 
 
-def qml_zones(candles, P=None):
+def qml_zones(candles, P=None, include_dead=False):
     """Zones QML M15 encore valides sur `candles` (bougies clôturées), en PRIX RÉELS, la plus récente d'abord.
     Valide = créée (cassure de L1 confirmée) et jamais traversée par une CLÔTURE du TF QML (ni au-delà de la tête H2).
     L'ÂGE n'invalide pas un QML (QML_ZONE_MAX_BARS = 0) ; la profondeur d'historique (QML_HISTORY_BARS) ne sert qu'à le trouver."""
@@ -9766,10 +9794,18 @@ def qml_zones(candles, P=None):
                 zlo, zhi, head, L1, Q = -s["zhi"], -s["zlo"], -s["h2"], -s["L1"], -s["Q"]
             after = c[s["j"] + 1:]
             dead = bool((after > min(zhi, head)).any()) if side == "SELL" else bool((after < max(zlo, head)).any())
+            z_dead = None
             if dead:
-                continue
-            out.append(dict(side=side, zlo=float(zlo), zhi=float(zhi), head=float(head), L1=float(L1), Q=float(Q),
-                            j=int(s["j"]), head_i=int(s["p"]), t=candles[s["j"]]["t"], t_head=candles[s["p"]]["t"]))
+                if not include_dead:
+                    continue
+                lvl = min(zhi, head) if side == "SELL" else max(zlo, head)
+                hit = (after > lvl) if side == "SELL" else (after < lvl)
+                z_dead = candles[s["j"] + 1 + int(np.argmax(hit))]["t"]   # 1re clôture qui traverse la zone / la tête
+            zd = dict(side=side, zlo=float(zlo), zhi=float(zhi), head=float(head), L1=float(L1), Q=float(Q),
+                      j=int(s["j"]), head_i=int(s["p"]), t=candles[s["j"]]["t"], t_head=candles[s["p"]]["t"])
+            if z_dead is not None:   # uniquement avec include_dead=True (affichage) : le moteur de signal ne l'utilise jamais
+                zd.update(dead=True, t_dead=z_dead)
+            out.append(zd)
     out.sort(key=lambda z: -z["j"])
     return out
 
@@ -9853,7 +9889,7 @@ def _qml_load_m15(symbol, force=False, tf=None):
         except Exception:
             traceback.print_exc(limit=-3)
             zones = fresh   # mémoire indisponible : on garde au moins les zones de la fenêtre
-        st.update(t=m15[-1]["t"], zones=zones, atr=atr_series(m15)[-1], close=m15[-1]["c"])
+        st.update(t=m15[-1]["t"], zones=zones, atr=atr_series(m15)[-1], close=m15[-1]["c"], n=len(m15), t0=m15[0]["t"])
     return st
 
 
@@ -9925,6 +9961,7 @@ def qml_analyze(symbol, force=False, tf=None):
     r = {"symbol": symbol, "status": "NO_QML", "dec": dec, "tf": tf, "htf_on": htf_on}
     st = _qml_load_m15(symbol, force, tf)
     zones, atr = st["zones"], st["atr"]
+    r.update(hist_n=st.get("n"), hist_t0=st.get("t0"))   # information d'affichage : taille réelle de l'historique analysé
     if not zones or not atr:
         return r
     if htf_on:   # H1 = filtre : seulement les QML dans le sens du biais ; HTF OFF -> aucune requête H1
@@ -10036,6 +10073,47 @@ def qml_context_text(r):
             "ℹ️ FVG/OB = information seulement, aucun effet sur le signal.")
 
 
+QML_PAST_SHOW = _env_on("QML_PAST_SHOW", True)            # AFFICHAGE SEUL : QML passés / invalidés (gris) sur le graphique d'analyse
+QML_PAST_MAX = 4                                          # nombre max de zones passées dessinées
+
+
+def qml_past_zones(candles, t_from):
+    """QML PASSÉS pour l'affichage : (a) zones détectées avec les règles du moteur mais déjà invalidées par une clôture ;
+    (b) zones « larges » (EQH non exigé) absentes du moteur strict — jamais tradées. LECTURE SEULE : le moteur de signal
+    (qml_zones sans include_dead, QML_PARAMS) n'est pas modifié."""
+    from dataclasses import replace as _dc_replace
+    key = lambda z: (z["side"], z["t"], z["t_head"])
+    strict = qml_zones(candles, include_dead=True)
+    skeys, found = {key(z) for z in strict}, {}
+    for z in strict:
+        if z.get("dead"):
+            found[key(z)] = dict(z, kind="past")
+    try:
+        for z in qml_zones(candles, P=_dc_replace(QML_PARAMS, require_eqh=False), include_dead=True):
+            if key(z) not in skeys:
+                found[key(z)] = dict(z, kind="loose")
+    except Exception:
+        traceback.print_exc(limit=-3)
+    vis = sorted((z for z in found.values() if z["t_head"] >= t_from), key=lambda z: -z["j"])
+    firm = [z for z in vis if z["kind"] == "past"][:2]   # les QML « stricts » invalidés d'abord, puis les larges
+    return sorted(firm + [z for z in vis if z["kind"] == "loose"][:max(0, QML_PAST_MAX - len(firm))], key=lambda z: -z["j"])
+
+
+def qml_history_text(r):
+    """Ligne de diagnostic ajoutée aux analyses manuelles : combien de bougies ont RÉELLEMENT été analysées."""
+    n, t0 = (r or {}).get("hist_n"), (r or {}).get("hist_t0")
+    if not n or not t0:
+        return ""
+    tf = r.get("tf") or get_qml_tf()
+    out = f"\n\n🕓 Historique analysé : {n} bougies {_tf_lbl(tf)} (depuis le {datetime.fromtimestamp(t0, timezone.utc).strftime('%d/%m')})"
+    if n < 0.9 * QML_HISTORY_BARS:
+        out += (f"\n⚠️ Seulement {n} bougies reçues sur {QML_HISTORY_BARS} demandées : la source d'historique long n'a pas répondu "
+                f"(repli sur l'historique court).")
+    if QML_PAST_SHOW:
+        out += "\n⬜ Zones grises = QML passés / invalidés (affichage seul) · « large* » = règles assouplies (EQH non exigé), jamais tradé."
+    return out
+
+
 def make_qml_chart(symbol, tf, r=None, n_show=120, extend=25):
     """Graphique QML (lecture seule) : bougies du TF, zones QML valides (la plus proche en plein, les autres atténuées),
     tête / liquidité balayée, ligne de cassure BOS/CHoCH (L1), et si une entrée est proposée : entrée, SL, TP."""
@@ -10099,6 +10177,27 @@ def make_qml_chart(symbol, tf, r=None, n_show=120, extend=25):
                         va="top" if z["side"] == "SELL" else "bottom")
         lows += [z["zlo"], z["head"], z["L1"]]
         highs += [z["zhi"], z["head"], z["L1"]]
+    past = []
+    if QML_PAST_SHOW:   # QML passés / invalidés en gris (affichage seul : aucune décision ne les lit)
+        try:
+            live = {(z["side"], z["t"], z["t_head"]) for z in zones}
+            past = [z for z in qml_past_zones(candles, view[0]["t"]) if (z["side"], z["t"], z["t_head"]) not in live]
+        except Exception:
+            traceback.print_exc(limit=-3)
+        for z in past:
+            gry, loose = "#8a8f98", z["kind"] == "loose"
+            xj, xh = pos.get(z["t"]), pos.get(z["t_head"])
+            x_from = xj if xj is not None else 0
+            x_to = pos.get(z["t_dead"], x_end) if z.get("dead") else x_end
+            ax.add_patch(Rectangle((x_from, z["zlo"]), max(x_to - x_from, 1), z["zhi"] - z["zlo"], facecolor=gry, alpha=0.16,
+                                   edgecolor=gry, lw=0.8, ls=":" if loose else "-"))
+            ax.text(x_from + 0.5, z["zhi"], f"QML {'large*' if loose else 'passé'} {z['side']}", color=gry, fontsize=6, va="bottom")
+            if xh is not None:
+                ax.plot([max(xh - 3, 0), xh + 3], [z["head"]] * 2, color=gry, lw=0.9)
+                if xj is not None:
+                    ax.plot([xh, xj], [z["L1"]] * 2, color=gry, lw=0.7, ls="--")
+            lows += [z["zlo"], z["head"]]
+            highs += [z["zhi"], z["head"]]
     ctx_pois = []
     if QML_CTX_SHOW and zones:   # FVG/OB de contexte de la zone principale (affichage seul, aucune décision)
         try:
@@ -10132,7 +10231,7 @@ def make_qml_chart(symbol, tf, r=None, n_show=120, extend=25):
     lo, hi = min(lows), max(highs)
     pad = (hi - lo) * 0.05 or 1
     ax.set_ylim(lo - pad, hi + pad)
-    title = f"{symbol} {_tf_lbl(tf)} — QML" + ("" if zones else " : aucune zone valide") + (" + FVG/OB" if ctx_pois else "")
+    title = f"{symbol} {_tf_lbl(tf)} — QML" + ("" if zones else " : aucune zone valide") + (" + FVG/OB" if ctx_pois else "") + (f" · {len(past)} passé(s)" if past else "")
     ax.set_title(title, color="white", fontsize=11)
     ax.tick_params(colors="#888888", labelsize=7)
     ax.set_xticks([])
@@ -10216,7 +10315,7 @@ def analyse_all(symbol):
         res = qml_analyze(symbol, force=True)
         txt = qml_analysis_text(res)
         try:
-            txt += qml_context_text(res)   # contexte FVG/OB : information seulement
+            txt += qml_context_text(res) + qml_history_text(res)   # contexte FVG/OB + historique analysé : information seulement
         except Exception:
             traceback.print_exc(limit=-3)
         chart = None
@@ -10392,5 +10491,4 @@ if __name__ == "__main__":
     if "--selftest" in sys.argv:
         sys.exit(_selftest())
     main()
-
 
