@@ -23,7 +23,7 @@ nouvelle bougie clôturée du timeframe choisi.
 Risque : le lot est calculé à partir du risque $ choisi + SL, SANS solde de compte.
 Le levier ne sert qu'à afficher une marge indicative (jamais utilisé pour le lot).
 Grille de sortie par défaut : paliers RR1/RR2/RR3 notifiés au groupe, BE (SL -> entrée) à
-RR2, TP finale à RR4 (réglable : BE depuis Telegram (/be), ou via BE_RR / TP_RR / RR_LEVELS). Aucun PnL $ n'est affiché,
+RR2, TP finale à RR3 (réglable : BE depuis Telegram (/be), ou via BE_RR / TP_RR / RR_LEVELS). Aucun PnL $ n'est affiché,
 ni au groupe ni en privé Leader — uniquement des R et des taux de réussite par RR.
 
 Réglages : section 1 (CONFIGURATION) ou fichier .env (voir README) — ex. TIMEFRAME=M15.
@@ -275,6 +275,29 @@ USE_MTF_FIBONACCI_PD_FILTER = _env_bool("MTF_FIBONACCI_PD_FILTER", _env_bool("US
 MTF_FIB_TF = {1: 15, 3: 15, 5: 60, 15: 240}
 MTF_FIB_MIN_RETRACE = 0.5   # niveau minimum (50%) à atteindre pour considérer la zone Premium/Discount comme mitigée
 
+# --- Filtre M15 « VRAIE IMPULSION + STRUCTURE + FIBONACCI » ----------------------------------------
+# use_m15_impulse_filter = true/false : activable/désactivable à tout moment (ENV M15_IMPULSE_FILTER, ou à chaud via
+# /m15imp on|off et le bouton « 📈 IMPULSION M15 » du menu ⚙️ Paramètres signal ; le choix Telegram est mémorisé en base).
+# N'ajoute AUCUNE nouvelle règle de score : filtre seulement les CHoCH déjà produits par la logique existante.
+# Ordre de lecture : structure M15 -> vraie tendance -> vraie impulsion (swing High/Low structurel, jamais une micro-jambe)
+# -> Fibonacci sur toute la jambe -> retracement atteint -> confluence OB/FVG (-> sweep) -> CHoCH d'entrée.
+# DÉFAUT = OFF : le filtre ne doit JAMAIS se réactiver seul si la base SQLite est perdue (même logique que MTF_FIBONACCI_PD_FILTER).
+USE_M15_IMPULSE_FILTER = _env_bool("M15_IMPULSE_FILTER", False)
+M15_IMP_DEPTH = _env_int("M15_IMP_DEPTH", 5)                      # profondeur des pivots M15 (> SWING_DEPTH : ignore les micro-jambes)
+M15_IMP_MIN_LEG_ATR = _env_float("M15_IMP_MIN_LEG_ATR", 2.0)      # amplitude mini de l'impulsion (en ATR M15), sinon micro-jambe ignorée
+M15_IMP_LOOKBACK = _env_int("M15_IMP_LOOKBACK", 200)               # remontée max (bougies M15) pour trouver l'origine de l'impulsion
+M15_IMP_MIN_RETRACE = _env_float("M15_IMP_MIN_RETRACE", 0.5)      # zone de réaction principale : 50 % et au-delà
+M15_IMP_EARLY_MIN = _env_float("M15_IMP_EARLY_MIN", 0.236)        # sous ce niveau : jamais de signal ; entre EARLY_MIN et 50 % : seulement avec POI fort
+M15_IMP_NEED_POI = _env_bool("M15_IMP_NEED_POI", True)            # à 50 %+ : exiger une confluence OB / FVG (M15 ou H1) -- « 50 % ne s'utilise pas seul »
+M15_IMP_NEED_SWEEP = _env_bool("M15_IMP_NEED_SWEEP", False)       # à 50 %+ : exiger aussi un sweep sur le point de retournement (optionnel)
+
+# Valeurs de DÉPART des nouveaux filtres : tout se règle ensuite depuis Telegram (menu ⚙️ Paramètres signal), rien à toucher sur Render.
+BOS_REAL_RETRACE = 0.5                 # « vrai BOS » : retracement mini (en % de la jambe) après la cassure
+POI_FILTER_TF = "BOTH"                 # filtre POI HTF : M15 | H1 | BOTH
+BOS_RETRACE_CHOICES = (0.4, 0.45, 0.5)
+M15_RETRACE_CHOICES = (0.382, 0.5, 0.618)
+POI_TF_CHOICES = ("M15", "H1", "BOTH")
+
 EXT_DEPTH = _env_int("EXT_DEPTH", 5)   # profondeur (bougies de chaque côté) pour confirmer un pivot swing de liquidité externe
 EQ_TOL_ATR = 0.1                       # tolérance EQH/EQL : 2 pivots à moins de EQ_TOL_ATR ATR sont considérés au même niveau
 POI_MAX_AGE = _env_int("POI_MAX_AGE", 60)                  # âge max d'un POI (OB / FVG), en bougies de sa propre UT
@@ -284,20 +307,30 @@ SWEEP_LOOKBACK = _env_int("SWEEP_LOOKBACK", 10)            # bougies d'entrée c
 SL_BUFFER_ATR = _env_float("SL_BUFFER_ATR", 0.2)   # buffer au-delà de la ligne du BOS (0.1 laissait le SL pile sur la mèche -> balayé par le bruit)
 MIN_SL_ATR = _env_float("MIN_SL_ATR", 0.8)         # SL minimum (en ATR) -- 0.3 donnait des SL de quelques points sur BTC en M1/M5, balayés par le spread/bruit
 MAX_SL_ATR = _env_float("MAX_SL_ATR", 6.0)         # au-delà : signal ignoré (BOS trop ancien)
+# Seuils de la détection SWEEP -> CHoCH -> verrou (machine SETUP50), tous modifiables ici ou par variable d'environnement.
+SWEEP_EQUAL_ATR = _env_float("SWEEP_EQUAL_ATR", 0.20)        # equal highs / lows : écart < N x ATR14
+SWEEP_MIN_ATR = _env_float("SWEEP_MIN_ATR", 0.10)            # mèche au-delà du niveau : au moins N x ATR14 ...
+SWEEP_MAX_ATR = _env_float("SWEEP_MAX_ATR", 1.00)            # ... et au plus N x ATR14 (au-delà : cassure BOS, pas un sweep)
+SWEEP_LEVEL_MIN_AGE = _env_int("SWEEP_LEVEL_MIN_AGE", 20)    # niveau balayé : vieux d'au moins N bougies (et jamais balayé)
+SWEEP_CLOSE_BACK = _env_int("SWEEP_CLOSE_BACK", 3)           # clôture de retour : sur la bougie du sweep ou l'une des N suivantes
+SWING_FRACTAL = _env_int("SE_SWING_DEPTH", 5)                # swing fractal : N bougies de chaque côté
+CHOCH_WINDOW = _env_int("CHOCH_WINDOW", 10)                  # le CHoCH doit survenir dans les N bougies après le sweep valide
+CHOCH_BODY_ATR_MIN = _env_float("CHOCH_BODY_ATR_MIN", 1.00)  # CHoCH : corps >= N x ATR14 (ou FVG créé), sinon ignoré
+MAX_BOUGIES = _env_int("MAX_BOUGIES", _env_int("SE_MAX_BOUGIES", 20))   # le verrou se lève N bougies après le CHoCH si pas d'entrée
 # Plancher ABSOLU du SL, en % du prix d'entrée : filet de sécurité indépendant de l'ATR (l'ATR d'une UT basse comme M1
 # peut lui-même être minuscule en marché calme -> MIN_SL_ATR seul ne suffit pas à empêcher un SL de quelques points).
 # Réglable par actif ci-dessous (SYMBOLS[...]["min_sl_pct"]), sinon valeur par défaut MIN_SL_PCT.
 MIN_SL_PCT = _env_float("MIN_SL_PCT", 0.0015)      # 0.15% par défaut (ex. ~120 pts sur du BTC à 80 000)
 BE_RR = _env_float("BE_RR", 2.0)          # RR auquel le SL est déplacé à l'entrée (BE) : valeur de départ, ensuite /be sur Telegram
 BE_RR_CHOICES = (0.5, 1, 1.5, 2, 3)       # boutons du menu BE (n'importe quelle valeur > 0 via /be 0.75)
-TP_RR = _env_float("TP_RR", 4.0)          # RR de la TP finale (clôture complète, pas de TP1/TP2)
+TP_RR = _env_float("TP_RR", 3.0)          # RR de la TP finale (clôture complète, pas de TP1/TP2) ; modifiable : /rr ou menu RR
 RR_LEVELS = (1.0, 2.0, 3.0)                # paliers intermédiaires notifiés au groupe (hors TP finale)
 # ⚙️ PARAMÈTRES SIGNAL (menu Telegram) : TP_RR, HTF_FILTER et le timeframe ci-dessus ne sont que les valeurs de
 # DÉPART ; le choix fait sur Telegram est mémorisé en base (table settings) et prime après chaque redémarrage.
 SIGNAL_RR_CHOICES = (1, 2, 3, 4)     # boutons « RR1 | RR2 | RR3 | RR4 »
 SIGNAL_TF_CHOICES = (1, 5, 15)       # boutons « M1 | M5 | M15 » (timeframe du déclenchement final)
 MAX_POSITIONS = _env_int("MAX_POSITIONS", 1)     # signaux ouverts max par actif (1 = aucun nouveau signal tant que le précédent n'est pas clôturé) ; ensuite /maxpos
-MAX_POSITIONS_CHOICES = (1, 2, 3, 5, 10)               # boutons du menu « signaux simultanés »
+MAX_POSITIONS_CHOICES = (1, 2, 3, 4, 5, 10)               # boutons du menu « signaux simultanés »
 
 # --- Type d'entrée : DIRECT (au marché) ou LIMIT (on attend le retour du prix) ---------------
 # ENTRY_MODE : MARKET = toujours direct (par défaut) | LIMIT = toujours limit | BOTH = le bot choisit et le précise.
@@ -2156,6 +2189,61 @@ def set_mtf_fib_filter(on):
     set_setting("mtf_fib_filter", "1" if on else "0")
 
 
+def get_m15_imp_filter():
+    """Filtre M15 vraie impulsion + structure + Fibonacci : ON/OFF, réglable à tout moment. Dernier choix Telegram
+    ('m15_imp_filter' en base) sinon USE_M15_IMPULSE_FILTER (ENV / défaut OFF)."""
+    v = get_setting("m15_imp_filter")
+    if v is not None:
+        return str(v).strip().lower() in ("1", "true", "yes", "on")
+    return USE_M15_IMPULSE_FILTER
+
+
+def set_m15_imp_filter(on):
+    set_setting("m15_imp_filter", "1" if on else "0")
+
+
+def _get_float_setting(key, default):
+    try:
+        return float(get_setting(key))
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def get_m15_min_retrace():
+    """Retracement mini (zone de réaction principale) du filtre M15 impulsion : réglage Telegram, sinon valeur de départ."""
+    return _get_float_setting("m15_min_retrace", M15_IMP_MIN_RETRACE)
+
+
+def set_m15_min_retrace(v):
+    set_setting("m15_min_retrace", float(v))
+
+
+def get_m15_need_poi():
+    return _get_bool_setting("m15_need_poi", M15_IMP_NEED_POI)
+
+
+def get_m15_need_sweep():
+    return _get_bool_setting("m15_need_sweep", M15_IMP_NEED_SWEEP)
+
+
+def get_bos_real():
+    """Filtre « vrai BOS » : un BOS n'est validé que si le prix a retracé au moins get_bos_retrace() de la jambe. OFF par défaut."""
+    return _get_bool_setting("bos_real", False)
+
+
+def get_bos_retrace():
+    return _get_float_setting("bos_retrace", BOS_REAL_RETRACE)
+
+
+def get_poi_filter():
+    """Filtre POI HTF (OB / FVG M15 et/ou H1 mitigé dans le sens du trade) : OFF par défaut."""
+    return _get_bool_setting("poi_filter", False)
+
+
+def get_poi_filter_tf():
+    return _get_choice("poi_filter_tf", POI_FILTER_TF, POI_TF_CHOICES)
+
+
 def _get_bool_setting(key, default):
     v = get_setting(key)
     if v is None:
@@ -3226,7 +3314,7 @@ def _mtf_block(symbol, tr, final):
     """Synthèse de l'analyse multi-UT d'un CHoCH d'entrée : HTF bias / liquidité externe / liquidité interne / état du
     retracement / CHoCH M5 / trigger / POI / état final. Toujours les mêmes lignes, « — » pour une étape non atteinte."""
     rows = (("HTF bias", "htf"), ("liquidité ext.", "ext"), ("liquidité int.", "int"), ("retracement", "retr"),
-            ("CHoCH M5", "choch5"), (f"trigger {_tf_lbl(TIMEFRAME_MIN)}", "trigger"), ("POI", "poi"))
+            ("CHoCH M5", "choch5"), (f"trigger {_tf_lbl(TIMEFRAME_MIN)}", "trigger"), ("POI", "poi"), ("impulsion M15", "m15_imp"), ("vrai BOS", "bos_txt"), ("POI HTF", "poi_txt"))
     print(f"[{symbol}] ▸ analyse multi-UT")
     for lbl, k in rows:
         print(f"[{symbol}]   {lbl:<15}: {tr.get(k, '—')}")
@@ -3429,6 +3517,201 @@ def mtf_fib_pd_filter(symbol, ev, trace=None):
     return True, None
 
 
+# --- Filtre M15 : vraie impulsion + structure + Fibonacci (voir USE_M15_IMPULSE_FILTER) ---------------------
+def _m15_pivots(raw, depth):
+    """Pivots swing (profondeur `depth`) d'une série de bougies : (highs, lows), chacun [(index, prix)]."""
+    highs, lows = [], []
+    for p in range(depth, len(raw) - depth):
+        win = raw[p - depth:p + depth + 1]
+        if raw[p]["h"] == max(x["h"] for x in win) and all(raw[p]["h"] > raw[k]["h"] for k in range(p - depth, p)):
+            highs.append((p, raw[p]["h"]))
+        if raw[p]["l"] == min(x["l"] for x in win) and all(raw[p]["l"] < raw[k]["l"] for k in range(p - depth, p)):
+            lows.append((p, raw[p]["l"]))
+    return highs, lows
+
+
+def m15_impulse_context(symbol, c=None):
+    """Contexte M15 « vraie impulsion » : retourne (info | None, motif_si_None).
+
+    1) Structure : cassures de structure d'`analyze` avec une profondeur de pivot M15_IMP_DEPTH (plus large que le M1/M5 :
+       une petite jambe interne ne casse aucun pivot structurel, donc ne remplace jamais la tendance principale).
+    2) Impulsion = la dernière cassure dont la jambe fait au moins M15_IMP_MIN_LEG_ATR x ATR M15 (les micro-jambes plus récentes
+       sont ignorées). Origine = vrai extrême (High pour un SELL, Low pour un BUY) entre la cassure précédente et cette cassure,
+       jamais un micro-high / micro-low interne. Fin = extrême atteint depuis (la mesure suit la jambe tant que le prix ne
+       fait pas un nouvel extrême opposé). Impulsion invalidée si le prix dépasse son origine.
+    3) Retracement : plus forte excursion depuis le bout de la jambe, en % de la jambe (mitigation mémorisée, pas ponctuelle).
+    `c` = bougies de l'UT d'entrée (pour inclure la bougie M15 en cours de formation)."""
+    raw = _ctx_candles(symbol, 15)
+    depth, n = M15_IMP_DEPTH, len(raw)
+    if n <= 2 * depth + 1:
+        return None, "pas assez de bougies M15"
+    evs = analyze(raw, depth)
+    if not evs:
+        return None, "aucune cassure de structure M15"
+    atr = atr_series(raw)
+    imp = None
+    for k in range(len(evs) - 1, -1, -1):
+        e = evs[k]
+        d, bi = e["dir"], e["i"]
+        # début du mouvement : dernière cassure de sens OPPOSÉ (le vrai sommet / creux de la série de cassures de même sens
+        # se trouve après elle) -- un pullback interne (micro-high / micro-low) ne devient donc jamais l'origine du Fibonacci.
+        start = next((evs[j]["i"] for j in range(k - 1, -1, -1) if evs[j]["dir"] != d), 0)
+        start = max(start, bi - M15_IMP_LOOKBACK)
+        rng = range(min(start, bi), bi + 1)
+        o = max(rng, key=lambda j: raw[j]["h"]) if d == -1 else min(rng, key=lambda j: raw[j]["l"])
+        seg = list(raw[o:])
+        if c:   # bougie M15 en cours : les bougies d'entrée postérieures à la dernière M15 clôturée
+            t_next = raw[-1]["t"] + 15 * 60
+            seg += [x for x in c if x["t"] >= t_next]
+        if d == -1:
+            hi = seg[0]["h"]
+            lo_i = min(range(len(seg)), key=lambda j: seg[j]["l"])
+            lo = seg[lo_i]["l"]
+            broke = any(x["c"] > hi + 1e-9 for x in raw[o + 1:])   # corps M15 clôturé au-delà de l'origine (une mèche = sweep)
+        else:
+            lo = seg[0]["l"]
+            hi_i = max(range(len(seg)), key=lambda j: seg[j]["h"])
+            hi = seg[hi_i]["h"]
+            broke = any(x["c"] < lo - 1e-9 for x in raw[o + 1:])
+        hi_, lo_ = hi, lo
+        a = atr[min(bi, len(atr) - 1)] or 0.0
+        if (hi_ - lo_) < M15_IMP_MIN_LEG_ATR * a:
+            continue   # micro-jambe : jamais utilisée comme impulsion principale
+        if broke:
+            return None, ("impulsion M15 invalidée : une bougie M15 a CLÔTURÉ au-delà de son origine "
+                          f"({'High' if d == -1 else 'Low'} {hi if d == -1 else lo:.2f}) -- structure à relire")
+        # retracement maximal atteint depuis le bout de la jambe
+        if d == -1:
+            tail = seg[lo_i + 1:]
+            ext = max((x["h"] for x in tail), default=lo_)
+            retr = min(1.0, (ext - lo_) / (hi_ - lo_))   # mèche au-delà de l'origine = sweep : plafonné à 100 %
+        else:
+            tail = seg[hi_i + 1:]
+            ext = min((x["l"] for x in tail), default=hi_)
+            retr = min(1.0, (hi_ - ext) / (hi_ - lo_))
+        imp = {"dir": d, "hi": hi_, "lo": lo_, "ext": ext, "retr": max(0.0, retr), "break_i": bi, "ev": e}
+        break
+    if imp is None:
+        return None, f"aucune impulsion M15 significative (>= {M15_IMP_MIN_LEG_ATR:g} ATR) -- micro-jambes ignorées"
+    # structure par pivots (HH/HL vs LH/LL) : sert de garde-fou, jamais de seul déclencheur
+    ph, pl = _m15_pivots(raw, depth)
+    struct = "mixte"
+    if len(ph) >= 2 and len(pl) >= 2:
+        hh, hl = ph[-1][1] > ph[-2][1], pl[-1][1] > pl[-2][1]
+        lh, ll = ph[-1][1] < ph[-2][1], pl[-1][1] < pl[-2][1]
+        struct = "HH/HL" if (hh and hl) else "LH/LL" if (lh and ll) else "mixte"
+    imp["struct"] = struct
+    rng_ = imp["hi"] - imp["lo"]
+    imp["lvl"] = (lambda r: imp["lo"] + r * rng_) if imp["dir"] == -1 else (lambda r: imp["hi"] - r * rng_)
+    imp["mid"] = imp["lvl"](0.5)
+    return imp, None
+
+
+def m15_impulse_filter(symbol, c, ev, trace=None):
+    """Filtre M15 vraie impulsion + structure + Fibonacci (voir get_m15_imp_filter) : ne fait que filtrer un CHoCH déjà
+    produit. Retourne (autorisé: bool, motif_de_refus | None). Aucune donnée -> refus (jamais de passage « à l'aveugle »)."""
+    side = "BUY" if ev["dir"] == 1 else "SELL"
+    try:
+        imp, why = m15_impulse_context(symbol, c)
+    except Exception as e:
+        imp, why = None, f"lecture M15 impossible ({type(e).__name__}: {e})"
+    if imp is None:
+        if trace is not None:
+            trace["m15_imp"] = f"indisponible -- {why}"
+        return False, f"Filtre M15 impulsion : {why}"
+    d = imp["dir"]
+    dtxt = "baissière" if d == -1 else "haussière"
+    pct = imp["retr"] * 100
+    txt = (f"impulsion M15 {dtxt} {imp['hi']:.2f}→{imp['lo']:.2f} ({'HIGH→LOW' if d == -1 else 'LOW→HIGH'}) · "
+           f"retracement max {pct:.0f}% (50% = {imp['mid']:.2f}) · structure {imp['struct']}")
+    if trace is not None:
+        trace["m15_imp"] = txt
+    if ev["dir"] != d:
+        return False, (f"{side} contre l'impulsion M15 {dtxt} -- une petite jambe inverse n'est qu'un retracement "
+                       f"(seuls les {'SELL' if d == -1 else 'BUY'} sont autorisés)")
+    if (d == -1 and imp["struct"] == "HH/HL") or (d == 1 and imp["struct"] == "LH/LL"):
+        return False, f"structure par pivots M15 ({imp['struct']}) contredit l'impulsion {dtxt}"
+    if imp["retr"] < M15_IMP_EARLY_MIN:
+        return False, (f"retracement M15 {pct:.0f}% < {M15_IMP_EARLY_MIN * 100:.1f}% -- trop peu retracé pour trader "
+                       f"(50% = {imp['mid']:.2f})")
+    # POI structurels (OB / FVG) M15 + H1 dans le sens du trade, touchés par le retracement
+    a, b = sorted((imp["lvl"](M15_IMP_EARLY_MIN), imp["ext"]))
+    pois = []
+    for tf in (15, HTF_MINUTES):
+        try:
+            pois += find_pois(_ctx_candles(symbol, tf), tf, d)
+        except Exception:
+            pass
+    hit = [x for x in pois if x["hi"] >= a and x["lo"] <= b]
+    poi_txt = _poi_txt(hit[0], SYMBOLS[symbol]["decimals"]) if hit else None
+    try:
+        sweep = bool(_sweep_at(c, _turn_index(c, ev), d)[1])
+    except Exception:
+        sweep = False
+    if trace is not None:
+        trace["m15_imp"] = txt + f" · POI {poi_txt or 'aucun'} · sweep {'oui' if sweep else 'non'}"
+    if imp["retr"] < get_m15_min_retrace():
+        if not hit:
+            return False, (f"retracement M15 {pct:.0f}% (< 50%) = signal précoce -- aucun POI OB/FVG fort dans cette zone, "
+                           f"attendre 50% ({imp['mid']:.2f}) et au-delà")
+    else:
+        if get_m15_need_poi() and not hit:
+            return False, (f"retracement M15 {pct:.0f}% atteint mais 50% ne se trade pas seul -- aucune confluence OB/FVG/imbalance")
+        if get_m15_need_sweep() and not sweep:
+            return False, "confluence 50%+ sans sweep de liquidité sur le point de retournement"
+    return True, None
+
+
+def bos_real_check(symbol, c, ev, trace=None):
+    """Filtre « vrai BOS » (get_bos_real) : la cassure de structure M15 n'est qualifiée de vrai BOS que si le prix a ensuite
+    retracé au moins get_bos_retrace() (40 / 45 / 50 %) de la jambe. Sinon : faux BOS / cassure non confirmée -> pas de signal.
+    Retourne (autorisé, motif_de_refus | None). Pas de lecture M15 -> refus."""
+    try:
+        imp, why = m15_impulse_context(symbol, c)
+    except Exception as e:
+        imp, why = None, f"lecture M15 impossible ({type(e).__name__})"
+    if imp is None:
+        if trace is not None:
+            trace["bos_txt"] = f"indisponible -- {why}"
+        return False, f"Vrai BOS M15 : {why}"
+    need, got = get_bos_retrace(), imp["retr"]
+    if trace is not None:
+        trace["bos_txt"] = f"retracement {got * 100:.0f}% / mini {need * 100:.0f}% -- {'BOS validé' if got >= need else 'BOS non validé'}"
+    if got < need:
+        return False, (f"BOS M15 non validé : retracement {got * 100:.0f}% < {need * 100:.0f}% de la jambe "
+                       f"(un vrai BOS est suivi d'un retracement vers 50 %)")
+    return True, None
+
+
+def poi_mitigation_check(symbol, c, ev, trace=None):
+    """Filtre POI HTF (get_poi_filter) : au moment du CHoCH, le point de retournement doit avoir MITIGÉ un OB ou un FVG
+    (imbalance) M15 et/ou H1 dans le sens du trade. POI non mitigé / zone indécise -> pas de signal.
+    Retourne (autorisé, motif_de_refus | None)."""
+    mode = get_poi_filter_tf()
+    tfs = {"M15": (15,), "H1": (HTF_MINUTES,), "BOTH": (15, HTF_MINUTES)}[mode]
+    d, dec = ev["dir"], SYMBOLS[symbol]["decimals"]
+    found, hit = 0, None
+    for tf in tfs:
+        try:
+            pois = find_pois(_ctx_candles(symbol, tf), tf, d)
+        except Exception:
+            pois = []
+        found += len(pois)
+        for p in pois:
+            mit, react = poi_reaction(c, ev, p)
+            if mit and (hit is None or react):
+                hit = (p, react)
+    lbl = "/".join(_tf_lbl(t) for t in tfs)
+    if hit is None:
+        if trace is not None:
+            trace["poi_txt"] = f"{found} POI {lbl} détecté(s), aucun mitigé"
+        return False, (f"aucun OB/FVG {lbl} mitigé ({found} détecté(s)) -- zone non touchée ou indécise, signal ignoré")
+    p, react = hit
+    if trace is not None:
+        trace["poi_txt"] = f"{_poi_txt(p, dec)} mitigé" + (f" · {react}" if react else "")
+    return True, None
+
+
 def sl_by_mode(c, ev, a, symbol):
     """SL de l'entrée directe selon le mode réglé. Retourne (sl, étiquette). Un mode indisponible retombe sur STRUCT (loggé)."""
     d, i = ev["dir"], ev["i"]
@@ -3577,7 +3860,7 @@ def crt_build(c, ev, symbol):
             return []
         htf_txt = f" + tendance {_tf_lbl(htf_ref_tf())} {_dir_txt(trend)}"
     base = {"htf": False, "htf_mode": "OFF", "setup": f"CRT {_tf_lbl(ctx['ref_tf'])} -> {TF_LABEL}{htf_txt}", "poi": None,
-            "mtf_fib_on": False, "mtf_fib": None, "crt": ctx, "strategy": "CRT"}
+            "mtf_fib_on": False, "mtf_fib": None, "m15_imp_on": False, "m15_imp": None, "crt": ctx, "strategy": "CRT"}
     out = []
     if get_entry_direct():
         entry = c[i]["c"]
@@ -3928,6 +4211,22 @@ def build_signal(c, ev, symbol=None, multi=False):
         ok, why = mtf_fib_pd_filter(symbol, ev, trace)
         if not ok:
             return _rej(why)
+    # Filtre M15 vraie impulsion + structure + Fibonacci : indépendant des deux filtres ci-dessus (OFF par défaut).
+    m15_imp_on = bool(symbol and get_m15_imp_filter())
+    if m15_imp_on:
+        ok, why = m15_impulse_filter(symbol, c, ev, trace)
+        if not ok:
+            return _rej(why)
+    bos_on = bool(symbol and get_bos_real())
+    if bos_on:
+        ok, why = bos_real_check(symbol, c, ev, trace)
+        if not ok:
+            return _rej(why)
+    poi_on = bool(symbol and get_poi_filter())
+    if poi_on:
+        ok, why = poi_mitigation_check(symbol, c, ev, trace)
+        if not ok:
+            return _rej(why)
     qf = quality_check(c, ev, SYMBOLS[symbol]["decimals"] if symbol else 5)   # filtres qualité : toujours calculés
     why = quality_reject(qf)                                                    # ... refusent seulement s'ils sont ON
     if why:
@@ -3963,6 +4262,8 @@ def build_signal(c, ev, symbol=None, multi=False):
             "rr": tp_rr, "htf": htf_on, "htf_mode": htf_mode, "be_rr": be_rr, "tf": TF_LABEL,   # affichés sur le signal
             "setup": setup, "poi": poi,   # CONTINUATION (COMPLET) / TENDANCE M15 ... (M15) ; None si filtre HTF OFF
             "mtf_fib_on": mtf_fib_on, "mtf_fib": trace.get("mtf_fib"),   # affichage filtre Fibonacci HTF Premium/Discount
+            "m15_imp_on": m15_imp_on, "m15_imp": trace.get("m15_imp"),   # affichage filtre M15 impulsion
+            "bos_txt": trace.get("bos_txt"), "poi_txt": trace.get("poi_txt"),
             "qf": dict(qf, ind={"ok": True, "txt": "n/a (entrée directe : l'IND se juge sur le limit OB/FVG)"}),
         }
         # Entrée LIMIT : retest du niveau cassé (la ligne du CHoCH), avec le même SL structurel.
@@ -4003,7 +4304,8 @@ def build_signal(c, ev, symbol=None, multi=False):
             out.append(_accept(sig))
     if get_entry_limit():
         lim, why = poi_limit_signal(c, ev, symbol, tp_rr, be_rr, dict(
-            htf=htf_on, htf_mode=htf_mode, setup=setup, poi=poi, mtf_fib_on=mtf_fib_on, mtf_fib=trace.get("mtf_fib")))
+            htf=htf_on, htf_mode=htf_mode, setup=setup, poi=poi, mtf_fib_on=mtf_fib_on, mtf_fib=trace.get("mtf_fib"),
+            m15_imp_on=m15_imp_on, m15_imp=trace.get("m15_imp"), bos_txt=trace.get("bos_txt"), poi_txt=trace.get("poi_txt")))
         if lim:
             ind = ind_check(c, ev, lim["entry"])
             lim["qf"] = dict(qf, ind=ind)
@@ -4015,6 +4317,609 @@ def build_signal(c, ev, symbol=None, multi=False):
         elif symbol and DEBUG_CHOCH:
             print(f"[{symbol}] limit OB/FVG non placé : {why}")
     return out
+
+
+# ============================================================================
+# 4b. MACHINE À ÉTATS SETUP50 (remplace l'entrée directe sur le CHoCH de la stratégie principale)
+#
+#   IDLE → SWEEP → CHOCH_VALIDE → MESURE → ZONE_50_ACTIVE → ENTREE → IDLE
+#
+# CHoCH ≠ entrée : le CHoCH (clôture du corps + déplacement) valide la direction et démarre la mesure du Fibonacci
+# (ancre mobile, jamais figée). L'entrée n'existe qu'après un retracement >= 50 % (mèche comprise) ET une bougie de
+# rejet (engulfing / pin bar / doji) à sa clôture. SL derrière le sweep, TP selon le RR Telegram (/rr).
+# SWEEP = swing fractal (ou equal highs/lows) intact et vieux d'au moins 20 bougies, mèche 0.1-1 ATR, clôture de retour en <= 3 bougies ;
+# CHoCH = clôture du corps au-delà du dernier swing opposé, <= 10 bougies après le sweep, corps >= 1 ATR ou FVG (seuils en tête de fichier).
+# Verrou : un seul setup actif par actif et par timeframe, levé à l'entrée / sweep cassé / 100 % / MAX_BOUGIES ; pause après N SL consécutifs. Interrupteur : SETUP_ENGINE=0 sur
+# Render pour revenir à l'ancienne logique (entrée directe sur CHoCH), sans redéployer de code.
+# ============================================================================
+from dataclasses import dataclass as _se_dataclass  # noqa: E402  (alias : l'import « dataclass » de la section 10 reste intact)
+
+SETUP_ENGINE = _env_bool("SETUP_ENGINE", True)
+
+
+SE_IDLE = "IDLE"
+SE_SWEEP = "SWEEP"
+SE_CHOCH_VALIDE = "CHOCH_VALIDE"
+SE_MESURE = "MESURE"
+SE_ZONE_50_ACTIVE = "ZONE_50_ACTIVE"
+SE_ENTREE = "ENTREE"
+
+SE_ALLOWED = {
+    SE_IDLE: (SE_SWEEP,),
+    SE_SWEEP: (SE_CHOCH_VALIDE, SE_IDLE),
+    SE_CHOCH_VALIDE: (SE_MESURE, SE_IDLE),            # jamais SE_ENTREE
+    SE_MESURE: (SE_ZONE_50_ACTIVE, SE_IDLE),
+    SE_ZONE_50_ACTIVE: (SE_MESURE, SE_ENTREE, SE_IDLE),
+    SE_ENTREE: (SE_IDLE,),
+}
+
+
+class SEIllegalTransition(RuntimeError):
+    pass
+
+
+@_se_dataclass
+class SEParams:
+    atr_period: int = 14
+    swing_depth: int = SWING_FRACTAL
+    sweep_equal_atr: float = SWEEP_EQUAL_ATR
+    sweep_min_atr: float = SWEEP_MIN_ATR
+    sweep_max_atr: float = SWEEP_MAX_ATR
+    level_min_age: int = SWEEP_LEVEL_MIN_AGE
+    sweep_close_back: int = SWEEP_CLOSE_BACK
+    choch_window: int = CHOCH_WINDOW
+    choch_body_atr: float = CHOCH_BODY_ATR_MIN
+    max_bougies: int = MAX_BOUGIES
+    fib_entry: float = _env_float("SE_FIB_ENTRY", 0.50)          # zone d'entrée
+    fib_invalid: float = _env_float("SE_FIB_INVALID", 1.00)      # annulation : retour au sweep
+    reject_same_candle: bool = _env_bool("SE_REJECT_SAME_CANDLE", True)  # la bougie qui touche le 50 % peut être la bougie de rejet
+    rr: float = 3.0                                              # le RR réel vient du réglage Telegram (get_tp_rr)
+    sl_buffer_atr: float = _env_float("SE_SL_BUFFER_ATR", 0.10)  # marge derrière l'extrême du sweep
+    max_sl_atr: float = MAX_SL_ATR
+    pause_after_sl: int = _env_int("SE_PAUSE_AFTER_SL", 3)       # pause après N SL consécutifs
+    pause_candles: int = _env_int("SE_PAUSE_CANDLES", 60)
+
+
+def se_signal_log(symbol, sig):
+    """Ligne de log d'un signal SETUP50 : ancre Fibo (prix, heure), retracement atteint, bougie de rejet, timeframe."""
+    f = sig["fib"]
+    t = f.get("anchor_t")
+    hr = datetime.fromtimestamp(t, timezone.utc).strftime("%Y-%m-%d %H:%M UTC") if t else "?"
+    return (f"[{symbol}] SETUP50 {sig['side']} · ancre Fibo {f['anchor']:.5g} ({hr}) · retracement atteint "
+            f"{f['retr_max']:.0%} (zone {f['level']:.5g}) · rejet {f['reject']} · timeframe {sig['tf']}")
+
+
+def _se_flip(x):
+    """Miroir de prix : ramène un achat à une vente."""
+    return {"o": -x["o"], "h": -x["l"], "l": -x["h"], "c": -x["c"]}
+
+
+def se_rejection(prev, x, d):
+    """Bougie de rejet dans le sens d (-1 vente, +1 achat) : 'engulfing', 'pin bar', 'doji' ou None."""
+    if d == 1:
+        prev, x = _se_flip(prev), _se_flip(x)
+    o, h, l, c = x["o"], x["h"], x["l"], x["c"]
+    rng = h - l
+    if rng <= 0:
+        return None
+    body = abs(c - o)
+    upper = h - max(o, c)
+    lower = min(o, c) - l
+    if c < o and prev["c"] > prev["o"] and o >= prev["c"] and c <= prev["o"]:
+        return "engulfing"
+    if upper >= 2 * body and upper >= 0.6 * rng:
+        return "pin bar"
+    if body <= 0.1 * rng and upper > lower and upper >= 0.4 * rng:
+        return "doji"
+    return None
+
+
+class SetupEngine:
+    """Machine à états SWEEP → CHoCH → verrou → mesure → zone 50 % → entrée. Les fenêtres en bougies
+    (âge du niveau, clôture de retour, délai du CHoCH, MAX_BOUGIES) sont des paramètres, définis en tête de fichier."""
+
+    def __init__(self, symbol="?", tf="M1", params=None, verbose=False):
+        self.symbol, self.tf, self.p, self.verbose = symbol, tf, params or SEParams(), verbose
+        self.state = SE_IDLE
+        self.setup = None
+        self.pending = None             # sweep en attente de réintégration du niveau
+        self.c, self.atr, self._tr_head = [], [], []
+        self.base = 0                   # index absolu de self.c[0]
+        self.highs, self.lows = [], []  # swings confirmés : {"i","p","used"}
+        self.last_t = None
+        self.pause_until = -1
+        self.losses = 0
+        self.quiet = False              # échauffement (historique) : événements enregistrés mais jamais affichés
+        self.log = []
+
+    # ------------------------------------------------------------------ utilitaires
+    def _g(self, k):
+        return self.c[k - self.base]
+
+    def _ts(self, k):
+        """Heure (jj/mm hh:mm UTC) de la bougie d'index absolu k, '?' si elle a été purgée."""
+        if k is None or k < self.base:
+            return "?"
+        return datetime.fromtimestamp(self._g(k)["t"], timezone.utc).strftime("%d/%m %H:%M")
+
+    def _note(self, msg):
+        line = f"[{self.symbol} {self.tf}] {msg}"
+        self.log.append(line)
+        del self.log[:-500]
+        if self.verbose:
+            print(line)
+
+    def _ev(self, tag, ok, msg):
+        """Événement SWEEP / CHOCH / LOCK : toujours affiché (sauf échauffement), toujours gardé dans self.log."""
+        icon = ("🔒" if ok else "🔓") if tag == "LOCK" else ("✅" if ok else "❌")
+        line = f"[{tag}] {icon} [{self.symbol} {self.tf}] {msg}"
+        self.log.append(line)
+        del self.log[:-500]
+        if not self.quiet:
+            print(line)
+
+    def _once(self, key):
+        """Dédoublonne un événement ❌ répété à chaque bougie pour un même setup."""
+        seen = self.setup.setdefault("seen", set())
+        if key in seen:
+            return False
+        seen.add(key)
+        return True
+
+    def _to(self, new):
+        if new not in SE_ALLOWED[self.state]:
+            raise SEIllegalTransition(f"{self.state} → {new} interdit")
+        self._note(f"état {self.state} → {new}")
+        self.state = new
+
+    def _drop(self, reason):
+        if self.setup:
+            self._ev("LOCK", False, f"verrou libéré — {reason}")
+        self._note(f"setup annulé : {reason}")
+        self.setup = self.pending = None
+        if self.state != SE_IDLE:
+            self._to(SE_IDLE)
+
+    def _fib(self, s, f):
+        """Prix au niveau f du retracement (0 = ancre, 1 = extrême du sweep) ; valable achat ET vente."""
+        return s["anchor"] + f * (s["start"] - s["anchor"])
+
+    # ------------------------------------------------------------------ structure HH / HL / LH / LL
+    def _lbl(self, lst, v, high, a):
+        """Étiquette structurelle d'un swing confirmé par rapport au swing précédent du même type."""
+        k = next((n for n, w in enumerate(lst) if w["i"] == v["i"]), 0)
+        if k == 0:
+            return "swing high" if high else "swing low"
+        prev = lst[k - 1]["p"]
+        if abs(v["p"] - prev) < self.p.sweep_equal_atr * a:
+            return "EQH" if high else "EQL"
+        if high:
+            return "HH" if v["p"] > prev else "LH"
+        return "HL" if v["p"] > prev else "LL"
+
+    def _trend(self):
+        """Structure courante d'après les 2 derniers swings de chaque côté."""
+        if len(self.highs) < 2 or len(self.lows) < 2:
+            return "indéterminée"
+        up_h = self.highs[-1]["p"] > self.highs[-2]["p"]
+        up_l = self.lows[-1]["p"] > self.lows[-2]["p"]
+        if up_h and up_l:
+            return "haussière (HH/HL)"
+        if not up_h and not up_l:
+            return "baissière (LH/LL)"
+        return "transition / range"
+
+    def report_result(self, sl_hit, pause=True):
+        """À appeler à la clôture d'un trade : N SL consécutifs -> pause de pause_candles bougies.
+        pause=False (interrupteur /pausesl off) : aucune pause, le compteur reste à zéro."""
+        if not pause:
+            self.losses = 0
+            return
+        self.losses = self.losses + 1 if sl_hit else 0
+        if self.losses >= self.p.pause_after_sl:
+            self.pause_until = self.base + len(self.c) + self.p.pause_candles
+            self._note(f"pause {self.p.pause_candles} bougies après {self.losses} SL consécutifs")
+            self.losses = 0
+
+    # ------------------------------------------------------------------ flux de bougies
+    def feed(self, candles):
+        out, first = [], self.last_t is None
+        self.quiet = first
+        for x in candles:
+            if self.last_t is not None and x["t"] <= self.last_t:
+                continue
+            self._push(x)
+            self.last_t = x["t"]
+            sig = self._step(self.base + len(self.c) - 1)
+            if sig and not first:       # échauffement : l'historique n'émet jamais de signal
+                out.append(sig)
+        self.quiet = False
+        if len(self.c) > 3000:
+            self._trim(len(self.c) - 2000)
+        return out
+
+    def _trim(self, cut):
+        self.c, self.atr = self.c[cut:], self.atr[cut:]
+        self.base += cut
+        self.highs = [v for v in self.highs if v["i"] >= self.base]
+        self.lows = [v for v in self.lows if v["i"] >= self.base]
+
+    def _push(self, x):
+        P = self.p
+        self.c.append(x)
+        i = self.base + len(self.c) - 1
+        if len(self.c) == 1:
+            tr = x["h"] - x["l"]
+        else:
+            pc = self.c[-2]["c"]
+            tr = max(x["h"] - x["l"], abs(x["h"] - pc), abs(x["l"] - pc))
+        if len(self._tr_head) < P.atr_period:
+            self._tr_head.append(tr)
+            a = sum(self._tr_head) / len(self._tr_head)
+        else:
+            a = (self.atr[-1] * (P.atr_period - 1) + tr) / P.atr_period
+        self.atr.append(a)
+        d = P.swing_depth
+        p = i - d
+        if p - d >= self.base:          # swing confirmé (même définition que analyze() du bot)
+            win = [self._g(k) for k in range(p - d, p + d + 1)]
+            s = self._g(p)
+            if s["h"] == max(w["h"] for w in win) and all(s["h"] > self._g(k)["h"] for k in range(p - d, p)):
+                self.highs.append({"i": p, "p": s["h"], "used": False})
+            if s["l"] == min(w["l"] for w in win) and all(s["l"] < self._g(k)["l"] for k in range(p - d, p)):
+                self.lows.append({"i": p, "p": s["l"], "used": False})
+
+    def _step(self, i):
+        x, a = self._g(i), self.atr[i - self.base]
+        sig = None
+        if self.state == SE_IDLE:
+            self._look_for_sweep(i, x, a)
+        elif self.state == SE_SWEEP:
+            self._wait_choch(i, x, a)
+        elif self.state == SE_MESURE:
+            sig = self._measure(i, x, a)
+        elif self.state == SE_ZONE_50_ACTIVE:
+            sig = self._zone(i, x, a)
+        for lv in self.highs:           # un niveau percé est consommé : il ne sera plus jamais « un niveau intact »
+            if not lv["used"] and x["h"] > lv["p"]:
+                lv["used"] = True
+        for lv in self.lows:
+            if not lv["used"] and x["l"] < lv["p"]:
+                lv["used"] = True
+        return sig
+
+    # ------------------------------------------------------------------ 1. sweep (liquidité structurelle)
+    def _levels_pierced(self, i, x, a):
+        """Niveaux de liquidité structurelle intacts percés par la bougie : swing high/low confirmé, ou equal highs/lows
+        (swings intacts voisins à moins de SWEEP_EQUAL_ATR x ATR : le niveau est alors l'extrême du groupe)."""
+        P, seen, out = self.p, set(), []
+        for high, lst in ((True, self.highs), (False, self.lows)):
+            for lv in lst:
+                if lv["used"]:
+                    continue
+                grp = [w for w in lst if not w["used"] and abs(w["p"] - lv["p"]) < P.sweep_equal_atr * a]
+                top = max(grp, key=lambda w: w["p"]) if high else min(grp, key=lambda w: w["p"])
+                if (high, top["i"]) in seen:
+                    continue
+                seen.add((high, top["i"]))
+                pen = (x["h"] - top["p"]) if high else (top["p"] - x["l"])
+                if pen <= 0:
+                    continue
+                lbl = ("EQH" if high else "EQL") if len(grp) > 1 else self._lbl(lst, top, high, a)
+                out.append({"high": high, "dir": -1 if high else 1, "lvl": top["p"], "lv_i": top["i"], "age": i - top["i"],
+                            "lbl": lbl, "pierce": pen / a, "ext": x["h"] if high else x["l"]})
+        return out
+
+    def _look_for_sweep(self, i, x, a):
+        P = self.p
+        if i < self.pause_until:
+            self.pending = None
+            return
+        if self.pending:
+            return self._advance_pending(i, x, a)
+        pierced = self._levels_pierced(i, x, a)
+        if not pierced:
+            return
+        young = [c for c in pierced if c["age"] < P.level_min_age]
+        if young and len(young) == len(pierced):
+            c = young[0]
+            return self._ev("SWEEP", False, f"{c['lbl']} {c['lvl']:.5g} ({self._ts(c['lv_i'])}) trop récent : {c['age']} bougies "
+                                            f"< {P.level_min_age} (niveau non établi)")
+        pierced = [c for c in pierced if c["age"] >= P.level_min_age]
+        ok = [c for c in pierced if P.sweep_min_atr <= c["pierce"] <= P.sweep_max_atr]
+        if not ok:
+            c = min(pierced, key=lambda c: c["pierce"])
+            if c["pierce"] > P.sweep_max_atr:
+                return self._ev("SWEEP", False, f"{c['lbl']} {c['lvl']:.5g} ({self._ts(c['lv_i'])}) percé de {c['pierce']:.2f} ATR "
+                                                f"> {P.sweep_max_atr:g} : cassure structurelle (BOS), pas un sweep")
+            return self._ev("SWEEP", False, f"{c['lbl']} {c['lvl']:.5g} ({self._ts(c['lv_i'])}) : mèche de {c['pierce']:.2f} ATR "
+                                            f"< {P.sweep_min_atr:g} (trop courte)")
+        if len({c["dir"] for c in ok}) > 1:
+            return self._ev("SWEEP", False, "bougie englobante (swing high ET swing low percés) : ambiguë, ignorée")
+        c = min(ok, key=lambda c: c["pierce"])      # niveau le plus extérieur parmi ceux réellement pris
+        self.pending = {"dir": c["dir"], "lvl": c["lvl"], "ext": c["ext"], "ext_i": i, "i0": i, "atr": a,
+                        "lv_i": c["lv_i"], "lbl": c["lbl"], "trend": self._trend()}
+        self._note(f"mèche au-delà de {c['lbl']} {c['lvl']:.5g} ({c['pierce']:.2f} ATR) : sweep candidat")
+        self._advance_pending(i, x, a)
+
+    def _advance_pending(self, i, x, a):
+        P, pend = self.p, self.pending
+        d = pend["dir"]
+        what = f"{pend['lbl']} {pend['lvl']:.5g} ({self._ts(pend['lv_i'])})"
+        if i > pend["i0"]:
+            if d == -1 and x["h"] > pend["ext"]:
+                pend["ext"], pend["ext_i"] = x["h"], i
+            if d == 1 and x["l"] < pend["ext"]:
+                pend["ext"], pend["ext_i"] = x["l"], i
+            if abs(pend["ext"] - pend["lvl"]) > P.sweep_max_atr * pend["atr"]:
+                self.pending = None
+                return self._ev("SWEEP", False, f"{what} : mèche à {abs(pend['ext'] - pend['lvl']) / pend['atr']:.2f} ATR "
+                                                f"> {P.sweep_max_atr:g} : cassure structurelle (BOS), pas un sweep")
+        back = x["c"] < pend["lvl"] if d == -1 else x["c"] > pend["lvl"]
+        if back:
+            return self._confirm_sweep(i, x, pend, what)
+        if i - pend["i0"] >= P.sweep_close_back:
+            self.pending = None
+            return self._ev("SWEEP", False, f"{what} : aucune clôture de retour dans la bougie du sweep ni les {P.sweep_close_back} suivantes")
+
+    def _choch_level(self, ext_i, d, lv_i):
+        """Dernier swing structurel OPPOSÉ avant l'extrême du sweep : bas (vente) / haut (achat). Retourne (prix, index, étiquette)."""
+        lst = self.lows if d == -1 else self.highs
+        prior = [v for v in lst if v["i"] < ext_i]
+        a = self.atr[ext_i - self.base]
+        if prior:
+            v = prior[-1]
+            return v["p"], v["i"], self._lbl(lst, v, d == 1, a)
+        seg = [(k, self._g(k)) for k in range(max(self.base, lv_i), ext_i + 1)]    # repli : extrême de la jambe qui a fait le sweep
+        k, z = min(seg, key=lambda e: e[1]["l"]) if d == -1 else max(seg, key=lambda e: e[1]["h"])
+        return (z["l"] if d == -1 else z["h"]), k, "extrême de jambe"
+
+    def _confirm_sweep(self, i, x, pend, what):
+        d = pend["dir"]
+        lvl_p, lvl_i, lbl = self._choch_level(pend["ext_i"], d, pend["lv_i"])
+        self.setup = {"dir": d, "level": pend["lvl"], "start": pend["ext"], "ext_i": pend["ext_i"],
+                      "sweep_i": i, "choch_lvl": lvl_p, "choch_lvl_i": lvl_i, "choch_lbl": lbl,
+                      "swept_lbl": pend["lbl"], "trend": pend["trend"],
+                      "choch_i": None, "anchor": None, "retr": 0.0, "ext_t": self._g(pend["ext_i"])["t"], "locked": True}
+        self.pending = None
+        self._to(SE_SWEEP)
+        self._ev("SWEEP", True, f"{'haut' if d == -1 else 'bas'} balayé : {what}, mèche {abs(pend['ext'] - pend['lvl']) / pend['atr']:.2f} ATR "
+                                f"(extrême {pend['ext']:.5g}), réintégré par clôture {x['c']:.5g} · structure avant sweep : {pend['trend']} · "
+                                f"swing à casser : {lbl} {lvl_p:.5g} ({self._ts(lvl_i)})")
+        self._ev("LOCK", True, f"setup {'VENTE' if d == -1 else 'ACHAT'} actif sur {self.symbol} {self.tf} : nouveaux sweeps et CHoCH "
+                               f"ignorés jusqu'à l'entrée, l'invalidation (sweep cassé, 100 %) ou {self.p.max_bougies} bougies après le CHoCH")
+
+    # ------------------------------------------------------------------ 2. CHoCH (changement de structure)
+    def _wait_choch(self, i, x, a):
+        P, s = self.p, self.setup
+        d = s["dir"]
+        if i - s["sweep_i"] > P.choch_window:
+            return self._drop(f"pas de CHoCH dans les {P.choch_window} bougies après le sweep")
+        if (d == -1 and x["h"] > s["start"]) or (d == 1 and x["l"] < s["start"]):
+            return self._drop("sweep cassé : extrême du sweep dépassé avant le CHoCH")
+        lvl, lbl = s["choch_lvl"], s["choch_lbl"]
+        tgt = f"{lbl} {lvl:.5g} ({self._ts(s['choch_lvl_i'])})"
+        closed = (x["c"] < lvl) if d == -1 else (x["c"] > lvl)
+        if not closed:
+            if ((x["l"] < lvl) if d == -1 else (x["h"] > lvl)) and self._once("wick"):
+                self._ev("CHOCH", False, f"{tgt} percé par la mèche seule (clôture {x['c']:.5g}) : pas de CHoCH")
+            return
+        body = (x["c"] - x["o"]) * d
+        fvg = False
+        if i - 2 >= self.base:
+            k = self._g(i - 2)
+            fvg = (k["l"] > x["h"]) if d == -1 else (k["h"] < x["l"])
+        if body <= 0 or not (body >= P.choch_body_atr * a or fvg):
+            if self._once("micro"):
+                self._ev("CHOCH", False, f"clôture au-delà de {tgt} mais déplacement insuffisant (corps {max(body, 0) / a:.2f} ATR "
+                                         f"< {P.choch_body_atr:g}, pas de FVG) : micro-break ignoré")
+            return
+        s["choch_i"] = i
+        s["locked"] = True
+        self._to(SE_CHOCH_VALIDE)
+        seg = [self._g(k) for k in range(s["ext_i"], i + 1)]
+        s["anchor"] = min(z["l"] for z in seg) if d == -1 else max(z["h"] for z in seg)
+        s["anchor_t"] = next(z["t"] for z in reversed(seg) if (z["l"] if d == -1 else z["h"]) == s["anchor"])
+        self._ev("CHOCH", True, f"{tgt} cassé par clôture {x['c']:.5g} (corps {body / a:.2f} ATR{' + FVG' if fvg else ''}) · "
+                                f"sweep associé : {s['swept_lbl']} {s['level']:.5g} · départ {s['start']:.5g} → ancre {s['anchor']:.5g}")
+        self._to(SE_MESURE)                # le CHoCH démarre la mesure ; l'entrée est impossible ici
+
+    # ------------------------------------------------------------------ 3. mesure / zone 50 %
+    def _invalid(self, i, x):
+        """Libère le verrou : MAX_BOUGIES dépassé depuis le CHoCH, ou retracement à 100 % (retour au sweep)."""
+        P, s = self.p, self.setup
+        d = s["dir"]
+        if i - s["choch_i"] > P.max_bougies:
+            self._drop(f"plus de {P.max_bougies} bougies depuis le CHoCH (MAX_BOUGIES)")
+            return True
+        inv = self._fib(s, P.fib_invalid)
+        if (x["h"] >= inv) if d == -1 else (x["l"] <= inv):
+            self._drop("retracement jusqu'au sweep (100 %)")
+            return True
+        return False
+
+    def _new_extreme(self, x):
+        s = self.setup
+        if s["dir"] == -1 and x["l"] < s["anchor"]:
+            s["anchor"], s["anchor_t"] = x["l"], x["t"]
+            return True
+        if s["dir"] == 1 and x["h"] > s["anchor"]:
+            s["anchor"], s["anchor_t"] = x["h"], x["t"]
+            return True
+        return False
+
+    def _measure(self, i, x, a):
+        s = self.setup
+        if self._invalid(i, x):
+            return None
+        if self._new_extreme(x):        # l'impulsion continue : on déplace l'ancre, on ne fige jamais le Fibo
+            return self._note(f"nouvel extrême : ancre déplacée à {s['anchor']:.5g}")
+        ext = x["h"] if s["dir"] == -1 else x["l"]
+        s["retr"] = max(s["retr"], (ext - s["anchor"]) / (s["start"] - s["anchor"]))
+        if self._touched(x):
+            self._to(SE_ZONE_50_ACTIVE)
+            self._note(f"zone {self.p.fib_entry:.0%} active à {self._fib(s, self.p.fib_entry):.5g}")
+            if self.p.reject_same_candle:
+                return self._try_entry(i, x, a)
+        return None                      # correction < 50 % : ignorée, on continue à surveiller
+
+    def _touched(self, x):
+        lvl = self._fib(self.setup, self.p.fib_entry)
+        return x["h"] >= lvl if self.setup["dir"] == -1 else x["l"] <= lvl
+
+    def _zone(self, i, x, a):
+        if self._invalid(i, x):
+            return None
+        if self._new_extreme(x):
+            self._to(SE_MESURE)
+            return self._note("nouvel extrême avant le rejet : zone désactivée, mesure reprise")
+        return self._try_entry(i, x, a)
+
+    # ------------------------------------------------------------------ 4. entrée
+    def _try_entry(self, i, x, a):
+        P, s = self.p, self.setup
+        d = s["dir"]
+        ext = x["h"] if d == -1 else x["l"]
+        s["retr"] = max(s["retr"], (ext - s["anchor"]) / (s["start"] - s["anchor"]))   # retracement atteint, bougie d'entrée incluse
+        if not self._touched(x):
+            return None
+        if i < self.pause_until:        # pause après N SL : un setup déjà en cours ne peut pas entrer non plus
+            return self._drop(f"pause active ({self.pause_until - i} bougies restantes)")
+        why = se_rejection(self._g(i - 1), x, d)
+        if not why:
+            return None
+        entry = x["c"]
+        sl = s["start"] - d * P.sl_buffer_atr * a
+        if (entry - sl) * d <= 0:
+            return self._drop("SL du mauvais côté de l'entrée")
+        risk = abs(entry - sl)
+        if risk > P.max_sl_atr * a:
+            return self._drop(f"SL trop large ({risk / a:.1f} ATR)")
+        sig = {
+            "dir": d, "side": "BUY" if d == 1 else "SELL", "type": "SETUP50", "order": "MARKET",
+            "ref_price": entry, "entry": entry, "sl": sl, "risk": risk, "tp": entry + d * risk * P.rr,
+            "rr": P.rr, "t": x["t"], "tf": self.tf, "atr": a, "sweep_t": s["ext_t"], "bos_level": s["choch_lvl"], "setup": f"SWEEP+CHoCH+50% ({why})",
+            "fib": {"start": s["start"], "anchor": s["anchor"], "anchor_t": s.get("anchor_t"), "level": self._fib(s, P.fib_entry),
+                    "retr_max": s["retr"], "sweep_level": s["level"], "reject": why},
+        }
+        self._to(SE_ENTREE)
+        self._note(f"ENTRÉE {sig['side']} {entry:.5g} · SL {sl:.5g} · TP {sig['tp']:.5g} · rejet {why}")
+        sig["log"] = se_signal_log(self.symbol, sig)
+        self._ev("LOCK", False, f"verrou libéré — entrée {sig['side']} déclenchée à {entry:.5g} (un setup = un trade)")
+        self.setup = None
+        self._to(SE_IDLE)
+        return sig
+
+
+SE_PAUSE_ENABLED = _env_bool("SE_PAUSE_ENABLED", True)   # valeur de départ ; ensuite /pausesl on|off sur Telegram
+
+
+def get_se_pause():
+    """Pause automatique après N SL consécutifs (SETUP50) : dernier choix Telegram, sinon SE_PAUSE_ENABLED."""
+    return _get_bool_setting("se_pause", SE_PAUSE_ENABLED)
+
+
+def set_se_pause(on):
+    set_setting("se_pause", "on" if on else "off")
+
+
+def get_se_pause_n():
+    try:
+        v = int(float(get_setting("se_pause_n", SEParams.pause_after_sl)))
+    except (TypeError, ValueError):
+        return SEParams.pause_after_sl
+    return v if v >= 1 else SEParams.pause_after_sl
+
+
+def get_se_pause_candles():
+    try:
+        v = int(float(get_setting("se_pause_candles", SEParams.pause_candles)))
+    except (TypeError, ValueError):
+        return SEParams.pause_candles
+    return v if v >= 1 else SEParams.pause_candles
+
+
+def se_pause_text():
+    n, k = get_se_pause_n(), get_se_pause_candles()
+    return f"ON — {n} SL consécutifs → pause de {k} bougies {TF_LABEL}" if get_se_pause() else "OFF"
+
+
+_SE_ENGINES = {}   # (symbole, timeframe) -> SetupEngine : l'état vit en mémoire, il repart de zéro à chaque redémarrage
+
+
+def _se_engine(symbol):
+    key = (symbol, TF_LABEL)
+    eng = _SE_ENGINES.get(key)
+    if eng is None:
+        eng = _SE_ENGINES[key] = SetupEngine(symbol, TF_LABEL, verbose=DEBUG_CHOCH)
+    return eng
+
+
+def _se_make_signal(symbol, raw, candles):
+    """Signal brut du moteur -> signal au format de publish_signal (mêmes clés que build_signal / _direct)."""
+    d, entry, a = raw["dir"], raw["entry"], raw["atr"]
+    sl, risk = raw["sl"], raw["risk"]
+    # même double plancher que l'entrée directe : un SL de quelques points serait balayé par le spread / le bruit
+    min_pct = SYMBOLS.get(symbol, {}).get("min_sl_pct", MIN_SL_PCT)
+    min_risk = max(MIN_SL_ATR * a, entry * min_pct)
+    if risk < min_risk:
+        risk = min_risk
+        sl = entry - d * risk
+    tp_rr, be_rr = get_tp_rr(), get_be_rr()
+    sig = dict(raw)
+    sig.update(
+        risk=risk, sl=sl, tp=entry + d * risk * tp_rr, rr=tp_rr, be_rr=be_rr, tf=TF_LABEL,
+        htf=False, htf_mode="OFF", poi=None, mtf_fib_on=False, mtf_fib=None, m15_imp_on=False, m15_imp=None, qf={}, sl_mode="STRUCT",
+        key_suffix="se", ext=None,
+        sweep={"tf": TF_LABEL, "side": "haut" if d == -1 else "bas", "level": raw["fib"]["sweep_level"],
+               "swept": True, "eq": False, "t": raw["sweep_t"], "i": None},
+    )
+    try:   # lecture de la liquidité externe : affichage seulement, jamais une condition (comme liquidity_reading)
+        sig["ext"] = ext_target(symbol, d, entry)
+    except Exception as e:
+        print(f"[{symbol}] lecture liquidité externe impossible ({type(e).__name__}) : signal sans ligne « Ext. »")
+    idx = next((k for k, c in enumerate(candles) if c["t"] == sig["t"]), len(candles) - 1)
+    apply_tp_mode(sig, candles, {"i": idx}, symbol, tp_rr)   # /modetp rr (fixe) | target (liquidité ext.) | swing ; repli RR si pas de cible
+    return sig
+
+
+def setup_engine_signals(symbol, candles, last_seen):
+    """Nourrit la machine à états avec les bougies clôturées et retourne les signaux d'ENTRÉE (0 ou 1 en pratique).
+    Ne lève jamais : une erreur du moteur est loggée, le scan et le suivi des positions continuent."""
+    try:
+        eng = _se_engine(symbol)
+        eng.p.pause_after_sl, eng.p.pause_candles = get_se_pause_n(), get_se_pause_candles()
+        if not get_se_pause():          # interrupteur OFF : lève aussi une pause déjà en cours
+            eng.pause_until, eng.losses = -1, 0
+        raws = eng.feed(candles)
+        out = []
+        recent = {c["t"] for c in candles[-SIGNAL_MAX_AGE:]}
+        for raw in raws:
+            side = raw["side"]
+            if raw["t"] <= (last_seen or 0) or raw["t"] not in recent:
+                print(f"[{symbol}] SETUP50 {side} ignoré : entrée trop ancienne (rattrapage après interruption)")
+                continue
+            if not session_ok(raw["t"]):
+                print(f"[{symbol}] SETUP50 {side} ignoré : hors session ({get_session()})")
+                continue
+            if raw.get("log"):
+                print(raw["log"])
+            out.append(_se_make_signal(symbol, raw, candles))
+        return out
+    except Exception:
+        print(f"[{symbol}] machine à états SETUP50 : erreur (aucun signal ce passage)")
+        traceback.print_exc()
+        return []
+
+
+def setup_engine_report(trade, name):
+    """Résultat d'un trade SETUP50 -> pause automatique après N SL consécutifs (TP / BE remettent le compteur à zéro)."""
+    try:
+        if trade.get("kind") != "SETUP50" or name not in ("SL", "TP", "BE"):
+            return
+        _se_engine(trade["symbol"]).report_result(name == "SL", pause=get_se_pause())
+    except Exception:
+        traceback.print_exc()
 
 
 # ============================================================================
@@ -4542,7 +5447,7 @@ def make_chart(symbol, candles, events, sig, decimals=2, n_show=70, extend=25):
         up, lbl = ext_edge
         ax.text(0, (hi + pad) if up else (lo - pad), f"{lbl} {'↑' if up else '↓'}", color="#f5a623", fontsize=7,
                 va="top" if up else "bottom")
-    ax.set_title(f"{symbol} {TF_LABEL} - {sig['side']}{' LIMIT' if sig.get('order') == 'LIMIT' else ''} ({'CHoCH + CHoCH' if sig['type'] == 'CHOCH2' else 'CHoCH'})",
+    ax.set_title(f"{symbol} {TF_LABEL} - {sig['side']}{' LIMIT' if sig.get('order') == 'LIMIT' else ''} ({'Sweep + CHoCH + 50%' if sig['type'] == 'SETUP50' else 'CHoCH + CHoCH' if sig['type'] == 'CHOCH2' else 'CHoCH'})",
                  color="white", fontsize=11)
     ax.tick_params(colors="#888888", labelsize=7)
     ax.set_xticks([])
@@ -5123,6 +6028,12 @@ def _params_lines(sig, tf=None):
     fib_line = _mtf_fib_line(sig)
     if fib_line:
         lines += f"\n{fib_line}"
+    if sig.get("m15_imp_on"):
+        lines += f"\nImpulsion M15 : {sig.get('m15_imp') or 'ON'}"
+    if sig.get("bos_txt"):
+        lines += f"\nVrai BOS : {sig['bos_txt']}"
+    if sig.get("poi_txt"):
+        lines += f"\nPOI HTF : {sig['poi_txt']}"
     crt = sig.get("crt")
     if crt:
         lines += (f"\n🕯 CRT {_tf_lbl(crt['ref_tf'])} : range {_fmt(crt['crl'], 2)} – {_fmt(crt['crh'], 2)} "
@@ -5306,6 +6217,10 @@ def _signal_text():
             f"⏱ Timeframe : {TF_LABEL}\n"
             f"🧠 Filtre HTF : {_htf_mode_txt()}\n"
             f"📐 Filtre Fibo HTF : {'ON' if get_mtf_fib_filter() else 'OFF'}\n"
+            f"📈 Filtre Impulsion M15 : {'ON' if get_m15_imp_filter() else 'OFF'}\n"
+            f"🧱 Vrai BOS : {'ON ≥ %d%%' % round(get_bos_retrace() * 100) if get_bos_real() else 'OFF'} · "
+            f"🎯 POI HTF : {'ON ' + get_poi_filter_tf() if get_poi_filter() else 'OFF'}\n"
+            f"⏸ Pause après SL : {se_pause_text()}\n"
             f"🔒 BE à : RR{get_be_rr():g}\n"
             f"📥 Entrée : {_entry_txt()}\n"
             f"🛡 SL : {_SL_LBL[get_sl_mode()]} · 🎯 TP : {_TP_LBL[get_tp_mode()]}\n"
@@ -5351,7 +6266,8 @@ def _signal_sltp_text():
             f"SL — structure : ligne du BOS opposé · zone : derrière l'OB/FVG du CHoCH · sweep : derrière l'extrême de la jambe. "
             f"(Le limit OB/FVG et le CRT mettent toujours leur SL derrière la zone / le sweep.)\n"
             f"TP — RR fixe (réglage RR) · liquidité ext. : cible visée · swing : plus proche swing H/L non cassé. "
-            f"Cible absente ou sous RR{TP_MIN_RR:g} : repli sur le RR fixe.\n"
+            f"Cible absente ou sous RR{TP_MIN_RR:g} : repli sur le RR fixe. "
+            f"SETUP50 : SL toujours derrière le sweep ; TP = RR fixe (RR{get_tp_rr():g}) ou liquidité ext. selon ce choix.\n"
             f"Effet immédiat sur les NOUVEAUX signaux. Aussi : /modesl struct|zone|sweep · /modetp rr|target|swing")
 
 
@@ -5457,8 +6373,11 @@ def _signal_keyboard():
          {"text": "🧠 FILTRE HTF", "callback_data": "sig:htf"}],
         [{"text": "🔒 BE", "callback_data": "sig:be"}, {"text": "📍 SIGNAUX MAX", "callback_data": "sig:max"}],
         [{"text": "🌐 LIQ. EXTERNE", "callback_data": "sig:ext"}, {"text": "📐 FIBO HTF", "callback_data": "sig:fib"}],
+        [{"text": "📈 IMPULSION M15", "callback_data": "sig:m15imp"}],
+        [{"text": "🧱 VRAI BOS", "callback_data": "sig:bos"}, {"text": "🎯 POI HTF (OB/FVG)", "callback_data": "sig:poih"}],
         [{"text": "📥 ENTRÉE", "callback_data": "sig:entry"}, {"text": "🛡 SL / 🎯 TP", "callback_data": "sig:sltp"}],
         [{"text": "🧩 STRATÉGIES (CRT)", "callback_data": "sig:strat"}, {"text": "🕐 SESSION", "callback_data": "sig:sess"}],
+        [{"text": "⏸ PAUSE APRÈS SL", "callback_data": "sig:pause"}],
         [{"text": "🔬 FILTRES QUALITÉ", "callback_data": "sig:qf"}, {"text": "🌍 ACTIFS", "callback_data": "sig:sym"}],
         [{"text": "⚙️ QML", "callback_data": "qml:home"}],
         [{"text": "🔙 Menu", "callback_data": "menu:home"}]]}
@@ -5530,11 +6449,95 @@ def _signal_fib_keyboard():
         {"text": ("✅ " if not on else "") + "🔴 OFF", "callback_data": "sfib:off"}]])
 
 
+def _onoff_row(on, cb):
+    return [{"text": ("✅ " if on else "") + "🟢 ON", "callback_data": f"{cb}:on"},
+            {"text": ("✅ " if not on else "") + "🔴 OFF", "callback_data": f"{cb}:off"}]
+
+
+def _signal_m15imp_text():
+    on = get_m15_imp_filter()
+    return (f"📈 Filtre M15 « vraie impulsion + structure + Fibonacci » : <b>{'ON' if on else 'OFF'}</b>\n\n"
+            f"🟢 ON : la structure M15 (HH/HL ou LH/LL, micro-jambes ignorées) donne la vraie tendance ; la vraie impulsion "
+            f"(swing High/Low structurel → cassure) est mesurée au Fibonacci. Un CHoCH n'est accepté que dans le sens de "
+            f"l'impulsion, après un retracement :\n"
+            f"• &lt; {M15_IMP_EARLY_MIN * 100:.1f}% : refusé\n"
+            f"• entre {M15_IMP_EARLY_MIN * 100:.1f}% et {get_m15_min_retrace() * 100:.0f}% : précoce, seulement avec un OB/FVG fort\n"
+            f"• {get_m15_min_retrace() * 100:.0f}% et au-delà : zone principale, 50% jamais seul\n\n"
+            f"Retracement mini : <b>{get_m15_min_retrace() * 100:.1f}%</b>\n"
+            f"Confluence OB/FVG exigée : <b>{'OUI' if get_m15_need_poi() else 'NON'}</b> · "
+            f"Sweep exigé : <b>{'OUI' if get_m15_need_sweep() else 'NON'}</b>\n\n"
+            f"Effet immédiat sur les NOUVEAUX signaux. Aussi : /m15imp on|off")
+
+
+def _signal_m15imp_keyboard():
+    cur = get_m15_min_retrace()
+    return _signal_back([
+        _onoff_row(get_m15_imp_filter(), "sm15"),
+        [{"text": ("✅ " if abs(cur - v) < 1e-9 else "") + f"{v * 100:g}%", "callback_data": f"sm15r:{v}"}
+         for v in M15_RETRACE_CHOICES],
+        [{"text": "OB/FVG exigé : " + ("✅ ON" if get_m15_need_poi() else "OFF"),
+          "callback_data": "sm15p:" + ("off" if get_m15_need_poi() else "on")},
+         {"text": "Sweep exigé : " + ("✅ ON" if get_m15_need_sweep() else "OFF"),
+          "callback_data": "sm15s:" + ("off" if get_m15_need_sweep() else "on")}]])
+
+
+def _signal_bos_text():
+    on = get_bos_real()
+    return (f"🧱 Filtre « vrai BOS » : <b>{'ON' if on else 'OFF'}</b> (retracement mini {get_bos_retrace() * 100:g}%)\n\n"
+            f"🟢 ON : une cassure de structure M15 n'est considérée comme un vrai BOS que si le prix a ensuite retracé au moins "
+            f"40 / 45 / 50 % de la jambe. Sans ce retracement : faux BOS, aucun signal.\n"
+            f"🔴 OFF : aucune contrainte. Effet immédiat sur les NOUVEAUX signaux. Aussi : /bos on|off [40|45|50]")
+
+
+def _signal_bos_keyboard():
+    cur = get_bos_retrace()
+    return _signal_back([
+        _onoff_row(get_bos_real(), "sbos"),
+        [{"text": ("✅ " if abs(cur - v) < 1e-9 else "") + f"{v * 100:g}%", "callback_data": f"sbosr:{v}"}
+         for v in BOS_RETRACE_CHOICES]])
+
+
+def _signal_poih_text():
+    on = get_poi_filter()
+    return (f"🎯 Filtre POI HTF (OB / imbalance) : <b>{'ON — ' + get_poi_filter_tf() if on else 'OFF'}</b>\n\n"
+            f"🟢 ON : à chaque signal, le bot vérifie qu'un Order Block ou un FVG (bullish/bearish selon le sens) de l'UT choisie "
+            f"(M15, H1 ou les deux) a bien été MITIGÉ par le point de retournement. Zone non mitigée ou indécise : signal ignoré.\n"
+            f"🔴 OFF : aucune contrainte. Effet immédiat. Aussi : /poihtf on|off [m15|h1|both]")
+
+
+def _signal_poih_keyboard():
+    cur = get_poi_filter_tf()
+    return _signal_back([
+        _onoff_row(get_poi_filter(), "spoi"),
+        [{"text": ("✅ " if cur == m else "") + {"M15": "M15", "H1": "H1", "BOTH": "M15 + H1"}[m], "callback_data": f"spoit:{m}"}
+         for m in POI_TF_CHOICES]])
+
+
 def _signal_be_text():
     return (f"🔒 BE actuel : <b>RR{get_be_rr():g}</b>\n"
             f"Quand le prix atteint ce RR, le SL est déplacé à l'entrée. Si le prix revient sur l'entrée : "
             f"« BE touché » (0 R), pas un SL. S'applique aux NOUVEAUX signaux : les trades déjà ouverts gardent leur BE. "
             f"Un BE égal ou supérieur au RR de la TP finale est ignoré. Autre valeur : /be 0.75")
+
+
+SE_PAUSE_N_CHOICES = (2, 3, 4, 5)
+SE_PAUSE_CANDLES_CHOICES = (30, 60, 120)
+
+
+def _signal_pause_text():
+    return (f"⏸ <b>Pause après SL consécutifs</b> (stratégie SETUP50)\n"
+            f"État : <b>{se_pause_text()}</b>\n\n"
+            f"ON : après N SL consécutifs, plus aucune entrée pendant la pause (un TP ou un BE remet le compteur à zéro). "
+            f"OFF : aucune pause, et une pause en cours est levée immédiatement.\n"
+            f"Effet immédiat. Aussi : /pausesl on|off · /pausesl on 3 60")
+
+
+def _signal_pause_keyboard():
+    on, n, k = get_se_pause(), get_se_pause_n(), get_se_pause_candles()
+    return _signal_back([
+        [_btn("Activer", "spause:on", on), _btn("Désactiver", "spause:off", not on)],
+        [_btn(f"{v} SL", f"spause:n{v}", n == v) for v in SE_PAUSE_N_CHOICES],
+        [_btn(f"{v} bougies", f"spause:c{v}", k == v) for v in SE_PAUSE_CANDLES_CHOICES]])
 
 
 def _signal_be_keyboard():
@@ -5929,6 +6932,10 @@ def handle_command(text):
                "/modesl [struct|zone|sweep] — SL de l'entrée directe · /modetp [rr|target|swing] — mode du TP\n"
                "/strategie [main|crt|both] · /crt [on|off|h1|h4|d1|range|mid|rr] — module CRT (désactivé par défaut)\n"
                "/mtffib [on|off] — filtre Fibonacci HTF Premium/Discount\n"
+               "/m15imp [on|off] — filtre M15 vraie impulsion + structure + Fibonacci\n"
+               "/bos [on|off] [40|45|50] — vrai BOS : retracement mini après la cassure\n"
+               "/poihtf [on|off] [m15|h1|both] — OB/FVG M15/H1 mitigé obligatoire\n"
+               "/pausesl [on|off] [nb_SL] [bougies] — pause automatique après N SL consécutifs (stratégie SETUP50)\n"
                "/medias — stickers / images / GIF du groupe (TP, SL, BE, motivation)\n"
                "/qml [on|off] — module QML (TF M5/M15, filtre H1 optionnel, M1 avalement) et clôtures partielles\n"
                "/analyse — analyse technique / fondamentale à la demande (BTCUSD, XAUUSD)\n"
@@ -5970,6 +6977,25 @@ def handle_command(text):
             except ValueError:
                 return ("RR invalide. Exemple : /be 1 ou /be 0.5", None)
         return (_signal_be_text(), _signal_be_keyboard())
+    if cmd in ("/pausesl", "/pause"):
+        nums = []
+        for tok in parts[1:]:
+            t = tok.strip().lower()
+            if t in ("on", "1", "true", "activer", "activé"):
+                set_se_pause(True)
+            elif t in ("off", "0", "false", "desactiver", "désactiver"):
+                set_se_pause(False)
+            elif t.isdigit() and int(t) >= 1 and len(nums) < 2:
+                nums.append(int(t))
+            else:
+                return ("Valeur invalide. Exemples : /pausesl on  ·  /pausesl off  ·  /pausesl on 3 60 "
+                        "(3 SL consécutifs → pause de 60 bougies)", None)
+        if nums:
+            set_setting("se_pause_n", nums[0])
+            if len(nums) > 1:
+                set_setting("se_pause_candles", nums[1])
+        return (f"⏸ Pause après SL consécutifs (stratégie SETUP50) : <b>{se_pause_text()}</b>\n"
+                f"Change avec /pausesl on, /pausesl off ou /pausesl on 3 60 (nb de SL, nb de bougies).", None)
     if cmd in ("/mtffib", "/fibohtf"):
         if len(parts) > 1:
             arg = parts[1].strip().lower()
@@ -5983,6 +7009,47 @@ def handle_command(text):
         return (f"📐 Filtre Fibonacci HTF Premium/Discount : <b>{'ON' if on else 'OFF'}</b>\n"
                 f"UT Fibo : {_tf_lbl(mtf_fib_tf())} (auto selon le timeframe d'entrée {TF_LABEL})\n"
                 f"Change avec /mtffib on ou /mtffib off.", None)
+    if cmd in ("/m15imp", "/impulsion", "/m15impulse"):
+        if len(parts) > 1:
+            arg = parts[1].strip().lower()
+            if arg in ("on", "1", "true", "activer", "activé"):
+                set_m15_imp_filter(True)
+            elif arg in ("off", "0", "false", "desactiver", "désactiver"):
+                set_m15_imp_filter(False)
+            else:
+                return ("Valeur invalide. Exemple : /m15imp on  ou  /m15imp off", None)
+        on = get_m15_imp_filter()
+        return (f"📈 Filtre M15 vraie impulsion + structure + Fibonacci : <b>{'ON' if on else 'OFF'}</b>\n"
+                f"Retracement mini {get_m15_min_retrace() * 100:.0f}% (précoce, sous 50%, seulement avec OB/FVG fort).\n"
+                f"Change avec /m15imp on ou /m15imp off.", None)
+    if cmd == "/bos":
+        for a_ in parts[1:]:
+            a_ = a_.strip().lower().rstrip("%")
+            if a_ in ("on", "1", "true"):
+                set_setting("bos_real", "1")
+            elif a_ in ("off", "0", "false"):
+                set_setting("bos_real", "0")
+            else:
+                try:
+                    v = float(a_) / (100 if float(a_) > 1 else 1)
+                except ValueError:
+                    return ("Exemple : /bos on 50  ou  /bos off", None)
+                if not 0.2 <= v <= 0.9:
+                    return ("Retracement entre 20 et 90 % (ex. /bos on 45).", None)
+                set_setting("bos_retrace", v)
+        return (f"🧱 Vrai BOS : <b>{'ON' if get_bos_real() else 'OFF'}</b> (retracement mini {get_bos_retrace() * 100:g}%)\n"
+                f"Change avec /bos on|off [40|45|50].", None)
+    if cmd in ("/poihtf", "/poih"):
+        for a_ in parts[1:]:
+            a_ = a_.strip().lower()
+            if a_ in ("on", "1", "true"):
+                set_setting("poi_filter", "1")
+            elif a_ in ("off", "0", "false"):
+                set_setting("poi_filter", "0")
+            elif not set_choice("poi_filter_tf", a_, POI_TF_CHOICES):
+                return ("Exemple : /poihtf on both  ·  /poihtf on h1  ·  /poihtf off", None)
+        return (f"🎯 Filtre POI HTF : <b>{'ON — ' + get_poi_filter_tf() if get_poi_filter() else 'OFF'}</b>\n"
+                f"Change avec /poihtf on|off [m15|h1|both].", None)
     if cmd in ("/entree", "/entrée", "/entry"):
         if len(parts) > 1:
             modes = {"direct": (True, False), "marche": (True, False), "marché": (True, False),
@@ -6236,6 +7303,12 @@ def _handle_update(u):
                 _edit(cq, _signal_max_text(), _signal_max_keyboard())
             elif page == "fib":
                 _edit(cq, _signal_fib_text(), _signal_fib_keyboard())
+            elif page == "m15imp":
+                _edit(cq, _signal_m15imp_text(), _signal_m15imp_keyboard())
+            elif page == "bos":
+                _edit(cq, _signal_bos_text(), _signal_bos_keyboard())
+            elif page == "poih":
+                _edit(cq, _signal_poih_text(), _signal_poih_keyboard())
             elif page == "entry":
                 _edit(cq, _signal_entry_text(), _signal_entry_keyboard())
             elif page == "sltp":
@@ -6248,6 +7321,8 @@ def _handle_update(u):
                 _edit(cq, _signal_sym_text(), _signal_sym_keyboard())
             elif page == "qf":
                 _edit(cq, _signal_qf_text(), _signal_qf_keyboard())
+            elif page == "pause":
+                _edit(cq, _signal_pause_text(), _signal_pause_keyboard())
             else:
                 _edit(cq, _signal_text(), _signal_keyboard())
         elif data.startswith("ssym:"):
@@ -6337,6 +7412,66 @@ def _handle_update(u):
                 set_mtf_fib_filter(arg == "on")
                 _edit(cq, _signal_text(), _signal_keyboard())
                 ack = "Filtre Fibo HTF : " + ("ON" if arg == "on" else "OFF")
+        elif data.startswith("sm15:"):
+            arg = data[5:]
+            if arg in ("on", "off"):
+                set_m15_imp_filter(arg == "on")
+                _edit(cq, _signal_m15imp_text(), _signal_m15imp_keyboard())
+                ack = "Filtre Impulsion M15 : " + ("ON" if arg == "on" else "OFF")
+        elif data.startswith("sm15r:"):
+            try:
+                v = float(data[6:])
+            except ValueError:
+                v = 0
+            if v in M15_RETRACE_CHOICES:
+                set_m15_min_retrace(v)
+                _edit(cq, _signal_m15imp_text(), _signal_m15imp_keyboard())
+                ack = f"Retracement mini : {v * 100:g}%"
+        elif data.startswith("sm15p:") or data.startswith("sm15s:"):
+            arg = data[6:]
+            if arg in ("on", "off"):
+                set_setting("m15_need_poi" if data.startswith("sm15p:") else "m15_need_sweep", "1" if arg == "on" else "0")
+                _edit(cq, _signal_m15imp_text(), _signal_m15imp_keyboard())
+                ack = "OB/FVG exigé" if data.startswith("sm15p:") else "Sweep exigé"
+                ack += " : " + arg.upper()
+        elif data.startswith("sbos:"):
+            arg = data[5:]
+            if arg in ("on", "off"):
+                set_setting("bos_real", "1" if arg == "on" else "0")
+                _edit(cq, _signal_bos_text(), _signal_bos_keyboard())
+                ack = "Vrai BOS : " + arg.upper()
+        elif data.startswith("sbosr:"):
+            try:
+                v = float(data[6:])
+            except ValueError:
+                v = 0
+            if v in BOS_RETRACE_CHOICES:
+                set_setting("bos_retrace", v)
+                _edit(cq, _signal_bos_text(), _signal_bos_keyboard())
+                ack = f"Vrai BOS : retracement mini {v * 100:g}%"
+        elif data.startswith("spoi:"):
+            arg = data[5:]
+            if arg in ("on", "off"):
+                set_setting("poi_filter", "1" if arg == "on" else "0")
+                _edit(cq, _signal_poih_text(), _signal_poih_keyboard())
+                ack = "Filtre POI HTF : " + arg.upper()
+        elif data.startswith("spoit:"):
+            if set_choice("poi_filter_tf", data[6:], POI_TF_CHOICES):
+                _edit(cq, _signal_poih_text(), _signal_poih_keyboard())
+                ack = "POI HTF : " + data[6:]
+        elif data.startswith("spause:"):
+            arg = data[7:]
+            if arg in ("on", "off"):
+                set_se_pause(arg == "on")
+                ack = "Pause après SL : " + ("ON" if arg == "on" else "OFF")
+            elif arg[:1] == "n" and arg[1:].isdigit() and int(arg[1:]) in SE_PAUSE_N_CHOICES:
+                set_setting("se_pause_n", int(arg[1:]))
+                ack = f"Pause après {arg[1:]} SL"
+            elif arg[:1] == "c" and arg[1:].isdigit() and int(arg[1:]) in SE_PAUSE_CANDLES_CHOICES:
+                set_setting("se_pause_candles", int(arg[1:]))
+                ack = f"Pause de {arg[1:]} bougies"
+            if ack:
+                _edit(cq, _signal_pause_text(), _signal_pause_keyboard())
         elif data.startswith("sbe:"):
             v = float(data[4:])
             if any(abs(v - x) < 1e-9 for x in BE_RR_CHOICES):
@@ -7384,6 +8519,7 @@ def process_symbol(symbol):
     events = analyze(candles)
     for trade in open_trades(symbol):
         for ev in track_trade(trade, candles):
+            setup_engine_report(ev["trade"], ev["name"])
             chart = make_event_chart(symbol, candles, events, ev["trade"], dec) \
                 if ev["name"] in CHART_ON_EVENTS else None
             # Réponse au message Telegram EXACT du signal d'ouverture de CE trade (jamais le dernier
@@ -7402,6 +8538,10 @@ def process_symbol(symbol):
         set_meta(meta_key, last_t)
         return
     n = len(candles)
+    se_ok = False   # stratégie principale (machine à états SETUP50) : signal d'entrée publié pendant ce passage
+    if SETUP_ENGINE and get_strat_main():
+        for se_sig in setup_engine_signals(symbol, candles, last_seen):
+            se_ok = _publish_group(symbol, candles, events, [se_sig]) or se_ok
     for ev in events:
         if ev["t"] <= last_seen or ev["i"] < n - SIGNAL_MAX_AGE:
             continue
@@ -7409,8 +8549,8 @@ def process_symbol(symbol):
             if DEBUG_CHOCH:
                 print(f"[{symbol}] CHoCH {'BUY' if ev['dir'] == 1 else 'SELL'} {ev.get('type')} ignoré : hors session ({get_session()})")
             continue
-        main_ok = False
-        if get_strat_main():
+        main_ok = se_ok
+        if get_strat_main() and not SETUP_ENGINE:   # ancienne logique (SETUP_ENGINE=0) : entrée directe sur le CHoCH
             main_ok = _publish_group(symbol, candles, events, build_signal(candles, ev, symbol, multi=True) or [])
         if get_strat_crt() and (not main_ok or get_crt_dup()):   # sauf interrupteur « doublons CRT » : même CHoCH déjà pris = pas de 2e trade
             try:
@@ -9345,12 +10485,247 @@ class TestActifsEtEntrees(unittest.TestCase):
             self._restore("entry_direct", old[0]); self._restore("entry_limit", old[1])
 
 
+class TestSetupEngineEntreeEtPause(unittest.TestCase):
+    """SETUP50 : entrée sur bougie de rejet à la clôture (clôture > 50 % permise), annulation à 100 %, pause après N SL activable."""
+
+    def _engine(self):
+        eng = _E.SetupEngine("TEST", "M1")
+        for k in range(30):
+            eng._push({"t": k * 60, "o": 100.0, "h": 100.5, "l": 99.5, "c": 100.0})
+        return eng
+
+    def _arm(self, eng):
+        """VENTE : sweep haut à 110, ancre 100, zone 50 % à 105, annulation à 110 ; prev = bougie haussière."""
+        eng._push({"t": 30 * 60, "o": 104.0, "h": 105.6, "l": 103.9, "c": 105.5})
+        i = eng.base + len(eng.c) - 1
+        eng.setup = {"dir": -1, "level": 109.0, "start": 110.0, "ext_i": i - 5, "sweep_i": i - 4, "choch_lvl": 101.0,
+                     "choch_i": i, "anchor": 100.0, "retr": 0.5, "ext_t": 0}
+        eng.state = _E.SE_ZONE_50_ACTIVE
+
+    def _step(self, eng, o, h, l, c):
+        eng._push({"t": eng.c[-1]["t"] + 60, "o": o, "h": h, "l": l, "c": c})
+        i = eng.base + len(eng.c) - 1
+        return eng._zone(i, eng._g(i), eng.atr[-1])
+
+    def test_rejection_types(self):
+        prev = {"o": 104.0, "h": 105.6, "l": 103.9, "c": 105.5}
+        self.assertEqual(_E.se_rejection(prev, {"o": 106.0, "h": 106.2, "l": 103.0, "c": 103.5}, -1), "engulfing")
+        self.assertEqual(_E.se_rejection(prev, {"o": 105.2, "h": 108.0, "l": 104.9, "c": 105.1}, -1), "pin bar")
+        self.assertEqual(_E.se_rejection(prev, {"o": 105.0, "h": 106.0, "l": 104.2, "c": 105.02}, -1), "doji")
+        self.assertIsNone(_E.se_rejection(prev, {"o": 105.0, "h": 106.0, "l": 104.9, "c": 105.9}, -1), "bougie haussière : pas de rejet")
+
+    def test_entree_sur_rejet_cloture_au_dela_de_50(self):
+        eng = self._engine()
+        self._arm(eng)
+        sig = self._step(eng, 105.2, 108.0, 104.9, 105.1)   # pin bar : clôture 105.1 > 105 (50 %)
+        self.assertIsNotNone(sig, "la clôture peut dépasser 50 %")
+        self.assertEqual((sig["side"], sig["entry"], sig["type"]), ("SELL", 105.1, "SETUP50"))
+        self.assertGreater(sig["sl"], 110.0, "SL derrière le sweep")
+        self.assertAlmostEqual(sig["tp"], sig["entry"] - sig["risk"] * sig["rr"], places=6)
+        self.assertEqual(eng.state, _E.SE_IDLE)
+
+    def test_pas_d_entree_sans_rejet(self):
+        eng = self._engine()
+        self._arm(eng)
+        self.assertIsNone(self._step(eng, 105.0, 106.0, 104.9, 105.9))
+        self.assertEqual(eng.state, _E.SE_ZONE_50_ACTIVE, "le setup reste actif, en attente d'un rejet")
+
+    def test_annulation_a_100_pourcent(self):
+        eng = self._engine()
+        self._arm(eng)
+        self.assertIsNone(self._step(eng, 105.2, 110.2, 104.9, 105.1), "même avec une bougie de rejet")
+        self.assertEqual((eng.state, eng.setup), (_E.SE_IDLE, None))
+
+    def test_pause_bloque_l_entree(self):
+        eng = self._engine()
+        self._arm(eng)
+        eng.pause_until = eng.base + len(eng.c) + 50
+        self.assertIsNone(self._step(eng, 105.2, 108.0, 104.9, 105.1))
+        self.assertEqual(eng.state, _E.SE_IDLE)
+
+    def test_pause_apres_n_sl_et_interrupteur(self):
+        eng = self._engine()
+        eng.p.pause_after_sl, eng.p.pause_candles = 3, 60
+        for _ in range(3):
+            eng.report_result(True, pause=True)
+        self.assertGreater(eng.pause_until, eng.base + len(eng.c))
+        off = self._engine()
+        off.p.pause_after_sl = 3
+        for _ in range(5):
+            off.report_result(True, pause=False)
+        self.assertEqual((off.pause_until, off.losses), (-1, 0), "interrupteur OFF : jamais de pause")
+
+    def test_parametres_en_tete_de_fichier(self):
+        got = (_E.SWEEP_EQUAL_ATR, _E.SWEEP_MIN_ATR, _E.SWEEP_MAX_ATR, _E.CHOCH_BODY_ATR_MIN, _E.SWEEP_LEVEL_MIN_AGE,
+               _E.SWEEP_CLOSE_BACK, _E.CHOCH_WINDOW, _E.MAX_BOUGIES, _E.SWING_FRACTAL)
+        self.assertEqual(got, (0.2, 0.1, 1.0, 1.0, 20, 3, 10, 20, 5))
+        p = _E.SEParams()
+        self.assertEqual((p.level_min_age, p.sweep_close_back, p.choch_window, p.max_bougies), (20, 3, 10, 20))
+
+    def test_duree_de_vie_max_bougies(self):
+        eng = self._engine()
+        self._arm(eng)
+        for _ in range(20):    # 20 bougies après le CHoCH : le setup vit encore
+            self.assertIsNone(self._step(eng, 100.5, 101.0, 100.2, 100.6))
+        self.assertEqual(eng.state, _E.SE_ZONE_50_ACTIVE)
+        self.assertIsNone(self._step(eng, 105.2, 108.0, 104.9, 105.1), "21e bougie : annulé même avec un rejet")
+        self.assertEqual((eng.state, eng.setup), (_E.SE_IDLE, None))
+        eng2 = self._engine()
+        self._arm(eng2)
+        for _ in range(19):
+            self._step(eng2, 100.5, 101.0, 100.2, 100.6)
+        self.assertIsNotNone(self._step(eng2, 105.2, 108.0, 104.9, 105.1), "20e bougie : entrée encore permise")
+
+    # --- SWEEP -> CHoCH -> verrou ---------------------------------------------------------------------
+    def _struct(self):
+        """30 bougies plates ; swing high intact 108 (HH, vieux de 22 bougies), swing low intact 103 (à casser)."""
+        eng = self._engine()
+        eng.highs = [{"i": 4, "p": 106.0, "used": False}, {"i": 8, "p": 108.0, "used": False}]
+        eng.lows = [{"i": 10, "p": 103.0, "used": False}]
+        return eng
+
+    def _feed(self, eng, o, h, l, c):
+        eng._push({"t": eng.c[-1]["t"] + 60, "o": o, "h": h, "l": l, "c": c})
+        i = eng.base + len(eng.c) - 1
+        return eng._step(i)
+
+    def _lines(self, eng, tag):
+        return [l for l in eng.log if l.startswith(f"[{tag}]")]
+
+    def _sweep_choch(self, eng):
+        self._feed(eng, 107.5, 108.5, 107.4, 107.9)       # mèche 0.5 ATR au-dessus du swing high 108, clôture de retour
+        self._feed(eng, 107.0, 107.2, 105.8, 106.0)
+        self._feed(eng, 106.0, 106.2, 101.5, 102.0)       # clôture sous le swing low 103, corps >= 1 ATR
+
+    def test_sweep_choch_verrou(self):
+        eng = self._struct()
+        self._feed(eng, 107.5, 108.5, 107.4, 107.9)
+        self.assertEqual(eng.state, _E.SE_SWEEP)
+        self.assertIn("HH 108", self._lines(eng, "SWEEP")[-1])
+        self.assertIn("✅", self._lines(eng, "SWEEP")[-1])
+        self.assertIn("🔒", self._lines(eng, "LOCK")[-1])
+        self._feed(eng, 107.0, 107.2, 105.8, 106.0)
+        self._feed(eng, 106.0, 106.2, 101.5, 102.0)
+        self.assertEqual(eng.state, _E.SE_MESURE)
+        self.assertIn("103", self._lines(eng, "CHOCH")[-1])
+        self.assertIn("✅", self._lines(eng, "CHOCH")[-1])
+        eng.highs.append({"i": 5, "p": 107.0, "used": False})       # autre niveau percé pendant le verrou : ignoré
+        self._feed(eng, 102.0, 107.5, 102.0, 105.0)
+        self.assertEqual(eng.setup["level"], 108.0)
+
+    def test_niveau_trop_recent_refuse(self):
+        eng = self._struct()
+        eng.highs = [{"i": 20, "p": 108.0, "used": False}]            # 10 bougies seulement
+        self._feed(eng, 107.5, 108.5, 107.4, 107.9)
+        self.assertEqual(eng.state, _E.SE_IDLE)
+        self.assertIn("trop récent", self._lines(eng, "SWEEP")[-1])
+
+    def test_equal_highs(self):
+        eng = self._struct()
+        eng.highs = [{"i": 6, "p": 108.0, "used": False}, {"i": 9, "p": 108.1, "used": False}]   # écart 0.1 < 0.2 ATR
+        self._feed(eng, 107.5, 108.7, 107.4, 107.9)
+        self.assertEqual(eng.state, _E.SE_SWEEP)
+        self.assertIn("EQH 108.1", self._lines(eng, "SWEEP")[-1])
+
+    def test_sweep_trop_profond_est_un_bos(self):
+        eng = self._struct()
+        self._feed(eng, 107.5, 110.6, 107.4, 108.2)       # mèche > 1 ATR
+        self.assertEqual((eng.state, eng.pending), (_E.SE_IDLE, None))
+        self.assertIn("❌", self._lines(eng, "SWEEP")[-1])
+        self.assertIn("BOS", self._lines(eng, "SWEEP")[-1])
+
+    def test_cloture_de_retour_dans_les_3_bougies(self):
+        eng = self._struct()
+        self._feed(eng, 107.5, 108.5, 107.4, 108.3)       # clôture au-dessus : en attente
+        self._feed(eng, 108.3, 108.5, 108.1, 108.3)
+        self._feed(eng, 108.3, 108.5, 108.1, 108.3)
+        self.assertIsNotNone(eng.pending)
+        self._feed(eng, 108.2, 108.3, 107.5, 107.8)       # 3e bougie suivante : retour accepté
+        self.assertEqual(eng.state, _E.SE_SWEEP)
+        eng2 = self._struct()
+        self._feed(eng2, 107.5, 108.5, 107.4, 108.3)
+        for _ in range(3):
+            self._feed(eng2, 108.3, 108.5, 108.1, 108.3)
+        self.assertEqual((eng2.state, eng2.pending), (_E.SE_IDLE, None))
+        self.assertIn("aucune clôture de retour", self._lines(eng2, "SWEEP")[-1])
+
+    def test_choch_dans_les_10_bougies(self):
+        eng = self._struct()
+        self._feed(eng, 107.5, 108.5, 107.4, 107.9)
+        for _ in range(10):
+            self._feed(eng, 107.0, 107.5, 106.5, 107.0)
+        self.assertEqual(eng.state, _E.SE_SWEEP)
+        self._feed(eng, 107.0, 107.5, 106.5, 107.0)       # 11e bougie sans CHoCH
+        self.assertEqual((eng.state, eng.setup), (_E.SE_IDLE, None))
+        self.assertIn("🔓", self._lines(eng, "LOCK")[-1])
+        self.assertIn("pas de CHoCH", self._lines(eng, "LOCK")[-1])
+
+    def test_sweep_casse_leve_le_verrou(self):
+        eng = self._struct()
+        self._feed(eng, 107.5, 108.5, 107.4, 107.9)
+        self._feed(eng, 107.9, 108.8, 107.5, 107.8)       # dépasse l'extrême du sweep avant le CHoCH
+        self.assertEqual((eng.state, eng.setup), (_E.SE_IDLE, None))
+        self.assertIn("sweep cassé", self._lines(eng, "LOCK")[-1])
+
+    def test_choch_ignore_micro_break_et_meche(self):
+        eng = self._struct()
+        self._feed(eng, 107.5, 108.5, 107.4, 107.9)
+        c = 107.9
+        for _ in range(8):                                 # descente lente : aucun FVG, aucun corps >= 1 ATR
+            self._feed(eng, c, c + 0.3, c - 0.85, c - 0.55)
+            c -= 0.55
+        self._feed(eng, c, c + 0.1, 102.4, 103.2)         # mèche sous 103, clôture au-dessus
+        self.assertEqual(eng.state, _E.SE_SWEEP)
+        self.assertIn("mèche seule", self._lines(eng, "CHOCH")[-1])
+        self._feed(eng, 103.2, 103.3, 102.7, 102.9)       # clôture sous 103 mais corps 0.3 ATR, pas de FVG
+        self.assertEqual(eng.state, _E.SE_SWEEP, "micro-break : pas de CHoCH")
+        self.assertIn("micro-break", self._lines(eng, "CHOCH")[-1])
+
+    def test_verrou_libere_a_100_pourcent(self):
+        eng = self._struct()
+        self._sweep_choch(eng)
+        self.assertEqual(eng.state, _E.SE_MESURE)
+        self._feed(eng, 102.0, 108.6, 102.0, 103.0)       # mèche jusqu'au sweep (100 %)
+        self.assertEqual((eng.state, eng.setup), (_E.SE_IDLE, None))
+        self.assertIn("🔓", self._lines(eng, "LOCK")[-1])
+        self.assertIn("100 %", self._lines(eng, "LOCK")[-1])
+
+    def test_un_seul_trade_par_setup_et_log(self):
+        eng = self._engine()
+        self._arm(eng)
+        eng.setup["anchor_t"] = 1700000000
+        sig = self._step(eng, 105.2, 108.0, 104.9, 105.1)
+        self.assertIsNotNone(sig)
+        self.assertIsNone(eng.setup, "setup consommé")
+        self.assertIsNone(self._step(eng, 105.2, 108.0, 104.9, 105.1) if eng.state == _E.SE_ZONE_50_ACTIVE else None)
+        for needle in ("ancre Fibo 100", "2023-11-14 22:13 UTC", "retracement atteint 80%", "rejet pin bar", "timeframe M1"):
+            self.assertIn(needle, sig["log"])
+
+    def test_interrupteur_telegram(self):
+        keys = ("se_pause", "se_pause_n", "se_pause_candles")
+        old = {k: _E.get_setting(k) for k in keys}
+        try:
+            _E.handle_command("/pausesl off")
+            self.assertFalse(_E.get_se_pause())
+            self.assertIn("spause:on", str(_E._signal_pause_keyboard()))
+            _E.handle_command("/pausesl on 4 90")
+            self.assertTrue(_E.get_se_pause())
+            self.assertEqual((_E.get_se_pause_n(), _E.get_se_pause_candles()), (4, 90))
+            self.assertIn("sig:pause", str(_E._signal_keyboard()))
+        finally:
+            for k, v in old.items():
+                if v is None:
+                    _E._q("DELETE FROM settings WHERE key=?", (k,), commit=True)
+                else:
+                    _E.set_setting(k, v)
+
+
 def _selftest():
     _E.HTF_MODE = "FULL"   # les tests historiques (H1 -> M15 -> M5 -> POI) évaluent la cascade complète ; TestHtfM15 passe en mode M15
     suite, loader = unittest.TestSuite(), unittest.TestLoader()
     for cls in (TestRetracement, TestContinuation, TestInvalidationHTF, TestChop, TestGetExtTf,
                 TestLiquiditePure, TestM1NeDecidePasSeul, TestLogs, TestEntreeM5, TestNonRegression,
-                TestHtfM15, TestBE, TestEntreeOBFVG, TestSLTPCRT, TestSignauxSimultanes, TestLectureExtInt, TestModifyPositionGardeSLTP, TestBEDoubleVerif, TestClientId, TestLogVolumeReel, TestRiskGateUniversel, TestFiltresQualite, TestActifsEtEntrees, TestAjoutsNewsStopUS30, TestQmlSansLimiteAge, TestQmlMemoireEtHistoriqueProfond):
+                TestHtfM15, TestBE, TestEntreeOBFVG, TestSLTPCRT, TestSignauxSimultanes, TestLectureExtInt, TestModifyPositionGardeSLTP, TestBEDoubleVerif, TestClientId, TestLogVolumeReel, TestRiskGateUniversel, TestFiltresQualite, TestActifsEtEntrees, TestAjoutsNewsStopUS30, TestQmlSansLimiteAge, TestQmlMemoireEtHistoriqueProfond, TestSetupEngineEntreeEtPause):
         suite.addTests(loader.loadTestsFromTestCase(cls))
     return 0 if unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful() else 1
 
