@@ -286,16 +286,16 @@ USE_M15_IMPULSE_FILTER = _env_bool("M15_IMPULSE_FILTER", False)
 M15_IMP_DEPTH = _env_int("M15_IMP_DEPTH", 5)                      # profondeur des pivots M15 (> SWING_DEPTH : ignore les micro-jambes)
 M15_IMP_MIN_LEG_ATR = _env_float("M15_IMP_MIN_LEG_ATR", 2.0)      # amplitude mini de l'impulsion (en ATR M15), sinon micro-jambe ignorée
 M15_IMP_LOOKBACK = _env_int("M15_IMP_LOOKBACK", 200)               # remontée max (bougies M15) pour trouver l'origine de l'impulsion
-M15_IMP_MIN_RETRACE = _env_float("M15_IMP_MIN_RETRACE", 0.5)      # zone de réaction principale : 50 % et au-delà
+M15_IMP_MIN_RETRACE = _env_float("M15_IMP_MIN_RETRACE", 0.4)      # zone de réaction principale : 50 % et au-delà
 M15_IMP_EARLY_MIN = _env_float("M15_IMP_EARLY_MIN", 0.236)        # sous ce niveau : jamais de signal ; entre EARLY_MIN et 50 % : seulement avec POI fort
 M15_IMP_NEED_POI = _env_bool("M15_IMP_NEED_POI", True)            # à 50 %+ : exiger une confluence OB / FVG (M15 ou H1) -- « 50 % ne s'utilise pas seul »
 M15_IMP_NEED_SWEEP = _env_bool("M15_IMP_NEED_SWEEP", False)       # à 50 %+ : exiger aussi un sweep sur le point de retournement (optionnel)
 
 # Valeurs de DÉPART des nouveaux filtres : tout se règle ensuite depuis Telegram (menu ⚙️ Paramètres signal), rien à toucher sur Render.
-BOS_REAL_RETRACE = 0.5                 # « vrai BOS » : retracement mini (en % de la jambe) après la cassure
+BOS_REAL_RETRACE = 0.4                 # « vrai BOS » : retracement mini (en % de la jambe) après la cassure
 POI_FILTER_TF = "BOTH"                 # filtre POI HTF : M15 | H1 | BOTH
 BOS_RETRACE_CHOICES = (0.4, 0.45, 0.5)
-M15_RETRACE_CHOICES = (0.382, 0.5, 0.618)
+M15_RETRACE_CHOICES = (0.4, 0.5, 0.618)
 POI_TF_CHOICES = ("M15", "H1", "BOTH")
 
 EXT_DEPTH = _env_int("EXT_DEPTH", 5)   # profondeur (bougies de chaque côté) pour confirmer un pivot swing de liquidité externe
@@ -4378,6 +4378,9 @@ class SEParams:
     max_sl_atr: float = MAX_SL_ATR
     pause_after_sl: int = _env_int("SE_PAUSE_AFTER_SL", 3)       # pause après N SL consécutifs
     pause_candles: int = _env_int("SE_PAUSE_CANDLES", 60)
+    leg_min_atr: float = 0.0           # qualité de jambe : amplitude mini de l'impulsion qui a fait le sweep (en ATR) ; 0 = pas de contrôle
+    sl_mode: str = "SWEEP"             # SWEEP = derrière l'extrême du sweep (historique) · BOUGIE = derrière la bougie d'entrée · AUTO = OB → avalement → bougie d'entrée
+    entry_mode: str = "STRICT"         # STRICT = se_rejection (historique) · CLOSE = avalement ou mèche > corps · TOUCH = mèche seule au 50 %
 
 
 def se_signal_log(symbol, sig):
@@ -4392,6 +4395,21 @@ def se_signal_log(symbol, sig):
 def _se_flip(x):
     """Miroir de prix : ramène un achat à une vente."""
     return {"o": -x["o"], "h": -x["l"], "l": -x["h"], "c": -x["c"]}
+
+
+def se_rejection_close(prev, x, d):
+    """Entrée SETUP50 à la CLÔTURE de la bougie qui touche le 50 % : 'avalement' (engulfing) ou 'mèche > corps' (pin bar : la mèche
+    du côté du rejet — haute pour une vente, basse pour un achat — est plus grande que le corps). Sinon None."""
+    if d == 1:
+        prev, x = _se_flip(prev), _se_flip(x)
+    o, h, l, c = x["o"], x["h"], x["l"], x["c"]
+    if h - l <= 0:
+        return None
+    if c < o and prev["c"] > prev["o"] and o >= prev["c"] and c <= prev["o"]:
+        return "avalement"
+    if (h - max(o, c)) > abs(c - o):
+        return "mèche > corps"
+    return None
 
 
 def se_rejection(prev, x, d):
@@ -4676,6 +4694,15 @@ class SetupEngine:
 
     def _confirm_sweep(self, i, x, pend, what):
         d = pend["dir"]
+        if self.p.leg_min_atr > 0:
+            # jambe = de l'extrême opposé le plus bas (vente) / haut (achat) depuis la formation du niveau balayé, jusqu'à l'extrême du sweep
+            seg = [self._g(k) for k in range(max(self.base, pend["lv_i"]), pend["ext_i"] + 1)]
+            org = min(z["l"] for z in seg) if d == -1 else max(z["h"] for z in seg)
+            leg = abs(pend["ext"] - org) / pend["atr"]
+            if leg < self.p.leg_min_atr:
+                self.pending = None
+                return self._ev("SWEEP", False, f"{what} : jambe trop faible ({leg:.2f} ATR < {self.p.leg_min_atr:g}) — "
+                                                f"le sweep n'est pas le fait d'une vraie impulsion, ignoré")
         lvl_p, lvl_i, lbl = self._choch_level(pend["ext_i"], d, pend["lv_i"])
         self.setup = {"dir": d, "level": pend["lvl"], "start": pend["ext"], "ext_i": pend["ext_i"],
                       "sweep_i": i, "choch_lvl": lvl_p, "choch_lvl_i": lvl_i, "choch_lbl": lbl,
@@ -4693,7 +4720,7 @@ class SetupEngine:
     def _wait_choch(self, i, x, a):
         P, s = self.p, self.setup
         d = s["dir"]
-        if i - s["sweep_i"] > P.choch_window:
+        if P.choch_window > 0 and i - s["sweep_i"] > P.choch_window:
             return self._drop(f"pas de CHoCH dans les {P.choch_window} bougies après le sweep")
         if (d == -1 and x["h"] > s["start"]) or (d == 1 and x["l"] < s["start"]):
             return self._drop("sweep cassé : extrême du sweep dépassé avant le CHoCH")
@@ -4785,11 +4812,30 @@ class SetupEngine:
             return None
         if i < self.pause_until:        # pause après N SL : un setup déjà en cours ne peut pas entrer non plus
             return self._drop(f"pause active ({self.pause_until - i} bougies restantes)")
-        why = se_rejection(self._g(i - 1), x, d)
+        why = ("mèche au 50 %" if P.entry_mode == "TOUCH" else
+               se_rejection_close(self._g(i - 1), x, d) if P.entry_mode == "CLOSE" else se_rejection(self._g(i - 1), x, d))
         if not why:
             return None
         entry = x["c"]
-        sl = s["start"] - d * P.sl_buffer_atr * a
+        sl, sl_basis = s["start"] - d * P.sl_buffer_atr * a, "extrême du sweep"
+        if P.sl_mode in ("AUTO", "BOUGIE"):
+            # SL serré : légèrement derrière l'OB, sinon derrière l'avalement, sinon derrière la bougie d'entrée (jamais à l'intérieur de sa mèche)
+            prev = self._g(i - 1)
+            far, sl_basis = (x["h"] if d == -1 else x["l"]), "bougie d'entrée"
+            if P.sl_mode == "AUTO":
+                ob = None
+                try:
+                    ob = next((z for z in find_pois(self.c, TIMEFRAME_MIN, d)
+                               if z["kind"] == "OB" and z["t_valid"] <= x["t"] and x["l"] <= z["hi"] and x["h"] >= z["lo"]), None)
+                except Exception:
+                    ob = None
+                if ob:
+                    far = max(far, ob["hi"]) if d == -1 else min(far, ob["lo"])
+                    sl_basis = f"OB {ob['lo']:.5g}-{ob['hi']:.5g}"
+                elif why == "avalement":
+                    far = max(far, prev["h"]) if d == -1 else min(far, prev["l"])
+                    sl_basis = "avalement"
+            sl = far - d * P.sl_buffer_atr * a
         if (entry - sl) * d <= 0:
             return self._drop("SL du mauvais côté de l'entrée")
         risk = abs(entry - sl)
@@ -4798,7 +4844,8 @@ class SetupEngine:
         sig = {
             "dir": d, "side": "BUY" if d == 1 else "SELL", "type": "SETUP50", "order": "MARKET",
             "ref_price": entry, "entry": entry, "sl": sl, "risk": risk, "tp": entry + d * risk * P.rr,
-            "rr": P.rr, "t": x["t"], "tf": self.tf, "atr": a, "sweep_t": s["ext_t"], "bos_level": s["choch_lvl"], "setup": f"SWEEP+CHoCH+50% ({why})",
+            "rr": P.rr, "t": x["t"], "tf": self.tf, "atr": a, "sweep_t": s["ext_t"], "bos_level": s["choch_lvl"],
+            "setup": f"SWEEP+CHoCH+50% ({why}) · SL {sl_basis}", "sl_basis": sl_basis,
             "fib": {"start": s["start"], "anchor": s["anchor"], "anchor_t": s.get("anchor_t"), "level": self._fib(s, P.fib_entry),
                     "retr_max": s["retr"], "sweep_level": s["level"], "reject": why},
         }
@@ -4821,6 +4868,50 @@ def get_se_pause():
 
 def set_se_pause(on):
     set_setting("se_pause", "on" if on else "off")
+
+
+SE_CHOCH_WINDOW_CHOICES = (0, 10, 30, 100)      # 0 = illimité
+SE_LEG_ATR_CHOICES = (1.5, 2.0, 3.0)
+SE_ENTRY_CHOICES = ("REJET", "MECHE", "STRICT")
+SE_FIB_CHOICES = (0.4, 0.45, 0.5)
+SE_SL_CHOICES = ("AUTO", "BOUGIE", "SWEEP")
+
+
+def get_se_sl():
+    """SL SETUP50 : AUTO (défaut) = légèrement derrière l'OB, sinon l'avalement, sinon la bougie d'entrée ; BOUGIE = derrière la
+    bougie d'entrée ; SWEEP = derrière l'extrême du sweep (ancien, SL large)."""
+    return _get_choice("se_sl", "AUTO", SE_SL_CHOICES)
+
+
+def get_se_fib_entry():
+    """Retracement MINI de la zone d'entrée SETUP50 (défaut 40 %) : le prix doit avoir retracé au moins ce niveau de la jambe."""
+    v = _get_float_setting("se_fib_entry", 0.4)
+    return v if any(abs(v - c) < 1e-9 for c in SE_FIB_CHOICES) else 0.4
+
+
+def get_se_choch_window():
+    """Bougies max entre le sweep et le CHoCH. 0 = illimité (défaut) : le sweep est l'oeuvre de l'impulsion, on attend la
+    cassure tant que l'extrême du sweep n'est pas dépassé. Réglage Telegram (menu ⛓ Séquence SETUP50)."""
+    try:
+        v = int(float(get_setting("se_choch_window")))
+    except (TypeError, ValueError):
+        return 0
+    return v if v in SE_CHOCH_WINDOW_CHOICES else 0
+
+
+def get_se_entry():
+    """REJET (défaut) : au 50 %, signal à la clôture d'un avalement ou d'une bougie à mèche de rejet > corps (pin bar).
+    MECHE : dès que la mèche touche le 50 %. STRICT : ancien filtre de rejet (engulfing / pin bar 2x / doji)."""
+    return _get_choice("se_entry", "REJET", SE_ENTRY_CHOICES)
+
+
+def get_se_leg():
+    """Qualité de jambe (défaut ON) : le sweep doit être le fait d'une vraie impulsion (>= get_se_leg_atr() ATR)."""
+    return _get_bool_setting("se_leg", True)
+
+
+def get_se_leg_atr():
+    return _get_float_setting("se_leg_atr", 2.0)
 
 
 def get_se_pause_n():
@@ -4883,12 +4974,37 @@ def _se_make_signal(symbol, raw, candles):
     return sig
 
 
+def se_apply_filters(symbol, candles, sig):
+    """Applique à un signal SETUP50 les trois filtres activables sur Telegram (Impulsion M15, Vrai BOS, POI HTF). Tous OFF par défaut :
+    sans aucun filtre actif, retourne (True, None) sans rien lire ni modifier. Retourne (autorisé, motif_de_refus | None) ; en cas
+    d'acceptation, ajoute les lignes d'information au signal. Le point de retournement = extrême du sweep (sweep_t) jusqu'à l'entrée."""
+    f_m15, f_bos, f_poi = get_m15_imp_filter(), get_bos_real(), get_poi_filter()
+    if not (f_m15 or f_bos or f_poi):
+        return True, None
+    idx = next((k for k, x in enumerate(candles) if x["t"] == sig["t"]), len(candles) - 1)
+    st = next((k for k, x in enumerate(candles) if x["t"] == sig.get("sweep_t")), max(0, idx - 20))
+    ev = {"dir": sig["dir"], "i": idx, "t": sig["t"], "src": min(st, idx), "kind": "CHOCH", "type": "SETUP50"}
+    c, trace = candles[:idx + 1], {}
+    for on, fn in ((f_m15, m15_impulse_filter), (f_bos, bos_real_check), (f_poi, poi_mitigation_check)):
+        if on:
+            ok, why = fn(symbol, c, ev, trace)
+            if not ok:
+                return False, why
+    sig.update(m15_imp_on=f_m15, m15_imp=trace.get("m15_imp"), bos_txt=trace.get("bos_txt"), poi_txt=trace.get("poi_txt"))
+    return True, None
+
+
 def setup_engine_signals(symbol, candles, last_seen):
     """Nourrit la machine à états avec les bougies clôturées et retourne les signaux d'ENTRÉE (0 ou 1 en pratique).
     Ne lève jamais : une erreur du moteur est loggée, le scan et le suivi des positions continuent."""
     try:
         eng = _se_engine(symbol)
         eng.p.pause_after_sl, eng.p.pause_candles = get_se_pause_n(), get_se_pause_candles()
+        eng.p.choch_window = get_se_choch_window()
+        eng.p.sl_mode = get_se_sl()
+        eng.p.fib_entry = get_se_fib_entry()
+        eng.p.entry_mode = {"REJET": "CLOSE", "MECHE": "TOUCH", "STRICT": "STRICT"}[get_se_entry()]
+        eng.p.leg_min_atr = get_se_leg_atr() if get_se_leg() else 0.0
         if not get_se_pause():          # interrupteur OFF : lève aussi une pause déjà en cours
             eng.pause_until, eng.losses = -1, 0
         raws = eng.feed(candles)
@@ -4904,7 +5020,12 @@ def setup_engine_signals(symbol, candles, last_seen):
                 continue
             if raw.get("log"):
                 print(raw["log"])
-            out.append(_se_make_signal(symbol, raw, candles))
+            sig = _se_make_signal(symbol, raw, candles)
+            ok, why = se_apply_filters(symbol, candles, sig)
+            if not ok:
+                print(f"[{symbol}] SETUP50 {side} REJETÉ par filtre : {why}")
+                continue
+            out.append(sig)
         return out
     except Exception:
         print(f"[{symbol}] machine à états SETUP50 : erreur (aucun signal ce passage)")
@@ -6218,6 +6339,8 @@ def _signal_text():
             f"🧠 Filtre HTF : {_htf_mode_txt()}\n"
             f"📐 Filtre Fibo HTF : {'ON' if get_mtf_fib_filter() else 'OFF'}\n"
             f"📈 Filtre Impulsion M15 : {'ON' if get_m15_imp_filter() else 'OFF'}\n"
+            f"⛓ SETUP50 : jambe {'≥%gATR' % get_se_leg_atr() if get_se_leg() else 'OFF'} · CHoCH "
+            f"{'illimité' if not get_se_choch_window() else '≤%d bougies' % get_se_choch_window()} · entrée {get_se_entry().lower()}\n"
             f"🧱 Vrai BOS : {'ON ≥ %d%%' % round(get_bos_retrace() * 100) if get_bos_real() else 'OFF'} · "
             f"🎯 POI HTF : {'ON ' + get_poi_filter_tf() if get_poi_filter() else 'OFF'}\n"
             f"⏸ Pause après SL : {se_pause_text()}\n"
@@ -6375,6 +6498,7 @@ def _signal_keyboard():
         [{"text": "🌐 LIQ. EXTERNE", "callback_data": "sig:ext"}, {"text": "📐 FIBO HTF", "callback_data": "sig:fib"}],
         [{"text": "📈 IMPULSION M15", "callback_data": "sig:m15imp"}],
         [{"text": "🧱 VRAI BOS", "callback_data": "sig:bos"}, {"text": "🎯 POI HTF (OB/FVG)", "callback_data": "sig:poih"}],
+        [{"text": "⛓ SÉQUENCE SETUP50", "callback_data": "sig:seq"}],
         [{"text": "📥 ENTRÉE", "callback_data": "sig:entry"}, {"text": "🛡 SL / 🎯 TP", "callback_data": "sig:sltp"}],
         [{"text": "🧩 STRATÉGIES (CRT)", "callback_data": "sig:strat"}, {"text": "🕐 SESSION", "callback_data": "sig:sess"}],
         [{"text": "⏸ PAUSE APRÈS SL", "callback_data": "sig:pause"}],
@@ -6511,6 +6635,37 @@ def _signal_poih_keyboard():
         _onoff_row(get_poi_filter(), "spoi"),
         [{"text": ("✅ " if cur == m else "") + {"M15": "M15", "H1": "H1", "BOTH": "M15 + H1"}[m], "callback_data": f"spoit:{m}"}
          for m in POI_TF_CHOICES]])
+
+
+def _signal_seq_text():
+    cw = get_se_choch_window()
+    return ("⛓ <b>Séquence SETUP50</b>\n"
+            "1️⃣ Qualité de jambe → 2️⃣ Sweep → 3️⃣ CHoCH → 4️⃣ zone 50 % → 5️⃣ entrée\n\n"
+            f"1️⃣ Jambe : <b>{'ON ≥ %g ATR' % get_se_leg_atr() if get_se_leg() else 'OFF'}</b> — le sweep doit être le fait d'une vraie "
+            f"impulsion (du plus bas/haut depuis la formation du niveau balayé jusqu'à l'extrême du sweep).\n"
+            f"3️⃣ CHoCH : <b>{'illimité' if not cw else 'dans les %d bougies' % cw}</b> après le sweep — illimité = on attend la cassure "
+            f"tant que l'extrême du sweep n'est pas dépassé.\n"
+            f"4️⃣ Retracement mini : <b>{get_se_fib_entry() * 100:g} %</b> de la jambe (zone d'entrée)\n"
+            f"6️⃣ SL : <b>{ {'AUTO': 'derrière l OB, sinon l avalement, sinon la bougie d entrée', 'BOUGIE': 'derrière la bougie d entrée', 'SWEEP': 'derrière l extrême du sweep (large)'}[get_se_sl()] }</b>\n"
+            f"5️⃣ Entrée dans la zone : <b>{ {'REJET': 'à la clôture, avalement ou mèche > corps (pin bar)', 'MECHE': 'dès que la mèche touche le 50 %', 'STRICT': 'rejet strict (ancien filtre)'}[get_se_entry()] }</b>\n\n"
+            f"Effet immédiat sur les NOUVEAUX setups. Aussi : /seq")
+
+
+def _signal_seq_keyboard():
+    cw, lg, la, en = get_se_choch_window(), get_se_leg(), get_se_leg_atr(), get_se_entry()
+    return _signal_back([
+        _onoff_row(lg, "sselg"),
+        [{"text": ("✅ " if abs(la - v) < 1e-9 else "") + f"{v:g} ATR", "callback_data": f"ssela:{v}"} for v in SE_LEG_ATR_CHOICES],
+        [{"text": ("✅ " if cw == v else "") + ("CHoCH illimité" if v == 0 else f"{v} bougies"), "callback_data": f"ssecw:{v}"}
+         for v in SE_CHOCH_WINDOW_CHOICES],
+        [{"text": ("✅ " if abs(get_se_fib_entry() - v) < 1e-9 else "") + f"Retracement {v * 100:g}%", "callback_data": f"ssefe:{v}"}
+         for v in SE_FIB_CHOICES],
+        [{"text": ("✅ " if get_se_sl() == "AUTO" else "") + "SL : OB/avalement/bougie", "callback_data": "ssesl:AUTO"}],
+        [{"text": ("✅ " if get_se_sl() == "BOUGIE" else "") + "SL : bougie d'entrée", "callback_data": "ssesl:BOUGIE"},
+         {"text": ("✅ " if get_se_sl() == "SWEEP" else "") + "SL : sweep (large)", "callback_data": "ssesl:SWEEP"}],
+        [{"text": ("✅ " if en == "REJET" else "") + "Avalement / mèche > corps", "callback_data": "sseen:REJET"}],
+        [{"text": ("✅ " if en == "MECHE" else "") + "Mèche seule", "callback_data": "sseen:MECHE"},
+         {"text": ("✅ " if en == "STRICT" else "") + "Rejet strict (ancien)", "callback_data": "sseen:STRICT"}]])
 
 
 def _signal_be_text():
@@ -7022,6 +7177,41 @@ def handle_command(text):
         return (f"📈 Filtre M15 vraie impulsion + structure + Fibonacci : <b>{'ON' if on else 'OFF'}</b>\n"
                 f"Retracement mini {get_m15_min_retrace() * 100:.0f}% (précoce, sous 50%, seulement avec OB/FVG fort).\n"
                 f"Change avec /m15imp on ou /m15imp off.", None)
+    if cmd in ("/seq", "/sequence"):
+        # /seq entree rejet|meche|strict · /seq choch illimite|10|30|100 · /seq jambe on|off|1.5|2|3
+        a_ = [x.strip().lower() for x in parts[1:]]
+        try:
+            if len(a_) >= 2 and a_[0] in ("entree", "entrée"):
+                if not set_choice("se_entry", a_[1], SE_ENTRY_CHOICES):
+                    raise ValueError
+            elif len(a_) >= 2 and a_[0] in ("retrace", "retracement", "fib"):
+                v = float(a_[1].rstrip("%").replace(",", "."))
+                v = v / 100 if v > 1 else v
+                if not any(abs(v - c) < 1e-9 for c in SE_FIB_CHOICES):
+                    raise ValueError
+                set_setting("se_fib_entry", v)
+            elif len(a_) >= 2 and a_[0] == "sl":
+                if not set_choice("se_sl", a_[1], SE_SL_CHOICES):
+                    raise ValueError
+            elif len(a_) >= 2 and a_[0] == "choch":
+                v = 0 if a_[1].startswith(("ill", "0")) else int(a_[1])
+                if v not in SE_CHOCH_WINDOW_CHOICES:
+                    raise ValueError
+                set_setting("se_choch_window", v)
+            elif len(a_) >= 2 and a_[0] == "jambe":
+                if a_[1] in ("on", "off"):
+                    set_setting("se_leg", "1" if a_[1] == "on" else "0")
+                else:
+                    v = float(a_[1].replace(",", "."))
+                    if v not in SE_LEG_ATR_CHOICES:
+                        raise ValueError
+                    set_setting("se_leg", "1"); set_setting("se_leg_atr", v)
+            elif a_:
+                raise ValueError
+        except ValueError:
+            return ("Exemples : /seq sl auto|bougie|sweep · /seq retrace 40 · /seq entree rejet · /seq entree meche · /seq entree strict · /seq choch illimite · /seq choch 30 · "
+                    "/seq jambe on · /seq jambe 2", None)
+        return (_signal_seq_text(), _signal_seq_keyboard())
     if cmd == "/bos":
         for a_ in parts[1:]:
             a_ = a_.strip().lower().rstrip("%")
@@ -7307,6 +7497,8 @@ def _handle_update(u):
                 _edit(cq, _signal_m15imp_text(), _signal_m15imp_keyboard())
             elif page == "bos":
                 _edit(cq, _signal_bos_text(), _signal_bos_keyboard())
+            elif page == "seq":
+                _edit(cq, _signal_seq_text(), _signal_seq_keyboard())
             elif page == "poih":
                 _edit(cq, _signal_poih_text(), _signal_poih_keyboard())
             elif page == "entry":
@@ -7434,6 +7626,39 @@ def _handle_update(u):
                 _edit(cq, _signal_m15imp_text(), _signal_m15imp_keyboard())
                 ack = "OB/FVG exigé" if data.startswith("sm15p:") else "Sweep exigé"
                 ack += " : " + arg.upper()
+        elif data.startswith(("sselg:", "ssela:", "ssecw:", "sseen:", "ssefe:", "ssesl:")):
+            kind, _, arg = data.partition(":")
+            ok_ = False
+            if kind == "sselg" and arg in ("on", "off"):
+                set_setting("se_leg", "1" if arg == "on" else "0"); ok_ = True
+            elif kind == "ssela":
+                try:
+                    v = float(arg)
+                except ValueError:
+                    v = 0
+                if v in SE_LEG_ATR_CHOICES:
+                    set_setting("se_leg_atr", v); ok_ = True
+            elif kind == "ssecw":
+                try:
+                    v = int(arg)
+                except ValueError:
+                    v = -1
+                if v in SE_CHOCH_WINDOW_CHOICES:
+                    set_setting("se_choch_window", v); ok_ = True
+            elif kind == "ssefe":
+                try:
+                    v = float(arg)
+                except ValueError:
+                    v = 0
+                if v in SE_FIB_CHOICES:
+                    set_setting("se_fib_entry", v); ok_ = True
+            elif kind == "ssesl":
+                ok_ = set_choice("se_sl", arg, SE_SL_CHOICES)
+            elif kind == "sseen":
+                ok_ = set_choice("se_entry", arg, SE_ENTRY_CHOICES)
+            if ok_:
+                _edit(cq, _signal_seq_text(), _signal_seq_keyboard())
+                ack = "Séquence SETUP50 mise à jour"
         elif data.startswith("sbos:"):
             arg = data[5:]
             if arg in ("on", "off"):
