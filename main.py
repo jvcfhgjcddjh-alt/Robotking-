@@ -37,7 +37,7 @@ catégorie (gestion via /medias). Optionnel : variables MEDIA_TP, MEDIA_SL, MEDI
 Auto-tests du moteur H1 -> M15 -> M5 -> M1 (sans réseau ni base de prod) :  python main.py --selftest
 Sommaire : 1 Configuration · 2 Base de données · 3 Données de prix · 4 Signaux
            5 Risque · 6 Suivi des positions · 7 Graphique · 8 Telegram · 9 Boucle principale
-           10 Serveur web (Render) · 11 Auto-tests · 12 Module QML (Quasimodo)
+           10 Serveur web (Render) · 11 Auto-tests · 12 Module QML (Quasimodo) · 13 Module FIBTREND
 """
 import json
 import math
@@ -5136,6 +5136,8 @@ def risk_strategy_label(sig):
         base = "CRT"
     elif typ == "QML" or sig.get("key_suffix") == "qml":
         base = "QML"
+    elif typ == "FIBTREND" or sig.get("key_suffix") == "ft":
+        base = "FIBTREND"
     elif typ == "MANUAL":
         base = "MANUAL"
     else:
@@ -6503,7 +6505,7 @@ def _signal_keyboard():
         [{"text": "🧩 STRATÉGIES (CRT)", "callback_data": "sig:strat"}, {"text": "🕐 SESSION", "callback_data": "sig:sess"}],
         [{"text": "⏸ PAUSE APRÈS SL", "callback_data": "sig:pause"}],
         [{"text": "🔬 FILTRES QUALITÉ", "callback_data": "sig:qf"}, {"text": "🌍 ACTIFS", "callback_data": "sig:sym"}],
-        [{"text": "⚙️ QML", "callback_data": "qml:home"}],
+        [{"text": "⚙️ QML", "callback_data": "qml:home"}, {"text": "⚙️ FIBTREND", "callback_data": "ft:home"}],
         [{"text": "🔙 Menu", "callback_data": "menu:home"}]]}
 
 
@@ -7021,10 +7023,11 @@ def _home_text():
 
 def _strategies_text():
     on = lambda b: "🟢 ON" if b else "🔴 OFF"
-    live = [n for n, b in (("BOS/CHoCH", get_strat_main()), ("CRT", get_strat_crt()), ("QML", get_qml_on())) if b]
+    live = [n for n, b in (("BOS/CHoCH", get_strat_main()), ("CRT", get_strat_crt()), ("QML", get_qml_on()), ("FIBTREND", get_ft_on())) if b]
     return (f"🧩 <b>STRATÉGIES</b>\n\n"
             f"BOS / CHoCH : {on(get_strat_main())}\nCRT : {on(get_strat_crt())}\nQML : {on(get_qml_on())}"
-            f" · publication auto : {on(get_qml_auto())}\n\n"
+            f" · publication auto : {on(get_qml_auto())}\n"
+            f"FIBTREND : {on(get_ft_on())} · publication auto : {on(get_ft_auto())}\n\n"
             f"Actives : {', '.join(live) if live else 'aucune ⚠️ (plus aucun signal automatique)'}\n"
             f"Bot : {'🟢 ACTIF' if get_bot_on() else '⏸ ARRÊTÉ'}\n\n"
             f"Chaque stratégie ON scanne tous les actifs activés (🌍 ACTIFS) et publie / exécute automatiquement. "
@@ -7036,7 +7039,9 @@ def _strategies_keyboard():
     return _with_back({"inline_keyboard": [
         [_btn("BOS / CHoCH", "str:main", get_strat_main()), _btn("CRT", "str:crt", get_strat_crt())],
         [_btn("QML", "str:qml", get_qml_on()), _btn("QML auto (signal)", "str:qmlauto", get_qml_auto())],
+        [_btn("FIBTREND", "str:ft", get_ft_on()), _btn("FIBTREND auto (signal)", "str:ftauto", get_ft_auto())],
         [{"text": "📊 Analyse (point potentiel)", "callback_data": "ana:home"}, {"text": "⚙️ QML", "callback_data": "qml:home"}],
+        [{"text": "⚙️ FIBTREND", "callback_data": "ft:home"}],
     ]})
 
 
@@ -7093,6 +7098,7 @@ def handle_command(text):
                "/pausesl [on|off] [nb_SL] [bougies] — pause automatique après N SL consécutifs (stratégie SETUP50)\n"
                "/medias — stickers / images / GIF du groupe (TP, SL, BE, motivation)\n"
                "/qml [on|off] — module QML (TF M5/M15, filtre H1 optionnel, M1 avalement) et clôtures partielles\n"
+               "/ft [on|off|auto|tf 5|tp FIB0/LIQ/RR|rr 2|side|tl] — module FIBTREND (BOS+BOS, Fibo 50 %, avalement/doji), activable à part\n"
                "/analyse — analyse technique / fondamentale à la demande (BTCUSD, XAUUSD)\n"
                "/compte — statut API/broker, balance, equity, marge\n"
                "/manuel [on|off] — active/désactive le trading manuel Telegram\n"
@@ -7333,6 +7339,8 @@ def handle_command(text):
         if len(parts) > 1 and parts[1].lower() in ("on", "off"):
             set_setting("qml_on", "1" if parts[1].lower() == "on" else "0")
         return (_qml_text(), _qml_keyboard())
+    if cmd == "/ft":
+        return (_ft_command(parts), _ft_keyboard())
     if cmd == "/medias":
         if len(parts) > 1 and parts[1].lower() == "export":
             lines = [f"<code>MEDIA_{c}={','.join(get_media(c))}</code>" for c in MEDIA_CATS if get_media(c)]
@@ -7792,6 +7800,8 @@ def _handle_update(u):
                 ack = "Analyse envoyée"
         elif data.startswith("qml:"):
             ack = _qml_callback(cq, data[4:])
+        elif data.startswith("ft:"):
+            ack = _ft_callback(cq, data[3:])
         elif data.startswith("mm:"):
             ack = _mm_callback(cq, data[3:])
         elif data.startswith("ana:fond:"):
@@ -7928,6 +7938,10 @@ def _handle_update(u):
                 set_setting("qml_on", "0" if get_qml_on() else "1"); ack = "QML : " + ("ON" if get_qml_on() else "OFF")
             elif a_ == "qmlauto":
                 set_setting("qml_auto", "0" if get_qml_auto() else "1"); ack = "QML auto : " + ("ON" if get_qml_auto() else "OFF")
+            elif a_ == "ft":
+                set_setting("ft_on", "0" if get_ft_on() else "1"); ack = "FIBTREND : " + ("ON" if get_ft_on() else "OFF")
+            elif a_ == "ftauto":
+                set_setting("ft_auto", "0" if get_ft_auto() else "1"); ack = "FIBTREND auto : " + ("ON" if get_ft_auto() else "OFF")
             _edit(cq, _strategies_text(), _strategies_keyboard())
         elif data.startswith("news:"):
             if data == "news:on":
@@ -8887,6 +8901,11 @@ def _trading_loop():
                     qml_process_symbol(symbol)   # stratégie QML séparée (OFF par défaut) : jamais bloquante
                 except Exception:
                     print(f"[{symbol}] module QML : erreur (ignorée)")
+                    traceback.print_exc(limit=-3)
+                try:
+                    ft_process_symbol(symbol)    # stratégie FIBTREND séparée (OFF par défaut) : jamais bloquante
+                except Exception:
+                    print(f"[{symbol}] module FIBTREND : erreur (ignorée)")
                     traceback.print_exc(limit=-3)
             if time.time() - last_mt5_sync >= MT5_SYNC_INTERVAL:   # réconciliation broker, indépendante du scan par symbole
                 last_mt5_sync = time.time()
@@ -12087,8 +12106,394 @@ def _qml_callback(cq, arg):
     return ack
 
 
+# ============================================================================
+# 13. MODULE FIBTREND — tendance (BOS + BOS) + ligne de tendance + retracement Fibo >= 50 % + avalement / doji
+#
+# Stratégie SÉPARÉE, activable / désactivable à part (/ft on|off ou menu ⚙️ FIBTREND, OFF par défaut) :
+# ne touche ni au moteur BOS/CHoCH, ni au CRT, ni au QML. Fonctionne sur M1 / M3 / M5 / M15 / M30 / H1 (réglable à chaud).
+# Règles (tout est en ATR, en % du Fibo ou en nombre de bougies, donc valable sur tous les timeframes) :
+#   1. TENDANCE : les FT_MIN_BOS (2) derniers événements de `analyze` sont des BOS de même sens
+#      (BOS + BOS baissier = vente ; BOS + BOS haussier = achat). Un CHoCH annule la tendance.
+#   2. LIGNE DE TENDANCE : les 2 derniers pivots (sommets pour une vente, creux pour un achat) sont décroissants /
+#      croissants et la clôture reste du bon côté de la ligne (réglable : /ft tl).
+#   3. PAS DE RANGE : efficience >= FT_MIN_ER à la fin de l'impulsion, et jambe >= FT_MIN_LEG_ATR x ATR.
+#   4. FIBO : 1.0 = origine de la jambe (dernier pivot avant l'extrême), 0.0 = extrême (plus bas / plus haut depuis la
+#      cassure). Recalculé à chaque bougie : l'extrême suit le prix tant qu'il fait de nouveaux extrêmes.
+#   5. RETRACEMENT : la MÈCHE de la bougie signal atteint au moins FT_MIN_RET (50 %) de la jambe, sans dépasser l'origine.
+#   6. DÉCLENCHEUR : bougie d'avalement (dans le sens de la tendance) ou doji. Entrée à la clôture de cette bougie.
+#   7. SL : DERRIÈRE la bougie d'entrée (+ FT_SL_ATR x ATR, 0 = pile sur la mèche).
+#   8. TP au choix (/ft tp FIB0|LIQ|RR) :
+#        FIB0 = niveau 0.0 du Fibo (extrême de la jambe) · RR = RR fixe (/ft rr 2)
+#        LIQ  = liquidité externe : buy side (achat, plus proche haut non balayé au-dessus) / sell side (vente, plus proche
+#               bas non balayé en dessous) sur l'UT supérieure (LIQ_EXT) ; repli sur le 0.0 si aucune cible exploitable.
+# ============================================================================
+FT_MIN_BOS = _env_int("FT_MIN_BOS", 2)              # nombre de BOS consécutifs exigés (même sens)
+FT_MIN_RET = _env_float("FT_MIN_RET", 0.5)          # retracement minimum par la mèche (0.5 = 50 %)
+FT_MAX_AGE = _env_int("FT_MAX_AGE", 120)            # âge maximum du dernier BOS (en bougies)
+FT_MIN_LEG_ATR = _env_float("FT_MIN_LEG_ATR", 3.0)  # jambe minimale en ATR (anti micro-impulsion)
+FT_MIN_ER = _env_float("FT_MIN_ER", 0.20)           # efficience minimale (anti-range)
+FT_ER_LOOKBACK = _env_int("FT_ER_LOOKBACK", 30)     # bougies analysées pour l'efficience
+FT_SL_ATR = _env_float("FT_SL_ATR", 0.05)           # marge du SL derrière la bougie d'entrée (x ATR ; 0 = pile sur la mèche)
+FT_MIN_RR = _env_float("FT_MIN_RR", 1.0)            # RR minimum
+FT_DOJI_BODY = _env_float("FT_DOJI_BODY", 0.15)     # doji : corps <= 15 % du range
+FT_DOJI_MIN_ATR = _env_float("FT_DOJI_MIN_ATR", 0.3)  # doji : range >= 0.3 ATR (ignore les micro-bougies)
+FT_TF_CHOICES = (1, 3, 5, 15, 30, 60)
+FT_TP_MODES = ("FIB0", "LIQ", "RR")
+FT_RR_CHOICES = (1.5, 2.0, 3.0, 4.0)
+FT_SIDE_CHOICES = ("BOTH", "SELL", "BUY")
+FT_SCAN_SEC = _env_int("FT_SCAN_SEC", 15)
+_ft_last_scan, _ft_last_t = {}, {}
+
+
+def get_ft_on():
+    return _get_bool_setting("ft_on", _env_on("FT_ENABLED", False))
+
+
+def get_ft_auto():
+    """ON : une entrée validée est publiée comme vrai signal (suivi + exécution existante). OFF : message admin seulement."""
+    return _get_bool_setting("ft_auto", _env_on("FT_AUTO", False))
+
+
+def get_ft_tf():
+    try:
+        v = int(float(get_setting("ft_tf", os.getenv("FT_TF", "15").strip().upper().lstrip("M") or 15)))
+    except (TypeError, ValueError):
+        v = 15
+    return v if v in FT_TF_CHOICES else 15
+
+
+def get_ft_tp():
+    return _get_choice("ft_tp", os.getenv("FT_TP", "FIB0").strip().upper(), FT_TP_MODES)
+
+
+def get_ft_rr():
+    try:
+        v = float(get_setting("ft_rr", os.getenv("FT_RR", "2")))
+    except (TypeError, ValueError):
+        v = 2.0
+    return v if v > 0 else 2.0
+
+
+def get_ft_sides():
+    return _get_choice("ft_sides", os.getenv("FT_SIDES", "BOTH").strip().upper(), FT_SIDE_CHOICES)
+
+
+def get_ft_trendline():
+    return _get_bool_setting("ft_tl", _env_on("FT_TRENDLINE", True))
+
+
+def _ft_pivots(c, depth):
+    """Pivots confirmés (même règle que `analyze`) : (sommets, creux), chacun = liste de (index, prix)."""
+    n, hs, ls = len(c), [], []
+    for p in range(depth, n - depth):
+        win_h = [x["h"] for x in c[p - depth:p + depth + 1]]
+        win_l = [x["l"] for x in c[p - depth:p + depth + 1]]
+        if c[p]["h"] == max(win_h) and all(c[p]["h"] > c[k]["h"] for k in range(p - depth, p)):
+            hs.append((p, c[p]["h"]))
+        if c[p]["l"] == min(win_l) and all(c[p]["l"] < c[k]["l"] for k in range(p - depth, p)):
+            ls.append((p, c[p]["l"]))
+    return hs, ls
+
+
+def _ft_efficiency(c, end, n):
+    """Déplacement net / chemin parcouru sur les n bougies qui finissent à `end` (1 = tendance pure, ~0 = range)."""
+    w = c[max(0, end - n):end + 1]
+    path = sum(abs(w[k]["c"] - w[k - 1]["c"]) for k in range(1, len(w)))
+    return abs(w[-1]["c"] - w[0]["c"]) / path if path > 0 else 0.0
+
+
+def _ft_trigger(c, atr):
+    """Dernière bougie clôturée : ('doji', 0) / ('avalement', sens : 1 haussier, -1 baissier) ou (None, 0)."""
+    x, p = c[-1], c[-2]
+    rng, body = x["h"] - x["l"], abs(x["c"] - x["o"])
+    if rng <= 0:
+        return None, 0
+    if body <= FT_DOJI_BODY * rng and rng >= FT_DOJI_MIN_ATR * atr:
+        return "doji", 0
+    if x["c"] < x["o"] and p["c"] > p["o"] and x["o"] >= p["c"] and x["c"] <= p["o"]:
+        return "avalement", -1
+    if x["c"] > x["o"] and p["c"] < p["o"] and x["o"] <= p["c"] and x["c"] >= p["o"]:
+        return "avalement", 1
+    return None, 0
+
+
+def ft_ext_pools(symbol, tf, own=None):
+    """Liquidité externe NON balayée (pivots swing de l'UT supérieure LIQ_EXT[tf] ; sans UT supérieure : l'UT elle-même `own`).
+    Retourne {"tf", "highs": [{"level", "eq"}], "lows": [...]} (même méthode que `ext_map`, mais pour l'UT du module)."""
+    ext_tf = LIQ_EXT.get(tf, HTF_MINUTES)
+    if ext_tf <= tf:
+        ext_tf = tf
+    raw = own if (ext_tf == tf and own) else _ctx_candles(symbol, ext_tf)
+    if len(raw) <= 2 * EXT_DEPTH + 1:
+        return {"tf": ext_tf, "highs": [], "lows": []}
+    atr_now = atr_series(raw)[-1]
+    highs, lows = [], []
+    for p in range(EXT_DEPTH, len(raw) - EXT_DEPTH):
+        win_h = [x["h"] for x in raw[p - EXT_DEPTH:p + EXT_DEPTH + 1]]
+        win_l = [x["l"] for x in raw[p - EXT_DEPTH:p + EXT_DEPTH + 1]]
+        if raw[p]["h"] == max(win_h) and all(raw[p]["h"] > raw[k]["h"] for k in range(p - EXT_DEPTH, p)):
+            if not any(k["h"] > raw[p]["h"] for k in raw[p + 1:]):
+                highs.append({"level": raw[p]["h"]})
+        if raw[p]["l"] == min(win_l) and all(raw[p]["l"] < raw[k]["l"] for k in range(p - EXT_DEPTH, p)):
+            if not any(k["l"] < raw[p]["l"] for k in raw[p + 1:]):
+                lows.append({"level": raw[p]["l"]})
+    tol = EQ_TOL_ATR * atr_now
+    for lst in (highs, lows):
+        for a in lst:
+            a["eq"] = any(b is not a and abs(a["level"] - b["level"]) < tol for b in lst)
+    return {"tf": ext_tf, "highs": highs, "lows": lows}
+
+
+def _ft_pick_tp(d, entry, risk, extreme, tp_mode, rr_fixed, pools):
+    """(tp, libellé) selon le mode ; None si aucune cible valable (RR < FT_MIN_RR)."""
+    if tp_mode == "RR":
+        if rr_fixed < FT_MIN_RR:
+            return None
+        return entry + d * rr_fixed * risk, f"RR fixe {rr_fixed:g}"
+    if tp_mode == "LIQ":
+        try:
+            m = pools() if callable(pools) else pools
+        except Exception as e:
+            print(f"[FIBTREND] liquidité externe indisponible ({type(e).__name__}) : repli sur le 0.0")
+            m = None
+        if m:
+            lst = m["highs"] if d == 1 else m["lows"]
+            for pv in sorted((p for p in lst if (p["level"] - entry) * d > 0), key=lambda p: abs(p["level"] - entry)):
+                if abs(pv["level"] - entry) / risk >= FT_MIN_RR:
+                    kind = ("EQH" if pv["eq"] else "buy side") if d == 1 else ("EQL" if pv["eq"] else "sell side")
+                    return pv["level"], f"liquidité {kind} {_tf_lbl(m['tf'])}"
+    # FIB0 (ou repli de LIQ) : 0.0 du Fibo
+    if (extreme - entry) * d > 0 and abs(extreme - entry) / risk >= FT_MIN_RR:
+        return extreme, "Fibo 0.0" + (" (repli : pas de liquidité externe)" if tp_mode == "LIQ" else "")
+    return None
+
+
+def ft_find_setup(c, depth=None, tp_mode="FIB0", rr_fixed=2.0, pools=None, sides="BOTH", use_tl=True):
+    """Cherche une entrée FIBTREND sur la DERNIÈRE bougie clôturée de `c`. Retourne un dict ou None (jamais de look-ahead).
+    pools : carte de liquidité externe (dict) ou fonction qui la calcule (appelée seulement si tout le reste est validé)."""
+    depth = depth or SWING_DEPTH
+    c = c[-500:]
+    n = len(c)
+    if n < max(60, 4 * depth + 10):
+        return None
+    atr = atr_series(c)[-1]
+    if not atr:
+        return None
+    evs = analyze(c, depth)
+    if len(evs) < FT_MIN_BOS:
+        return None
+    last = evs[-FT_MIN_BOS:]
+    d = last[-1]["dir"]
+    if any(e["kind"] != "BOS" or e["dir"] != d for e in last):
+        return None                                         # BOS + BOS exigés, un CHoCH annule la tendance
+    if (sides == "SELL" and d != -1) or (sides == "BUY" and d != 1):
+        return None
+    if n - 1 - last[-1]["i"] > FT_MAX_AGE:
+        return None                                         # tendance trop ancienne
+
+    hs, ls = _ft_pivots(c, depth)
+    # --- jambe / Fibo : 0.0 = extrême depuis la cassure, 1.0 = dernier pivot avant cet extrême
+    src = last[-1]["src"]
+    if d == -1:
+        e = min(range(src, n), key=lambda k: c[k]["l"])
+        extreme = c[e]["l"]
+        before = [v for p, v in hs if p < e]
+    else:
+        e = max(range(src, n), key=lambda k: c[k]["h"])
+        extreme = c[e]["h"]
+        before = [v for p, v in ls if p < e]
+    if e >= n - 1 or not before:
+        return None                                         # pas de retracement encore, ou pas d'origine
+    origin = before[-1]
+    leg = abs(origin - extreme)
+    if (origin - extreme) * d >= 0 or leg < FT_MIN_LEG_ATR * atr:
+        return None                                         # jambe trop petite (anti micro-impulsion)
+    er = _ft_efficiency(c, e, FT_ER_LOOKBACK)
+    if er < FT_MIN_ER:
+        return None                                         # range : on ne trade pas
+
+    # --- ligne de tendance : pivots décroissants (vente) / croissants (achat), clôture du bon côté
+    x = c[-1]
+    tl = None
+    if use_tl:
+        pts = hs if d == -1 else ls
+        if len(pts) < 2:
+            return None
+        (i1, p1), (i2, p2) = pts[-2], pts[-1]
+        if (p2 - p1) * d <= 0 or i2 == i1:
+            return None
+        tl = p2 + (p2 - p1) / (i2 - i1) * (n - 1 - i2)
+        if (x["c"] - tl) * d < 0:
+            return None                                     # clôture au-delà de la ligne : tendance cassée
+
+    # --- retracement : la MÈCHE atteint >= 50 % de la jambe, sans dépasser l'origine
+    if d == -1:
+        lvl = extreme + FT_MIN_RET * leg
+        far = max(k["h"] for k in c[e + 1:])
+        ret = (x["h"] - extreme) / leg
+        wick_ok = x["h"] >= lvl
+    else:
+        lvl = extreme - FT_MIN_RET * leg
+        far = min(k["l"] for k in c[e + 1:])
+        ret = (extreme - x["l"]) / leg
+        wick_ok = x["l"] <= lvl
+    if not wick_ok or (origin - far) * d > 0:
+        return None                                         # pas assez de retracement, ou origine dépassée
+
+    # --- déclencheur : avalement (dans le sens de la tendance) ou doji, entrée à la clôture
+    trig, tdir = _ft_trigger(c, atr)
+    if trig is None or (trig == "avalement" and tdir != d):
+        return None
+    entry = x["c"]
+    sl = x["h"] + FT_SL_ATR * atr if d == -1 else x["l"] - FT_SL_ATR * atr   # DERRIÈRE la bougie d'entrée
+    risk = abs(entry - sl)
+    if risk <= 0 or (entry - sl) * d <= 0:
+        return None
+    picked = _ft_pick_tp(d, entry, risk, extreme, tp_mode, rr_fixed, pools)
+    if picked is None:
+        return None
+    tp, tp_lbl = picked
+    return {"dir": d, "side": "BUY" if d == 1 else "SELL", "t": x["t"], "entry": entry, "sl": sl, "tp": tp,
+            "risk": risk, "rr": abs(tp - entry) / risk, "tp_label": tp_lbl, "trigger": trig, "origin": origin,
+            "extreme": extreme, "lvl": lvl, "ret": ret, "t_extreme": c[e]["t"], "trendline": tl, "atr": atr, "er": er}
+
+
+def ft_build_signal(r, tf):
+    """Signal compatible avec publish_signal (même format que qml_build_signal)."""
+    d = r["dir"]
+    lo, hi = sorted((r["lvl"], r["origin"]))
+    return {
+        "dir": d, "side": r["side"], "type": "FIBTREND", "order": "MARKET", "ref_price": r["entry"],
+        "entry": r["entry"], "sl": r["sl"], "risk": r["risk"], "tp": r["tp"], "t": r["t"], "bos_level": r["origin"],
+        "rr": round(r["rr"], 2), "htf": False, "htf_mode": "OFF", "be_rr": get_be_rr(), "tf": _tf_lbl(tf),
+        "setup": f"FIBTREND {_tf_lbl(tf)} BOS+BOS · retracement {r['ret']:.0%} · {r['trigger']}",
+        "poi": None, "mtf_fib_on": False, "mtf_fib": None, "qf": {}, "ext": None, "sweep": None,
+        "sl_mode": "STRUCT", "tp_mode": r["tp_label"], "key_suffix": "ft",
+        "zone": {"tf": tf, "kind": "FIBTREND", "d": d, "lo": lo, "hi": hi},
+    }
+
+
+def ft_text(r, symbol, tf):
+    dec = SYMBOLS[symbol]["decimals"]
+    f = lambda v: _fmt(v, dec)
+    icon = "🔴" if r["dir"] == -1 else "🟢"
+    return (f"{icon} <b>FIBTREND {r['side']} {symbol}</b> · {_tf_lbl(tf)}\n"
+            f"Tendance : BOS + BOS {'baissier' if r['dir'] == -1 else 'haussier'} · efficience {r['er']:.2f}\n"
+            f"Fibo : 1.0 = {f(r['origin'])} · 50 % = {f(r['lvl'])} · 0.0 = {f(r['extreme'])}\n"
+            f"Retracement par la mèche : {r['ret']:.0%} · déclencheur : {r['trigger']}\n"
+            f"Entrée {f(r['entry'])} · SL {f(r['sl'])} (derrière la bougie) · TP {f(r['tp'])} ({r['tp_label']}) · RR {r['rr']:.2f}")
+
+
+def ft_process_symbol(symbol):
+    """Une analyse par nouvelle bougie clôturée ; une proposition par jambe de Fibo."""
+    if not get_ft_on() or not get_symbol_on(symbol) or not get_bot_on():
+        return
+    now = time.time()
+    if now - _ft_last_scan.get(symbol, 0.0) < FT_SCAN_SEC:
+        return
+    _ft_last_scan[symbol] = now
+    tf = get_ft_tf()
+    c = get_candles(symbol, minutes=tf)
+    if not c or _ft_last_t.get((symbol, tf)) == c[-1]["t"]:
+        return                                              # pas de nouvelle bougie clôturée
+    _ft_last_t[(symbol, tf)] = c[-1]["t"]
+    r = ft_find_setup(c, tp_mode=get_ft_tp(), rr_fixed=get_ft_rr(), sides=get_ft_sides(), use_tl=get_ft_trendline(),
+                      pools=lambda: ft_ext_pools(symbol, tf, own=c))
+    if not r:
+        return
+    key = f"ft_sent:{symbol}:{tf}:{r['side']}:{r['t_extreme']}"
+    if get_meta(key) or not session_ok(r["t"]) or news_block_info(symbol):
+        return
+    set_meta(key, 1)
+    if get_ft_auto():
+        if publish_signal(symbol, c, analyze(c), ft_build_signal(r, tf)):
+            return
+    to_admin(ft_text(r, symbol, tf))
+
+
+# --- Telegram : menu ⚙️ FIBTREND ------------------------------------------------------------------
+_FT_TP_LBL = {"FIB0": "Fibo 0.0", "LIQ": "Liquidité externe", "RR": "RR fixe"}
+_FT_SIDE_LBL = {"BOTH": "Achat + vente", "SELL": "Vente seule", "BUY": "Achat seul"}
+
+
+def _ft_menu_text():
+    on = lambda b: "🟢 ON" if b else "🔴 OFF"
+    tp = get_ft_tp()
+    return (f"⚙️ <b>FIBTREND</b>\n\nModule : {on(get_ft_on())}\nTimeframe : {_tf_lbl(get_ft_tf())}\n"
+            f"Publier comme signal (auto) : {on(get_ft_auto())}\nSens : {_FT_SIDE_LBL[get_ft_sides()]}\n\n"
+            f"Tendance : {FT_MIN_BOS} BOS · ligne de tendance : {on(get_ft_trendline())}\n"
+            f"Retracement min (mèche) : {FT_MIN_RET:.0%} · jambe min : {FT_MIN_LEG_ATR:g} ATR · efficience min : {FT_MIN_ER:g}\n"
+            f"Déclencheur : avalement ou doji · SL derrière la bougie d'entrée\n"
+            f"TP : <b>{_FT_TP_LBL[tp]}</b>" + (f" {get_ft_rr():g}" if tp == "RR" else "") + "\n\n"
+            f"OFF = plus aucune entrée FIBTREND. « Auto » OFF : proposition envoyée à l'admin seulement, aucun ordre.\n"
+            f"Commandes : /ft on · off · auto · tf 5 · tp FIB0|LIQ|RR · rr 2 · side BOTH|SELL|BUY · tl")
+
+
+def _ft_keyboard():
+    return _with_back({"inline_keyboard": [
+        [_btn("FIBTREND", "ft:on", get_ft_on()), _btn("Auto (signal)", "ft:auto", get_ft_auto())],
+        [_btn(_tf_lbl(t), f"ft:tf:{t}", get_ft_tf() == t) for t in FT_TF_CHOICES],
+        [_btn(_FT_TP_LBL[m], f"ft:tp:{m}", get_ft_tp() == m) for m in FT_TP_MODES],
+        [_btn(f"RR {v:g}", f"ft:rr:{v:g}", abs(get_ft_rr() - v) < 1e-9) for v in FT_RR_CHOICES],
+        [_btn(_FT_SIDE_LBL[s], f"ft:side:{s}", get_ft_sides() == s) for s in FT_SIDE_CHOICES],
+        [_btn("Ligne de tendance", "ft:tl", get_ft_trendline())],
+    ]})
+
+
+def _ft_command(parts):
+    """/ft [on|off|auto|tf N|tp X|rr N|side X|tl] — retourne le texte du menu."""
+    _ft_do([x.lower() for x in parts[1:]], explicit=True)
+    return _ft_menu_text()
+
+
+def _ft_do(args, explicit):
+    """Applique une action. explicit=True : « on » / « off » fixent l'état (commande) ; False : le bouton « ft:on » bascule."""
+    if not args:
+        return ""
+    a, v = args[0], (args[1] if len(args) > 1 else "")
+    if a == "on":
+        set_setting("ft_on", "1" if explicit else ("0" if get_ft_on() else "1"))
+        return "FIBTREND : " + ("ON" if get_ft_on() else "OFF")
+    if a == "off":
+        set_setting("ft_on", "0")
+        return "FIBTREND : OFF"
+    if a == "auto":
+        set_setting("ft_auto", "0" if get_ft_auto() else "1")
+        return "Auto : " + ("ON" if get_ft_auto() else "OFF")
+    if a == "tl":
+        set_setting("ft_tl", "0" if get_ft_trendline() else "1")
+        return "Ligne de tendance : " + ("ON" if get_ft_trendline() else "OFF")
+    if a == "tf" and v.lstrip("mM").isdigit() and int(v.lstrip("mM")) in FT_TF_CHOICES:
+        set_setting("ft_tf", int(v.lstrip("mM")))
+        return "TF FIBTREND : " + _tf_lbl(get_ft_tf())
+    if a == "tp" and v.upper() in FT_TP_MODES:
+        set_setting("ft_tp", v.upper())
+        return "TP : " + _FT_TP_LBL[get_ft_tp()]
+    if a == "rr":
+        try:
+            if float(v) > 0:
+                set_setting("ft_rr", float(v))
+                return f"RR fixe : {get_ft_rr():g}"
+        except ValueError:
+            pass
+        return "RR invalide"
+    if a == "side" and v.upper() in FT_SIDE_CHOICES:
+        set_setting("ft_sides", v.upper())
+        return "Sens : " + _FT_SIDE_LBL[get_ft_sides()]
+    return ""
+
+
+def _ft_callback(cq, arg):
+    """Gère les boutons « ft:... ». Retourne le texte de confirmation (toast)."""
+    ack = "" if arg == "home" else _ft_do(arg.split(":"), explicit=False)
+    _edit(cq, _ft_menu_text(), _ft_keyboard())
+    return ack
+
+
+
 if __name__ == "__main__":
     if "--selftest" in sys.argv:
         sys.exit(_selftest())
     main()
+
 
