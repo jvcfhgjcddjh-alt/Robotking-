@@ -37,7 +37,7 @@ catégorie (gestion via /medias). Optionnel : variables MEDIA_TP, MEDIA_SL, MEDI
 Auto-tests du moteur H1 -> M15 -> M5 -> M1 (sans réseau ni base de prod) :  python main.py --selftest
 Sommaire : 1 Configuration · 2 Base de données · 3 Données de prix · 4 Signaux
            5 Risque · 6 Suivi des positions · 7 Graphique · 8 Telegram · 9 Boucle principale
-           10 Serveur web (Render) · 11 Auto-tests · 12 Module QML (Quasimodo) · 13 Module FIBTREND
+           10 Serveur web (Render) · 11 Auto-tests · 12 Module QML (Quasimodo) · 13 Module FIBTREND · 14 Moteur SMC · 15 Stratégie QML GAGNANT
 """
 import json
 import math
@@ -1960,6 +1960,8 @@ def place_manual_order(symbol, side, sl_price=None):
     qui reste inchangé. Sans sl_price : SL automatique (plancher de risque). execute_mt5_order fait toutes les validations
     techniques (specs, stopsLevel, volume, filling mode) et ne lève jamais, il retourne None si refusé.
     Retourne {"ok": True, ...détails...} ou {"ok": False, "error": "..."} — jamais d'exception."""
+    if not get_mt5_orders_on():
+        return {"ok": False, "error": "ordres MT5 désactivés (menu 🧩 Stratégies → 📈 Ordres MT5)"}
     plan = _manual_plan(symbol, side, sl_price)
     if not plan["ok"]:
         return plan
@@ -2249,6 +2251,20 @@ def _get_bool_setting(key, default):
     if v is None:
         return bool(default)
     return str(v).strip().lower() in ("1", "true", "yes", "on")
+
+
+# Interrupteur général des ORDRES MT5 (via l'API MetaApi) : ON = comportement d'avant (ordre envoyé quand les identifiants
+# MetaApi sont présents) ; OFF = signaux toujours publiés et suivis (RR / BE / TP / SL), mais AUCUN ordre envoyé au broker.
+MT5_ORDERS_DEFAULT = os.getenv("MT5_ORDERS_ENABLED", "1").strip().lower() in ("1", "on", "true", "yes", "oui")
+
+
+def get_mt5_orders_on():
+    return _get_bool_setting("mt5_orders", MT5_ORDERS_DEFAULT)
+
+
+def mt5_orders_allowed():
+    """Ordres MT5 autorisés = identifiants MetaApi présents ET interrupteur sur ON."""
+    return bool(METAAPI_TOKEN and METAAPI_ACCOUNT_ID) and get_mt5_orders_on()
 
 
 def get_poc_entry():
@@ -6046,7 +6062,9 @@ def to_admin(text, reply_markup=None):
 # la catégorie (voir _handle_update). Stockage : base SQLite + variables d'env optionnelles MEDIA_TP, MEDIA_SL,
 # MEDIA_BE, MEDIA_MOTIV (liste séparée par des virgules, cf. /medias export) qui survivent à un redéploiement
 # Render sans disque persistant. Plusieurs médias par catégorie : un est tiré au hasard à chaque événement.
-MEDIA_CATS = {"TP": "🎯 TP", "SL": "🔴 SL", "BE": "➖ BE", "MOTIV": "💪 Motivation"}
+MEDIA_CATS = {"TP": "🎯 TP", "SL": "🔴 SL", "BE": "➖ BE", "MOTIV": "💪 Motivation",
+              "BUY": "🟢 ACHAT", "SELL": "🔴 VENTE"}   # BUY / SELL : envoyés à CHAQUE entrée (plusieurs à la fois)
+MEDIA_ENTRY_COUNT = _env_int("MEDIA_ENTRY_COUNT", 3)   # nombre de stickers BUY / SELL envoyés à chaque entrée
 _MEDIA_SEND = {"sticker": "sendSticker", "photo": "sendPhoto", "animation": "sendAnimation"}
 _pending_media = {}   # (chat_id, message_id) -> "type:file_id" en attente du choix de catégorie
 
@@ -6068,17 +6086,35 @@ def clear_media(cat):
     set_setting(f"media:{cat}", "[]")
 
 
-def to_group_media(cat):
-    """Envoie au groupe un média tiré au hasard dans la catégorie (silencieux si aucun n'est configuré)."""
+def to_group_media(cat, n=1):
+    """Envoie au groupe n médias DIFFÉRENTS tirés au hasard dans la catégorie (n=1 : comme avant ; silencieux si aucun
+    n'est configuré)."""
     items = get_media(cat)
     if not items or not CHAT_ID_GROUPE:
         return
-    kind, _, file_id = random.choice(items).partition(":")
-    if kind not in _MEDIA_SEND:
+    for item in random.sample(items, min(max(1, int(n)), len(items))):
+        kind, _, file_id = item.partition(":")
+        if kind not in _MEDIA_SEND:
+            continue
+        res = _post(_MEDIA_SEND[kind], {"chat_id": CHAT_ID_GROUPE, kind: file_id})
+        if res is not None and not res.get("ok"):
+            print(f"[telegram] média {cat} refusé : {res.get('description')}")
+
+
+ENTRY_MEDIA_ENABLED = os.getenv("ENTRY_MEDIA_ENABLED", "1").strip().lower() in ("1", "on", "true", "yes", "oui")
+
+
+def entry_media_and_lot(symbol, sig, lot):
+    """À chaque entrée : plusieurs stickers ACHAT (verts) ou VENTE (rouges) au groupe, puis à l'admin UNE ligne courte :
+    sens + actif + lot, rien d'autre. Ne lève jamais (un souci de média ne doit pas gêner le signal)."""
+    if not ENTRY_MEDIA_ENABLED:
         return
-    res = _post(_MEDIA_SEND[kind], {"chat_id": CHAT_ID_GROUPE, kind: file_id})
-    if res is not None and not res.get("ok"):
-        print(f"[telegram] média {cat} refusé : {res.get('description')}")
+    try:
+        buy = sig["side"] == "BUY"
+        to_group_media("BUY" if buy else "SELL", n=MEDIA_ENTRY_COUNT)
+        to_admin(f"{'🟢 <b>ACHAT</b>' if buy else '🔴 <b>VENTE</b>'} {symbol} · LOT <b>{lot:g}</b>")
+    except Exception as e:
+        print(f"[{symbol}] stickers d'entrée indisponibles ({type(e).__name__})")
 
 
 # --- formats ---------------------------------------------------------------------
@@ -6181,13 +6217,20 @@ def _be_line(sig):
     return f"BE → RR{be_rr:g}" if be_rr < _sig_rr(sig) else "BE : non utilisé (RR du BE ≥ TP)"
 
 
-def group_signal(symbol, sig, position_n, dec, tf=None):
-    """Message groupe ultra court : sens, entrée, SL, TP."""
-    icon = "🟢" if sig["side"] == "BUY" else "🔴"
+def _head_line(symbol, sig, lot=None):
+    """1re ligne (aperçu de la notification) : gros pictos ACHAT vert / VENTE rouge + actif + LOT en gras."""
+    buy = sig["side"] == "BUY"
+    lbl = ("ACHAT" if buy else "VENTE") + (" LIMIT" if sig.get("order") == "LIMIT" else "")
+    lot_txt = f" · LOT {lot:g}" if lot else ""
+    return f"{'🟢🟢🟢' if buy else '🔴🔴🔴'} <b>{lbl} {symbol}{lot_txt}</b>"
+
+
+def group_signal(symbol, sig, position_n, dec, tf=None, lot=None):
+    """Message groupe court : 1re ligne sens + LOT (visible dans la notification), puis entrée, SL, TP et RR."""
     limit = sig.get("order") == "LIMIT"
-    label = f"{sig['side']} LIMIT" if limit else sig["side"]
     return (
-        f"{icon} <b>{label} {symbol}</b> · {tf or (sig.get('tf') if sig.get('type') == 'QML' else None) or TF_LABEL}\n"
+        f"{_head_line(symbol, sig, lot)}\n"
+        f"⏱ {tf or (sig.get('tf') if sig.get('type') == 'QML' else None) or TF_LABEL} · RR {_sig_rr(sig):g}\n"
         f"Entrée : {'limit ' if limit else '≈ '}{_fmt(sig['entry'], dec)}\n"
         f"🛡 SL : {_fmt(sig['sl'], dec)}\n"
         f"🎯 TP : {_fmt(sig['tp'], dec)}\n"
@@ -6201,7 +6244,7 @@ def admin_signal(symbol, sig, risk_usd, leverage, lot_info, margin, dec):
     icon = "🟢" if sig["side"] == "BUY" else "🔴"
     base = "ta limit" if sig.get("order") == "LIMIT" else "ton prix réel"
     txt = (
-        f"<b>{symbol} · LOT {lot_info['lot']:g}</b>\n"
+        f"{_head_line(symbol, sig, lot_info['lot'])}\n"
         f"{icon} {label} · Entrée ≈ {_fmt(sig['entry'], dec)}\n"
         f"🛡 SL {_fmt(sig['sl'], dec)} · 🎯 TP {_fmt(sig['tp'], dec)} (RR{_sig_rr(sig):g})\n"
         f"📐 Depuis {base} : SL {_dist(sig, sig['sl'], dec)} pts / TP {_dist(sig, sig['tp'], dec)} pts\n"
@@ -6792,6 +6835,7 @@ def _analyse_symbol_keyboard(symbol):
          {"text": "📰 FONDAMENTAL", "callback_data": f"ana:fond:{code}"}],
         [{"text": "🎯 BOS/CHoCH", "callback_data": f"ana:str:{code}:main"}, {"text": "🕯 CRT", "callback_data": f"ana:str:{code}:crt"}],
         [{"text": f"🎯 QML {_tf_lbl(t)}", "callback_data": f"ana:qml:{code}:{t}"} for t in QML_ANALYSE_TFS],
+        [{"text": "🏆 QML GAGNANT", "callback_data": f"ana:qmlg:{code}"}],
         [{"text": "🔎 TOUTES LES STRATÉGIES", "callback_data": f"ana:all:{code}"}],
         [{"text": "🔙 Analyse", "callback_data": "ana:home"}, {"text": "🔙 Menu", "callback_data": "menu:home"}],
     ]}
@@ -7027,7 +7071,10 @@ def _strategies_text():
     return (f"🧩 <b>STRATÉGIES</b>\n\n"
             f"BOS / CHoCH : {on(get_strat_main())}\nCRT : {on(get_strat_crt())}\nQML : {on(get_qml_on())}"
             f" · publication auto : {on(get_qml_auto())}\n"
-            f"FIBTREND : {on(get_ft_on())} · publication auto : {on(get_ft_auto())}\n\n"
+            f"FIBTREND : {on(get_ft_on())} · publication auto : {on(get_ft_auto())}\n"
+            f"QML GAGNANT : {on(get_qmlg_on())} (règles à venir : aucun signal pour l'instant)\n"
+            f"📈 Ordres MT5 (API) : {on(get_mt5_orders_on())}"
+            f"{'' if get_mt5_orders_on() else ' — signaux publiés et suivis, AUCUN ordre envoyé au broker'}\n\n"
             f"Actives : {', '.join(live) if live else 'aucune ⚠️ (plus aucun signal automatique)'}\n"
             f"Bot : {'🟢 ACTIF' if get_bot_on() else '⏸ ARRÊTÉ'}\n\n"
             f"Chaque stratégie ON scanne tous les actifs activés (🌍 ACTIFS) et publie / exécute automatiquement. "
@@ -7040,6 +7087,8 @@ def _strategies_keyboard():
         [_btn("BOS / CHoCH", "str:main", get_strat_main()), _btn("CRT", "str:crt", get_strat_crt())],
         [_btn("QML", "str:qml", get_qml_on()), _btn("QML auto (signal)", "str:qmlauto", get_qml_auto())],
         [_btn("FIBTREND", "str:ft", get_ft_on()), _btn("FIBTREND auto (signal)", "str:ftauto", get_ft_auto())],
+        [_btn("QML GAGNANT", "str:qmlg", get_qmlg_on()), {"text": "⚙️ QML GAGNANT", "callback_data": "qmlg:home"}],
+        [_btn("📈 Ordres MT5 (API)", "str:mt5", get_mt5_orders_on())],
         [{"text": "📊 Analyse (point potentiel)", "callback_data": "ana:home"}, {"text": "⚙️ QML", "callback_data": "qml:home"}],
         [{"text": "⚙️ FIBTREND", "callback_data": "ft:home"}],
     ]})
@@ -7769,6 +7818,13 @@ def _handle_update(u):
                         send(chat_id, f"🎯 {sym}", photo=chart)
                     send(chat_id, txt, reply_markup=_analyse_symbol_keyboard(sym) if i_ == len(results) - 1 else None)
                 ack = "Analyse envoyée"
+        elif data.startswith("ana:qmlg:"):   # QML GAGNANT : analyse toujours disponible, ON ou OFF
+            sym = _ANALYSE_SYMS.get(data[9:])
+            if sym:
+                _edit(cq, f"⏳ Analyse QML GAGNANT {sym} en cours…", None)
+                txt = qml_gagnant_text(qml_gagnant_analyze(sym, QMLG_TF))
+                _edit(cq, txt, _analyse_symbol_keyboard(sym))
+                ack = "Analyse QML GAGNANT"
         elif data.startswith("ana:qml:"):
             code, _, tfs = data[8:].partition(":")
             sym = _ANALYSE_SYMS.get(code)
@@ -7800,6 +7856,8 @@ def _handle_update(u):
                 ack = "Analyse envoyée"
         elif data.startswith("qml:"):
             ack = _qml_callback(cq, data[4:])
+        elif data.startswith("qmlg:"):
+            ack = _qmlg_callback(cq, data[5:])
         elif data.startswith("ft:"):
             ack = _ft_callback(cq, data[3:])
         elif data.startswith("mm:"):
@@ -7942,6 +8000,10 @@ def _handle_update(u):
                 set_setting("ft_on", "0" if get_ft_on() else "1"); ack = "FIBTREND : " + ("ON" if get_ft_on() else "OFF")
             elif a_ == "ftauto":
                 set_setting("ft_auto", "0" if get_ft_auto() else "1"); ack = "FIBTREND auto : " + ("ON" if get_ft_auto() else "OFF")
+            elif a_ == "mt5":
+                set_setting("mt5_orders", "0" if get_mt5_orders_on() else "1"); ack = "Ordres MT5 : " + ("ON" if get_mt5_orders_on() else "OFF")
+            elif a_ == "qmlg":
+                set_setting("qmlg_on", "0" if get_qmlg_on() else "1"); ack = "QML GAGNANT : " + ("ON" if get_qmlg_on() else "OFF")
             _edit(cq, _strategies_text(), _strategies_keyboard())
         elif data.startswith("news:"):
             if data == "news:on":
@@ -8517,7 +8579,7 @@ def publish_signal(symbol, candles, events, sig, companion=False):
     margin = calc_margin(symbol, lot_info["lot"], sig["entry"], leverage)
 
     is_market = sig.get("order", "MARKET") == "MARKET"
-    mt5_enabled = bool(METAAPI_TOKEN and METAAPI_ACCOUNT_ID)
+    mt5_enabled = mt5_orders_allowed()   # interrupteur « Ordres MT5 » du menu Stratégies
     # Le trade est TOUJOURS suivi (OPEN, ou PENDING pour une LIMIT) dès sa création : le suivi RR / BE / TP / SL
     # sur le groupe et le bot ne dépend jamais de l'exécution MT5. L'exécution est tracée à part (exec_status).
     initial_status = "PENDING" if sig.get("order") == "LIMIT" else "OPEN"
@@ -8553,8 +8615,9 @@ def publish_signal(symbol, candles, events, sig, companion=False):
 
     _deliver_signal(trade_id, symbol,
                     admin_txt=admin_signal(symbol, sig, risk_usd, leverage, lot_info, margin, dec) + mm_note,
-                    group_txt=group_signal(symbol, sig, n_open + 1, dec),
+                    group_txt=group_signal(symbol, sig, n_open + 1, dec, lot=lot_info["lot"]),
                     chart=chart)
+    entry_media_and_lot(symbol, sig, lot_info["lot"])
 
     # 2) Exécution MT5 ensuite, dans un thread dédié : n'interrompt ni le scan ni le suivi des autres trades.
     #    Un échec est notifié à l'admin mais n'arrête JAMAIS le suivi TP / SL / BE du signal.
@@ -8584,7 +8647,7 @@ def publish_signal(symbol, candles, events, sig, companion=False):
 def _exec_filled_limit(t, dec):
     """Limit touché (suivi bougies) -> ordre MT5 au marché, sauf si le prix a déjà trop dérivé du limit.
     Avant : un LIMIT n'était jamais envoyé à MT5 (signal + suivi seulement)."""
-    if not (LIMIT_MT5_EXEC and METAAPI_TOKEN and METAAPI_ACCOUNT_ID):
+    if not (LIMIT_MT5_EXEC and mt5_orders_allowed()):
         return
     if t.get("mt5_position_id") or t.get("exec_status") in ("PENDING", "OK"):
         return
@@ -8710,7 +8773,7 @@ def retry_unsent_signals():
         late = "⏱ <i>Envoi différé</i>\n"
         _deliver_signal(t["id"], sym,
                         admin_txt=late + admin_signal(sym, sig, t["risk_usd"], lev, lot_info, margin, dec),
-                        group_txt=late + group_signal(sym, sig, None, dec, tf=t["timeframe"]))
+                        group_txt=late + group_signal(sym, sig, None, dec, tf=t["timeframe"], lot=t["lot"]))
 
 
 def _publish_group(symbol, candles, events, sigs):
@@ -8757,7 +8820,7 @@ def process_symbol(symbol):
     # 1) suivi des positions ouvertes (BE / TP / SL)
     events = analyze(candles)
     for trade in open_trades(symbol):
-        for ev in track_trade(trade, candles):
+        for ev in track_trade_verified(trade, candles):
             setup_engine_report(ev["trade"], ev["name"])
             chart = make_event_chart(symbol, candles, events, ev["trade"], dec) \
                 if ev["name"] in CHART_ON_EVENTS else None
@@ -8969,6 +9032,7 @@ def main():
 
     start_polling()
     start_metaapi_background()   # connexion MT5 persistante en arrière-plan, indépendante des signaux M1
+    start_qmlg_alerts()          # alertes de zone QML GAGNANT (posées par le bouton Analyse)
     ok_grp, msg_grp = check_group()
     print(f"[groupe] {msg_grp}")
     if not ok_grp and TELEGRAM_TOKEN:
@@ -10964,12 +11028,552 @@ class TestSetupEngineEntreeEtPause(unittest.TestCase):
                     _E.set_setting(k, v)
 
 
+class TestMoteurSmc(unittest.TestCase):
+    """Moteur SMC fusionné (section 14, ex analyse_smc.py) : son auto-test d'origine doit rester vert."""
+
+    def test_selftest_d_origine(self):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.assertEqual(_E.smc_selftest(), 0)
+        self.assertIn("tous les tests OK", buf.getvalue())
+
+
+class TestQmlGagnant(unittest.TestCase):
+    """Stratégie QML GAGNANT (section 15) : OFF par défaut, aucune règle -> aucun signal ; analyse toujours dispo."""
+    _KEYS = ("qmlg_on",)
+
+    def setUp(self):
+        self._old = {k: _E.get_setting(k) for k in self._KEYS}
+        self._gc = _E.get_candles
+        self._env_default = _E.QMLG_ENABLED_DEFAULT
+        _E.QMLG_ENABLED_DEFAULT = False
+        for k in self._KEYS:
+            _E._q("DELETE FROM settings WHERE key=?", (k,), commit=True)
+
+    def tearDown(self):
+        _E.get_candles = self._gc
+        _E.QMLG_ENABLED_DEFAULT = self._env_default
+        for k, v in self._old.items():
+            if v is None:
+                _E._q("DELETE FROM settings WHERE key=?", (k,), commit=True)
+            else:
+                _E.set_setting(k, v)
+
+    def _fake_flux(self, n=1500):
+        cs = TestQmlSansLimiteAge._walk(2, n=n, tf=900)
+        _E.get_candles = lambda symbol, minutes=None, count=None: list(cs)
+        return cs
+
+    def test_off_par_defaut_et_bascule(self):
+        self.assertFalse(_E.get_qmlg_on(), "désactivée par défaut")
+        _E.set_setting("qmlg_on", "1")
+        self.assertTrue(_E.get_qmlg_on())
+        _E.set_setting("qmlg_on", "0")
+        self.assertFalse(_E.get_qmlg_on())
+
+    def test_bouton_menu_et_qml_existant_present(self):
+        kb = str(_E._strategies_keyboard())
+        self.assertIn("str:qmlg", kb)
+        self.assertIn("str:qml\"", kb.replace("'", '"'), "le bouton QML existant reste en place")
+        self.assertIn("QML GAGNANT", _E._strategies_text())
+
+    def test_tourne_sur_bougies_synthetiques(self):
+        cs = self._fake_flux()
+        r = _E.qml_gagnant_analyze("XAUUSD", 15)
+        self.assertEqual(r["strategy"], "QML_GAGNANT")
+        self.assertEqual((r["symbol"], r["tf_minutes"], r["bars"]), ("XAUUSD", 15, len(cs)))
+        self.assertEqual(r["status"], "NO_RULES")
+        self.assertIn(r["trend"], ("bullish", "bearish", "range"))
+        self.assertIsInstance(r["n_qml"], int)
+        self.assertFalse(r["enabled"])
+
+    def test_aucun_signal_meme_active(self):
+        self._fake_flux()
+        _E.set_setting("qmlg_on", "1")
+        r = _E.qml_gagnant_analyze("XAUUSD", "M15")
+        self.assertTrue(r["enabled"])
+        self.assertIsNone(r["signal"], "sans règles, jamais de signal")
+
+    def test_pas_de_donnees_ne_leve_pas(self):
+        _E.get_candles = lambda symbol, minutes=None, count=None: []
+        r = _E.qml_gagnant_analyze("XAUUSD", 15)
+        self.assertEqual(r["status"], "NO_DATA")
+        self.assertIsNone(r["signal"])
+
+    def test_analyse_toujours_dispo_bouton_et_texte(self):
+        self._fake_flux()
+        self.assertIn("ana:qmlg:", str(_E._analyse_symbol_keyboard("XAUUSD")))
+        txt = _E.qml_gagnant_text(_E.qml_gagnant_analyze("XAUUSD", 15))   # réglage OFF : l'analyse répond quand même
+        self.assertIn("QML GAGNANT", txt)
+        self.assertIn("aucune", txt)
+
+
+class TestComputeTrade(unittest.TestCase):
+    """compute_trade(qml) : entrée = bord proche (jamais 50 %), SL derrière la zone (jamais derrière la tête), TP = liquidité."""
+
+    @staticmethod
+    def _structure(highs=(), lows=(), extra_h=None, base=100.0):
+        n = 60
+        h, l, c = [base + 1] * n, [base - 1] * n, [base] * n   # TR = 2 partout -> ATR = 2
+        sw = [{"type": "high", "idx": i, "price": p, "label": lab} for i, p, lab in highs]
+        sw += [{"type": "low", "idx": i, "price": p, "label": lab} for i, p, lab in lows]
+        for i, v in (extra_h or {}).items():
+            h[i] = v
+        return {"_series": {"t": list(range(n)), "h": h, "l": l, "c": c}, "swings": sw}
+
+    BUY = {"dir": "bull", "zone": {"top": 110.0, "bottom": 108.0}, "head": {"price": 106.0}}
+    SELL = {"dir": "bear", "zone": {"top": 110.0, "bottom": 108.0}, "head": {"price": 112.0}}
+
+    def setUp(self):
+        self._p = (_E.QMLG_SL_MODE, _E.QMLG_SL_BUFFER_ATR, _E.QMLG_EQ_TOL_ATR, _E.QMLG_ATR_PERIOD)
+        _E.QMLG_SL_MODE, _E.QMLG_SL_BUFFER_ATR, _E.QMLG_EQ_TOL_ATR, _E.QMLG_ATR_PERIOD = "BUFFER", 0.05, 0.10, 14
+
+    def tearDown(self):
+        _E.QMLG_SL_MODE, _E.QMLG_SL_BUFFER_ATR, _E.QMLG_EQ_TOL_ATR, _E.QMLG_ATR_PERIOD = self._p
+
+    def test_achat_entree_bord_proche_sl_buffer_tp_liquidite(self):
+        st = self._structure(highs=[(10, 115.0, "HH"), (20, 120.0, "HH"), (30, 120.1, "EQH")])
+        t = _E.compute_trade(self.BUY, st)
+        self.assertTrue(t["ok"], t["reason"])
+        self.assertEqual((t["side"], t["order"]), ("BUY", "LIMIT"))
+        self.assertEqual(t["entry"], 110.0, "bord proche, jamais le milieu (109)")
+        self.assertAlmostEqual(t["sl"], 107.9, places=9)   # 108 - ATR(2) x 0.05
+        self.assertGreater(t["sl"], 106.0, "jamais derrière la tête")
+        self.assertEqual((t["tp1"], t["tp1_kind"]), (115.0, "SWING"))
+        self.assertEqual((t["tp2"], t["tp2_kind"]), (120.0, "EQH"), "120 et 120.1 = equal highs, premier niveau touché")
+        self.assertAlmostEqual(t["rr1"], 5 / 2.1)
+        self.assertAlmostEqual(t["rr2"], 10 / 2.1)
+
+    def test_vente_miroir(self):
+        st = self._structure(lows=[(10, 103.0, "LL"), (20, 98.0, "LL"), (30, 97.9, "EQL")], base=120.0)
+        t = _E.compute_trade(self.SELL, st)
+        self.assertTrue(t["ok"], t["reason"])
+        self.assertEqual((t["side"], t["order"], t["entry"]), ("SELL", "LIMIT", 108.0))
+        self.assertAlmostEqual(t["sl"], 110.1, places=9)
+        self.assertLess(t["sl"], 112.0, "jamais derrière la tête")
+        self.assertEqual((t["tp1"], t["tp2"], t["tp2_kind"]), (103.0, 98.0, "EQL"))
+        self.assertAlmostEqual(t["rr1"], 5 / 2.1)
+
+    def test_sl_extreme_et_jamais_derriere_la_tete(self):
+        st = self._structure(highs=[(10, 115.0, "HH")])
+        _E.QMLG_SL_MODE = "EXTREME"
+        self.assertEqual(_E.compute_trade(self.BUY, st)["sl"], 108.0, "EXTREME : pile sur le bord de la zone")
+        _E.QMLG_SL_MODE = "BUFFER"
+        near = dict(self.BUY, head={"price": 107.95})   # le buffer (107.9) passerait derrière la tête
+        t = _E.compute_trade(near, st)
+        self.assertEqual(t["sl"], 108.0)
+        self.assertGreater(t["sl"], 107.95)
+
+    def test_liquidite_deja_prise_ignoree(self):
+        st = self._structure(highs=[(10, 115.0, "HH"), (20, 120.0, "HH")], extra_h={40: 116.0})
+        t = _E.compute_trade(self.BUY, st)
+        self.assertEqual(t["tp1"], 120.0, "le sommet 115 a déjà été balayé : plus de liquidité")
+        self.assertIsNone(t["tp2"])
+        self.assertIsNone(t["rr2"])
+
+    def test_jamais_de_marche_et_sans_structure(self):
+        t = _E.compute_trade(self.BUY)
+        self.assertFalse(t["ok"])
+        self.assertEqual(t["order"], "LIMIT")
+        self.assertIsNone(t["tp1"])
+        self.assertEqual(t["entry"], 110.0)
+        self.assertFalse(_E.compute_trade({"dir": "bull"})["ok"], "QML incomplet : pas d'exception")
+        for q, st in ((self.BUY, self._structure(highs=[(10, 115.0, "HH")])), (self.SELL, self._structure(lows=[(10, 103.0, "LL")], base=120.0))):
+            self.assertEqual(_E.compute_trade(q, st)["order"], "LIMIT")
+
+    def test_analyse_expose_le_plan_sans_signal(self):
+        cs = TestQmlSansLimiteAge._walk(2, n=1500, tf=900)
+        saved = _E.get_candles
+        _E.get_candles = lambda symbol, minutes=None, count=None: list(cs)
+        try:
+            r = _E.qml_gagnant_analyze("XAUUSD", 15)
+        finally:
+            _E.get_candles = saved
+        self.assertIsNone(r["signal"])
+        self.assertIsNotNone(r["trade"])
+        self.assertEqual(r["trade"]["order"], "LIMIT")
+        self.assertIn("LIMIT", _E.qml_gagnant_text(r) + "LIMIT")
+
+
+class TestQmlGagnantBoutons(unittest.TestCase):
+    """3 boutons : Analyse (scan + JSON + validation), Ordre limite (EN ATTENTE de mitigation), Entrée directe (rejet dans la zone)."""
+
+    @staticmethod
+    def _candle(o, h, l, c, t=0):
+        return {"t": t, "o": o, "h": h, "l": l, "c": c}
+
+    def _flat(self, n=60):
+        return [self._candle(100, 101, 99, 100, t=i) for i in range(n)]
+
+    def _structure(self, n=60, highs=(), lows=()):
+        sw = [{"type": "high", "idx": i, "price": p, "label": "HH"} for i, p in highs]
+        sw += [{"type": "low", "idx": i, "price": p, "label": "LL"} for i, p in lows]
+        return {"_series": {"t": list(range(n)), "h": [101.0] * n, "l": [99.0] * n, "c": [100.0] * n}, "swings": sw}
+
+    CR = {"tendance_avant": True, "sweep": True, "choch_cloture": True, "zone_epaule": True, "zone_fraiche": True, "rr_ok": True}
+
+    def _qml(self, buy=True, mitigated_idx=None, **cr):
+        z = {"top": 110.0, "bottom": 108.0}
+        return {"dir": "bull" if buy else "bear", "zone": z, "head": {"price": 106.0 if buy else 112.0},
+                "criteres": dict(self.CR, **cr), "mitigated_idx": mitigated_idx, "statut": "non mitigé"}
+
+    # --- rejets
+    def test_rejets_dans_le_sens_du_trade(self):
+        eng = [self._candle(110, 110.5, 108, 108.5), self._candle(108.4, 111, 108.3, 110.6)]   # haussière avale baissière
+        self.assertEqual(_E.qmlg_rejection(eng, True), "ENGULFING")
+        self.assertIsNone(_E.qmlg_rejection(eng, False), "un avalement haussier ne valide pas une vente")
+        sell = [self._candle(108.5, 110, 108.4, 109.5), self._candle(109.6, 109.7, 107, 108.2)]
+        self.assertEqual(_E.qmlg_rejection(sell, False), "ENGULFING")
+        pin = [self._candle(109, 109, 109, 109), self._candle(109, 109.3, 106.0, 109.1)]   # longue mèche basse
+        self.assertEqual(_E.qmlg_rejection(pin, True), "PIN_BAR")
+        self.assertIsNone(_E.qmlg_rejection(pin, False))
+        doji = [self._candle(109, 109, 109, 109), self._candle(109.0, 110.0, 108.0, 109.05)]
+        self.assertEqual(_E.qmlg_rejection(doji, True), "DOJI")
+        plain = [self._candle(109, 109, 109, 109), self._candle(108.5, 110.5, 108.4, 110.3)]   # grosse bougie sans rejet
+        self.assertIsNone(_E.qmlg_rejection(plain, True))
+        self.assertIsNone(_E.qmlg_rejection([], True))
+
+    # --- entrée directe
+    def test_entree_directe_achat(self):
+        st = self._structure(highs=[(10, 115.0)])
+        cs = self._flat() + [self._candle(109.5, 109.8, 108, 108.5), self._candle(108.4, 110.2, 108.3, 109.8)]
+        st = self._structure(n=len(cs), highs=[(10, 115.0)])
+        d = _E.qmlg_direct_entry(self._qml(mitigated_idx=len(cs) - 1), st, cs)
+        self.assertIsNotNone(d)
+        self.assertEqual((d["pattern"], d["entry"]), ("ENGULFING", 109.8), "entrée = clôture de la bougie de rejet")
+        tr = d["trade"]
+        self.assertEqual((tr["order"], tr["side"]), ("DIRECT", "BUY"))
+        self.assertAlmostEqual(tr["sl"], 107.9, places=9)
+        self.assertEqual(tr["tp1"], 115.0)
+        self.assertGreaterEqual(tr["rr1"], _E.QMLG_MIN_RR)
+
+    def test_entree_directe_refus(self):
+        base = self._flat() + [self._candle(109.5, 109.8, 108, 108.5)]
+        eng = base + [self._candle(108.4, 110.2, 108.3, 109.8)]
+        st = self._structure(n=len(eng), highs=[(10, 115.0)])
+        last = len(eng) - 1
+        self.assertIsNotNone(_E.qmlg_direct_entry(self._qml(mitigated_idx=last), st, eng))
+        self.assertIsNone(_E.qmlg_direct_entry(self._qml(mitigated_idx=last - 5), st, eng), "zone déjà touchée avant : pas fraîche")
+        hors = base + [self._candle(111.0, 113.0, 110.9, 112.5)]   # clôture au-dessus de la zone
+        self.assertIsNone(_E.qmlg_direct_entry(self._qml(mitigated_idx=None), self._structure(n=len(hors), highs=[(10, 115.0)]), hors))
+        sans_rejet = base + [self._candle(108.8, 110.0, 108.6, 109.9)]
+        self.assertIsNone(_E.qmlg_direct_entry(self._qml(mitigated_idx=len(sans_rejet) - 1), self._structure(n=len(sans_rejet), highs=[(10, 115.0)]), sans_rejet))
+        self.assertIsNone(_E.qmlg_direct_entry(self._qml(mitigated_idx=last, sweep=False), st, eng), "formation invalide : pas de signal")
+
+    def test_entree_directe_vente(self):
+        cs = [self._candle(120, 121, 119, 120, t=i) for i in range(60)] + [self._candle(108.5, 110, 108.4, 109.5),
+                                                                          self._candle(109.6, 109.7, 108.2, 108.4)]
+        n = len(cs)
+        st = {"_series": {"t": list(range(n)), "h": [121.0] * n, "l": [119.0] * n, "c": [120.0] * n},
+              "swings": [{"type": "low", "idx": 10, "price": 100.0, "label": "LL"}]}
+        d = _E.qmlg_direct_entry(self._qml(buy=False, mitigated_idx=n - 1), st, cs)
+        self.assertIsNotNone(d)
+        self.assertEqual((d["trade"]["side"], d["entry"], d["trade"]["order"]), ("SELL", 108.4, "DIRECT"))
+        self.assertAlmostEqual(d["trade"]["sl"], 110.1, places=9)
+
+    def test_ordre_limite_jamais_direct(self):
+        t = _E.compute_trade(self._qml(), self._structure(highs=[(10, 115.0)]))
+        self.assertEqual(t["order"], "LIMIT")
+        self.assertEqual(t["entry"], 110.0)
+
+    # --- listes
+    def test_liste_ordre_limite(self):
+        def rec(valid, statut, ago):
+            return {"symbol": "XAUUSD", "tf": 15, "dir": "bull", "statut": statut, "bars_ago": ago, "direct": None,
+                    "validation": {"valid": valid, "reasons": []},
+                    "plan": {"side": "BUY", "entry": 110.0, "sl": 107.9, "tp1": 115.0, "tp2": 120.0, "rr1": 2.4, "rr2": 4.8}}
+        data = {"formations": [rec(True, "non mitigé", 30), rec(True, "mitigé", 5), rec(False, "non mitigé", 2), rec(True, "non mitigé", 7)],
+                "generated_ts": time.time(), "n_formations": 4, "n_valid": 3, "markets": ["XAUUSD"], "tfs": [15], "errors": []}
+        items = _E.qmlg_pending_limits(data)
+        self.assertEqual([f["bars_ago"] for f in items], [7, 30], "valides + non mitigés seulement, la plus récente d'abord")
+        txt = _E.qmlg_limit_text(data)
+        self.assertIn("EN ATTENTE de mitigation", txt)
+        self.assertIn("LIMIT", txt)
+        self.assertIn("EN ATTENTE", _E.qmlg_limit_text(dict(data, formations=[])) + "EN ATTENTE")
+        self.assertIn("Aucun QML valide", _E.qmlg_limit_text(dict(data, formations=[])))
+
+    # --- scan + JSON
+    def test_scan_ecrit_le_json_et_valide_chaque_formation(self):
+        import tempfile
+        cs = TestQmlSansLimiteAge._walk(2, n=1500, tf=900)
+        saved = (_E.get_candles, _E.QMLG_JSON_PATH)
+        path = os.path.join(tempfile.mkdtemp(), "sub", "qml.json")
+        _E.QMLG_JSON_PATH = path
+        def fake(symbol, minutes=None, count=None):
+            if symbol == "EURUSD":
+                raise RuntimeError("réseau")
+            return list(cs)
+        _E.get_candles = fake
+        try:
+            data = _E.qmlg_scan(symbols=["XAUUSD", "EURUSD", "BTCUSD"], tfs=[15, 60])
+        finally:
+            _E.get_candles, _E.QMLG_JSON_PATH = saved
+        self.assertGreater(data["n_formations"], 0)
+        self.assertEqual(len(data["errors"]), 2, "EURUSD en erreur sur 2 TF : noté, le scan continue")
+        self.assertTrue(all("valid" in f["validation"] and "plan" in f for f in data["formations"]), "chaque formation est validée")
+        self.assertEqual(data["n_valid"], sum(1 for f in data["formations"] if f["validation"]["valid"]))
+        on_disk = _E._qmlg_load(path)
+        self.assertEqual(on_disk["n_formations"], data["n_formations"], "toutes les formations sont dans le JSON")
+        self.assertEqual({f["symbol"] for f in on_disk["formations"]}, {"XAUUSD", "BTCUSD"})
+        self.assertEqual(len({f["id"] for f in on_disk["formations"] if f["symbol"] == "XAUUSD" and f["tf"] == 15}),
+                         len([f for f in on_disk["formations"] if f["symbol"] == "XAUUSD" and f["tf"] == 15]), "ids uniques")
+        self.assertIn("ANALYSE QML GAGNANT", _E.qmlg_analyse_text(data))
+        for f in _E.qmlg_pending_limits(data):
+            self.assertTrue(f["validation"]["valid"] and f["statut"] == "non mitigé")
+
+    # --- boutons / thread
+    def test_boutons_et_callbacks(self):
+        kb = str(_E._strategies_keyboard())
+        self.assertIn("qmlg:home", kb)
+        kb2 = str(_E._qmlg_keyboard())
+        for cb in ("qmlg:analyse", "qmlg:limit", "qmlg:direct"):
+            self.assertIn(cb, kb2)
+        for label in ("Analyse", "Ordre limite", "Entrée directe"):
+            self.assertIn(label, kb2)
+        edits = []
+        saved = _E._edit
+        _E._edit = lambda cq, text, kb: edits.append((text, kb))
+        try:
+            self.assertEqual(_E._qmlg_callback({"message": {"chat": {"id": 1}, "message_id": 2}}, "home"), "")
+        finally:
+            _E._edit = saved
+        self.assertIn("QML GAGNANT", edits[0][0])
+
+    def test_job_envoie_le_resultat_et_libere_le_verrou(self):
+        sent = []
+        saved = (_E.send, _E.qmlg_data, _E.qmlg_scan)
+        d = {"formations": [], "generated_ts": time.time(), "n_formations": 0, "n_valid": 0, "markets": [], "tfs": [], "errors": []}
+        _E.send = lambda chat_id, text, **kw: sent.append(text)
+        _E.qmlg_data = lambda age: d
+        _E.qmlg_scan = lambda *a, **k: d
+        try:
+            _E._qmlg_job(1, "limit")
+            _E._qmlg_job(1, "direct")
+            _E._qmlg_job(1, "analyse")
+            self.assertEqual(len(sent), 3)
+            self.assertIn("ORDRES LIMITE", sent[0])
+            self.assertIn("ENTRÉES DIRECTES", sent[1])
+            self.assertIn("ANALYSE QML GAGNANT", sent[2])
+            self.assertTrue(_E._qmlg_lock.acquire(blocking=False), "verrou libéré après chaque scan")
+            _E._qmlg_job(1, "limit")   # verrou pris : message « déjà en cours », pas de scan
+            _E._qmlg_lock.release()
+            self.assertIn("déjà en cours", sent[3])
+        finally:
+            _E.send, _E.qmlg_data, _E.qmlg_scan = saved
+
+
+class TestQmlGagnantAlertes(unittest.TestCase):
+    """Alertes de zone : entrée du prix, puis rejet ; anti-doublon (marché, TF, zone) ; suppression si zone invalidée."""
+
+    def setUp(self):
+        self._old = _E.get_setting("qmlg_alerts")
+        _E._q("DELETE FROM settings WHERE key=?", ("qmlg_alerts",), commit=True)
+        self._saved = (_E.get_candles, _E.get_live_price, _E.to_admin, _E.send, _E.qmlg_scan)
+
+    def tearDown(self):
+        _E.get_candles, _E.get_live_price, _E.to_admin, _E.send, _E.qmlg_scan = self._saved
+        if self._old is None:
+            _E._q("DELETE FROM settings WHERE key=?", ("qmlg_alerts",), commit=True)
+        else:
+            _E.set_setting("qmlg_alerts", self._old)
+
+    @staticmethod
+    def _c(o, h, l, c, t):
+        return {"t": t, "o": o, "h": h, "l": l, "c": c}
+
+    def _alert(self, buy=True, last_t=100):
+        return {"key": "k", "symbol": "XAUUSD", "tf": 15, "dir": "bull" if buy else "bear",
+                "zone": {"top": 110.0, "bottom": 108.0}, "sl": 107.9 if buy else 110.1,
+                "tp1": 115.0 if buy else 103.0, "tp1_kind": "SWING", "tp2": 120.0 if buy else 98.0, "tp2_kind": "EQH",
+                "last_t": last_t, "entered": False}
+
+    @staticmethod
+    def _rec(symbol="XAUUSD", tf=15, top=110.0, bottom=108.0, valid=True, statut="non mitigé"):
+        return {"symbol": symbol, "tf": tf, "dir": "bull", "statut": statut, "bars_ago": 3, "direct": None, "last_t": 500,
+                "zone": {"top": top, "bottom": bottom}, "validation": {"valid": valid, "reasons": []},
+                "plan": {"side": "BUY", "entry": top, "sl": bottom - 0.1, "tp1": 115.0, "tp1_kind": "SWING", "tp2": None, "tp2_kind": None,
+                         "rr1": 2.5, "rr2": None}}
+
+    # --- pose + anti-doublon
+    def test_pose_et_anti_doublon(self):
+        data = {"formations": [self._rec(), self._rec(), self._rec(tf=60), self._rec(top=120.0, bottom=118.0),
+                               self._rec(top=130.0, bottom=128.0, valid=False), self._rec(top=140.0, bottom=138.0, statut="mitigé")]}
+        r = _E.qmlg_place_alerts(data)
+        self.assertEqual(r, {"placed": 3, "existing": 1, "total": 3},
+                         "2 QML identiques = 1 alerte ; autre TF / autre zone = autres alertes ; invalides et mitigés ignorés")
+        self.assertEqual(_E.qmlg_place_alerts(data), {"placed": 0, "existing": 4, "total": 3}, "relancer Analyse ne double rien")
+        self.assertEqual(len(_E._qmlg_alerts_load()), 3)
+        self.assertEqual(_E.qmlg_alert_key("XAUUSD", 15, {"top": 110.0, "bottom": 108.0}), "XAUUSD|M15|110|108")
+
+    # --- cycle complet : entrée puis rejet
+    def test_entree_puis_rejet_achat(self):
+        a = self._alert()
+        c1 = self._c(113, 114, 112, 113.5, 1000)                   # au-dessus de la zone : rien
+        c2 = self._c(112, 112.5, 109, 109.6, 2000)                 # mèche dans la zone, clôture dans la zone, pas de rejet
+        a, msgs = _E.qmlg_alert_eval(a, [c1, c2])
+        self.assertTrue(a["entered"])
+        self.assertEqual(len(msgs), 1)
+        self.assertIn("entre dans la zone", msgs[0])
+        self.assertEqual(a["last_t"], 2000)
+        a, msgs = _E.qmlg_alert_eval(a, [c1, c2])                  # mêmes bougies relues : aucune alerte en double
+        self.assertEqual(msgs, [])
+        c3 = self._c(108.4, 110.2, 108.3, 109.8, 3000)             # avalement haussier, clôture dans la zone
+        c2b = self._c(109.5, 109.8, 108.0, 108.5, 2500)
+        a, msgs = _E.qmlg_alert_eval(a, [c1, c2, c2b, c3])
+        self.assertIsNone(a, "2e alerte envoyée : alerte terminée et supprimée")
+        self.assertEqual(len(msgs), 1)
+        self.assertIn("REJET ENGULFING", msgs[0])
+        self.assertIn("109.8", msgs[0].replace(" ", ""))
+        self.assertIn("RR", msgs[0])
+
+    def test_rejet_sur_la_bougie_d_entree(self):
+        a = self._alert()
+        eng = [self._c(109.5, 109.8, 108.6, 108.7, 1000), self._c(108.6, 110.2, 108.4, 109.8, 2000)]   # entre ET avale
+        a, msgs = _E.qmlg_alert_eval(a, eng)
+        self.assertIsNone(a)
+        self.assertEqual(len(msgs), 2)
+        self.assertIn("entre dans la zone", msgs[0])
+        self.assertIn("REJET", msgs[1])
+
+    def test_vente_miroir(self):
+        a = self._alert(buy=False)
+        cs = [self._c(106, 108.5, 105, 107.5, 1000),               # sous la zone
+              self._c(108.5, 109.6, 108.4, 109.5, 2000),           # touche la zone par le bas
+              self._c(109.6, 109.7, 108.2, 108.4, 3000)]           # avalement baissier dans la zone
+        cs[1] = self._c(108.5, 109.6, 108.4, 109.5, 2000)
+        a, msgs = _E.qmlg_alert_eval(a, cs)
+        self.assertIsNone(a)
+        self.assertIn("entre dans la zone", msgs[0])
+        self.assertIn("REJET ENGULFING", msgs[-1])
+        self.assertIn("Vente", msgs[-1])
+
+    def test_prix_en_direct_declenche_la_premiere_alerte_une_fois(self):
+        a = self._alert()
+        a, msgs = _E.qmlg_alert_eval(a, [], live_px=112.0)
+        self.assertEqual(msgs, [])
+        self.assertFalse(a["entered"])
+        a, msgs = _E.qmlg_alert_eval(a, [], live_px=109.7)
+        self.assertEqual(len(msgs), 1)
+        a, msgs = _E.qmlg_alert_eval(a, [], live_px=109.5)
+        self.assertEqual(msgs, [], "1re alerte une seule fois")
+
+    # --- invalidation
+    def test_zone_invalidee_supprime_l_alerte(self):
+        for entered in (False, True):
+            a = dict(self._alert(), entered=entered)
+            a, msgs = _E.qmlg_alert_eval(a, [self._c(108.5, 109, 106.5, 107.0, 1000)])   # clôture sous le bord lointain (108)
+            self.assertIsNone(a)
+            self.assertIn("invalidée", msgs[-1])
+            self.assertNotIn("REJET", msgs[-1])
+        s_ = self._alert(buy=False)
+        a, msgs = _E.qmlg_alert_eval(s_, [self._c(109.5, 111.5, 109.0, 110.5, 1000)])    # vente : clôture au-dessus de 110
+        self.assertIsNone(a)
+        self.assertIn("invalidée", msgs[-1])
+
+    def test_meche_au_dela_sans_cloture_n_invalide_pas(self):
+        a, msgs = _E.qmlg_alert_eval(self._alert(), [self._c(110.5, 110.6, 106.0, 108.5, 1000)])   # mèche sous 108, clôture 108.5, pas de rejet
+        self.assertIsNotNone(a, "une mèche au-delà de la zone n'invalide pas : seule une clôture le fait")
+        self.assertTrue(a["entered"])
+        self.assertEqual(len(msgs), 1)
+        self.assertNotIn("invalidée", msgs[0])
+
+    # --- boucle (E/S) : un seul message par événement, état conservé en base
+    def test_tick_envoie_une_fois_et_persiste(self):
+        sent = []
+        _E.to_admin = lambda txt, **kw: sent.append(txt)
+        _E.get_live_price = lambda sym: 111.0
+        cs = [self._c(113, 114, 112, 113.5, 1000), self._c(112, 112.5, 109, 109.6, 2000)]
+        _E.get_candles = lambda symbol, minutes=None, count=None: list(cs)
+        _E._qmlg_alerts_save({"k": self._alert()})
+        self.assertEqual(_E.qmlg_alert_tick(), 1)
+        self.assertEqual(_E.qmlg_alert_tick(), 0, "second passage : rien de nouveau, aucun doublon")
+        self.assertEqual(len(sent), 1)
+        self.assertTrue(_E._qmlg_alerts_load()["k"]["entered"])
+        cs.append(self._c(108.4, 110.2, 108.3, 109.8, 3000))   # avalement haussier
+        cs.insert(2, self._c(109.5, 109.8, 108.0, 108.5, 2500))
+        self.assertEqual(_E.qmlg_alert_tick(), 1)
+        self.assertIn("REJET", sent[-1])
+        self.assertEqual(_E._qmlg_alerts_load(), {}, "alerte terminée : supprimée de la base")
+        self.assertEqual(_E.qmlg_alert_tick(), 0, "plus d'alerte : aucun appel réseau")
+
+    def test_tick_sans_reseau_quand_pas_de_bougie_due(self):
+        calls = []
+        _E.get_candles = lambda *a, **k: calls.append("candles") or []
+        _E.get_live_price = lambda sym: calls.append("px") or None
+        a = dict(self._alert(), last_t=int(time.time()), entered=True)   # dernière bougie toute fraîche, déjà entrée
+        _E._qmlg_alerts_save({"k": a})
+        _E.qmlg_alert_tick()
+        self.assertEqual(calls, [], "ni bougies (aucune nouvelle clôture possible) ni prix (déjà entrée)")
+
+    # --- bouton Analyse -> alertes
+    def test_analyse_pose_les_alertes(self):
+        sent = []
+        data = {"formations": [self._rec()], "generated_ts": time.time(), "n_formations": 1, "n_valid": 1,
+                "markets": ["XAUUSD"], "tfs": [15], "errors": []}
+        _E.send = lambda chat_id, text, **kw: sent.append(text)
+        _E.qmlg_scan = lambda *a, **k: data
+        _E._qmlg_job(1, "analyse")
+        self.assertEqual(len(_E._qmlg_alerts_load()), 1)
+        self.assertIn("1 posée(s)", sent[-1])
+        _E._qmlg_job(1, "analyse")
+        self.assertEqual(len(_E._qmlg_alerts_load()), 1, "anti-doublon")
+        self.assertIn("1 déjà en place", sent[-1])
+        _E._qmlg_job(1, "limit")   # les autres boutons ne posent pas d'alerte
+        self.assertEqual(len(_E._qmlg_alerts_load()), 1)
+
+
+class TestOrdresMt5EtStickers(unittest.TestCase):
+    """Interrupteur « Ordres MT5 » et stickers ACHAT / VENTE à l'entrée."""
+
+    def setUp(self):
+        self._old = _E.get_setting("mt5_orders")
+        self._saved = (_E._post, _E.get_media, _E.CHAT_ID_GROUPE, _E.to_admin)
+
+    def tearDown(self):
+        _E._post, _E.get_media, _E.CHAT_ID_GROUPE, _E.to_admin = self._saved
+        if self._old is None:
+            _E._q("DELETE FROM settings WHERE key=?", ("mt5_orders",), commit=True)
+        else:
+            _E.set_setting("mt5_orders", self._old)
+
+    def test_interrupteur_mt5(self):
+        _E._q("DELETE FROM settings WHERE key=?", ("mt5_orders",), commit=True)
+        self.assertEqual(_E.get_mt5_orders_on(), _E.MT5_ORDERS_DEFAULT)
+        _E.set_setting("mt5_orders", "0")
+        self.assertFalse(_E.get_mt5_orders_on())
+        self.assertFalse(_E.mt5_orders_allowed())
+        self.assertFalse(_E.place_manual_order("XAUUSD", "BUY")["ok"], "OFF : même l'ordre manuel est bloqué")
+        self.assertIn("str:mt5", str(_E._strategies_keyboard()))
+        self.assertIn("Ordres MT5", _E._strategies_text())
+
+    def test_stickers_achat_vente_plusieurs(self):
+        self.assertIn("BUY", _E.MEDIA_CATS)
+        self.assertIn("SELL", _E.MEDIA_CATS)
+        sent, msgs = [], []
+        _E.CHAT_ID_GROUPE = "-100"
+        _E.get_media = lambda cat: [f"sticker:{cat}{i}" for i in range(5)]
+        _E._post = lambda method, payload: sent.append((method, payload["sticker"])) or {"ok": True}
+        _E.to_admin = lambda txt, **kw: msgs.append(txt)
+        _E.entry_media_and_lot("XAUUSD", {"side": "BUY"}, 0.05)
+        self.assertEqual(len(sent), _E.MEDIA_ENTRY_COUNT)
+        self.assertEqual(len({p for _, p in sent}), len(sent), "stickers tous différents")
+        self.assertTrue(all(p.startswith("BUY") for _, p in sent))
+        self.assertEqual(len(msgs), 1)
+        self.assertIn("ACHAT", msgs[0])
+        self.assertIn("0.05", msgs[0])
+        self.assertNotIn("SL", msgs[0], "achat + lot seulement")
+        sent.clear(); msgs.clear()
+        _E.entry_media_and_lot("XAUUSD", {"side": "SELL"}, 0.1)
+        self.assertTrue(all(p.startswith("SELL") for _, p in sent))
+        self.assertIn("VENTE", msgs[0])
+
+
 def _selftest():
     _E.HTF_MODE = "FULL"   # les tests historiques (H1 -> M15 -> M5 -> POI) évaluent la cascade complète ; TestHtfM15 passe en mode M15
     suite, loader = unittest.TestSuite(), unittest.TestLoader()
     for cls in (TestRetracement, TestContinuation, TestInvalidationHTF, TestChop, TestGetExtTf,
                 TestLiquiditePure, TestM1NeDecidePasSeul, TestLogs, TestEntreeM5, TestNonRegression,
-                TestHtfM15, TestBE, TestEntreeOBFVG, TestSLTPCRT, TestSignauxSimultanes, TestLectureExtInt, TestModifyPositionGardeSLTP, TestBEDoubleVerif, TestClientId, TestLogVolumeReel, TestRiskGateUniversel, TestFiltresQualite, TestActifsEtEntrees, TestAjoutsNewsStopUS30, TestQmlSansLimiteAge, TestQmlMemoireEtHistoriqueProfond, TestSetupEngineEntreeEtPause):
+                TestHtfM15, TestBE, TestEntreeOBFVG, TestSLTPCRT, TestSignauxSimultanes, TestLectureExtInt, TestModifyPositionGardeSLTP, TestBEDoubleVerif, TestClientId, TestLogVolumeReel, TestRiskGateUniversel, TestFiltresQualite, TestActifsEtEntrees, TestAjoutsNewsStopUS30, TestQmlSansLimiteAge, TestQmlMemoireEtHistoriqueProfond, TestSetupEngineEntreeEtPause, TestMoteurSmc, TestQmlGagnant, TestComputeTrade, TestQmlGagnantBoutons, TestQmlGagnantAlertes, TestOrdresMt5EtStickers):
         suite.addTests(loader.loadTestsFromTestCase(cls))
     return 0 if unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful() else 1
 
@@ -12491,9 +13095,1711 @@ def _ft_callback(cq, arg):
 
 
 
+# ============================================================================
+# 14. MOTEUR SMC — structure de marché (fractals, HH/HL/LH/LL, BOS / CHoCH par clôture) + Quasimodo
+#     ex « analyse_smc.py », fusionné ici : detect_structure(df, tf) puis detect_qml(structure).
+#     Module pur (aucun réseau, aucune base) ; ses noms internes sont préfixés smc_ pour ne rien heurter dans ce fichier.
+#     Auto-test : smc_selftest() (lancé par python main.py --selftest, classe TestMoteurSmc).
+# ============================================================================
+SMC_FRACTAL_N = 3
+_SMC_TREND = {1: "bullish", -1: "bearish", 0: "range"}
+
+
+# ----------------------------------------------------------------------------- timeframe
+def smc_parse_tf(tf):
+    """'M5' / '5m' / 5 -> 5 ; 'H4' / '4h' / 240 -> 240 ; 'D1' -> 1440 ; None -> None."""
+    if tf is None:
+        return None
+    if isinstance(tf, (int, float)) and not isinstance(tf, bool):
+        m = int(tf)
+    else:
+        s = str(tf).strip().upper()
+        g = re.fullmatch(r"M?(\d+)M?", s)
+        if g:
+            m = int(g.group(1))
+        else:
+            g = re.fullmatch(r"H(\d+)|(\d+)H", s)
+            if g:
+                m = int(g.group(1) or g.group(2)) * 60
+            else:
+                g = re.fullmatch(r"D(\d+)|(\d+)D", s)
+                if not g:
+                    raise ValueError(f"timeframe illisible : {tf!r}")
+                m = int(g.group(1) or g.group(2)) * 1440
+    if m <= 0:
+        raise ValueError(f"timeframe invalide : {tf!r}")
+    return m
+
+
+def smc_tf_label(minutes):
+    if minutes is None:
+        return None
+    if minutes % 1440 == 0:
+        return f"D{minutes // 1440}"
+    if minutes % 60 == 0:
+        return f"H{minutes // 60}"
+    return f"M{minutes}"
+
+
+# ----------------------------------------------------------------------------- données
+def _smc_ts(x):
+    if x is None:
+        return None
+    if hasattr(x, "isoformat"):
+        return x.isoformat()
+    if hasattr(x, "item"):
+        return x.item()
+    return x
+
+
+def _smc_load(df):
+    """-> (temps, high, low, close) : listes nettoyées (NaN retirés, triées, sans doublon de temps)."""
+    if df is None:
+        raise ValueError("df est None")
+    if hasattr(df, "columns"):
+        low = {str(k).lower(): k for k in df.columns}
+        pick = lambda *names: next((low[x] for x in names if x in low), None)
+        kh, kl, kc = pick("high", "h"), pick("low", "l"), pick("close", "c")
+        if kh is None or kl is None or kc is None:
+            raise ValueError("df doit avoir des colonnes high/low/close (ou h/l/c)")
+        h, l, c = (df[k].tolist() for k in (kh, kl, kc))
+        kt = pick("time", "t", "timestamp", "datetime", "date", "open_time")
+        if kt is not None:
+            t = df[kt].tolist()
+        elif getattr(getattr(df.index, "dtype", None), "kind", None) == "M":
+            t = list(df.index)
+        else:
+            t = [None] * len(h)
+    else:
+        rows = list(df)
+        g = lambda r, *ks: next((r[k] for k in ks if k in r), None)
+        t = [g(r, "t", "time") for r in rows]
+        h = [g(r, "h", "high") for r in rows]
+        l = [g(r, "l", "low") for r in rows]
+        c = [g(r, "c", "close") for r in rows]
+
+    rows = []
+    for ti, hi, li, ci in zip(t, h, l, c):
+        try:
+            hi, li, ci = float(hi), float(li), float(ci)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(hi) and math.isfinite(li) and math.isfinite(ci):
+            rows.append((ti, hi, li, ci))
+    if rows and all(r[0] is not None for r in rows):
+        try:
+            rows.sort(key=lambda r: r[0])            # tri stable
+            out = []
+            for r in rows:                           # doublon de temps (bougie répétée) : on garde la dernière
+                if out and out[-1][0] == r[0]:
+                    out[-1] = r
+                else:
+                    out.append(r)
+            rows = out
+        except TypeError:
+            pass
+    return ([r[0] for r in rows], [r[1] for r in rows], [r[2] for r in rows], [r[3] for r in rows])
+
+
+# ----------------------------------------------------------------------------- moteur
+def detect_structure(df, tf=None, n=SMC_FRACTAL_N, keep=50, drop_last=False):
+    """Analyse la structure de marché. Retourne un dict :
+
+      tf, tf_minutes, n, bars, last_time, last_close
+      trend            "bullish" | "bearish" | "range" (aucune cassure encore)
+      label_bias       "bullish" (HH+HL) | "bearish" (LH+LL) | "mixed" | None — d'après les derniers swings
+      swing_high / swing_low             dernier fractal confirmé : {type, idx, time, price, label, confirmed_idx, bars_ago}
+      prev_swing_high / prev_swing_low   le fractal précédent du même type
+      break_up / break_down              niveaux dont la CLÔTURE au-delà casse la structure (None = niveau déjà
+                                         consommé, en attente d'un nouveau fractal)
+      bos_level / choch_level            niveau de continuation / de retournement selon la tendance
+                                         (None si tendance "range")
+      last_bos / last_choch / last_event {type, dir, level, pivot_idx, pivot_time, break_idx, break_time,
+                                         close, initial, bars_ago} ou None
+      event_on_last_bar                  l'événement survenu sur la dernière bougie, sinon None
+      swings, events                     historique (les `keep` derniers), du plus ancien au plus récent
+      _series                            {"t","h","l","c"} de la série nettoyée (lu par detect_qml)
+    Les indices (idx) renvoient à la série nettoyée (NaN retirés, triée) ; `time` est le temps d'origine.
+    """
+    n = int(n)
+    if n < 1:
+        raise ValueError("n doit être >= 1")
+    tf_min = smc_parse_tf(tf)
+    t, h, l, c = _smc_load(df)
+    if drop_last and t:
+        t, h, l, c = t[:-1], h[:-1], l[:-1], c[:-1]
+    N = len(c)
+    last = N - 1
+
+    # --- fractals : gauche strict (> les n précédents), droite >= (le 1er de deux extrêmes égaux est retenu)
+    is_ph, is_pl = [False] * N, [False] * N
+    for p in range(n, N - n):
+        if h[p] > max(h[p - n:p]) and h[p] >= max(h[p + 1:p + n + 1]):
+            is_ph[p] = True
+        if l[p] < min(l[p - n:p]) and l[p] <= min(l[p + 1:p + n + 1]):
+            is_pl[p] = True
+
+    swings, events = [], []
+    last_h = last_l = prev_h = prev_l = None      # derniers fractals confirmés
+    ref_h = ref_l = None                          # fractals pas encore cassés (niveaux actifs)
+    trend = 0
+
+    for k in range(N):
+        p = k - n                                 # fractal confirmé à la bougie k
+        if p >= n:
+            if is_ph[p]:
+                lab = None if last_h is None else ("HH" if h[p] > last_h["price"] else "LH" if h[p] < last_h["price"] else "EQH")
+                s = {"type": "high", "idx": p, "time": _smc_ts(t[p]), "price": h[p], "label": lab, "confirmed_idx": k}
+                swings.append(s)
+                prev_h, last_h, ref_h = last_h, s, s
+            if is_pl[p]:
+                lab = None if last_l is None else ("HL" if l[p] > last_l["price"] else "LL" if l[p] < last_l["price"] else "EQL")
+                s = {"type": "low", "idx": p, "time": _smc_ts(t[p]), "price": l[p], "label": lab, "confirmed_idx": k}
+                swings.append(s)
+                prev_l, last_l, ref_l = last_l, s, s
+
+        # --- cassure par CLÔTURE uniquement
+        up = ref_h is not None and c[k] > ref_h["price"]
+        dn = (not up) and ref_l is not None and c[k] < ref_l["price"]
+        if up or dn:
+            ref = ref_h if up else ref_l
+            d = 1 if up else -1
+            events.append({
+                "type": "CHOCH" if trend == -d else "BOS", "dir": "bull" if up else "bear",
+                "level": ref["price"], "pivot_idx": ref["idx"], "pivot_time": ref["time"],
+                "break_idx": k, "break_time": _smc_ts(t[k]), "close": c[k], "initial": trend == 0,
+            })
+            trend = d
+            if up:
+                ref_h = None                      # un niveau ne casse qu'une fois
+            else:
+                ref_l = None
+
+    # --- assemblage du résultat
+    def _sw(s):
+        return None if s is None else {**s, "bars_ago": last - s["confirmed_idx"]}
+
+    def _ev(e):
+        return None if e is None else {**e, "bars_ago": last - e["break_idx"]}
+
+    def _last(pred):
+        return next((_ev(e) for e in reversed(events) if pred(e)), None)
+
+    lab_h = last_h["label"] if last_h else None
+    lab_l = last_l["label"] if last_l else None
+    if lab_h in ("HH",) and lab_l in ("HL",):
+        bias = "bullish"
+    elif lab_h in ("LH",) and lab_l in ("LL",):
+        bias = "bearish"
+    else:
+        bias = "mixed" if (lab_h and lab_l) else None
+
+    break_up = ref_h["price"] if ref_h else None
+    break_dn = ref_l["price"] if ref_l else None
+    bos_level = {1: break_up, -1: break_dn}.get(trend)
+    choch_level = {1: break_dn, -1: break_up}.get(trend)
+    ev_last = _ev(events[-1]) if events else None
+
+    return {
+        "tf": smc_tf_label(tf_min), "tf_minutes": tf_min, "n": n, "bars": N,
+        "last_time": _smc_ts(t[-1]) if N else None, "last_close": c[-1] if N else None,
+        "trend": _SMC_TREND[trend], "label_bias": bias,
+        "swing_high": _sw(last_h), "swing_low": _sw(last_l),
+        "prev_swing_high": _sw(prev_h), "prev_swing_low": _sw(prev_l),
+        "break_up": break_up, "break_down": break_dn,
+        "bos_level": bos_level, "choch_level": choch_level,
+        "last_bos": _last(lambda e: e["type"] == "BOS"),
+        "last_choch": _last(lambda e: e["type"] == "CHOCH"),
+        "last_event": ev_last,
+        "event_on_last_bar": ev_last if ev_last and ev_last["bars_ago"] == 0 else None,
+        "swings": [_sw(s) for s in swings[-keep:]],
+        "events": [_ev(e) for e in events[-keep:]],
+        "_series": {"t": [_smc_ts(x) for x in t], "h": h, "l": l, "c": c},
+    }
+
+
+# ----------------------------------------------------------------------------- QML
+SMC_QML_MIN_RR = 2.0
+
+
+def detect_qml(structure, min_rr=SMC_QML_MIN_RR):
+    """Quasimodo (QML) à partir de la sortie de detect_structure. Retourne un dict :
+
+      tf, min_rr
+      qmls        tous les QML trouvés, du plus ancien au plus récent
+      last_qml    le dernier (ou None)
+      last_valid  le dernier QML valide (ou None)
+
+    Un QML est construit sur chaque CHoCH (celui de detect_structure, donc par CLÔTURE) :
+      épaule gauche = dernier swing du même côté que la tête, avant le niveau cassé (le "neckline")
+      tête          = extrême entre le neckline et la bougie de cassure (bougies brutes, pas de fractal :
+                      aucun regard dans le futur)
+      balayage      = la tête dépasse l'épaule (mèche suffisante), l'épaule étant la liquidité prise
+
+    Type
+      "continuation" : séquence BOS(d) -> CHoCH(-d) -> CHoCH(d) et épaule APRÈS le BOS, donc petit QML
+                       dans le retracement, dans le sens de la tendance ;
+      "retournement" : sinon (QML qui retourne la tendance précédente).
+
+    Zone = bougie de l'épaule gauche (haut/bas de cette bougie ; l'open n'est pas lu).
+    Statut : "non mitigé" si, APRÈS la bougie de cassure du CHoCH, aucune bougie n'a retouché la zone
+             (la zone n'existe comme POI qu'à partir du CHoCH : la tête la traverse forcément avant),
+             sinon "mitigé" (mitigated_idx / mitigated_time = première retouche).
+    Trade : entrée = bord proche de la zone, SL = extrême de la tête, TP =
+      retournement : dernier swing opposé avant l'épaule ; continuation : extrême de l'impulsion
+      (entre le BOS et la tête). rr = |TP-entrée| / |entrée-SL| (None si TP ou SL inexploitable).
+    Valide si TOUT est vrai (détail dans "criteres") :
+      tendance_avant   retournement : le CHoCH suit un BOS (tendance confirmée) ; continuation : BOS présent
+      sweep            la tête balaie l'épaule
+      choch_cloture    clôture au-delà du neckline
+      zone_epaule      zone = épaule, placée avant le neckline et la tête
+      zone_fraiche     statut "non mitigé"
+      rr_ok            rr >= min_rr
+    """
+    ser = (structure or {}).get("_series")
+    if ser is None:
+        raise ValueError("structure doit venir de detect_structure() (clé '_series' absente)")
+    H, L, C, T = ser["h"], ser["l"], ser["c"], ser["t"]
+    swings, events = structure["swings"], structure["events"]
+    last = len(C) - 1
+    qmls = []
+
+    for i, e in enumerate(events):
+        if e["type"] != "CHOCH":
+            continue
+        d = 1 if e["dir"] == "bull" else -1                  # sens du mouvement attendu
+        sh_t, nk_t = ("low", "high") if d == 1 else ("high", "low")
+        ext = L if d == 1 else H                             # série où vivent épaule et tête
+        beyond = (lambda a, b: a < b) if d == 1 else (lambda a, b: a > b)
+        k, nk = e["break_idx"], e["pivot_idx"]
+
+        ls = next((w for w in reversed(swings) if w["type"] == sh_t and w["idx"] < nk), None)
+        if ls is None or k <= nk:
+            continue
+        seg = range(nk + 1, k + 1)
+        hd = min(seg, key=lambda j: ext[j]) if d == 1 else max(seg, key=lambda j: ext[j])
+
+        prev = events[i - 1] if i >= 1 else None
+        prev2 = events[i - 2] if i >= 2 else None
+        cont = bool(prev and prev2 and prev["type"] == "CHOCH" and prev2["type"] == "BOS"
+                    and prev2["dir"] == e["dir"] and ls["idx"] > prev2["break_idx"])
+        trend_before = cont or bool(prev and prev["type"] == "BOS")
+
+        zt, zb = H[ls["idx"]], L[ls["idx"]]
+        mit = next((j for j in range(k + 1, last + 1) if (L[j] <= zt if d == 1 else H[j] >= zb)), None)
+
+        entry, sl = (zt if d == 1 else zb), ext[hd]
+        if cont:
+            tp = max(H[prev2["break_idx"]:hd + 1]) if d == 1 else min(L[prev2["break_idx"]:hd + 1])
+        else:
+            o = next((w for w in reversed(swings) if w["type"] == nk_t and w["idx"] < ls["idx"]), None)
+            tp = o["price"] if o else None
+        side_ok = tp is not None and ((sl < entry < tp) if d == 1 else (tp < entry < sl))
+        rr = abs(tp - entry) / abs(entry - sl) if side_ok else None
+
+        crit = {
+            "tendance_avant": trend_before,
+            "sweep": beyond(ext[hd], ls["price"]),
+            "choch_cloture": (C[k] > e["level"]) if d == 1 else (C[k] < e["level"]),
+            "zone_epaule": ls["idx"] < nk < hd,
+            "zone_fraiche": mit is None,
+            "rr_ok": rr is not None and rr >= min_rr,
+        }
+        qmls.append({
+            "type": "continuation" if cont else "retournement",
+            "dir": e["dir"],
+            "shoulder": {"idx": ls["idx"], "time": ls["time"], "price": ls["price"]},
+            "neckline": {"idx": nk, "time": e["pivot_time"], "price": e["level"]},
+            "head": {"idx": hd, "time": T[hd], "price": ext[hd]},
+            "choch": e, "bos": prev2 if cont else None,
+            "zone": {"top": zt, "bottom": zb, "idx": ls["idx"], "time": ls["time"]},
+            "statut": "mitigé" if mit is not None else "non mitigé",
+            "mitigated_idx": mit, "mitigated_time": None if mit is None else T[mit],
+            "entry": entry, "sl": sl, "tp": tp, "rr": rr,
+            "criteres": crit, "valide": all(crit.values()),
+            "bars_ago": last - k,
+        })
+
+    valid = [q for q in qmls if q["valide"]]
+    return {"tf": structure.get("tf"), "min_rr": min_rr, "qmls": qmls,
+            "last_qml": qmls[-1] if qmls else None, "last_valid": valid[-1] if valid else None}
+
+
+# ----------------------------------------------------------------------------- auto-tests
+def _smc_path(waypoints, wick=0.1):
+    """Zigzag propre : pas de 1.0 entre les points ; high/low = close ± wick."""
+    cl = [float(waypoints[0])]
+    for a, b in zip(waypoints, waypoints[1:]):
+        step = 1.0 if b > a else -1.0
+        x = a
+        while abs(b - x) > 1e-9:
+            x += step if abs(b - x) >= 1 else (b - x)
+            cl.append(x)
+    return [{"t": 1_700_000_000 + 60 * i, "o": x, "h": x + wick, "l": x - wick, "c": x} for i, x in enumerate(cl)]
+
+
+def smc_selftest():
+    import random
+    # 1) scénario déterministe : BOS haussier initial, CHoCH baissier, CHoCH haussier
+    bars = _smc_path([100, 110, 104, 116, 108, 114, 100, 106, 101, 112])
+    r = detect_structure(bars, "M5")
+    seq = [(e["type"], e["dir"], round(e["level"], 1)) for e in r["events"]]
+    assert seq == [("BOS", "bull", 110.1), ("CHOCH", "bear", 107.9), ("CHOCH", "bull", 106.1)], seq
+    assert r["events"][0]["initial"] and not r["events"][1]["initial"]
+    assert r["trend"] == "bullish" and r["tf"] == "M5" and r["tf_minutes"] == 5
+    assert [s["label"] for s in r["swings"] if s["type"] == "high"] == [None, "HH", "LH", "LH"], r["swings"]
+    assert [s["label"] for s in r["swings"] if s["type"] == "low"] == [None, "HL", "LL", "HL"], r["swings"]
+    assert r["choch_level"] == r["break_down"] is not None and r["event_on_last_bar"] is None
+    assert r["bos_level"] is None and r["last_choch"]["dir"] == "bull" and r["last_bos"]["initial"]
+
+    # 2) une mèche au-dessus du niveau sans clôture ne casse rien
+    wk = _smc_path([100, 110, 104, 108.5])
+    wk[-1]["h"] = 112.0
+    assert detect_structure(wk, "M1")["events"] == []
+    wk[-1]["c"] = 111.0                                   # même bougie, mais clôture au-dessus : cassure
+    assert [e["type"] for e in detect_structure(wk, "M1")["events"]] == ["BOS"]
+
+    # 3) aléatoire : invariance d'échelle, pas de regard dans le futur, DataFrame == liste de dicts
+    random.seed(7)
+    x, rnd = 100.0, []
+    for i in range(1500):
+        o = x
+        x = max(1.0, x + random.gauss(0, 1))
+        hi, lo = max(o, x) + abs(random.gauss(0, .4)), min(o, x) - abs(random.gauss(0, .4))
+        rnd.append({"t": 1_700_000_000 + 60 * i, "o": o, "h": hi, "l": lo, "c": x})
+    sig = lambda res: [(e["type"], e["dir"], e["break_idx"], e["pivot_idx"]) for e in res["events"]]
+    full = detect_structure(rnd, "M1", keep=10_000)
+    assert len(full["events"]) > 10
+    big = [{**b, "h": b["h"] * 800, "l": b["l"] * 800, "c": b["c"] * 800} for b in rnd]
+    assert sig(detect_structure(big, "H4", keep=10_000)) == sig(full), "invariance d'échelle"
+    for m in (200, 777, 1234):
+        part = detect_structure(rnd[:m], "M1", keep=10_000)
+        assert sig(part) == [s for s in sig(full) if s[2] < m], f"regard dans le futur à {m}"
+    try:
+        import pandas as pd
+        df = pd.DataFrame({"Open": [b["o"] for b in rnd], "High": [b["h"] for b in rnd], "Low": [b["l"] for b in rnd],
+                           "Close": [b["c"] for b in rnd]}, index=pd.to_datetime([b["t"] for b in rnd], unit="s"))
+        assert sig(detect_structure(df, 15, keep=10_000)) == sig(full), "DataFrame"
+        shuf = df.sample(frac=1.0, random_state=1)        # désordre + NaN : nettoyé
+        shuf.iloc[3, 1] = float("nan")
+        detect_structure(shuf, "H1")
+    except ImportError:
+        print("pandas absent : test DataFrame ignoré")
+
+    # 4) cas limites : peu de bougies, tf variés
+    assert detect_structure([], "M1")["trend"] == "range"
+    assert detect_structure(rnd[:5], "M1")["events"] == []
+    assert [smc_parse_tf(v) for v in ("M1", "5m", "M15", "30", "H1", "1h", "H4", 240, "4H", "D1")] == [1, 5, 15, 30, 60, 60, 240, 240, 240, 1440]
+    assert smc_tf_label(240) == "H4" and smc_tf_label(3) == "M3"
+    # 5) QML : retournement, continuation, miroir, mitigation, absence de regard dans le futur
+    def _mirror(bars, K=300.0):
+        return [{**b, "h": K - b["l"], "l": K - b["h"], "c": K - b["c"], "o": K - b["o"]} for b in bars]
+
+    def _qml(bars, **kw):
+        return detect_qml(detect_structure(bars, "M5", keep=10_000), **kw)
+
+    near = lambda a, b: abs(a - b) < 1e-6
+    rev = _smc_path([100, 110, 104, 116, 108, 120, 106])           # épaule 116, tête 120 (balaie), CHoCH sous 108
+    q = _qml(rev)["last_qml"]
+    assert q["type"] == "retournement" and q["dir"] == "bear" and q["statut"] == "non mitigé", q
+    assert q["valide"] and all(q["criteres"].values()) and _qml(rev)["last_valid"]["valide"]
+    assert near(q["zone"]["top"], 116.1) and near(q["zone"]["bottom"], 115.9) and near(q["head"]["price"], 120.1)
+    assert near(q["entry"], 115.9) and near(q["sl"], 120.1) and near(q["tp"], 103.9) and near(q["rr"], 12 / 4.2)
+    assert not _qml(rev, min_rr=3.0)["last_qml"]["valide"]      # RR 2.86 < 3
+
+    mit = _qml(_smc_path([100, 110, 104, 116, 108, 120, 106, 117]))["last_qml"]   # retour dans la zone
+    assert mit["statut"] == "mitigé" and mit["mitigated_idx"] > mit["choch"]["break_idx"]
+    assert not mit["criteres"]["zone_fraiche"] and not mit["valide"]
+
+    nosweep = [x for x in _qml(_smc_path([100, 110, 104, 116, 108, 114, 100]))["qmls"] if x["dir"] == "bear"][0]
+    assert not nosweep["criteres"]["sweep"] and not nosweep["valide"] and nosweep["rr"] is None
+
+    mir = _qml(_mirror(rev))["last_qml"]                        # miroir : retournement haussier
+    assert mir["type"] == "retournement" and mir["dir"] == "bull" and mir["valide"] and near(mir["rr"], q["rr"])
+
+    cont = _smc_path([100, 110, 104, 124, 114, 118, 112, 119])     # BOS, retracement, petit QML haussier
+    c = _qml(cont)["last_qml"]
+    assert c["type"] == "continuation" and c["dir"] == "bull" and c["bos"]["type"] == "BOS", c
+    assert c["valide"] and near(c["entry"], 114.1) and near(c["sl"], 111.9) and near(c["tp"], 124.1)
+    assert near(c["rr"], 10 / 2.2) and c["shoulder"]["idx"] > c["bos"]["break_idx"]
+    cm = _qml(_smc_path([100, 110, 104, 124, 114, 118, 112, 119, 113]))["last_qml"]
+    assert cm["statut"] == "mitigé" and not cm["valide"]
+    cb = _qml(_mirror(cont))["last_qml"]
+    assert cb["type"] == "continuation" and cb["dir"] == "bear" and cb["valide"] and near(cb["rr"], c["rr"])
+
+    fsig = lambda res: [(x["type"], x["dir"], x["shoulder"]["idx"], x["neckline"]["idx"], x["head"]["idx"],
+                         x["choch"]["break_idx"]) for x in res["qmls"]]
+    qa = detect_qml(detect_structure(rnd, "M1", keep=10_000))
+    assert len(qa["qmls"]) > 3 and {x["type"] for x in qa["qmls"]} == {"retournement", "continuation"}
+    for m in (300, 777, 1234):
+        part = detect_qml(detect_structure(rnd[:m], "M1", keep=10_000))
+        assert fsig(part) == [x for x in fsig(qa) if x[5] < m], f"QML : regard dans le futur à {m}"
+    vs = lambda res: [(x["valide"], None if x["rr"] is None else round(x["rr"], 6)) for x in res["qmls"]]
+    assert vs(detect_qml(detect_structure(big, "H4", keep=10_000))) == vs(qa), "QML : invariance d'échelle"
+    assert detect_qml(detect_structure([], "M1"))["qmls"] == []
+    assert detect_qml(detect_structure(rnd[:5], "M1"))["last_qml"] is None
+
+    print("analyse_smc : tous les tests OK")
+    return 0
+
+
+# ============================================================================
+# 15. STRATÉGIE QML GAGNANT — squelette (AUCUNE règle de signal pour l'instant)
+#
+# Stratégie SÉPARÉE, à côté du QML de la section 12 (qui n'est ni lu ni modifié ici). OFF par défaut (menu
+# « 🧩 Stratégies » -> QML GAGNANT). Elle ne fait QUE : charger les bougies, appeler detect_structure puis
+# detect_qml (section 14, dans ce fichier) et renvoyer un dict de statut. L'ANALYSE est toujours disponible, ON ou OFF
+# (📊 Analyse -> 🏆 QML GAGNANT). Les règles d'entrée viennent plus tard dans _qmlg_rules() ; tant qu'elle renvoie
+# None, signal = None. Rien n'est branché sur la boucle principale : aucun signal, aucun ordre automatique.
+# ============================================================================
+
+# --- PARAMÈTRES (variables d'environnement, valeurs par défaut) -----------------------------------------
+QMLG_ENABLED_DEFAULT = _env_on("QMLG_ENABLED", False)    # état initial du réglage ON/OFF (le menu Telegram reprend la main)
+QMLG_TF = _env_int("QMLG_TF", 15)                        # TF d'analyse par défaut, en minutes
+QMLG_HISTORY_BARS = _env_int("QMLG_HISTORY_BARS", 1000)  # nombre de bougies clôturées analysées
+QMLG_FRACTAL_N = _env_int("QMLG_FRACTAL_N", 3)           # fractals de detect_structure (n bougies de chaque côté)
+QMLG_MIN_RR = _env_float("QMLG_MIN_RR", 2.0)             # RR minimum passé à detect_qml
+QMLG_MIN_BARS = _env_int("QMLG_MIN_BARS", 50)            # en dessous : « NO_DATA », pas d'analyse
+QMLG_ATR_PERIOD = _env_int("QMLG_ATR_PERIOD", 14)        # ATR (Wilder) du TF analysé, pour le buffer du SL et la tolérance EQH / EQL
+QMLG_SL_MODE = os.getenv("QMLG_SL_MODE", "BUFFER").strip().upper()   # BUFFER : SL = bord lointain de la zone + buffer ; EXTREME : pile sur ce bord
+QMLG_SL_BUFFER_ATR = _env_float("QMLG_SL_BUFFER_ATR", 0.05)          # buffer derrière la zone, en ATR
+QMLG_EQ_TOL_ATR = _env_float("QMLG_EQ_TOL_ATR", 0.10)    # deux sommets / creux à moins de N x ATR forment un EQH / EQL
+QMLG_TFS = tuple(int(x) for x in re.findall(r"\d+", os.getenv("QMLG_TFS", "5,15,30,60"))) or (5, 15, 30, 60)   # TF scannés (minutes)
+QMLG_KEEP = _env_int("QMLG_KEEP", 300)                   # événements / swings gardés par detect_structure (historique des formations)
+QMLG_JSON_PATH = os.getenv("QMLG_JSON_PATH") or os.path.join(os.path.dirname(os.path.abspath(DB_PATH)), "qml_gagnant.json")
+QMLG_MAX_AGE_MIN = _env_int("QMLG_MAX_AGE_MIN", 15)      # « Ordre limite » : au-delà, le JSON est périmé -> nouveau scan
+QMLG_CACHE_SEC = _env_int("QMLG_CACHE_SEC", 60)          # « Entrée directe » : un scan plus récent que ça est réutilisé
+QMLG_DOJI_BODY = _env_float("QMLG_DOJI_BODY", 0.10)      # doji : corps <= 10 % de la bougie
+QMLG_PIN_WICK = _env_float("QMLG_PIN_WICK", 0.60)        # pin bar : mèche de rejet >= 60 % de la bougie ...
+QMLG_PIN_BODY = _env_float("QMLG_PIN_BODY", 0.35)        # ... et corps <= 35 % de la bougie
+QMLG_LIST_MAX = _env_int("QMLG_LIST_MAX", 15)            # lignes max affichées dans Telegram (le JSON garde tout)
+QMLG_ALERT_SEC = _env_int("QMLG_ALERT_SEC", 20)          # pas de la surveillance des alertes de zone (secondes)
+QMLG_ALERT_LAG = _env_int("QMLG_ALERT_LAG", 5)           # délai après la clôture théorique d'une bougie avant de la relire
+
+
+def get_qmlg_on():
+    """Réglage ON/OFF de QML GAGNANT (clé « qmlg_on »). OFF tant que personne ne l'a activé."""
+    return _get_bool_setting("qmlg_on", QMLG_ENABLED_DEFAULT)
+
+
+def _qmlg_tf_minutes(tf):
+    """15 / "15" / "M15" -> 15 ; "H1" -> 60 ; illisible ou absent -> QMLG_TF."""
+    if isinstance(tf, (int, float)) and not isinstance(tf, bool) and tf > 0:
+        return int(tf)
+    g = re.fullmatch(r"(?:M)?(\d+)|H(\d+)", str(tf or "").strip().upper())
+    if g:
+        m = int(g.group(1)) if g.group(1) else int(g.group(2)) * 60
+        if m > 0:
+            return m
+    return QMLG_TF
+
+
+def _qmlg_rules(ctx):
+    """RÈGLES DE SIGNAL — VIDES pour l'instant. ctx = {symbol, tf_minutes, structure, qml, candles}.
+    À remplir plus tard : renvoyer un dict de signal (sens, entrée, SL, TP...) ou None. None = aucun signal."""
+    return None
+
+
+def _qmlg_atr(ser, n=None):
+    """ATR de Wilder sur la série de detect_structure (h / l / c), en Python pur. None si pas assez de bougies."""
+    n = n or QMLG_ATR_PERIOD
+    H, L, C = ser["h"], ser["l"], ser["c"]
+    if len(C) < n + 1:
+        return None
+    tr = [H[0] - L[0]] + [max(H[i] - L[i], abs(H[i] - C[i - 1]), abs(L[i] - C[i - 1])) for i in range(1, len(C))]
+    a = sum(tr[:n]) / n
+    for x in tr[n:]:
+        a = (a * (n - 1) + x) / n
+    return a
+
+
+def _qmlg_liquidity(structure, buy, entry, tol):
+    """Liquidité encore NON prise dans le sens du trade, de la plus proche à la plus lointaine : [{price, kind}].
+    achat : sommets (swing highs) au-dessus de l'entrée ; vente : creux (swing lows) en dessous. Un niveau déjà dépassé
+    par une mèche depuis sa formation n'est plus de la liquidité. EQH / EQL = niveau étiqueté EQH / EQL par le moteur
+    OU au moins 2 swings à moins de `tol` : le niveau retenu est le premier touché par le prix (le plus proche)."""
+    ser = structure["_series"]
+    ext = ser["h"] if buy else ser["l"]
+    kind_sw = "high" if buy else "low"
+    pts = []
+    for w in structure.get("swings") or []:
+        if w.get("type") != kind_sw:
+            continue
+        px, i = w["price"], w["idx"]
+        if (px <= entry) if buy else (px >= entry):
+            continue
+        later = ext[i + 1:]
+        if later and ((max(later) >= px) if buy else (min(later) <= px)):
+            continue   # liquidité déjà prise
+        pts.append((px, w.get("label") in ("EQH", "EQL")))
+    pts.sort(key=lambda x: x[0], reverse=not buy)   # du plus proche de l'entrée au plus lointain
+    out, cluster = [], []
+    for px, eq in pts:
+        if cluster and abs(px - cluster[-1][0]) <= tol:
+            cluster.append((px, eq))
+            continue
+        if cluster:
+            out.append(cluster)
+        cluster = [(px, eq)]
+    if cluster:
+        out.append(cluster)
+    lvls = []
+    for cl in out:
+        eq = len(cl) >= 2 or any(e for _, e in cl)
+        lvls.append({"price": cl[0][0], "kind": ("EQH" if buy else "EQL") if eq else "SWING"})
+    return lvls
+
+
+def compute_trade(qml, structure=None, entry_price=None):
+    """Plan de trade d'un QML (dict de detect_qml) : ENTRÉE LIMIT uniquement, jamais d'ordre à marché.
+      entrée : bord PROCHE de la zone (achat : haut de la zone ; vente : bas), jamais 50 %.
+      SL     : juste DERRIÈRE la zone (bord lointain +/- ATR x QMLG_SL_BUFFER_ATR), ou pile sur ce bord (QMLG_SL_MODE=EXTREME).
+               Jamais derrière la tête : si le buffer l'y amenait, le SL est ramené sur le bord de la zone.
+      TP1/TP2: les deux prochaines liquidités non prises (EQH / EQL, swings) dans le sens du trade, via `structure`
+               (sortie de detect_structure ; sans elle : pas de TP).
+      RR1/RR2: |TP - entrée| / |entrée - SL|.
+      entry_price (ENTRÉE DIRECTE seulement) : entrée = ce prix (clôture de la bougie de rejet, dans la zone), order = "DIRECT" ;
+               SL et TP inchangés. Ce plan est un compte rendu : rien ici n'envoie d'ordre à MT5.
+    Retourne {ok, reason, side, order ("LIMIT"), entry, sl, sl_mode, tp1, tp2, tp1_kind, tp2_kind, rr1, rr2, risk, atr}.
+    ok = True seulement si entrée, SL et TP1 sont exploitables (TP2 peut manquer : rr2 = None)."""
+    t = {"ok": False, "reason": None, "side": None, "order": "LIMIT", "entry": None, "sl": None, "sl_mode": None,
+         "tp1": None, "tp2": None, "tp1_kind": None, "tp2_kind": None, "rr1": None, "rr2": None,
+         "risk": None, "atr": None}
+    try:
+        z, head = qml["zone"], qml["head"]["price"]
+        buy = qml["dir"] == "bull"
+        top, bot = float(z["top"]), float(z["bottom"])
+    except (TypeError, KeyError, ValueError):
+        t["reason"] = "QML incomplet (zone / tête / sens)"
+        return t
+    t["side"] = "BUY" if buy else "SELL"
+    atr = _qmlg_atr(structure["_series"]) if structure and structure.get("_series") else None
+    t["atr"] = atr
+    entry = top if buy else bot                      # bord proche : le prix y revient en premier
+    far = bot if buy else top                        # bord lointain
+    if entry_price is not None:                      # entrée directe : à la clôture de la bougie de rejet
+        entry, t["order"] = float(entry_price), "DIRECT"
+    buf = (atr or 0.0) * QMLG_SL_BUFFER_ATR if QMLG_SL_MODE != "EXTREME" else 0.0
+    sl = far - buf if buy else far + buf
+    behind_head = (sl <= head) if buy else (sl >= head)
+    if behind_head:                                  # jamais derrière la tête
+        sl = far
+    t["sl_mode"] = "BUFFER" if (buf and sl != far) else "EXTREME"
+    risk = (entry - sl) if buy else (sl - entry)
+    t["entry"], t["sl"] = entry, sl
+    if risk <= 0 or ((sl <= head) if buy else (sl >= head)):
+        t["reason"] = "zone inexploitable (risque nul ou SL derrière la tête)"
+        return t
+    t["risk"] = risk
+    if not structure or not structure.get("_series"):
+        t["reason"] = "structure absente : pas de liquidité pour TP1 / TP2"
+        return t
+    tol = (atr or 0.0) * QMLG_EQ_TOL_ATR
+    lv = _qmlg_liquidity(structure, buy, entry, tol)
+    for k, lvl in enumerate(lv[:2], start=1):
+        t[f"tp{k}"], t[f"tp{k}_kind"] = lvl["price"], lvl["kind"]
+        t[f"rr{k}"] = abs(lvl["price"] - entry) / risk
+    if t["tp1"] is None:
+        t["reason"] = "aucune liquidité non prise dans le sens du trade"
+        return t
+    t["ok"] = True
+    return t
+
+
+def qml_gagnant_analyze(symbol, tf):
+    """Analyse QML GAGNANT d'un actif (toujours possible, ON ou OFF). Appelle detect_structure puis detect_qml et
+    renvoie un dict de statut :
+      strategy, symbol, tf, tf_minutes, enabled (réglage ON/OFF), status, signal, bars, trend, n_qml, last_qml, trade, error
+    status : NO_RULES (analyse faite, règles vides) · NO_DATA · ERROR · SIGNAL (futur).
+    signal est None tant que _qmlg_rules() ne renvoie rien. Ne lève jamais : toute erreur finit dans status/error."""
+    tf_min = _qmlg_tf_minutes(tf)
+    out = {"strategy": "QML_GAGNANT", "symbol": symbol, "tf": tf, "tf_minutes": tf_min,
+           "enabled": get_qmlg_on(), "status": "NO_DATA", "signal": None,
+           "bars": 0, "trend": None, "n_qml": 0, "last_qml": None, "trade": None, "error": None}
+    try:
+        candles = get_candles(symbol, minutes=tf_min, count=QMLG_HISTORY_BARS) or []
+        out["bars"] = len(candles)
+        if len(candles) < QMLG_MIN_BARS:
+            return out
+        structure = detect_structure(candles, f"M{tf_min}", n=QMLG_FRACTAL_N)
+        qml = detect_qml(structure, min_rr=QMLG_MIN_RR)
+        out["trend"] = structure.get("trend")
+        out["n_qml"] = len(qml.get("qmls") or [])
+        out["last_qml"] = qml.get("last_qml")
+        if out["last_qml"]:
+            out["trade"] = compute_trade(out["last_qml"], structure)   # information seulement : ce n'est PAS un signal
+        out["status"] = "NO_RULES"
+        sig = _qmlg_rules({"symbol": symbol, "tf_minutes": tf_min, "structure": structure,
+                           "qml": qml, "candles": candles})
+        if sig:
+            out["signal"], out["status"] = sig, "SIGNAL"
+    except Exception as e:
+        out["status"], out["error"] = "ERROR", f"{type(e).__name__}: {e}"
+    return out
+
+
+_QMLG_TREND_LBL = {"bullish": "haussière 📈", "bearish": "baissière 📉", "range": "indéterminée (range)"}
+
+
+def qml_gagnant_text(res):
+    """Texte Telegram de l'analyse QML GAGNANT (information seulement : aucune règle d'entrée n'existe encore)."""
+    head = (f"🏆 <b>ANALYSE QML GAGNANT — {res['symbol']}</b> · M{res['tf_minutes']}\n"
+            f"Stratégie : {'🟢 ON' if res['enabled'] else '🔴 OFF'} · règles d'entrée : <b>aucune</b> (aucun signal)\n")
+    if res["status"] == "ERROR":
+        return head + f"\n⚠️ Analyse impossible : {res['error']}"
+    if res["status"] == "NO_DATA":
+        return head + f"\n⚠️ Pas assez de bougies ({res['bars']} < {QMLG_MIN_BARS})."
+    txt = head + (f"\nTendance : {_QMLG_TREND_LBL.get(res['trend'], res['trend'])} · {res['bars']} bougies · "
+                  f"{res['n_qml']} QML détecté(s)")
+    q = res.get("last_qml")
+    if not q:
+        return txt + "\nAucun QML sur la période."
+    dec = SYMBOLS.get(res["symbol"], {}).get("decimals", 2)
+    z, tr = q["zone"], res.get("trade") or {}
+    txt += (f"\n\nDernier QML : {'🟢 achat' if q['dir'] == 'bull' else '🔴 vente'} · {q['type']} · {q['statut']}"
+            f" · {'✅ valide' if q['valide'] else '❌ non valide'}\n"
+            f"Zone : {_fmt(z['bottom'], dec)} → {_fmt(z['top'], dec)}\n")
+    if not tr.get("ok"):
+        return txt + f"Plan de trade : indisponible ({tr.get('reason')})\n(information seulement)"
+    f2 = lambda k: "—" if tr[k] is None else f"{_fmt(tr[k], dec)} ({tr[k + '_kind']})"
+    r2 = lambda k: "—" if tr[k] is None else f"{tr[k]:.2f}"
+    return txt + (f"⏳ <b>{tr['side']} LIMIT</b> (jamais au marché) : {_fmt(tr['entry'], dec)}\n"
+                  f"🛡 SL {_fmt(tr['sl'], dec)}\n"
+                  f"🎯 TP1 {f2('tp1')} · RR1 {r2('rr1')}\n"
+                  f"🎯 TP2 {f2('tp2')} · RR2 {r2('rr2')}\n"
+                  f"(information seulement)")
+
+
+# --- REJET, VALIDATION, SCAN MULTI-MARCHÉS / MULTI-TF, JSON ----------------------------------------------
+_QMLG_REASON_LBL = {"tendance_avant": "pas de BOS avant", "sweep": "pas de sweep", "choch_cloture": "CHoCH non clôturé",
+                    "zone_epaule": "zone ≠ épaule", "zone_fraiche": "zone mitigée", "plan": "plan de trade impossible",
+                    "rr1": f"RR1 < {QMLG_MIN_RR:g}"}
+
+
+def qmlg_rejection(candles, buy):
+    """Motif de rejet de la DERNIÈRE bougie clôturée, dans le sens du trade (achat : haussier ; vente : baissier) :
+    "ENGULFING" (le corps avale le corps précédent), "PIN_BAR" (longue mèche de rejet, petit corps), "DOJI" (corps minuscule,
+    mèche de rejet au moins aussi longue que l'opposée),
+    sinon None. candles : dicts {o, h, l, c}, la plus récente en dernier."""
+    if not candles:
+        return None
+    c = candles[-1]
+    o, h, l, cl = c["o"], c["h"], c["l"], c["c"]
+    rng = h - l
+    if rng <= 0:
+        return None
+    body = abs(cl - o)
+    if len(candles) >= 2:
+        po, pc = candles[-2]["o"], candles[-2]["c"]
+        if buy and pc < po and cl > o and o <= pc and cl >= po:
+            return "ENGULFING"
+        if not buy and pc > po and cl < o and o >= pc and cl <= po:
+            return "ENGULFING"
+    wick = (min(o, cl) - l) if buy else (h - max(o, cl))      # mèche de rejet : basse pour un achat, haute pour une vente
+    opposite = (h - max(o, cl)) if buy else (min(o, cl) - l)
+    if wick >= QMLG_PIN_WICK * rng and body <= QMLG_PIN_BODY * rng:
+        return "PIN_BAR"
+    if body <= QMLG_DOJI_BODY * rng and wick >= opposite:      # un doji qui rejette dans l'autre sens ne valide pas
+        return "DOJI"
+    return None
+
+
+def qmlg_validate(qml, structure, direct=False, entry_price=None):
+    """Valide UNE formation QML. Retourne {valid, reasons, trade}. Valide = critères de detect_qml (tendance_avant, sweep,
+    choch_cloture, zone_epaule) + zone fraîche (non mitigée ; ignoré en entrée directe, où le prix est justement dans la
+    zone) + plan compute_trade exploitable + RR1 >= QMLG_MIN_RR (calculé sur NOTRE plan : SL derrière la zone)."""
+    cr = qml.get("criteres") or {}
+    reasons = [k for k in ("tendance_avant", "sweep", "choch_cloture", "zone_epaule") if not cr.get(k)]
+    if not direct and not cr.get("zone_fraiche"):
+        reasons.append("zone_fraiche")
+    tr = compute_trade(qml, structure, entry_price=entry_price)
+    if not tr["ok"]:
+        reasons.append("plan")
+    elif tr["rr1"] < QMLG_MIN_RR:
+        reasons.append("rr1")
+    return {"valid": not reasons, "reasons": reasons, "trade": tr}
+
+
+def qmlg_direct_entry(qml, structure, candles):
+    """ENTRÉE DIRECTE : seulement si le prix (clôture de la dernière bougie clôturée) est DANS la zone ET que cette bougie est
+    un rejet dans le sens du QML. Entrée = cette clôture. La zone doit être fraîche jusqu'à cette bougie (1re touche) et la
+    formation valide. Retourne {pattern, entry, time, trade} ou None. Compte rendu seulement : aucun ordre n'est envoyé."""
+    if not candles or not qml.get("zone"):
+        return None
+    z, last = qml["zone"], candles[-1]
+    close = last["c"]
+    if not (z["bottom"] <= close <= z["top"]):
+        return None
+    mi = qml.get("mitigated_idx")
+    if mi is not None and mi != len(structure["_series"]["c"]) - 1:
+        return None   # déjà retouchée avant la dernière bougie : plus une zone fraîche
+    pattern = qmlg_rejection(candles, qml["dir"] == "bull")
+    if not pattern:
+        return None
+    v = qmlg_validate(qml, structure, direct=True, entry_price=close)
+    if not v["valid"]:
+        return None
+    return {"pattern": pattern, "entry": close, "time": last["t"], "trade": v["trade"]}
+
+
+def _qmlg_record(symbol, tf, q, structure, candles):
+    """Une formation, prête pour le JSON : données du QML + validation + plan limite + entrée directe éventuelle."""
+    v = qmlg_validate(q, structure)
+    direct = qmlg_direct_entry(q, structure, candles)
+    ag = None
+    if QMLG_AGENTS and (v["valid"] or direct):   # 3 agents : aucun QML n'est validé / envoyé sans leur accord
+        ag = qmlg_agents(symbol, tf, q, structure, candles, (direct or v)["trade"])
+        if not ag["ok"]:
+            v = dict(v, valid=False, reasons=list(v["reasons"]) + ["agents"])
+            direct = None
+    return {"id": f"{symbol}|M{tf}|{q['dir']}|{q['choch']['break_time']}", "symbol": symbol, "tf": tf, "agents": ag,
+            "dir": q["dir"], "type": q["type"], "statut": q["statut"], "mitigated_time": q.get("mitigated_time"),
+            "bars_ago": q.get("bars_ago"), "zone": q["zone"], "head": q["head"], "shoulder": q["shoulder"],
+            "neckline": q["neckline"], "choch_time": q["choch"]["break_time"], "criteres": q.get("criteres"),
+            "validation": {"valid": v["valid"], "reasons": v["reasons"]}, "plan": v["trade"],
+            "direct": direct, "last_t": candles[-1]["t"]}
+
+
+def _qmlg_scan_one(symbol, tf):
+    """Formations d'un (marché, TF). Retourne (liste de formations, nb de bougies, dernière clôture)."""
+    candles = get_candles(symbol, minutes=tf, count=QMLG_HISTORY_BARS) or []
+    if len(candles) < QMLG_MIN_BARS:
+        raise ValueError(f"{len(candles)} bougies (< {QMLG_MIN_BARS})")
+    structure = detect_structure(candles, f"M{tf}", n=QMLG_FRACTAL_N, keep=QMLG_KEEP)
+    res = detect_qml(structure, min_rr=QMLG_MIN_RR)
+    return [_qmlg_record(symbol, tf, q, structure, candles) for q in res["qmls"]], len(candles)
+
+
+def _qmlg_save(data, path=None):
+    """Écriture atomique du JSON (jamais de fichier à moitié écrit)."""
+    path = path or QMLG_JSON_PATH
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, separators=(",", ":"), default=str)
+    os.replace(tmp, path)
+
+
+def _qmlg_load(path=None):
+    try:
+        with open(path or QMLG_JSON_PATH, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+_qmlg_cache = {"data": None}
+
+
+def qmlg_scan(symbols=None, tfs=None):
+    """BOUTON « Analyse » : scanne TOUS les marchés (Deriv + BTC Binance) sur TOUS les TF, enregistre TOUTES les formations QML
+    dans le JSON (QMLG_JSON_PATH), chacune VALIDÉE (qmlg_validate). Un marché / TF en erreur est noté dans `errors`, le scan continue."""
+    symbols, tfs = list(symbols or SYMBOLS), list(tfs or QMLG_TFS)
+    forms, errors = [], []
+    for sym in symbols:
+        for tf in tfs:
+            try:
+                recs, _n = _qmlg_scan_one(sym, tf)
+                forms.extend(recs)
+            except Exception as e:
+                errors.append({"symbol": sym, "tf": tf, "error": f"{type(e).__name__}: {e}"})
+    data = {"generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"), "generated_ts": time.time(),
+            "markets": symbols, "tfs": tfs,
+            "params": {"min_rr": QMLG_MIN_RR, "sl_mode": QMLG_SL_MODE, "sl_buffer_atr": QMLG_SL_BUFFER_ATR,
+                       "fractal_n": QMLG_FRACTAL_N, "history_bars": QMLG_HISTORY_BARS},
+            "n_formations": len(forms), "n_valid": sum(1 for f in forms if f["validation"]["valid"]),
+            "formations": forms, "errors": errors}
+    try:
+        _qmlg_save(data)
+    except OSError as e:
+        data["errors"].append({"symbol": "*", "tf": "*", "error": f"JSON non écrit : {e}"})
+    _qmlg_cache["data"] = data
+    return data
+
+
+def qmlg_data(max_age_sec):
+    """Dernier scan s'il a moins de max_age_sec secondes (mémoire, sinon fichier JSON) ; sinon nouveau scan complet."""
+    for d in (_qmlg_cache["data"], _qmlg_load()):
+        if d and time.time() - d.get("generated_ts", 0) <= max_age_sec:
+            return d
+    return qmlg_scan()
+
+
+def qmlg_pending_limits(data):
+    """BOUTON « Ordre limite » : QML VALIDES dont la zone n'est pas mitigée (inclut les QML tout juste formés), la plus
+    récente d'abord. Statut : EN ATTENTE de mitigation."""
+    return sorted((f for f in data["formations"] if f["validation"]["valid"] and f["statut"] == "non mitigé"),
+                  key=lambda f: f.get("bars_ago") if f.get("bars_ago") is not None else 10 ** 9)
+
+
+def qmlg_direct_signals(data):
+    """BOUTON « Entrée directe » : formations dont le prix est dans la zone ET la dernière clôture est un rejet."""
+    return [f for f in data["formations"] if f.get("direct")]
+
+
+# --- ALERTES DE ZONE (posées après « Analyse ») ----------------------------------------------------------
+# Pour chaque QML VALIDE non mitigé trouvé par « Analyse » : une alerte sur la zone.
+#   1re alerte : le prix ENTRE dans la zone (prix en direct, ou mèche d'une bougie clôturée) ;
+#   2e alerte  : une bougie de REJET se forme (clôture dans la zone + avalement / pin bar / doji, dans le sens du QML), puis
+#                l'alerte est terminée et supprimée.
+#   Suppression sans 2e alerte : zone INVALIDÉE = une clôture au-delà du bord lointain de la zone (donc de la tête aussi).
+# Anti-doublon : une seule alerte par (marché, TF, zone). Stockées en base (réglage « qmlg_alerts ») : elles survivent aux
+# redémarrages. Alertes envoyées à l'admin seulement ; aucun ordre n'est jamais envoyé depuis ici.
+_qmlg_alert_lock = threading.RLock()
+
+
+def qmlg_alert_key(symbol, tf, zone):
+    return f"{symbol}|M{tf}|{float(zone['top']):.10g}|{float(zone['bottom']):.10g}"
+
+
+def _qmlg_alerts_load():
+    try:
+        d = json.loads(get_setting("qmlg_alerts", "{}") or "{}")
+        return d if isinstance(d, dict) else {}
+    except ValueError:
+        return {}
+
+
+def _qmlg_alerts_save(store):
+    set_setting("qmlg_alerts", json.dumps(store, separators=(",", ":"), default=str))
+
+
+def qmlg_place_alerts(data):
+    """Pose une alerte pour chaque QML valide non mitigé de `data` (résultat de qmlg_scan). Anti-doublon par (marché, TF, zone).
+    Retourne {placed, existing, total}."""
+    placed = existing = 0
+    with _qmlg_alert_lock:
+        store = _qmlg_alerts_load()
+        for f in qmlg_pending_limits(data):
+            key = qmlg_alert_key(f["symbol"], f["tf"], f["zone"])
+            if key in store:
+                existing += 1
+                continue
+            p = f["plan"]
+            store[key] = {"key": key, "symbol": f["symbol"], "tf": f["tf"], "dir": f["dir"],
+                          "zone": {"top": f["zone"]["top"], "bottom": f["zone"]["bottom"]},
+                          "sl": p["sl"], "tp1": p["tp1"], "tp1_kind": p["tp1_kind"], "tp2": p["tp2"], "tp2_kind": p["tp2_kind"],
+                          "last_t": f["last_t"], "entered": False, "created_ts": time.time()}
+            placed += 1
+        if placed:
+            _qmlg_alerts_save(store)
+        return {"placed": placed, "existing": existing, "total": len(store)}
+
+
+def _qmlg_alert_head(a):
+    dec = SYMBOLS.get(a["symbol"], {}).get("decimals", 2)
+    z = a["zone"]
+    return (f"{'🟢' if a['dir'] == 'bull' else '🔴'} <b>{a['symbol']} M{a['tf']}</b>", dec,
+            f"{_fmt(z['bottom'], dec)} → {_fmt(z['top'], dec)}")
+
+
+def _qmlg_alert_enter_text(a):
+    head, _dec, zone = _qmlg_alert_head(a)
+    return (f"🔔 {head} — le prix entre dans la zone QML\n{'Achat' if a['dir'] == 'bull' else 'Vente'} · zone {zone}\n"
+            f"Je te préviens à la bougie de rejet.")
+
+
+def _qmlg_alert_reject_text(a, pattern, close):
+    head, dec, zone = _qmlg_alert_head(a)
+    risk = abs(close - a["sl"])
+    rr = lambda tp: "—" if tp is None or risk <= 0 else f"{abs(tp - close) / risk:.2f}"
+    tp = lambda k: "—" if a[k] is None else f"{_fmt(a[k], dec)} ({a[k + '_kind']}) RR {rr(a[k])}"
+    warn = ""
+    if a["tp1"] is not None and risk > 0 and abs(a["tp1"] - close) / risk < QMLG_MIN_RR:
+        warn = f"\n⚠️ RR1 < {QMLG_MIN_RR:g}"
+    return (f"🔥 {head} — <b>REJET {pattern}</b> dans la zone {zone}\n"
+            f"{'Achat' if a['dir'] == 'bull' else 'Vente'} direct à la clôture : {_fmt(close, dec)}\n"
+            f"🛡 SL {_fmt(a['sl'], dec)} · 🎯 TP1 {tp('tp1')} · TP2 {tp('tp2')}{warn}\n"
+            f"(alerte seulement : aucun ordre envoyé)")
+
+
+def _qmlg_alert_invalid_text(a, close):
+    head, dec, zone = _qmlg_alert_head(a)
+    return f"🗑 {head} — zone QML {zone} invalidée (clôture {_fmt(close, dec)}) : alerte supprimée."
+
+
+def qmlg_alert_eval(a, candles, live_px=None):
+    """Fait avancer UNE alerte (fonction pure, sans réseau). candles : bougies clôturées (la plus récente en dernier) ;
+    live_px : prix en direct ou None. Retourne (alerte mise à jour, ou None si elle doit être supprimée, [messages à envoyer])."""
+    a, msgs = dict(a), []
+    top, bot, buy = a["zone"]["top"], a["zone"]["bottom"], a["dir"] == "bull"
+
+    def enter():
+        if not a["entered"]:
+            a["entered"] = True
+            msgs.append(_qmlg_alert_enter_text(a))
+
+    for k, c in enumerate(candles):
+        if c["t"] <= a["last_t"]:
+            continue
+        if (c["c"] < bot) if buy else (c["c"] > top):   # clôture au-delà du bord lointain : zone invalidée
+            msgs.append(_qmlg_alert_invalid_text(a, c["c"]))
+            return None, msgs
+        if c["l"] <= top and c["h"] >= bot:
+            enter()
+        if a["entered"] and bot <= c["c"] <= top:
+            pattern = qmlg_rejection(candles[:k + 1], buy)
+            if pattern:
+                msgs.append(_qmlg_alert_reject_text(a, pattern, c["c"]))
+                return None, msgs   # 2e alerte envoyée : l'alerte est terminée
+        a["last_t"] = c["t"]
+    if live_px is not None and not a["entered"] and ((live_px <= top) if buy else (live_px >= bot)):
+        enter()
+    return a, msgs
+
+
+def qmlg_alert_tick():
+    """Un passage de surveillance : relit les bougies clôturées (seulement si une nouvelle a pu clôturer) et le prix en direct
+    des marchés ayant une alerte, fait avancer chaque alerte, envoie les messages à l'admin, enregistre l'état."""
+    snap = _qmlg_alerts_load()
+    if not snap:
+        return 0
+    now, candles, prices = time.time(), {}, {}
+    for (sym, tf) in {(a["symbol"], a["tf"]) for a in snap.values()}:
+        if any(now >= a["last_t"] + 2 * tf * 60 + QMLG_ALERT_LAG for a in snap.values() if (a["symbol"], a["tf"]) == (sym, tf)):
+            try:
+                candles[(sym, tf)] = get_candles(sym, minutes=tf) or []
+            except Exception as e:
+                print(f"[qmlg-alertes] {sym} M{tf} : bougies indisponibles ({type(e).__name__})")
+    for sym in {a["symbol"] for a in snap.values() if not a["entered"]}:
+        try:
+            prices[sym] = get_live_price(sym)
+        except Exception:
+            prices[sym] = None
+    out = []
+    with _qmlg_alert_lock:
+        store = _qmlg_alerts_load()   # relu : une alerte posée / supprimée pendant les appels réseau est respectée
+        for key in list(store):
+            a = store[key]
+            new, msgs = qmlg_alert_eval(a, candles.get((a["symbol"], a["tf"]), []), prices.get(a["symbol"]))
+            out.extend(msgs)
+            if new is None:
+                del store[key]
+            else:
+                store[key] = new
+        _qmlg_alerts_save(store)
+    for m in out:
+        to_admin(m)   # hors du verrou : un envoi Telegram lent ne bloque pas la pose d'alertes
+    return len(out)
+
+
+_qmlg_alert_started = []
+
+
+def start_qmlg_alerts():
+    """Démarre (une seule fois) la boucle de surveillance des alertes de zone. Sans alerte, elle ne fait aucun appel réseau."""
+    if _qmlg_alert_started:
+        return
+
+    def loop():
+        while True:
+            try:
+                qmlg_alert_tick()
+            except Exception:
+                traceback.print_exc(limit=-3)
+            time.sleep(max(5, QMLG_ALERT_SEC))
+    _qmlg_alert_started.append(threading.Thread(target=loop, daemon=True, name="qmlg-alertes"))
+    _qmlg_alert_started[0].start()
+
+
+# --- TEXTES TELEGRAM + BOUTONS ----------------------------------------------------------------------------
+def _qmlg_age(data):
+    m = int((time.time() - data.get("generated_ts", 0)) // 60)
+    return "à l'instant" if m < 1 else f"il y a {m} min"
+
+
+def _qmlg_cap(head, lines, tail="", limit=3800):
+    """Assemble en respectant la limite Telegram : lignes en trop résumées par « + N autres »."""
+    out, used = [], len(head) + len(tail) + 40
+    for i, ln in enumerate(lines):
+        if i >= QMLG_LIST_MAX or used + len(ln) > limit:
+            out.append(f"… + {len(lines) - i} autre(s) (détail dans le JSON)")
+            break
+        out.append(ln)
+        used += len(ln) + 1
+    return head + "\n".join(out) + tail
+
+
+def _qmlg_line(f, plan, extra=""):
+    dec = SYMBOLS.get(f["symbol"], {}).get("decimals", 2)
+    buy = plan["side"] == "BUY"
+    f2 = lambda k: "—" if plan[k] is None else f"{_fmt(plan[k], dec)} (RR {plan['rr' + k[-1]]:.2f})"
+    return (f"{'🟢' if buy else '🔴'} <b>{f['symbol']}</b> M{f['tf']} · {plan['side']} @ {_fmt(plan['entry'], dec)}{extra}\n"
+            f"   🛡 {_fmt(plan['sl'], dec)} · 🎯 TP1 {f2('tp1')} · TP2 {f2('tp2')}")
+
+
+def qmlg_analyse_text(data, alerts=None):
+    forms = data["formations"]
+    bad = Counter(r for f in forms if not f["validation"]["valid"] for r in f["validation"]["reasons"])
+    txt = (f"🔍 <b>ANALYSE QML GAGNANT</b>\n{len(data['markets'])} marchés · TF {', '.join('M%d' % t for t in data['tfs'])}\n"
+           f"Formations : <b>{data['n_formations']}</b> · valides : <b>{data['n_valid']}</b> "
+           f"(en attente de mitigation : {len(qmlg_pending_limits(data))})\n")
+    if bad:
+        txt += "Rejets : " + " · ".join(f"{_QMLG_REASON_LBL.get(k, k)} ×{n}" for k, n in bad.most_common(4)) + "\n"
+    if data["errors"]:
+        txt += f"⚠️ {len(data['errors'])} marché(s)/TF en erreur : " + ", ".join(
+            f"{e['symbol']} M{e['tf']}" for e in data["errors"][:5]) + ("…" if len(data["errors"]) > 5 else "") + "\n"
+    if alerts is not None:
+        txt += (f"🔔 Alertes de zone : {alerts['placed']} posée(s) · {alerts['existing']} déjà en place · "
+                f"{alerts['total']} active(s)\n")
+    return txt + f"💾 JSON : <code>{QMLG_JSON_PATH}</code>"
+
+
+def qmlg_limit_text(data):
+    items = qmlg_pending_limits(data)
+    head = (f"⏳ <b>ORDRES LIMITE — QML GAGNANT</b>\nDonnées {_qmlg_age(data)} · {len(items)} QML valide(s)\n"
+            f"Statut : <b>EN ATTENTE de mitigation</b>\n\n")
+    if not items:
+        return head + "Aucun QML valide non mitigé pour l'instant."
+    return _qmlg_cap(head, [_qmlg_line(f, f["plan"], " · LIMIT") for f in items], "\n\n(information seulement : aucun ordre envoyé)")
+
+
+def qmlg_direct_text(data):
+    items = qmlg_direct_signals(data)
+    head = f"⚡ <b>ENTRÉES DIRECTES — QML GAGNANT</b>\nDonnées {_qmlg_age(data)} · {len(items)} signal(s)\n\n"
+    if not items:
+        return head + "Aucune entrée : il faut le prix DANS la zone ET une dernière bougie clôturée en rejet (avalement, doji, pin bar)."
+    return _qmlg_cap(head, [_qmlg_line(f, f["direct"]["trade"], f" · {f['direct']['pattern']} (clôture)") for f in items],
+                     "\n\n(compte rendu seulement : aucun ordre envoyé à MT5)")
+
+
+def _qmlg_menu_text():
+    return (f"🏆 <b>QML GAGNANT</b> — {'🟢 ON' if get_qmlg_on() else '🔴 OFF'}\n\n"
+            f"🔍 <b>Analyse</b> : scanne tous les marchés et TF (M{', M'.join(str(t) for t in QMLG_TFS)}), enregistre toutes les "
+            f"formations QML dans le JSON, valide chacune et pose une 🔔 alerte sur chaque zone valide (entrée du prix, puis rejet).\n"
+            f"⏳ <b>Ordre limite</b> : QML valides non mitigés, EN ATTENTE de mitigation.\n"
+            f"⚡ <b>Entrée directe</b> : prix dans la zone + dernière bougie clôturée en rejet.")
+
+
+def _qmlg_keyboard():
+    return _with_back({"inline_keyboard": [
+        [{"text": "🔍 Analyse", "callback_data": "qmlg:analyse"}],
+        [{"text": "⏳ Ordre limite", "callback_data": "qmlg:limit"}, {"text": "⚡ Entrée directe", "callback_data": "qmlg:direct"}],
+    ]})
+
+
+_qmlg_lock = threading.Lock()   # un seul scan à la fois
+_QMLG_JOBS = {"analyse": "Analyse", "limit": "Ordre limite", "direct": "Entrée directe"}
+
+
+def _qmlg_job(chat_id, kind):
+    """Exécuté dans un thread (le scan fait des appels réseau : il ne doit pas bloquer le polling Telegram)."""
+    if not _qmlg_lock.acquire(blocking=False):
+        send(chat_id, "⏳ Un scan QML GAGNANT est déjà en cours, patiente un instant.", reply_markup=_qmlg_keyboard())
+        return
+    try:
+        if kind == "analyse":
+            data = qmlg_scan()
+            txt = qmlg_analyse_text(data, qmlg_place_alerts(data))   # alerte de zone sur chaque QML valide non mitigé
+        elif kind == "limit":
+            txt = qmlg_limit_text(qmlg_data(QMLG_MAX_AGE_MIN * 60))
+        else:
+            txt = qmlg_direct_text(qmlg_data(QMLG_CACHE_SEC))
+    except Exception as e:
+        traceback.print_exc(limit=-3)
+        txt = f"🏆 QML GAGNANT — {_QMLG_JOBS.get(kind, kind)} : ⚠️ erreur ({type(e).__name__}), réessaie dans un instant."
+    finally:
+        _qmlg_lock.release()
+    send(chat_id, txt, reply_markup=_qmlg_keyboard())
+
+
+def _qmlg_callback(cq, arg):
+    """Boutons « qmlg:... » (admin seulement, filtré en amont). Retourne le texte de confirmation (toast)."""
+    if arg in _QMLG_JOBS:
+        _edit(cq, f"⏳ {_QMLG_JOBS[arg]} en cours… le résultat arrive dans un instant.", None)
+        threading.Thread(target=_qmlg_job, args=(cq["message"]["chat"]["id"], arg), daemon=True, name=f"qmlg-{arg}").start()
+        return "Scan lancé"
+    _edit(cq, _qmlg_menu_text(), _qmlg_keyboard())
+    return ""
+
+
+# ============================================================================
+# 16. GRAPHIQUE QML — draw_chart(df, qml, trade) + envoi Telegram avec légende
+#
+# À coller dans main.py juste AVANT le bloc `if __name__ == "__main__":`.
+# Utilise les globaux du fichier : CHART_DIR, SYMBOLS, _fmt, _tf_lbl, send, CHAT_ID_ADMIN, QMLG_*, get_candles,
+# detect_structure, detect_qml, compute_trade, _qmlg_tf_minutes.
+# ============================================================================
+QMLC_BARS_BEFORE = _env_int("QMLC_BARS_BEFORE", 25)   # bougies affichées avant l'élément le plus ancien du QML
+QMLC_MAX_BARS = _env_int("QMLC_MAX_BARS", 260)        # largeur maximale de la vue (en bougies)
+QMLC_EXTEND = _env_int("QMLC_EXTEND", 28)             # largeur de l'outil de position, à droite de la dernière bougie
+_QMLC = {"SELL": "#fb8c00", "BUY": "#1e66f5", "RED": "#e53935", "GREEN": "#2e9d4f", "BOS": "#546e7a",
+         "CHOCH": "#8e24aa", "EQ": "#37474f", "SWEEP": "#b71c1c", "BLACK": "#000000"}
+
+
+def _qmlc_load(df):
+    """df (DataFrame open/high/low/close, ou liste de dicts {t,o,h,l,c}) -> liste de bougies {t,o,h,l,c}.
+    Même nettoyage que detect_structure (NaN retirés, tri, doublons de temps) : les indices du QML restent valables.
+    Si detect_structure a été appelé avec drop_last=True, passer ici le même df tronqué."""
+    if df is None:
+        raise ValueError("df est None")
+    if hasattr(df, "columns"):
+        low = {str(k).lower(): k for k in df.columns}
+        pick = lambda *names: next((low[x] for x in names if x in low), None)
+        ko, kh, kl, kc = pick("open", "o"), pick("high", "h"), pick("low", "l"), pick("close", "c")
+        if kh is None or kl is None or kc is None:
+            raise ValueError("df doit avoir des colonnes high/low/close (ou h/l/c)")
+        h, l, c = (df[k].tolist() for k in (kh, kl, kc))
+        o = df[ko].tolist() if ko is not None else list(c)
+        kt = pick("time", "t", "timestamp", "datetime", "date", "open_time")
+        if kt is not None:
+            t = df[kt].tolist()
+        elif getattr(getattr(df.index, "dtype", None), "kind", None) == "M":
+            t = list(df.index)
+        else:
+            t = [None] * len(h)
+    else:
+        rows = list(df)
+        g = lambda r, *ks: next((r[k] for k in ks if k in r), None)
+        t = [g(r, "t", "time") for r in rows]
+        o = [g(r, "o", "open") for r in rows]
+        h = [g(r, "h", "high") for r in rows]
+        l = [g(r, "l", "low") for r in rows]
+        c = [g(r, "c", "close") for r in rows]
+    rows = []
+    for ti, oi, hi, li, ci in zip(t, o, h, l, c):
+        try:
+            hi, li, ci = float(hi), float(li), float(ci)
+        except (TypeError, ValueError):
+            continue
+        if not all(math.isfinite(x) for x in (hi, li, ci)):
+            continue
+        try:
+            oi = float(oi)
+        except (TypeError, ValueError):
+            oi = ci
+        rows.append((ti, oi if math.isfinite(oi) else ci, hi, li, ci))
+    if rows and all(r[0] is not None for r in rows):
+        try:
+            rows.sort(key=lambda r: r[0])
+            out = []
+            for r in rows:
+                if out and out[-1][0] == r[0]:
+                    out[-1] = r
+                else:
+                    out.append(r)
+            rows = out
+        except TypeError:
+            pass
+    return [{"t": r[0], "o": r[1], "h": r[2], "l": r[3], "c": r[4]} for r in rows]
+
+
+def _qmlc_time_label(t):
+    """Temps (Timestamp / datetime / epoch s ou ms / ISO) -> 'jj/mm HH:MM' ; '' si illisible."""
+    try:
+        if t is None:
+            return ""
+        if hasattr(t, "strftime"):
+            return t.strftime("%d/%m %H:%M")
+        if isinstance(t, (int, float)):
+            return datetime.fromtimestamp(t / 1000 if t > 1e11 else t, timezone.utc).strftime("%d/%m %H:%M")
+        s = str(t)
+        return f"{s[8:10]}/{s[5:7]} {s[11:16]}" if len(s) >= 16 and s[4] == "-" else s[:16]
+    except Exception:
+        return ""
+
+
+def _qmlc_purge(keep=40):
+    os.makedirs(CHART_DIR, exist_ok=True)
+    files = sorted((os.path.join(CHART_DIR, f) for f in os.listdir(CHART_DIR)), key=os.path.getmtime)
+    for f in files[:-keep]:
+        try:
+            os.remove(f)
+        except OSError:
+            pass
+
+
+def draw_chart(df, qml, trade=None, symbol=None, tf=None, structure=None, path=None, others=None):
+    """Graphique d'un QML (matplotlib, fond clair). Retourne le chemin du PNG, ou None (matplotlib absent / données vides).
+
+      df         DataFrame (open/high/low/close, index temps) ou liste de dicts {t,o,h,l,c} — LA MÊME série que celle
+                 passée à detect_structure (les indices du QML y renvoient).
+      qml        un élément de detect_qml(...)["qmls"] (zone, épaule, tête, choch, bos éventuel, statut, mitigated_idx).
+      trade      dict de compute_trade(qml, structure) ; None / non exploitable -> pas d'outil de position.
+      others     (optionnel) autres QML (achat ET vente) à afficher aussi : zone + étiquette.
+      structure  (optionnel) sortie de detect_structure : ajoute les BOS / CHoCH de la vue (sinon : ceux du QML seulement).
+
+    Éléments : bougies · EQH/EQL en pointillés (liquidité de l'épaule balayée + liquidités visées par TP1/TP2) ·
+    flèche SWEEP sur la tête · BOS / CHoCH étiquetés · zone orange (vente) ou bleue (achat) ;
+    QML NON MITIGÉ : zone, ligne d'entrée et bordure NOIRES ÉPAISSES (la zone mitigée s'arrête à sa 1re retouche) ·
+    outil de position : boîte rouge entrée→SL, verte entrée→TP2 (TP1 si pas de TP2), ligne TP1, étiquettes prix + RR."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        return None
+    candles = _qmlc_load(df)
+    n = len(candles)
+    if n < 10 or not qml:
+        return None
+    C = _QMLC
+    buy = qml["dir"] == "bull"
+    side = "BUY" if buy else "SELL"
+    z, sh, hd, ck = qml["zone"], qml["shoulder"], qml["head"], qml["choch"]
+    zt, zb = float(z["top"]), float(z["bottom"])
+    fresh = qml.get("mitigated_idx") is None
+    bos = qml.get("bos")
+    dec = SYMBOLS.get(symbol, {}).get("decimals", 2)
+    px = lambda v: f"{v:.{dec}f}"       # image : prix sans séparateur de milliers (lisible)
+
+    # --- fenêtre visible : depuis l'élément le plus ancien du QML (- marge), plafonnée à QMLC_MAX_BARS
+    anchors = [sh["idx"], ck["pivot_idx"]] + ([bos["pivot_idx"]] if bos else [])
+    left = max(0, min(anchors) - QMLC_BARS_BEFORE)
+    if n - left > QMLC_MAX_BARS:
+        left = n - QMLC_MAX_BARS
+    view = candles[left:]
+    m = len(view)
+    X = lambda i: i - left
+    x0, x1 = m - 1, m - 1 + QMLC_EXTEND          # outil de position : de la dernière bougie vers la droite
+    ok_trade = bool(trade) and trade.get("entry") is not None and trade.get("sl") is not None
+
+    ys = [c["l"] for c in view] + [c["h"] for c in view] + [zt, zb, hd["price"], sh["price"]]
+    if ok_trade:
+        ys += [trade["entry"], trade["sl"]] + [trade[k] for k in ("tp1", "tp2") if trade.get(k) is not None]
+    ys += [float(v) for o in others or [] if o is not qml and o["shoulder"]["idx"] >= left for v in (o["zone"]["top"], o["zone"]["bottom"])]
+    lo, hi = min(ys), max(ys)
+    rng = (hi - lo) or 1.0
+    ys += [hd["price"] + (0.09 * rng if not buy else -0.09 * rng)]      # place pour la flèche SWEEP
+    lo, hi = min(ys), max(ys)
+    pad = (hi - lo) * 0.05
+
+    fig, ax = plt.subplots(figsize=(11, 6.5), dpi=110)
+    try:
+        fig.patch.set_facecolor("white")
+        ax.set_facecolor("white")
+        ax.grid(color="#eceff1", lw=0.6, zorder=0)
+
+        # --- bougies
+        xs = list(range(m))
+        cols = ["#26a69a" if c["c"] >= c["o"] else "#ef5350" for c in view]
+        ax.vlines(xs, [c["l"] for c in view], [c["h"] for c in view], colors="#455a64", lw=0.9, zorder=3)
+        ax.bar(xs, [max(abs(c["c"] - c["o"]), rng * 0.0006) for c in view], bottom=[min(c["o"], c["c"]) for c in view],
+               width=0.62, color=cols, edgecolor="#455a64", linewidth=0.6, zorder=3)
+
+        # --- zone QML : noire épaisse si non mitigée, sinon orange (vente) / bleue (achat)
+        xa = max(X(z.get("idx", sh["idx"])), 0) - 0.5
+        near = zt if buy else zb                                        # bord proche : niveau d'entrée limite
+        if fresh:
+            xb = x1
+            ax.add_patch(plt.Rectangle((xa, zb), xb - xa, zt - zb, facecolor=C["BLACK"], alpha=0.14, edgecolor="none", zorder=1))
+            ax.add_patch(plt.Rectangle((xa, zb), xb - xa, zt - zb, fill=False, edgecolor=C["BLACK"], lw=2.6, zorder=5))
+            ax.plot([xa, xb], [near, near], color=C["BLACK"], lw=3.0, solid_capstyle="butt", zorder=5)
+        else:
+            xb = x1
+            xm = max(X(qml["mitigated_idx"]), xa + 1)
+            col = C[side]
+            ax.add_patch(plt.Rectangle((xa, zb), xb - xa, zt - zb, facecolor=col, alpha=0.40, edgecolor="none", zorder=1))
+            ax.add_patch(plt.Rectangle((xa, zb), xb - xa, zt - zb, fill=False, edgecolor=col, lw=2.2, zorder=5))
+            ax.plot([xa, xb], [near, near], color=col, lw=2.2, zorder=5)
+            ax.axvline(xm, ymin=0, ymax=1, color=col, lw=0.8, ls=":", zorder=2)   # 1re retouche de la zone
+        ax.text(x0 - 1, zt if not buy else zb, f"QML {'ACHAT' if buy else 'VENTE'} · {'NON MITIGÉ' if fresh else 'mitigé'}",
+                fontsize=8, fontweight="bold", color=C["BLACK"] if fresh else C[side], ha="right", va="bottom" if not buy else "top",
+                bbox=dict(boxstyle="round,pad=0.2", fc="white", ec=C["BLACK"] if fresh else C[side], lw=1.0, alpha=0.95), zorder=7)
+
+        # --- autres QML (achat et vente) : zone + étiquette
+        for o in others or []:
+            if o is qml or o["shoulder"]["idx"] < left or (o["zone"]["top"], o["zone"]["bottom"]) == (z["top"], z["bottom"]):
+                continue
+            ob, ofresh = o["dir"] == "bull", o.get("mitigated_idx") is None
+            ot, obt = float(o["zone"]["top"]), float(o["zone"]["bottom"])
+            oxa = max(X(o["zone"].get("idx", o["shoulder"]["idx"])), 0) - 0.5
+            ocol = C["BLACK"] if ofresh else C["BUY" if ob else "SELL"]
+            ax.add_patch(plt.Rectangle((oxa, obt), x1 - oxa, ot - obt, facecolor=ocol, alpha=0.14 if ofresh else 0.35,
+                                       edgecolor=ocol, lw=2.0 if ofresh else 1.6, zorder=1))
+            ax.text(oxa + 0.5, ot if not ob else obt, f"QML {'ACHAT' if ob else 'VENTE'}{' · valide' if o.get('valide') else ''}",
+                    fontsize=7, fontweight="bold", color=ocol, va="bottom" if not ob else "top",
+                    bbox=dict(boxstyle="round,pad=0.15", fc="white", ec="none", alpha=0.85), zorder=7)
+
+        # --- EQH / EQL : liquidité de l'épaule, balayée par la tête
+        ex1 = min(X(hd["idx"]) + 3, m - 1)
+        ax.plot([X(sh["idx"]), ex1], [sh["price"], sh["price"]], color=C["EQ"], lw=1.3, ls=":", zorder=4)
+        ax.text(X(sh["idx"]), sh["price"], "EQL" if buy else "EQH", fontsize=8, fontweight="bold", color=C["EQ"],
+                ha="right", va="top" if buy else "bottom", zorder=7)
+
+        # --- flèche SWEEP sur la tête
+        hx, hp = X(hd["idx"]), hd["price"]
+        ax.annotate("SWEEP", xy=(hx, hp), xytext=(hx, hp + (-0.09 * rng if buy else 0.09 * rng)), ha="center",
+                    va="top" if buy else "bottom", fontsize=9, fontweight="bold", color=C["SWEEP"],
+                    arrowprops=dict(arrowstyle="-|>", color=C["SWEEP"], lw=1.6), zorder=8)
+
+        # --- BOS / CHoCH étiquetés (structure fournie + ceux du QML)
+        evs, seen = [], set()
+        key = lambda e: (e["type"], e["break_idx"], e["pivot_idx"])
+        for e in list((structure or {}).get("events") or [])[-8:] + [bos, ck]:
+            if e and key(e) not in seen and e["break_idx"] >= left:
+                seen.add(key(e))
+                evs.append(e)
+        for e in evs:
+            is_ch = e["type"] == "CHOCH"
+            col = C["CHOCH"] if is_ch else C["BOS"]
+            ea, eb = max(X(e["pivot_idx"]), 0), X(e["break_idx"])
+            ax.plot([ea, eb], [e["level"], e["level"]], color=col, lw=1.6 if is_ch else 1.1, ls="-" if is_ch else "--", zorder=4)
+            up = e["dir"] == "bull"
+            ax.text((ea + eb) / 2, e["level"], "CHoCH" if is_ch else "BOS", fontsize=8, fontweight="bold", color=col,
+                    ha="center", va="bottom" if up else "top", zorder=7)
+
+        # --- outil de position : boîte rouge entrée→SL, verte entrée→TP2, ligne TP1, étiquettes prix + RR
+        if ok_trade:
+            entry, sl = float(trade["entry"]), float(trade["sl"])
+            tp1, tp2 = trade.get("tp1"), trade.get("tp2")
+            tpb = tp2 if tp2 is not None else tp1
+            # liquidités visées (EQH / EQL / swing) : pointillés depuis la bougie du niveau jusqu'à l'outil
+            for k, tp in ((1, tp1), (2, tp2)):
+                if tp is None:
+                    continue
+                hit = next((i for i, c in enumerate(view) if math.isclose(c["h"], tp, rel_tol=1e-12) or math.isclose(c["l"], tp, rel_tol=1e-12)), None)
+                xs0 = hit if hit is not None else max(x0 - 12, 0)
+                ax.plot([xs0, x0], [tp, tp], color=C["EQ"], lw=1.2, ls=":", zorder=4)
+                kind = trade.get(f"tp{k}_kind")
+                ax.text(xs0, tp, f"{kind if kind in ('EQH', 'EQL') else 'Swing'} (TP{k})", fontsize=7, color=C["EQ"],
+                        ha="left", va="bottom" if tp > entry else "top", zorder=7)
+            ax.add_patch(plt.Rectangle((x0, min(entry, sl)), QMLC_EXTEND, abs(entry - sl), facecolor=C["RED"], alpha=0.22,
+                                       edgecolor=C["RED"], lw=1.0, zorder=2))
+            if tpb is not None:
+                ax.add_patch(plt.Rectangle((x0, min(entry, tpb)), QMLC_EXTEND, abs(tpb - entry), facecolor=C["GREEN"], alpha=0.22,
+                                           edgecolor=C["GREEN"], lw=1.0, zorder=2))
+            if tp1 is not None:
+                ax.plot([x0, x1], [tp1, tp1], color=C["GREEN"], lw=1.8, ls="--", zorder=5)
+            ax.plot([x0, x1], [entry, entry], color="#263238", lw=1.5, zorder=5)
+            risk = abs(entry - sl)
+            pills = [(f"ENTRÉE {side}{' LIMIT' if trade.get('order') == 'LIMIT' else ''} {px(entry)}", entry, "#263238"),
+                     (f"SL {px(sl)} · 1R ({px(risk)})", sl, C["RED"])]
+            for k, tp in ((1, tp1), (2, tp2)):
+                if tp is not None:
+                    rr = trade.get(f"rr{k}")
+                    pills.append((f"TP{k} {px(tp)}" + (f" · RR {rr:.2f}" if rr is not None else ""), tp, C["GREEN"]))
+            gap, prev = 0.045 * (hi - lo + 2 * pad), None
+            for txt, y, col in sorted(pills, key=lambda p: -p[1]):     # du haut vers le bas ; on écarte les étiquettes qui se chevauchent
+                yt = y if prev is None else min(y, prev - gap)
+                prev = yt
+                ax.text(x1 + 0.8, yt, txt, fontsize=8, fontweight="bold", color="white", va="center", ha="left", zorder=8,
+                        bbox=dict(boxstyle="round,pad=0.25", fc=col, ec="none"))
+                if abs(yt - y) > 1e-9:
+                    ax.plot([x1, x1 + 0.8], [y, yt], color=col, lw=1.0, zorder=7)
+
+        # --- cadre, axes, titre
+        ax.set_xlim(-1, x1 + int(0.27 * (m + QMLC_EXTEND)) + 8)
+        ax.set_ylim(lo - pad, hi + pad)
+        step = max(1, m // 7)
+        ticks = list(range(0, m, step))
+        ax.set_xticks(ticks)
+        ax.set_xticklabels([_qmlc_time_label(view[i]["t"]) for i in ticks], fontsize=7, color="#607d8b")
+        ax.tick_params(axis="y", labelsize=7, colors="#607d8b")
+        ax.yaxis.tick_right()
+        for sp in ax.spines.values():
+            sp.set_color("#cfd8dc")
+        title = " ".join(s for s in (symbol, _tf_lbl(tf) if isinstance(tf, int) else tf) if s)
+        ax.set_title(f"{title} — QML {'ACHAT' if buy else 'VENTE'} ({qml.get('type', '')}) · "
+                     f"{'non mitigé' if fresh else 'mitigé'} · {'valide' if qml.get('valide') else 'non valide'}",
+                     fontsize=11, color="#263238", loc="left")
+        _qmlc_purge()
+        path = path or os.path.join(CHART_DIR, f"{symbol or 'qml'}_qmlchart_{int(time.time() * 1000)}.png")
+        fig.savefig(path, facecolor="white", bbox_inches="tight")
+    finally:
+        plt.close(fig)
+    return path
+
+
+def qmlc_caption(qml, trade, symbol=None, tf=None):
+    """Légende Telegram (HTML, < 1000 caractères : limite d'une légende photo)."""
+    buy = qml["dir"] == "bull"
+    dec = SYMBOLS.get(symbol, {}).get("decimals", 2)
+    z, fresh = qml["zone"], qml.get("mitigated_idx") is None
+    tfl = _tf_lbl(tf) if isinstance(tf, int) else (tf or "")
+    txt = (f"{'🟢' if buy else '🔴'} <b>{symbol or 'QML'}</b> {tfl} · QML {'ACHAT' if buy else 'VENTE'} · {qml.get('type', '')}\n"
+           f"Zone {_fmt(z['bottom'], dec)} → {_fmt(z['top'], dec)} · {'non mitigé ⬛' if fresh else 'mitigé'} · "
+           f"{'✅ valide' if qml.get('valide') else '❌ non valide'}\n")
+    if not trade or not trade.get("ok"):
+        return txt + f"Plan de trade : indisponible ({(trade or {}).get('reason') or 'aucun plan'})"
+    f2 = lambda k: "—" if trade.get(k) is None else (f"{_fmt(trade[k], dec)} ({trade.get(k + '_kind')}) · RR {trade['rr' + k[-1]]:.2f}")
+    return txt + (f"⏳ <b>{trade['side']} {trade.get('order', 'LIMIT')}</b> : {_fmt(trade['entry'], dec)}\n"
+                  f"🛡 SL {_fmt(trade['sl'], dec)}\n🎯 TP1 {f2('tp1')}\n🎯 TP2 {f2('tp2')}\n"
+                  f"(information seulement : aucun ordre envoyé)")
+
+
+def send_qml_chart(df, qml, trade=None, symbol=None, tf=None, structure=None, chat_id=None, others=None):
+    """Dessine le graphique puis l'envoie sur Telegram avec sa légende (admin par défaut). Sans image (matplotlib absent
+    ou erreur de dessin), la légende part seule en texte. Retourne la réponse Telegram."""
+    chat_id = chat_id or CHAT_ID_ADMIN
+    path = None
+    try:
+        path = draw_chart(df, qml, trade, symbol=symbol, tf=tf, structure=structure, others=others)
+    except Exception:
+        traceback.print_exc(limit=-3)
+    return send(chat_id, qmlc_caption(qml, trade, symbol, tf), photo=path)
+
+
+def qmlg_send_last_chart(symbol, tf=None, chat_id=None, valid_only=False):
+    """Récupère les bougies, détecte structure + QML et envoie UN graphique par sens : le dernier QML VALIDE d'achat ET
+    celui de vente (les deux zones apparaissent sur chaque image). Sans QML valide : le dernier QML (sauf valid_only).
+    Retourne (ok, message)."""
+    tf_min = _qmlg_tf_minutes(tf)
+    candles = get_candles(symbol, minutes=tf_min, count=QMLG_HISTORY_BARS) or []
+    if len(candles) < QMLG_MIN_BARS:
+        return False, f"{len(candles)} bougies (< {QMLG_MIN_BARS})"
+    structure = detect_structure(candles, f"M{tf_min}", n=QMLG_FRACTAL_N)
+    res = detect_qml(structure, min_rr=QMLG_MIN_RR)
+    valid = [q for q in res["qmls"] if q["valide"]]
+    picks = [next((q for q in reversed(valid) if q["dir"] == d), None) for d in ("bull", "bear")]
+    picks = [q for q in picks if q]
+    if not picks and not valid_only and res["last_qml"]:
+        picks = [res["last_qml"]]
+    if not picks:
+        return False, "aucun QML valide" if valid_only else "aucun QML sur la période"
+    for q in picks:
+        send_qml_chart(candles, q, compute_trade(q, structure), symbol=symbol, tf=tf_min, structure=structure,
+                       chat_id=chat_id, others=picks + res["qmls"][-6:])
+    return True, f"{len(picks)} graphique(s) envoyé(s)"
+
+
+
+# ============================================================================
+# 17. VÉRIFICATIONS — 3 AGENTS QML (avant tout signal) + 4 CONTRÔLES TP / SL (avant tout rapport)
+#
+# A) qmlg_agents : un QML n'est « valide » que si les 3 agents sont d'accord (QMLG_AGENTS=0 pour désactiver).
+#      Agent 1 DONNÉES    : relit le maximum de bougies (appel indépendant), contrôle leur qualité, REFAIT la détection
+#                           et vérifie que le même QML est retrouvé.
+#      Agent 2 STRUCTURE  : critères (tendance, sweep, CHoCH clôturé, épaule), géométrie zone / SL / TP, RR >= minimum.
+#      Agent 3 PRIX       : la zone n'est pas invalidée (clôture au-delà du bord lointain) ; une zone simplement liquidée
+#                           (mèche au-delà, clôture revenue) reste valide ; position du prix (avant / dans la zone).
+# B) verify_outcome : un TP / SL / BE n'est annoncé et enregistré que s'il passe 4 contrôles (M1 rejouées, deals MT5,
+#    position MT5 fermée, cohérence des niveaux et du R). Sinon le résultat est annulé et ré-évalué à la bougie suivante.
+# ============================================================================
+QMLG_AGENTS = _env_on("QMLG_AGENTS", True)
+VERIFY_OUTCOME = _env_on("VERIFY_OUTCOME", True)
+VERIFY_MAX_TRIES = _env_int("VERIFY_MAX_TRIES", 3)       # refus consécutifs avant alerte admin (le trade reste ouvert)
+VERIFY_M1_COUNT = _env_int("VERIFY_M1_COUNT", 1000)
+_qmlg_fresh_cache = {}
+
+
+def _qmlg_fresh(symbol, tf):
+    """Agent 1 : nouvelle récupération des bougies + nouvelle détection (cache 45 s par marché / TF)."""
+    key, now = (symbol, tf), time.time()
+    hit = _qmlg_fresh_cache.get(key)
+    if hit and now - hit["ts"] < 45:
+        return hit
+    c2 = get_candles(symbol, minutes=tf, count=QMLG_HISTORY_BARS) or []
+    out = {"ts": now, "candles": c2, "qmls": [], "structure": None}
+    if len(c2) >= QMLG_MIN_BARS:
+        st = detect_structure(c2, f"M{tf}", n=QMLG_FRACTAL_N, keep=QMLG_KEEP)
+        out["structure"], out["qmls"] = st, detect_qml(st, min_rr=QMLG_MIN_RR)["qmls"]
+    _qmlg_fresh_cache[key] = out
+    return out
+
+
+def _qmlg_agent1(symbol, tf, q, candles):
+    try:
+        fr = _qmlg_fresh(symbol, tf)
+    except Exception as e:
+        return False, f"relecture impossible ({type(e).__name__})"
+    c2 = fr["candles"]
+    if len(c2) < QMLG_MIN_BARS:
+        return False, f"{len(c2)} bougies (< {QMLG_MIN_BARS})"
+    ts = [c["t"] for c in c2]
+    if any(b <= a for a, b in zip(ts, ts[1:])):
+        return False, "bougies désordonnées / doublons"
+    if any((c["h"] < c["l"]) or not all(math.isfinite(float(c[k])) for k in ("o", "h", "l", "c")) for c in c2):
+        return False, "bougie incohérente (high < low / NaN)"
+    if abs(c2[-1]["t"] - candles[-1]["t"]) > 2 * tf * 60:
+        return False, "les deux lectures ne finissent pas à la même bougie"
+    z = q["zone"]
+    same = [o for o in fr["qmls"] if o["dir"] == q["dir"] and o["choch"]["break_time"] == q["choch"]["break_time"]
+            and math.isclose(float(o["zone"]["top"]), float(z["top"]), rel_tol=1e-9)
+            and math.isclose(float(o["zone"]["bottom"]), float(z["bottom"]), rel_tol=1e-9)]
+    if not same:
+        return False, "QML non retrouvé à la 2e détection"
+    return True, f"{len(c2)} bougies · QML reproduit"
+
+
+def _qmlg_agent2(q, plan):
+    cr = q.get("criteres") or {}
+    miss = [k for k in ("tendance_avant", "sweep", "choch_cloture", "zone_epaule") if not cr.get(k)]
+    if miss:
+        return False, "critères manquants : " + ", ".join(miss)
+    z = q["zone"]
+    top, bot = float(z["top"]), float(z["bottom"])
+    if not top > bot:
+        return False, "zone invalide (haut <= bas)"
+    if not plan or not plan.get("ok"):
+        return False, "plan de trade indisponible"
+    buy = q["dir"] == "bull"
+    e, sl, tp1, tp2 = plan["entry"], plan["sl"], plan.get("tp1"), plan.get("tp2")
+    if buy and not (sl < bot <= e <= top * (1 + 1e-9) and (tp1 is None or tp1 > e)):
+        return False, "géométrie achat incohérente (SL / entrée / TP)"
+    if not buy and not (sl > top >= e >= bot * (1 - 1e-9) and (tp1 is None or tp1 < e)):
+        return False, "géométrie vente incohérente (SL / entrée / TP)"
+    if tp1 is not None and tp2 is not None and ((tp2 - tp1) * (1 if buy else -1)) < 0:
+        return False, "TP2 avant TP1"
+    if plan.get("rr1") is None or plan["rr1"] < QMLG_MIN_RR:
+        return False, f"RR1 {plan.get('rr1')} < {QMLG_MIN_RR}"
+    return True, f"critères OK · RR1 {plan['rr1']:.2f}"
+
+
+def _qmlg_agent3(symbol, q, structure, candles):
+    z, buy = q["zone"], q["dir"] == "bull"
+    top, bot = float(z["top"]), float(z["bottom"])
+    series = (structure.get("_series") or {}).get("c") or []
+    off = len(candles) - len(series)
+    start = max(0, q["choch"]["break_idx"] + 1 + off)
+    swept = False
+    for c in candles[start:]:
+        if (c["c"] < bot) if buy else (c["c"] > top):
+            return False, "zone invalidée (clôture au-delà du bord lointain)", "invalide"
+        if (c["l"] < bot) if buy else (c["h"] > top):
+            swept = True   # liquidité prise puis clôture revenue : la zone reste valide
+    try:
+        px = get_live_price(symbol)
+    except Exception:
+        px = None
+    px = px if px is not None else candles[-1]["c"]
+    if (px < bot) if buy else (px > top):
+        return False, "prix en direct au-delà du bord lointain", "invalide"
+    state = "dans la zone" if bot <= px <= top else "avant la zone"
+    return True, state + (" · zone liquidée puis reprise" if swept else ""), state
+
+
+def qmlg_agents(symbol, tf, q, structure, candles, plan):
+    """Les 3 agents. Retourne {ok, a1, a2, a3, state} ; chaque agent = [ok, détail]. Jamais d'exception."""
+    res = {}
+    for name, fn in (("a1", lambda: _qmlg_agent1(symbol, tf, q, candles)),
+                     ("a2", lambda: _qmlg_agent2(q, plan)),
+                     ("a3", lambda: _qmlg_agent3(symbol, q, structure, candles))):
+        try:
+            r = fn()
+        except Exception as e:
+            r = (False, f"erreur agent ({type(e).__name__})")
+        res[name] = [bool(r[0]), r[1]]
+        if name == "a3" and len(r) > 2:
+            res["state"] = r[2]
+    res["ok"] = all(res[k][0] for k in ("a1", "a2", "a3"))
+    return res
+
+
+# --- B) 4 contrôles avant d'annoncer un TP / SL / BE ---------------------------------------------------------
+def _vf_levels(trade):
+    side = 1 if trade["side"] == "BUY" else -1
+    entry, risk = trade["entry"], abs(trade["entry"] - trade["sl_initial"])
+    return side, entry, risk, trade["sl_initial"], entry + side * trade_tp_rr(trade) * risk
+
+
+def _vf_replay(trade, candles, t0):
+    """Rejoue le trade sur des bougies : 'TP' / 'SL' / 'BE' / 'OPEN' ; None si ambigu (SL et TP dans la même bougie)."""
+    side, entry, risk, sl0, tp = _vf_levels(trade)
+    if risk <= 0:
+        return None
+    sl, be_rr, be = sl0, trade_be_rr(trade), False
+    for c in candles:
+        if c["t"] <= t0:
+            continue
+        adv, fav = (c["l"], c["h"]) if side == 1 else (c["h"], c["l"])
+        sl_hit = (adv <= sl) if side == 1 else (adv >= sl)
+        tp_hit = (fav >= tp) if side == 1 else (fav <= tp)
+        if sl_hit and tp_hit:
+            return None
+        if sl_hit:
+            return "BE" if be else "SL"
+        if tp_hit:
+            return "TP"
+        if not be and be_rr < trade_tp_rr(trade) and (fav - entry) * side / risk >= be_rr:
+            be, sl = True, entry
+    return "OPEN"
+
+
+def verify_outcome(trade, outcome):
+    """4 contrôles indépendants. Retourne (accepté, [(nom, vote, note)]) ; vote True / False / None (non disponible)."""
+    t0 = trade.get("filled_ts") or trade.get("opened_ts") or 0
+    votes = []
+    # 1) bougies M1 rejouées (source fine, indépendante du TF de suivi)
+    try:
+        m1 = get_candles(trade["symbol"], minutes=1, count=VERIFY_M1_COUNT) or []
+        rp = _vf_replay(trade, m1, t0) if m1 and m1[0]["t"] <= (t0 + 120) else None
+        votes.append(("M1", None if rp is None else rp == outcome, f"M1 -> {rp}"))
+    except Exception as e:
+        votes.append(("M1", None, f"indisponible ({type(e).__name__})"))
+    pos = trade.get("mt5_position_id")
+    deals = None
+    if pos:
+        try:
+            deals = _run_mt5(_mt5_position_deals_async(str(pos)))
+        except Exception:
+            deals = None
+    # 2) deals MT5 (raison de sortie SL / TP)
+    if pos and deals:
+        o2, _r, _p = _mt5_close_outcome(trade, deals)
+        votes.append(("Deals MT5", None if o2 == "CLOSED_EXT" else o2 == outcome, f"MT5 -> {o2}"))
+    else:
+        votes.append(("Deals MT5", None, "pas de position MT5" if not pos else "deals indisponibles"))
+    # 3) position réellement fermée côté broker
+    if pos:
+        try:
+            ids = _run_mt5(_mt5_open_position_ids_async())
+        except Exception:
+            ids = None
+        votes.append(("Position MT5", None if ids is None else str(pos) not in ids,
+                      "indisponible" if ids is None else ("fermée" if str(pos) not in ids else "encore ouverte")))
+    else:
+        votes.append(("Position MT5", None, "n/a"))
+    # 4) cohérence : niveaux, signe du R, horodatage
+    try:
+        side, entry, risk, sl0, tp = _vf_levels(trade)
+        r = trade.get("result_r")
+        ok = risk > 0 and (sl0 < entry if side == 1 else sl0 > entry) and (tp > entry if side == 1 else tp < entry)
+        if r is not None:
+            ok = ok and ((r > 0) if outcome == "TP" else (r < 0) if outcome == "SL" else abs(r) < 1e-6 or outcome == "BE")
+        ok = ok and (not trade.get("closed_ts") or trade["closed_ts"] >= t0)
+        votes.append(("Cohérence", bool(ok), f"R={r}"))
+    except Exception as e:
+        votes.append(("Cohérence", False, f"erreur ({type(e).__name__})"))
+    agree = sum(1 for v in votes if v[1] is True)
+    contra = sum(1 for v in votes if v[1] is False)
+    avail = sum(1 for v in votes if v[1] is not None)
+    broker_ok = dict((v[0], v[1]) for v in votes).get("Deals MT5") is True and dict((v[0], v[1]) for v in votes).get("Position MT5") is True
+    need = 3 if pos else min(2, avail)
+    accepted = broker_ok or (contra == 0 and agree >= need and avail >= 2)
+    return accepted, votes
+
+
+_TRADE_RESTORE_KEYS = ("sl", "be_hit", "status", "last_ts", "closed_ts", "filled_ts", "result_r", "pnl_usd", "outcome",
+                       "rr1_hit", "rr2_hit", "rr3_hit", "part_done", "part_r", "part_pct")
+
+
+def track_trade_verified(trade, candles):
+    """track_trade + 4 contrôles sur TP / SL / BE. Un résultat refusé est ANNULÉ (état du trade restauré) puis ré-évalué
+    à la prochaine bougie ; après VERIFY_MAX_TRIES refus, l'admin est prévenu une fois (le groupe ne reçoit rien)."""
+    snap = {k: trade.get(k) for k in _TRADE_RESTORE_KEYS}
+    events = track_trade(trade, candles)
+    if not VERIFY_OUTCOME:
+        return events
+    final = next((e for e in events if e["name"] in ("TP", "SL", "BE")), None)
+    if not final:
+        return events
+    try:
+        ok, votes = verify_outcome(final["trade"], final["name"])
+    except Exception:
+        traceback.print_exc(limit=-3)
+        return events   # contrôle en panne : on ne bloque jamais le suivi
+    note = " · ".join(f"{n}: {'✅' if v else '❌' if v is False else '➖'} {t}" for n, v, t in votes)
+    if ok:
+        set_meta(f"vf_{trade['id']}", 0)
+        print(f"[verif] #{trade['id']} {final['name']} confirmé — {note}")
+        return events
+    tries = int(get_meta(f"vf_{trade['id']}", 0) or 0) + 1
+    set_meta(f"vf_{trade['id']}", tries)
+    trade.update(snap)
+    update_trade(trade["id"], **{k: (v if v is not None else 0) if k.startswith(("part_", "rr")) or k == "be_hit" else v
+                                 for k, v in snap.items()})
+    print(f"[verif] #{trade['id']} {final['name']} REFUSÉ ({tries}) — {note}")
+    if tries == VERIFY_MAX_TRIES:
+        to_admin(f"⚠️ <b>{trade['symbol']} #{trade['id']}</b> : résultat <b>{final['name']}</b> non confirmé après "
+                 f"{tries} contrôles — rien envoyé au groupe, le trade reste ouvert.\n{note}")
+    return [e for e in events if e["name"] not in ("TP", "SL", "BE")]
+
+
 if __name__ == "__main__":
     if "--selftest" in sys.argv:
         sys.exit(_selftest())
     main()
+
 
 
