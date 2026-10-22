@@ -1,6 +1,7 @@
 
 
 
+
 #!/usr/bin/env python3
 """AlphaBot BOS + CHoCH — Gold & BTC — version en un seul fichier.
 
@@ -9032,7 +9033,7 @@ def main():
 
     start_polling()
     start_metaapi_background()   # connexion MT5 persistante en arrière-plan, indépendante des signaux M1
-    start_qmlg_alerts()          # alertes de zone QML GAGNANT (posées par le bouton Analyse)
+    start_qmlg_alerts()          # alertes de réaction QML GAGNANT (inactives tant que tu n'as pas activé le bouton 🔔)
     ok_grp, msg_grp = check_group()
     print(f"[groupe] {msg_grp}")
     if not ok_grp and TELEGRAM_TOKEN:
@@ -11363,29 +11364,37 @@ class TestQmlGagnantBoutons(unittest.TestCase):
 
 
 class TestQmlGagnantAlertes(unittest.TestCase):
-    """Alertes de zone : entrée du prix, puis rejet ; anti-doublon (marché, TF, zone) ; suppression si zone invalidée."""
+    """Alertes de réaction : rien quand le prix entre dans la zone ; alerte seulement sur avalement / pin bar qui touche la zone ;
+    lot calculé ; image + entrée / SL / TP / lot + stickers au groupe ; anti-doublon ; suppression si zone invalidée."""
+    _KEYS = ("qmlg_alerts", "qmlg_alert_on", "qmlg_alert_tfs", "risk_usd")
 
     def setUp(self):
-        self._old = _E.get_setting("qmlg_alerts")
-        _E._q("DELETE FROM settings WHERE key=?", ("qmlg_alerts",), commit=True)
-        self._saved = (_E.get_candles, _E.get_live_price, _E.to_admin, _E.send, _E.qmlg_scan)
+        self._old = {k: _E.get_setting(k) for k in self._KEYS}
+        _E._q("DELETE FROM settings WHERE key IN ('qmlg_alerts','qmlg_alert_on','qmlg_alert_tfs')", commit=True)
+        self._saved = (_E.get_candles, _E.to_admin, _E.send, _E.qmlg_scan, _E.to_group_media, _E._qmlg_alert_chart,
+                       _E.CHAT_ID_GROUPE, _E.QMLG_ALERT_TO_GROUP, _E._qmlg_scan_one, _E.qmlg_alert_symbols)
+        _E.set_risk(10)
+        _E._qmlg_refresh_due.clear()
 
     def tearDown(self):
-        _E.get_candles, _E.get_live_price, _E.to_admin, _E.send, _E.qmlg_scan = self._saved
-        if self._old is None:
-            _E._q("DELETE FROM settings WHERE key=?", ("qmlg_alerts",), commit=True)
-        else:
-            _E.set_setting("qmlg_alerts", self._old)
+        (_E.get_candles, _E.to_admin, _E.send, _E.qmlg_scan, _E.to_group_media, _E._qmlg_alert_chart,
+         _E.CHAT_ID_GROUPE, _E.QMLG_ALERT_TO_GROUP, _E._qmlg_scan_one, _E.qmlg_alert_symbols) = self._saved
+        _E._q("DELETE FROM trades WHERE kind='QMLG'", commit=True)
+        for k, v in self._old.items():
+            if v is None:
+                _E._q("DELETE FROM settings WHERE key=?", (k,), commit=True)
+            else:
+                _E.set_setting(k, v)
 
     @staticmethod
     def _c(o, h, l, c, t):
         return {"t": t, "o": o, "h": h, "l": l, "c": c}
 
-    def _alert(self, buy=True, last_t=100):
-        return {"key": "k", "symbol": "XAUUSD", "tf": 15, "dir": "bull" if buy else "bear",
-                "zone": {"top": 110.0, "bottom": 108.0}, "sl": 107.9 if buy else 110.1,
-                "tp1": 115.0 if buy else 103.0, "tp1_kind": "SWING", "tp2": 120.0 if buy else 98.0, "tp2_kind": "EQH",
-                "last_t": last_t, "entered": False}
+    def _alert(self, buy=True, last_t=100, tf=15, **kw):
+        return dict({"key": "k", "symbol": "XAUUSD", "tf": tf, "dir": "bull" if buy else "bear",
+                     "zone": {"top": 110.0, "bottom": 108.0}, "sl": 107.9 if buy else 110.1,
+                     "tp1": 115.0 if buy else 103.0, "tp1_kind": "SWING", "tp2": 120.0 if buy else 98.0, "tp2_kind": "EQH",
+                     "last_t": last_t, "entered": False}, **kw)
 
     @staticmethod
     def _rec(symbol="XAUUSD", tf=15, top=110.0, bottom=108.0, valid=True, statut="non mitigé"):
@@ -11394,6 +11403,12 @@ class TestQmlGagnantAlertes(unittest.TestCase):
                 "plan": {"side": "BUY", "entry": top, "sl": bottom - 0.1, "tp1": 115.0, "tp1_kind": "SWING", "tp2": None, "tp2_kind": None,
                          "rr1": 2.5, "rr2": None}}
 
+    @staticmethod
+    def _fresh(n=4, tf=15):
+        """n dernières bougies clôturées de M{tf}, horodatées pour de vrai (la dernière vient de clôturer)."""
+        last = int(time.time()) // (tf * 60) * (tf * 60) - tf * 60
+        return [last - (n - 1 - i) * tf * 60 for i in range(n)]
+
     # --- pose + anti-doublon
     def test_pose_et_anti_doublon(self):
         data = {"formations": [self._rec(), self._rec(), self._rec(tf=60), self._rec(top=120.0, bottom=118.0),
@@ -11401,125 +11416,310 @@ class TestQmlGagnantAlertes(unittest.TestCase):
         r = _E.qmlg_place_alerts(data)
         self.assertEqual(r, {"placed": 3, "existing": 1, "total": 3},
                          "2 QML identiques = 1 alerte ; autre TF / autre zone = autres alertes ; invalides et mitigés ignorés")
-        self.assertEqual(_E.qmlg_place_alerts(data), {"placed": 0, "existing": 4, "total": 3}, "relancer Analyse ne double rien")
+        self.assertEqual(_E.qmlg_place_alerts(data), {"placed": 0, "existing": 4, "total": 3}, "relancer ne double rien")
         self.assertEqual(len(_E._qmlg_alerts_load()), 3)
         self.assertEqual(_E.qmlg_alert_key("XAUUSD", 15, {"top": 110.0, "bottom": 108.0}), "XAUUSD|M15|110|108")
 
-    # --- cycle complet : entrée puis rejet
-    def test_entree_puis_rejet_achat(self):
-        a = self._alert()
-        c1 = self._c(113, 114, 112, 113.5, 1000)                   # au-dessus de la zone : rien
-        c2 = self._c(112, 112.5, 109, 109.6, 2000)                 # mèche dans la zone, clôture dans la zone, pas de rejet
-        a, msgs = _E.qmlg_alert_eval(a, [c1, c2])
-        self.assertTrue(a["entered"])
-        self.assertEqual(len(msgs), 1)
-        self.assertIn("entre dans la zone", msgs[0])
+    # --- le prix qui entre dans la zone ne déclenche RIEN
+    def test_entree_dans_la_zone_sans_reaction_n_alerte_pas(self):
+        c1 = self._c(113, 114, 112, 113.5, 1000)
+        c2 = self._c(112, 112.5, 109, 109.6, 2000)   # mèche dans la zone, clôture dans la zone, aucun motif
+        a, evs = _E.qmlg_alert_eval(self._alert(), [c1, c2])
+        self.assertIsNotNone(a, "l'alerte reste en attente d'une réaction")
+        self.assertEqual(evs, [], "aucun message quand le prix entre dans la zone")
         self.assertEqual(a["last_t"], 2000)
-        a, msgs = _E.qmlg_alert_eval(a, [c1, c2])                  # mêmes bougies relues : aucune alerte en double
-        self.assertEqual(msgs, [])
-        c3 = self._c(108.4, 110.2, 108.3, 109.8, 3000)             # avalement haussier, clôture dans la zone
-        c2b = self._c(109.5, 109.8, 108.0, 108.5, 2500)
-        a, msgs = _E.qmlg_alert_eval(a, [c1, c2, c2b, c3])
-        self.assertIsNone(a, "2e alerte envoyée : alerte terminée et supprimée")
-        self.assertEqual(len(msgs), 1)
-        self.assertIn("REJET ENGULFING", msgs[0])
-        self.assertIn("109.8", msgs[0].replace(" ", ""))
-        self.assertIn("RR", msgs[0])
 
-    def test_rejet_sur_la_bougie_d_entree(self):
-        a = self._alert()
-        eng = [self._c(109.5, 109.8, 108.6, 108.7, 1000), self._c(108.6, 110.2, 108.4, 109.8, 2000)]   # entre ET avale
-        a, msgs = _E.qmlg_alert_eval(a, eng)
+    def test_reaction_avalement_achat(self):
+        c1 = self._c(113, 114, 112, 113.5, 1000)
+        c2b = self._c(109.5, 109.8, 108.0, 108.5, 2500)
+        c3 = self._c(108.4, 110.2, 108.3, 109.8, 3000)   # avalement haussier, clôture dans la zone
+        a, evs = _E.qmlg_alert_eval(self._alert(), [c1, c2b, c3])
+        self.assertIsNone(a, "réaction livrée : alerte terminée et supprimée")
+        self.assertEqual(len(evs), 1)
+        ev = evs[0]
+        self.assertEqual((ev["type"], ev["pattern"], ev["close"]), ("reaction", "ENGULFING", 109.8))
+        self.assertAlmostEqual(ev["rr1"], (115.0 - 109.8) / (109.8 - 107.9), places=6)
+
+    def test_pin_bar_qui_touche_la_zone_et_ferme_au_dessus_compte(self):
+        pin = self._c(111.2, 111.5, 108.9, 111.0, 1000)   # mèche basse dans la zone, clôture AU-DESSUS de la zone
+        a, evs = _E.qmlg_alert_eval(self._alert(tp1=118.0), [pin])
         self.assertIsNone(a)
-        self.assertEqual(len(msgs), 2)
-        self.assertIn("entre dans la zone", msgs[0])
-        self.assertIn("REJET", msgs[1])
+        self.assertEqual(evs[0]["pattern"], "PIN_BAR")
+        self.assertEqual(evs[0]["close"], 111.0)
+
+    def test_doji_ne_declenche_pas(self):
+        doji = self._c(109.0, 109.6, 108.4, 109.05, 1000)
+        a, evs = _E.qmlg_alert_eval(self._alert(), [doji])
+        self.assertIsNotNone(a)
+        self.assertEqual(evs, [], "seuls l'avalement et le pin bar déclenchent")
+
+    def test_bougie_qui_ne_touche_pas_la_zone_ne_declenche_pas(self):
+        eng = [self._c(114, 114.5, 112.6, 112.8, 1000), self._c(112.7, 114.6, 112.5, 114.2, 2000)]   # avalement, mais loin au-dessus
+        a, evs = _E.qmlg_alert_eval(self._alert(), eng)
+        self.assertIsNotNone(a)
+        self.assertEqual(evs, [])
+
+    def test_rr_trop_faible_l_alerte_attend_une_meilleure_reaction(self):
+        c2b = self._c(109.5, 109.8, 108.0, 108.5, 2500)
+        c3 = self._c(108.4, 110.2, 108.3, 109.8, 3000)
+        a, evs = _E.qmlg_alert_eval(self._alert(tp1=111.0), [c2b, c3])   # TP1 trop proche : RR1 < minimum
+        self.assertIsNotNone(a, "la zone reste valable, on attend un meilleur point d'entrée")
+        self.assertEqual(evs, [])
 
     def test_vente_miroir(self):
         a = self._alert(buy=False)
-        cs = [self._c(106, 108.5, 105, 107.5, 1000),               # sous la zone
-              self._c(108.5, 109.6, 108.4, 109.5, 2000),           # touche la zone par le bas
-              self._c(109.6, 109.7, 108.2, 108.4, 3000)]           # avalement baissier dans la zone
-        cs[1] = self._c(108.5, 109.6, 108.4, 109.5, 2000)
-        a, msgs = _E.qmlg_alert_eval(a, cs)
+        cs = [self._c(106, 108.5, 105, 107.5, 1000),
+              self._c(108.5, 109.6, 108.4, 109.5, 2000),
+              self._c(109.6, 109.7, 108.2, 108.4, 3000)]   # avalement baissier dans la zone
+        a, evs = _E.qmlg_alert_eval(a, cs)
         self.assertIsNone(a)
-        self.assertIn("entre dans la zone", msgs[0])
-        self.assertIn("REJET ENGULFING", msgs[-1])
-        self.assertIn("Vente", msgs[-1])
+        self.assertEqual(evs[-1]["pattern"], "ENGULFING")
+        self.assertIn("VENTE", _E.qmlg_alert_text(evs[-1], {"lot": 0.05, "real_risk": 9.0}))
 
-    def test_prix_en_direct_declenche_la_premiere_alerte_une_fois(self):
-        a = self._alert()
-        a, msgs = _E.qmlg_alert_eval(a, [], live_px=112.0)
-        self.assertEqual(msgs, [])
-        self.assertFalse(a["entered"])
-        a, msgs = _E.qmlg_alert_eval(a, [], live_px=109.7)
-        self.assertEqual(len(msgs), 1)
-        a, msgs = _E.qmlg_alert_eval(a, [], live_px=109.5)
-        self.assertEqual(msgs, [], "1re alerte une seule fois")
-
-    # --- invalidation
+    # --- invalidation, péremption, réaction trop vieille
     def test_zone_invalidee_supprime_l_alerte(self):
-        for entered in (False, True):
-            a = dict(self._alert(), entered=entered)
-            a, msgs = _E.qmlg_alert_eval(a, [self._c(108.5, 109, 106.5, 107.0, 1000)])   # clôture sous le bord lointain (108)
-            self.assertIsNone(a)
-            self.assertIn("invalidée", msgs[-1])
-            self.assertNotIn("REJET", msgs[-1])
-        s_ = self._alert(buy=False)
-        a, msgs = _E.qmlg_alert_eval(s_, [self._c(109.5, 111.5, 109.0, 110.5, 1000)])    # vente : clôture au-dessus de 110
+        a, evs = _E.qmlg_alert_eval(self._alert(), [self._c(108.5, 109, 106.5, 107.0, 1000)])   # clôture sous le bord lointain (108)
         self.assertIsNone(a)
-        self.assertIn("invalidée", msgs[-1])
+        self.assertEqual(evs[-1]["type"], "invalid")
+        a, evs = _E.qmlg_alert_eval(self._alert(buy=False), [self._c(109.5, 111.5, 109.0, 110.5, 1000)])   # vente : clôture au-dessus de 110
+        self.assertIsNone(a)
+        self.assertEqual(evs[-1]["type"], "invalid")
 
     def test_meche_au_dela_sans_cloture_n_invalide_pas(self):
-        a, msgs = _E.qmlg_alert_eval(self._alert(), [self._c(110.5, 110.6, 106.0, 108.5, 1000)])   # mèche sous 108, clôture 108.5, pas de rejet
+        a, evs = _E.qmlg_alert_eval(self._alert(), [self._c(110.5, 110.6, 106.0, 108.5, 1000)])
         self.assertIsNotNone(a, "une mèche au-delà de la zone n'invalide pas : seule une clôture le fait")
-        self.assertTrue(a["entered"])
-        self.assertEqual(len(msgs), 1)
-        self.assertNotIn("invalidée", msgs[0])
+        self.assertEqual(evs, [])
 
-    # --- boucle (E/S) : un seul message par événement, état conservé en base
-    def test_tick_envoie_une_fois_et_persiste(self):
-        sent = []
-        _E.to_admin = lambda txt, **kw: sent.append(txt)
-        _E.get_live_price = lambda sym: 111.0
-        cs = [self._c(113, 114, 112, 113.5, 1000), self._c(112, 112.5, 109, 109.6, 2000)]
+    def test_alerte_perimee_supprimee_en_silence(self):
+        now = time.time()
+        a, evs = _E.qmlg_alert_eval(self._alert(created_ts=now - 301 * 900), [], now=now)
+        self.assertIsNone(a)
+        self.assertEqual(evs[0]["type"], "expired")
+        a, evs = _E.qmlg_alert_eval(self._alert(created_ts=now - 10 * 900), [], now=now)
+        self.assertIsNotNone(a)
+
+    def test_reaction_trop_vieille_ignoree(self):
+        c2b = self._c(109.5, 109.8, 108.0, 108.5, 2500)
+        c3 = self._c(108.4, 110.2, 108.3, 109.8, 3000)
+        a, evs = _E.qmlg_alert_eval(self._alert(), [c2b, c3], now=3000 + 900 + 20 * 900)   # redémarrage tardif
+        self.assertEqual([e for e in evs if e["type"] == "reaction"], [])
+
+    # --- livraison complète : lot + image + groupe + stickers
+    def _mock_io(self):
+        io = {"send": [], "admin": [], "media": []}
+        _E.CHAT_ID_GROUPE = "-100"
+        _E.QMLG_ALERT_TO_GROUP = True
+        _E.send = lambda chat_id, text, photo=None, **kw: io["send"].append((str(chat_id), text, photo)) or {"ok": True}
+        _E.to_admin = lambda txt, **kw: io["admin"].append(txt)
+        _E.to_group_media = lambda cat, n=1: io["media"].append((cat, n))
+        _E._qmlg_alert_chart = lambda ev: "/tmp/qml_test.png"
+        return io
+
+    def _fresh_candles(self):
+        t = self._fresh(3)
+        return t, [self._c(113, 114, 112, 113.5, t[0]), self._c(109.5, 109.8, 108.0, 108.5, t[1]), self._c(108.4, 110.2, 108.3, 109.8, t[2])]
+
+    def test_tick_livre_lot_image_groupe_et_stickers(self):
+        io = self._mock_io()
+        t, cs = self._fresh_candles()
         _E.get_candles = lambda symbol, minutes=None, count=None: list(cs)
-        _E._qmlg_alerts_save({"k": self._alert()})
+        _E._qmlg_alerts_save({"k": self._alert(last_t=t[0] - 900)})
         self.assertEqual(_E.qmlg_alert_tick(), 1)
         self.assertEqual(_E.qmlg_alert_tick(), 0, "second passage : rien de nouveau, aucun doublon")
-        self.assertEqual(len(sent), 1)
-        self.assertTrue(_E._qmlg_alerts_load()["k"]["entered"])
-        cs.append(self._c(108.4, 110.2, 108.3, 109.8, 3000))   # avalement haussier
-        cs.insert(2, self._c(109.5, 109.8, 108.0, 108.5, 2500))
-        self.assertEqual(_E.qmlg_alert_tick(), 1)
-        self.assertIn("REJET", sent[-1])
+        group = [x for x in io["send"] if x[0] == "-100"]
+        admin = [x for x in io["send"] if x[0] != "-100"]
+        self.assertEqual((len(group), len(admin)), (1, 1), "même message à l'admin et au groupe")
+        txt = group[0][1]
+        for part in ("AVALEMENT", "Entrée", "SL", "TP1", "TP2", "Lot"):
+            self.assertIn(part, txt)
+        lot = float(re.search(r"Lot <b>([\d.]+)</b>", txt).group(1))
+        self.assertGreater(lot, 0, "le lot est toujours calculé")
+        self.assertEqual(group[0][2], "/tmp/qml_test.png", "l'image part dans le groupe")
+        self.assertEqual(io["media"], [("BUY", _E.MEDIA_ENTRY_COUNT)], "stickers ACHAT envoyés")
         self.assertEqual(_E._qmlg_alerts_load(), {}, "alerte terminée : supprimée de la base")
         self.assertEqual(_E.qmlg_alert_tick(), 0, "plus d'alerte : aucun appel réseau")
+
+    def test_lot_impossible_rien_au_groupe(self):
+        io = self._mock_io()
+        _E.set_risk(0.01)   # risque minuscule : même le lot minimum le dépasse
+        t, cs = self._fresh_candles()
+        _E.get_candles = lambda symbol, minutes=None, count=None: list(cs)
+        _E._qmlg_alerts_save({"k": self._alert(last_t=t[0] - 900)})
+        self.assertEqual(_E.qmlg_alert_tick(), 0)
+        self.assertEqual(io["send"], [], "pas de signal sans lot")
+        self.assertEqual(io["media"], [])
+        self.assertEqual(len(io["admin"]), 1)
+        self.assertIn("lot impossible", io["admin"][0])
+
+    def test_groupe_coupe_admin_seulement(self):
+        io = self._mock_io()
+        _E.QMLG_ALERT_TO_GROUP = False
+        t, cs = self._fresh_candles()
+        _E.get_candles = lambda symbol, minutes=None, count=None: list(cs)
+        _E._qmlg_alerts_save({"k": self._alert(last_t=t[0] - 900)})
+        self.assertEqual(_E.qmlg_alert_tick(), 1)
+        self.assertEqual([x[0] for x in io["send"] if x[0] == "-100"], [])
+        self.assertEqual(io["media"], [])
 
     def test_tick_sans_reseau_quand_pas_de_bougie_due(self):
         calls = []
         _E.get_candles = lambda *a, **k: calls.append("candles") or []
-        _E.get_live_price = lambda sym: calls.append("px") or None
-        a = dict(self._alert(), last_t=int(time.time()), entered=True)   # dernière bougie toute fraîche, déjà entrée
-        _E._qmlg_alerts_save({"k": a})
+        _E._qmlg_alerts_save({"k": self._alert(last_t=int(time.time()))})   # dernière bougie toute fraîche
         _E.qmlg_alert_tick()
-        self.assertEqual(calls, [], "ni bougies (aucune nouvelle clôture possible) ni prix (déjà entrée)")
+        self.assertEqual(calls, [], "aucune nouvelle clôture possible : aucun appel réseau")
 
-    # --- bouton Analyse -> alertes
-    def test_analyse_pose_les_alertes(self):
+    # --- recherche des zones + menu
+    def test_refresh_pose_les_alertes_sur_les_tf_choisis(self):
+        scans = []
+        _E.qmlg_alert_symbols = lambda: ["XAUUSD"]
+        _E._qmlg_scan_one = lambda s, t: scans.append((s, t)) or ([self._rec(tf=t)], 100)
+        self.assertEqual(_E.qmlg_alert_refresh(force=True), 0, "alerte OFF : rien")
+        _E.set_qmlg_alert_on(True)
+        _E.set_setting("qmlg_alert_tfs", "1,5")
+        self.assertEqual(_E.qmlg_alert_refresh(), 2)
+        self.assertEqual(sorted(scans), [("XAUUSD", 1), ("XAUUSD", 5)], "M1 scanné comme demandé")
+        self.assertEqual(_E.qmlg_alert_refresh(), 0, "prochain scan à la clôture de la bougie, pas avant")
+        self.assertEqual({a["tf"] for a in _E._qmlg_alerts_load().values()}, {1, 5})
+        _E.set_setting("qmlg_alert_tfs", "5")
+        _E.qmlg_alert_refresh()
+        self.assertEqual({a["tf"] for a in _E._qmlg_alerts_load().values()}, {5}, "un TF décoché retire ses alertes")
+
+    def test_activer_coupe_repart_de_zero(self):
+        _E._qmlg_alerts_save({"k": self._alert()})
+        _E.set_qmlg_alert_on(True)
+        self.assertTrue(_E.get_qmlg_alert_on())
+        self.assertEqual(_E._qmlg_alerts_load(), {}, "jamais d'alerte périmée à l'activation")
+        _E.set_qmlg_alert_on(False)
+        self.assertFalse(_E.get_qmlg_alert_on())
+
+    def test_boutons_alerte_et_tf(self):
+        _E.set_setting("qmlg_alert_tfs", "5")
+        self.assertEqual(_E.toggle_qmlg_alert_tf(1), [1, 5])
+        self.assertEqual(_E.toggle_qmlg_alert_tf(5), [1])
+        self.assertEqual(_E.toggle_qmlg_alert_tf(1), [1], "au moins un TF reste coché")
+        self.assertEqual(_E.toggle_qmlg_alert_tf(7), [1], "TF inconnu ignoré")
+        kb = str(_E._qmlg_keyboard())
+        for cb in ("qmlg:alert", "qmlg:tf:1", "qmlg:tf:5", "qmlg:tf:15", "qmlg:tf:60"):
+            self.assertIn(cb, kb)
+        edits = []
+        _E_edit = _E._edit
+        _E._edit = lambda cq, txt, kb=None: edits.append(txt)
+        try:
+            self.assertEqual(_E._qmlg_callback({}, "alert"), "Alerte réaction : ON")
+            self.assertTrue(_E.get_qmlg_alert_on())
+            self.assertEqual(_E._qmlg_callback({}, "alert"), "Alerte réaction : OFF")
+            self.assertIn("M1", _E._qmlg_callback({}, "tf:5"))
+        finally:
+            _E._edit = _E_edit
+        self.assertIn("Alerte réaction", edits[-1])
+
+    def test_analyse_ne_pose_plus_d_alerte(self):
         sent = []
         data = {"formations": [self._rec()], "generated_ts": time.time(), "n_formations": 1, "n_valid": 1,
                 "markets": ["XAUUSD"], "tfs": [15], "errors": []}
         _E.send = lambda chat_id, text, **kw: sent.append(text)
         _E.qmlg_scan = lambda *a, **k: data
         _E._qmlg_job(1, "analyse")
-        self.assertEqual(len(_E._qmlg_alerts_load()), 1)
-        self.assertIn("1 posée(s)", sent[-1])
-        _E._qmlg_job(1, "analyse")
-        self.assertEqual(len(_E._qmlg_alerts_load()), 1, "anti-doublon")
-        self.assertIn("1 déjà en place", sent[-1])
-        _E._qmlg_job(1, "limit")   # les autres boutons ne posent pas d'alerte
-        self.assertEqual(len(_E._qmlg_alerts_load()), 1)
+        self.assertEqual(_E._qmlg_alerts_load(), {}, "c'est le bouton 🔔 qui active les alertes, pas Analyse")
+        self.assertNotIn("Alertes de zone", sent[-1])
+
+    # --- TF strictement respectés, double vérification, suivi BE / TP / SL, cadence
+    def _ev(self, buy=True, tf=15, **kw):
+        a = self._alert(buy=buy, tf=tf)
+        close = 109.8 if buy else 108.2
+        risk = abs(close - a["sl"])
+        ev = {"type": "reaction", "alert": a, "pattern": "ENGULFING", "close": close, "t": 3000, "risk": risk,
+              "rr1": abs(a["tp1"] - close) / risk, "rr2": abs(a["tp2"] - close) / risk}
+        ev.update(kw)
+        return ev
+
+    def test_tf_non_coche_jamais_livre(self):
+        io = self._mock_io()
+        _E.set_setting("qmlg_alert_tfs", "15")
+        t = self._fresh(3, tf=5)
+        cs = [self._c(113, 114, 112, 113.5, t[0]), self._c(109.5, 109.8, 108.0, 108.5, t[1]), self._c(108.4, 110.2, 108.3, 109.8, t[2])]
+        _E.get_candles = lambda symbol, minutes=None, count=None: list(cs)
+        _E._qmlg_alerts_save({"k": self._alert(tf=5, last_t=t[0] - 300)})
+        self.assertEqual(_E.qmlg_alert_tick(), 0)
+        self.assertEqual(io["send"], [], "M5 non coché : aucun message, même si la réaction existe")
+        self.assertEqual(_E._qmlg_alerts_load(), {}, "l'alerte d'un TF non coché disparaît")
+        self.assertFalse(_E.qmlg_alert_deliver(self._ev(tf=5)), "contrôle de TF aussi à la livraison")
+        self.assertEqual(io["send"], [])
+
+    def test_double_verification_du_plan_et_du_lot(self):
+        _E.set_setting("qmlg_alert_tfs", "15")
+        ev = self._ev()
+        li = _E.calc_lot("XAUUSD", 10, ev["risk"], price=ev["close"])
+        ok, pb = _E.qmlg_verify_plan(ev["alert"], ev, li)
+        self.assertTrue(ok, pb)
+        self.assertLessEqual(li["real_risk"], 10 + 1e-9, "le risque suit le SL : jamais au-dessus du montant choisi")
+        bad = self._ev()
+        bad["alert"]["sl"] = 111.0   # SL du mauvais côté pour un achat
+        self.assertFalse(_E.qmlg_verify_plan(bad["alert"], bad, li)[0])
+        self.assertFalse(_E.qmlg_verify_plan(ev["alert"], ev, dict(li, real_risk=li["real_risk"] * 2))[0], "risque ≠ lot x SL")
+        self.assertFalse(_E.qmlg_verify_plan(ev["alert"], ev, dict(li, lot=li["lot"] * 3, real_risk=li["real_risk"] * 3))[0],
+                         "risque au-dessus du montant choisi")
+        self.assertFalse(_E.qmlg_verify_plan(self._ev(tf=5)["alert"], self._ev(tf=5), li)[0], "TF non coché")
+        sell = self._ev(buy=False)
+        lis = _E.calc_lot("XAUUSD", 10, sell["risk"], price=sell["close"])
+        self.assertTrue(_E.qmlg_verify_plan(sell["alert"], sell, lis)[0])
+
+    def test_risque_proportionnel_au_sl(self):
+        near, far = self._ev(), self._ev()
+        far["alert"]["sl"] = 105.8
+        far["risk"] = far["close"] - 105.8
+        l1 = _E.calc_lot("XAUUSD", 10, near["risk"], price=near["close"])
+        l2 = _E.calc_lot("XAUUSD", 10, far["risk"], price=far["close"])
+        self.assertGreater(l1["lot"], l2["lot"], "SL plus loin -> lot plus petit")
+        for li, ev in ((l1, near), (l2, far)):
+            self.assertLessEqual(li["real_risk"], 10 + 1e-9)
+            self.assertGreaterEqual(li["real_risk"], 10 * 0.75, "le lot utilise bien le risque choisi (arrondi au pas de lot)")
+
+    def test_trade_enregistre_et_be_suivi(self):
+        io = self._mock_io()
+        t, cs = self._fresh_candles()
+        _E.get_candles = lambda symbol, minutes=None, count=None: list(cs)
+        _E._qmlg_alerts_save({"k": self._alert(last_t=t[0] - 900)})
+        self.assertEqual(_E.qmlg_alert_tick(), 1)
+        rows = [dict(r) for r in _E._q("SELECT * FROM trades WHERE kind='QMLG'").fetchall()]
+        self.assertEqual(len(rows), 1, "la réaction est enregistrée pour le suivi")
+        tr = rows[0]
+        self.assertEqual((tr["status"], tr["side"], tr["symbol"], tr["timeframe"]), ("OPEN", "BUY", "XAUUSD", "M15"))
+        self.assertEqual(tr["tp"], 120.0, "TP final = TP2")
+        self.assertEqual((tr["sent_admin"], tr["sent_group"]), (1, 1))
+        be_rr, tp_rr = _E.trade_be_rr(tr), _E.trade_tp_rr(tr)
+        self.assertLess(be_rr, tp_rr, "BE actif sur QML GAGNANT")
+        self.assertIn("BE", [x for x in io["send"] if x[0] == "-100"][0][1])
+        entry, risk = tr["entry"], abs(tr["entry"] - tr["sl_initial"])
+        arm = {"t": tr["last_ts"] + 900, "o": entry, "h": entry + be_rr * risk + 0.01, "l": entry + 0.05, "c": entry + 1.0}
+        evs = _E.track_trade(dict(tr), [arm])
+        again = dict(_E._q("SELECT * FROM trades WHERE id=?", (tr["id"],)).fetchone())
+        self.assertEqual(again["be_hit"], 1, "le prix atteint le RR du BE : SL ramené à l'entrée")
+        self.assertAlmostEqual(again["sl"], entry)
+        self.assertTrue(any(e["name"].startswith("RR") or e["name"] == "BE_MOVED" for e in evs))
+        back = {"t": arm["t"] + 900, "o": entry + 1, "h": entry + 1.2, "l": entry - 0.5, "c": entry}
+        evs2 = _E.track_trade(again, [back])
+        self.assertEqual([e["name"] for e in evs2], ["BE"], "retour à l'entrée après le BE : BE touché, 0 R")
+        self.assertEqual(_E.qmlg_alert_tick(), 0)
+        self.assertEqual(len(_E._q("SELECT id FROM trades WHERE kind='QMLG'").fetchall()), 1, "aucun doublon")
+
+    def test_niveaux_be_repli(self):
+        ev = self._ev()
+        tp, tp_rr, be = _E._qmlg_trade_levels(ev["alert"], ev)
+        self.assertEqual(tp, 120.0)
+        self.assertLess(be, tp_rr)
+        short = self._ev()
+        short["alert"]["tp2"], short["rr2"] = None, None
+        tp, tp_rr, be = _E._qmlg_trade_levels(short["alert"], short)
+        self.assertEqual(tp, 115.0, "sans TP2 : TP final = TP1")
+        self.assertLess(be, tp_rr)
+        self.assertGreater(be, 0)
+
+    def test_cadence_m1_5s(self):
+        _E.set_setting("qmlg_alert_tfs", "1,15")
+        self.assertEqual(_E._qmlg_loop_delay(), 5)
+        _E.set_setting("qmlg_alert_tfs", "5,15")
+        self.assertEqual(_E._qmlg_loop_delay(), max(5, _E.QMLG_ALERT_SEC))
 
 
 class TestOrdresMt5EtStickers(unittest.TestCase):
@@ -13575,6 +13775,11 @@ QMLG_PIN_BODY = _env_float("QMLG_PIN_BODY", 0.35)        # ... et corps <= 35 % 
 QMLG_LIST_MAX = _env_int("QMLG_LIST_MAX", 15)            # lignes max affichées dans Telegram (le JSON garde tout)
 QMLG_ALERT_SEC = _env_int("QMLG_ALERT_SEC", 20)          # pas de la surveillance des alertes de zone (secondes)
 QMLG_ALERT_LAG = _env_int("QMLG_ALERT_LAG", 5)           # délai après la clôture théorique d'une bougie avant de la relire
+QMLG_ALERT_PATTERNS = tuple(x.strip().upper() for x in os.getenv("QMLG_ALERT_PATTERNS", "ENGULFING,PIN_BAR").split(",") if x.strip())   # réactions qui déclenchent l'alerte : avalement / pin bar seulement
+QMLG_ALERT_MIN_RR = _env_float("QMLG_ALERT_MIN_RR", QMLG_MIN_RR)   # RR1 minimum sur la VRAIE entrée (clôture de la bougie de réaction) ; en dessous : l'alerte attend une meilleure réaction
+QMLG_ALERT_MAX_BARS = _env_int("QMLG_ALERT_MAX_BARS", 300)   # une alerte qui n'a rien donné après N bougies de son TF est supprimée en silence
+QMLG_ALERT_STALE_BARS = _env_int("QMLG_ALERT_STALE_BARS", 3)   # une réaction plus vieille que N bougies (redémarrage, retard réseau) n'est plus envoyée
+QMLG_ALERT_TO_GROUP = _env_on("QMLG_ALERT_TO_GROUP", True)   # la réaction part aussi au groupe : image + entrée / SL / TP / lot + stickers
 
 
 def get_qmlg_on():
@@ -13937,14 +14142,18 @@ def qmlg_direct_signals(data):
     return [f for f in data["formations"] if f.get("direct")]
 
 
-# --- ALERTES DE ZONE (posées après « Analyse ») ----------------------------------------------------------
-# Pour chaque QML VALIDE non mitigé trouvé par « Analyse » : une alerte sur la zone.
-#   1re alerte : le prix ENTRE dans la zone (prix en direct, ou mèche d'une bougie clôturée) ;
-#   2e alerte  : une bougie de REJET se forme (clôture dans la zone + avalement / pin bar / doji, dans le sens du QML), puis
-#                l'alerte est terminée et supprimée.
-#   Suppression sans 2e alerte : zone INVALIDÉE = une clôture au-delà du bord lointain de la zone (donc de la tête aussi).
+# --- ALERTES DE RÉACTION (c'est TOI qui les actives) ----------------------------------------------------------
+# Menu 🏆 QML GAGNANT -> « 🔔 Alerte réaction » (ON / OFF) + choix du / des TF (M1, M5, M15, M30, H1). Activée, elle scanne
+# tous les marchés ON (menu 🌍 ACTIFS) sur ces TF, pose une alerte sur chaque QML VALIDE non mitigé, puis surveille les bougies
+# clôturées. RIEN n'est envoyé quand le prix ENTRE dans la zone : l'alerte part seulement sur une RÉACTION = une bougie qui touche
+# la zone, ne l'invalide pas (clôture au-delà du bord lointain) et forme un AVALEMENT ou un PIN BAR dans le sens du QML
+# (QMLG_ALERT_PATTERNS). La zone reste valable sans autre confirmation.
+# « Mieux entrer » (ce n'est PAS une confirmation) : RR1 recalculé sur la vraie entrée (clôture de la bougie de réaction) >=
+# QMLG_ALERT_MIN_RR ; sinon l'alerte reste en attente d'une meilleure réaction.
+# À la réaction : le lot est calculé (montant risqué du menu 💰 Risque) ; admin ET groupe reçoivent l'image du QML + entrée / SL /
+# TP / lot, puis le groupe reçoit les stickers ACHAT / VENTE. Aucun ordre n'est jamais envoyé à MT5 depuis ici.
 # Anti-doublon : une seule alerte par (marché, TF, zone). Stockées en base (réglage « qmlg_alerts ») : elles survivent aux
-# redémarrages. Alertes envoyées à l'admin seulement ; aucun ordre n'est jamais envoyé depuis ici.
+# redémarrages ; activer / couper l'alerte les efface (jamais d'alerte périmée).
 _qmlg_alert_lock = threading.RLock()
 
 
@@ -13986,120 +14195,335 @@ def qmlg_place_alerts(data):
         return {"placed": placed, "existing": existing, "total": len(store)}
 
 
-def _qmlg_alert_head(a):
-    dec = SYMBOLS.get(a["symbol"], {}).get("decimals", 2)
-    z = a["zone"]
-    return (f"{'🟢' if a['dir'] == 'bull' else '🔴'} <b>{a['symbol']} M{a['tf']}</b>", dec,
-            f"{_fmt(z['bottom'], dec)} → {_fmt(z['top'], dec)}")
+QMLG_ALERT_TF_CHOICES = (1, 5, 15, 30, 60)   # TF proposés dans le menu (minutes)
+_QMLG_PAT_FR = {"ENGULFING": "AVALEMENT", "PIN_BAR": "PIN BAR", "DOJI": "DOJI"}
+_qmlg_refresh_due = {}                         # (marché, TF) -> instant du prochain scan des zones
 
 
-def _qmlg_alert_enter_text(a):
-    head, _dec, zone = _qmlg_alert_head(a)
-    return (f"🔔 {head} — le prix entre dans la zone QML\n{'Achat' if a['dir'] == 'bull' else 'Vente'} · zone {zone}\n"
-            f"Je te préviens à la bougie de rejet.")
+def get_qmlg_alert_on():
+    """Alerte de réaction activée par l'admin (bouton du menu QML GAGNANT) ? OFF tant qu'il ne l'a pas activée."""
+    return _get_bool_setting("qmlg_alert_on", False)
 
 
-def _qmlg_alert_reject_text(a, pattern, close):
-    head, dec, zone = _qmlg_alert_head(a)
-    risk = abs(close - a["sl"])
-    rr = lambda tp: "—" if tp is None or risk <= 0 else f"{abs(tp - close) / risk:.2f}"
-    tp = lambda k: "—" if a[k] is None else f"{_fmt(a[k], dec)} ({a[k + '_kind']}) RR {rr(a[k])}"
-    warn = ""
-    if a["tp1"] is not None and risk > 0 and abs(a["tp1"] - close) / risk < QMLG_MIN_RR:
-        warn = f"\n⚠️ RR1 < {QMLG_MIN_RR:g}"
-    return (f"🔥 {head} — <b>REJET {pattern}</b> dans la zone {zone}\n"
-            f"{'Achat' if a['dir'] == 'bull' else 'Vente'} direct à la clôture : {_fmt(close, dec)}\n"
-            f"🛡 SL {_fmt(a['sl'], dec)} · 🎯 TP1 {tp('tp1')} · TP2 {tp('tp2')}{warn}\n"
-            f"(alerte seulement : aucun ordre envoyé)")
+def qmlg_alerts_clear():
+    """Efface toutes les alertes en base : on repart de zéro (jamais d'alerte périmée après une pause)."""
+    with _qmlg_alert_lock:
+        _qmlg_alerts_save({})
+    _qmlg_refresh_due.clear()
 
 
-def _qmlg_alert_invalid_text(a, close):
-    head, dec, zone = _qmlg_alert_head(a)
-    return f"🗑 {head} — zone QML {zone} invalidée (clôture {_fmt(close, dec)}) : alerte supprimée."
+def set_qmlg_alert_on(on):
+    """Active / coupe l'alerte. Dans les deux cas on repart de zéro : une réaction survenue pendant que c'était OFF ne ressort jamais."""
+    set_setting("qmlg_alert_on", "1" if on else "0")
+    qmlg_alerts_clear()
 
 
-def qmlg_alert_eval(a, candles, live_px=None):
-    """Fait avancer UNE alerte (fonction pure, sans réseau). candles : bougies clôturées (la plus récente en dernier) ;
-    live_px : prix en direct ou None. Retourne (alerte mise à jour, ou None si elle doit être supprimée, [messages à envoyer])."""
-    a, msgs = dict(a), []
+def get_qmlg_alert_tfs():
+    """TF scannés par l'alerte (minutes, triés). Choix du menu ; sinon QMLG_TF. Jamais vide."""
+    raw = get_setting("qmlg_alert_tfs", "") or ""
+    tfs = sorted({int(x) for x in re.findall(r"\d+", str(raw)) if int(x) in QMLG_ALERT_TF_CHOICES})
+    return tfs or [QMLG_TF if QMLG_TF in QMLG_ALERT_TF_CHOICES else 15]
+
+
+def toggle_qmlg_alert_tf(tf):
+    """Coche / décoche un TF (au moins un reste toujours coché). Retourne la liste des TF choisis."""
+    tfs = get_qmlg_alert_tfs()
+    if tf not in QMLG_ALERT_TF_CHOICES:
+        return tfs
+    if tf in tfs:
+        if len(tfs) > 1:
+            tfs.remove(tf)
+    else:
+        tfs.append(tf)
+    tfs = sorted(tfs)
+    set_setting("qmlg_alert_tfs", ",".join(str(t) for t in tfs))
+    return tfs
+
+
+def qmlg_alert_symbols():
+    """Marchés surveillés par l'alerte : ceux qui sont ON dans le menu 🌍 ACTIFS."""
+    return [s for s in SYMBOLS if get_symbol_on(s)]
+
+
+def _qmlg_alert_rr(a, close):
+    """(risque, RR1, RR2) d'une entrée à `close` avec le SL / les TP de l'alerte. None = niveau déjà dépassé ou absent."""
+    sgn = 1 if a["dir"] == "bull" else -1
+    risk = (close - a["sl"]) * sgn
+    if risk <= 0:
+        return 0.0, None, None
+    rr = lambda tp: None if tp is None or (tp - close) * sgn <= 0 else abs(tp - close) / risk
+    return risk, rr(a.get("tp1")), rr(a.get("tp2"))
+
+
+def qmlg_alert_eval(a, candles, now=None):
+    """Fait avancer UNE alerte (fonction pure, sans réseau). candles : bougies clôturées (la plus récente en dernier).
+    Aucun message quand le prix ENTRE dans la zone. Une RÉACTION = bougie qui touche la zone, ne l'invalide pas et forme un
+    AVALEMENT ou un PIN BAR dans le sens du QML ; RR1 sur la vraie entrée (clôture) >= QMLG_ALERT_MIN_RR, sinon l'alerte attend.
+    now (secondes) : active la péremption et le refus des réactions trop vieilles. Retourne (alerte mise à jour, ou None si elle
+    doit être supprimée, [événements]) ; événement = {type: reaction | invalid | expired, ...}."""
+    a, evs = dict(a), []
     top, bot, buy = a["zone"]["top"], a["zone"]["bottom"], a["dir"] == "bull"
-
-    def enter():
-        if not a["entered"]:
-            a["entered"] = True
-            msgs.append(_qmlg_alert_enter_text(a))
-
+    tf_sec = a["tf"] * 60
+    if now is not None and a.get("created_ts") and now - a["created_ts"] > QMLG_ALERT_MAX_BARS * tf_sec:
+        return None, [{"type": "expired", "alert": a}]
     for k, c in enumerate(candles):
         if c["t"] <= a["last_t"]:
             continue
         if (c["c"] < bot) if buy else (c["c"] > top):   # clôture au-delà du bord lointain : zone invalidée
-            msgs.append(_qmlg_alert_invalid_text(a, c["c"]))
-            return None, msgs
-        if c["l"] <= top and c["h"] >= bot:
-            enter()
-        if a["entered"] and bot <= c["c"] <= top:
+            return None, [{"type": "invalid", "alert": a, "close": c["c"]}]
+        if c["l"] <= top and c["h"] >= bot:               # la bougie touche la zone
+            a["entered"] = True
             pattern = qmlg_rejection(candles[:k + 1], buy)
-            if pattern:
-                msgs.append(_qmlg_alert_reject_text(a, pattern, c["c"]))
-                return None, msgs   # 2e alerte envoyée : l'alerte est terminée
+            fresh = now is None or now - (c["t"] + tf_sec) <= QMLG_ALERT_STALE_BARS * tf_sec
+            if pattern in QMLG_ALERT_PATTERNS and fresh:
+                risk, rr1, rr2 = _qmlg_alert_rr(a, c["c"])
+                if rr1 is not None and rr1 >= QMLG_ALERT_MIN_RR:
+                    evs.append({"type": "reaction", "alert": dict(a), "pattern": pattern, "close": c["c"], "t": c["t"],
+                                "risk": risk, "rr1": rr1, "rr2": rr2})
+                    return None, evs   # réaction envoyée : l'alerte est terminée
         a["last_t"] = c["t"]
-    if live_px is not None and not a["entered"] and ((live_px <= top) if buy else (live_px >= bot)):
-        enter()
-    return a, msgs
+    return a, evs
+
+
+def qmlg_alert_text(ev, li, be_rr=None):
+    """Légende de la réaction (admin + groupe) : sens, entrée, SL, TP1 / TP2 + RR, BE, lot. < 1000 caractères (limite d'une légende photo)."""
+    a, buy = ev["alert"], ev["alert"]["dir"] == "bull"
+    dec = SYMBOLS.get(a["symbol"], {}).get("decimals", 2)
+    px = lambda v: _fmt(v, dec)
+
+    def tp(k, rr):
+        return "—" if a.get(k) is None or rr is None else f"{px(a[k])} ({a.get(k + '_kind') or 'liquidité'}) · RR {rr:.2f}"
+    txt = (f"{'🟢' if buy else '🔴'} <b>{a['symbol']} {_tf_lbl(a['tf'])}</b> — QML {'ACHAT' if buy else 'VENTE'} · "
+           f"réaction {_QMLG_PAT_FR.get(ev['pattern'], ev['pattern'])}\n"
+           f"📍 Entrée {px(ev['close'])}\n🛡 SL {px(a['sl'])}\n"
+           f"🎯 TP1 {tp('tp1', ev['rr1'])}\n🎯 TP2 {tp('tp2', ev['rr2'])}\n"
+           + (f"🔒 BE → RR{be_rr:g}\n" if be_rr else "")
+           + f"💰 Lot <b>{li['lot']:g}</b> · risque {li['real_risk']:.2f} $")
+    if li.get("raised_to_min"):
+        txt += "\n⚠️ lot minimum du broker : risque réel plus élevé que prévu"
+    return txt
+
+
+def _qmlg_alert_chart(ev):
+    """Image du QML avec l'outil de position (entrée / SL / TP aux niveaux de l'alerte). None si le dessin est impossible."""
+    a = ev["alert"]
+    sym, tf = a["symbol"], a["tf"]
+    candles = get_candles(sym, minutes=tf, count=QMLG_HISTORY_BARS) or []
+    if len(candles) < QMLG_MIN_BARS:
+        return None
+    structure = detect_structure(candles, f"M{tf}", n=QMLG_FRACTAL_N, keep=QMLG_KEEP)
+    res = detect_qml(structure, min_rr=QMLG_MIN_RR)
+    tol = max(1e-6, abs(a["zone"]["top"]) * 1e-7)
+    q = next((x for x in reversed(res["qmls"]) if x["dir"] == a["dir"] and abs(x["zone"]["top"] - a["zone"]["top"]) <= tol
+              and abs(x["zone"]["bottom"] - a["zone"]["bottom"]) <= tol), None)
+    if q is None:
+        return None
+    trade = {"ok": True, "side": "BUY" if a["dir"] == "bull" else "SELL", "order": "DIRECT", "entry": ev["close"], "sl": a["sl"],
+             "tp1": a.get("tp1"), "tp1_kind": a.get("tp1_kind"), "rr1": ev["rr1"], "risk": ev["risk"],
+             "tp2": a.get("tp2") if ev["rr2"] is not None else None, "tp2_kind": a.get("tp2_kind"), "rr2": ev["rr2"]}
+    return draw_chart(candles, q, trade, symbol=sym, tf=tf, structure=structure, others=[q])
+
+
+def _qmlg_trade_levels(a, ev):
+    """(TP final, RR du TP final, RR du BE) du trade suivi. TP final = TP2 s'il existe, sinon TP1. BE = RR réglé avec /be ;
+    s'il n'est pas sous le TP final : RR1 (TP1 atteint -> SL à l'entrée) quand TP2 existe, sinon la moitié du RR final."""
+    has_tp2 = a.get("tp2") is not None and ev.get("rr2") is not None
+    tp_final = a["tp2"] if has_tp2 else a["tp1"]
+    tp_rr = round(ev["rr2"] if has_tp2 else ev["rr1"], 2)
+    be = get_be_rr()
+    if be >= tp_rr:
+        be = ev["rr1"] if (has_tp2 and ev["rr1"] < tp_rr) else tp_rr / 2
+    return tp_final, tp_rr, round(min(be, tp_rr - 0.01), 2)
+
+
+def qmlg_verify_plan(a, ev, li):
+    """DOUBLE VÉRIFICATION avant tout envoi. Retourne (ok, [problèmes]). Contrôle : TF bien coché dans le menu ; SL du bon côté de
+    l'entrée ; distance SL cohérente ; TP1 (et TP2) du bon côté et dans l'ordre ; risque réel recalculé = lot x distance SL x
+    valeur du point, et jamais au-dessus du montant risqué choisi (sauf lot minimum déjà signalé)."""
+    pb, sym = [], a["symbol"]
+    sgn = 1 if a["dir"] == "bull" else -1
+    close, sl = ev["close"], a["sl"]
+    dist = (close - sl) * sgn
+    if a["tf"] not in get_qmlg_alert_tfs():
+        pb.append(f"{_tf_lbl(a['tf'])} n'est pas un TF coché")
+    if dist <= 0:
+        pb.append("SL du mauvais côté de l'entrée")
+    elif abs(dist - ev["risk"]) > 1e-9 * max(1.0, abs(close)):
+        pb.append("distance SL incohérente")
+    tp1, tp2 = a.get("tp1"), a.get("tp2")
+    if tp1 is None or (tp1 - close) * sgn <= 0:
+        pb.append("TP1 du mauvais côté de l'entrée")
+    elif tp2 is not None and ev.get("rr2") is not None and (tp2 - tp1) * sgn <= 0:
+        pb.append("TP2 avant TP1")
+    if dist > 0 and li["lot"] > 0:
+        real = li["lot"] * dist * value_per_point(sym, close)
+        if abs(real - li["real_risk"]) > 0.01 + 1e-6 * real:
+            pb.append(f"risque recalculé {real:.2f} $ ≠ {li['real_risk']:.2f} $")
+        target = get_risk()
+        if not li.get("raised_to_min") and real > target * (1 + 1e-6) + 0.005:
+            pb.append(f"risque {real:.2f} $ > {target:.2f} $ choisi")
+    return not pb, pb
+
+
+def qmlg_alert_deliver(ev):
+    """Réaction détectée : contrôle le TF, calcule le lot (montant risqué du menu 💰 Risque / distance au SL), DOUBLE VÉRIFIE le plan,
+    envoie entrée / SL / TP1 / TP2 / RR / BE / lot à l'admin ET au groupe (image, puis stickers ACHAT / VENTE), et enregistre le trade pour
+    le suivi : RR, BE (SL -> entrée), TP, SL partent au groupe en réponse à ce message. Lot ou plan impossible : l'admin est prévenu, rien
+    ne part au groupe. Aucun ordre n'est envoyé à MT5."""
+    a = ev["alert"]
+    sym, buy = a["symbol"], a["dir"] == "bull"
+    if a["tf"] not in get_qmlg_alert_tfs():   # contrôle n°1 : jamais de signal sur un TF qui n'est pas coché dans le menu
+        print(f"[qmlg-alertes] {sym} {_tf_lbl(a['tf'])} : réaction ignorée (TF non coché)")
+        return False
+    key = f"QMLG:{a['key']}:{ev['t']}"
+    if signal_exists(key):   # déjà livrée (anti-doublon)
+        return False
+    li = calc_lot(sym, get_risk(), ev["risk"], price=ev["close"])
+    if li["lot"] <= 0:
+        why = li.get("rejected_reason") or "lot invalide (risque ou distance SL)"
+        to_admin(f"⚠️ <b>{sym} {_tf_lbl(a['tf'])}</b> — réaction {_QMLG_PAT_FR.get(ev['pattern'], ev['pattern'])} dans la zone QML "
+                 f"{'(achat)' if buy else '(vente)'} mais lot impossible : {why}")
+        return False
+    ok, problems = qmlg_verify_plan(a, ev, li)   # contrôle n°2 : plan, risque et lot recalculés
+    if not ok:
+        to_admin(f"⛔ <b>{sym} {_tf_lbl(a['tf'])}</b> — signal QML {'achat' if buy else 'vente'} BLOQUÉ par la double vérification : "
+                 + " · ".join(problems))
+        return False
+    tp_final, tp_rr, be_rr = _qmlg_trade_levels(a, ev)
+    caption = qmlg_alert_text(ev, li, be_rr=be_rr)
+    path = None
+    try:
+        path = _qmlg_alert_chart(ev)
+    except Exception:
+        traceback.print_exc(limit=-3)
+    send(CHAT_ID_ADMIN, caption, photo=path)
+    if QMLG_ALERT_TO_GROUP and CHAT_ID_GROUPE:
+        try:
+            trade_id = add_trade(
+                status="OPEN", order_type="DIRECT", placed_ts=ev["t"], ref_price=ev["close"],
+                sent_admin=1, sent_group=0,   # sent_group passe à 1 quand Telegram a confirmé (sinon renvoi automatique)
+                signal_key=key, symbol=sym, side="BUY" if buy else "SELL", kind="QMLG", timeframe=_tf_lbl(a["tf"]),
+                entry=ev["close"], sl=a["sl"], sl_initial=a["sl"], tp=tp_final, be_rr=be_rr,
+                risk_usd=li["real_risk"], lot=li["lot"], leverage=get_leverage(), opened_ts=now_ts(),
+                last_ts=ev["t"] + a["tf"] * 60 - 1,   # le suivi commence APRÈS la clôture de la bougie de réaction
+                exec_status=None, part_cfg=None)
+            _deliver_signal(trade_id, sym, admin_txt="", group_txt=caption, chart=path)
+        except Exception:
+            traceback.print_exc(limit=-3)
+            to_admin(f"⚠️ {sym} {_tf_lbl(a['tf'])} : suivi BE / TP / SL non enregistré — le signal part quand même au groupe.")
+            to_group(caption, photo=path)
+        try:
+            to_group_media("BUY" if buy else "SELL", n=MEDIA_ENTRY_COUNT)   # stickers ACHAT / VENTE (comme à chaque entrée)
+        except Exception:
+            traceback.print_exc(limit=-3)
+    return True
 
 
 def qmlg_alert_tick():
-    """Un passage de surveillance : relit les bougies clôturées (seulement si une nouvelle a pu clôturer) et le prix en direct
-    des marchés ayant une alerte, fait avancer chaque alerte, envoie les messages à l'admin, enregistre l'état."""
+    """Un passage de surveillance : relit les bougies clôturées des marchés ayant une alerte (seulement si une nouvelle a pu
+    clôturer), fait avancer chaque alerte, livre les réactions (lot + image + groupe), enregistre l'état. Retourne le nombre de
+    réactions livrées."""
     snap = _qmlg_alerts_load()
     if not snap:
         return 0
-    now, candles, prices = time.time(), {}, {}
-    for (sym, tf) in {(a["symbol"], a["tf"]) for a in snap.values()}:
-        if any(now >= a["last_t"] + 2 * tf * 60 + QMLG_ALERT_LAG for a in snap.values() if (a["symbol"], a["tf"]) == (sym, tf)):
+    tfs_ok, syms_ok = set(get_qmlg_alert_tfs()), set(qmlg_alert_symbols())   # TF cochés + marchés ON : rien d'autre n'est lu
+    snap_ok = {k: a for k, a in snap.items() if a["tf"] in tfs_ok and a["symbol"] in syms_ok}
+    now, candles = time.time(), {}
+    for (sym, tf) in {(a["symbol"], a["tf"]) for a in snap_ok.values()}:
+        if any(now >= a["last_t"] + 2 * tf * 60 + QMLG_ALERT_LAG for a in snap_ok.values() if (a["symbol"], a["tf"]) == (sym, tf)):
             try:
                 candles[(sym, tf)] = get_candles(sym, minutes=tf) or []
             except Exception as e:
                 print(f"[qmlg-alertes] {sym} M{tf} : bougies indisponibles ({type(e).__name__})")
-    for sym in {a["symbol"] for a in snap.values() if not a["entered"]}:
-        try:
-            prices[sym] = get_live_price(sym)
-        except Exception:
-            prices[sym] = None
-    out = []
+    events = []
     with _qmlg_alert_lock:
         store = _qmlg_alerts_load()   # relu : une alerte posée / supprimée pendant les appels réseau est respectée
         for key in list(store):
             a = store[key]
-            new, msgs = qmlg_alert_eval(a, candles.get((a["symbol"], a["tf"]), []), prices.get(a["symbol"]))
-            out.extend(msgs)
+            if a["tf"] not in tfs_ok or a["symbol"] not in syms_ok:   # TF décoché / marché coupé : l'alerte disparaît sans rien envoyer
+                del store[key]
+                continue
+            new, evs = qmlg_alert_eval(a, candles.get((a["symbol"], a["tf"]), []), now=now)
+            events.extend(evs)
             if new is None:
                 del store[key]
             else:
                 store[key] = new
         _qmlg_alerts_save(store)
-    for m in out:
-        to_admin(m)   # hors du verrou : un envoi Telegram lent ne bloque pas la pose d'alertes
-    return len(out)
+    sent = 0
+    for ev in events:   # hors du verrou : un envoi Telegram lent ne bloque pas la pose d'alertes
+        if ev["type"] == "reaction":
+            try:
+                sent += 1 if qmlg_alert_deliver(ev) else 0
+            except Exception:
+                traceback.print_exc(limit=-3)
+        else:
+            a = ev["alert"]
+            print(f"[qmlg-alertes] {a['symbol']} M{a['tf']} zone {a['zone']['bottom']:g}-{a['zone']['top']:g} : alerte supprimée ({ev['type']})")
+    return sent
+
+
+def qmlg_alert_refresh(force=False):
+    """Cherche les zones : pour chaque marché ON et chaque TF choisi, nouveau scan à chaque clôture de bougie du TF, et une
+    alerte sur chaque QML valide non mitigé (anti-doublon). Retire les alertes d'un marché / TF qui n'est plus choisi.
+    Retourne le nombre d'alertes posées. Ne fait rien si l'alerte est OFF."""
+    if not get_qmlg_alert_on():
+        return 0
+    syms, tfs = qmlg_alert_symbols(), get_qmlg_alert_tfs()
+    with _qmlg_alert_lock:
+        store = _qmlg_alerts_load()
+        keep = {k: v for k, v in store.items() if v["symbol"] in syms and v["tf"] in tfs}
+        if len(keep) != len(store):
+            _qmlg_alerts_save(keep)
+    now = time.time()
+    todo = [(s, t) for s in syms for t in tfs if force or now >= _qmlg_refresh_due.get((s, t), 0)]
+    if not todo or not _qmlg_lock.acquire(blocking=False):   # un scan « Analyse » en cours : on réessaie au prochain passage
+        return 0
+    try:
+        forms = []
+        for (s, t) in todo:
+            step = t * 60
+            _qmlg_refresh_due[(s, t)] = (now // step + 1) * step + QMLG_ALERT_LAG   # prochain scan juste après la clôture de la bougie
+            try:
+                forms.extend(_qmlg_scan_one(s, t)[0])
+            except Exception as e:
+                _qmlg_refresh_due[(s, t)] = now + 60
+                print(f"[qmlg-alertes] scan {s} M{t} impossible ({type(e).__name__}) : nouvel essai dans 1 min")
+    finally:
+        _qmlg_lock.release()
+    return qmlg_place_alerts({"formations": forms})["placed"] if forms else 0
 
 
 _qmlg_alert_started = []
 
 
+def _qmlg_loop_delay():
+    """Pause entre deux passages des boucles d'alerte : 5 s si M1 est coché (une bougie dure 60 s), sinon QMLG_ALERT_SEC."""
+    try:
+        return 5 if 1 in get_qmlg_alert_tfs() else max(5, QMLG_ALERT_SEC)
+    except Exception:
+        return max(5, QMLG_ALERT_SEC)
+
+
 def start_qmlg_alerts():
-    """Démarre (une seule fois) la boucle de surveillance des alertes de zone. Sans alerte, elle ne fait aucun appel réseau."""
+    """Démarre (une seule fois) les 2 boucles : surveillance des réactions (rapide) et recherche des zones (scans plus lourds,
+    dans un thread à part pour ne jamais retarder une réaction). Alerte OFF : aucune des deux ne fait d'appel réseau."""
     if _qmlg_alert_started:
         return
 
-    def loop():
+    def run(fn, label):
         while True:
             try:
-                qmlg_alert_tick()
+                if get_qmlg_alert_on():
+                    fn()
             except Exception:
+                print(f"[qmlg-alertes] {label} : erreur (ignorée)")
                 traceback.print_exc(limit=-3)
-            time.sleep(max(5, QMLG_ALERT_SEC))
-    _qmlg_alert_started.append(threading.Thread(target=loop, daemon=True, name="qmlg-alertes"))
-    _qmlg_alert_started[0].start()
+            time.sleep(_qmlg_loop_delay())
+    for fn, label in ((qmlg_alert_tick, "réactions"), (qmlg_alert_refresh, "zones")):
+        t = threading.Thread(target=run, args=(fn, label), daemon=True, name=f"qmlg-alertes-{label}")
+        _qmlg_alert_started.append(t)
+        t.start()
 
 
 # --- TEXTES TELEGRAM + BOUTONS ----------------------------------------------------------------------------
@@ -14165,14 +14589,22 @@ def qmlg_direct_text(data):
 
 def _qmlg_menu_text():
     return (f"🏆 <b>QML GAGNANT</b> — {'🟢 ON' if get_qmlg_on() else '🔴 OFF'}\n\n"
+            f"🔔 <b>Alerte réaction</b> : {'🟢 ON' if get_qmlg_alert_on() else '🔴 OFF'} · TF "
+            f"{', '.join(_tf_lbl(t) for t in get_qmlg_alert_tfs())} · {len(qmlg_alert_symbols())} marché(s) (menu 🌍 ACTIFS)\n"
+            f"C'est toi qui l'actives. Elle alerte seulement sur une RÉACTION dans une zone QML (avalement ou pin bar), pas quand le prix "
+            f"y entre. Entrée, SL, TP1 / TP2 (RR), BE, lot, image et stickers partent au groupe, puis RR / BE / TP / SL en réponse. "
+            f"Seuls les TF cochés ci-dessous sont scannés (chaque TF à chaque clôture de bougie : M1 = 1 min, M5 = 5 min, M15 = 15 min).\n\n"
             f"🔍 <b>Analyse</b> : scanne tous les marchés et TF (M{', M'.join(str(t) for t in QMLG_TFS)}), enregistre toutes les "
-            f"formations QML dans le JSON, valide chacune et pose une 🔔 alerte sur chaque zone valide (entrée du prix, puis rejet).\n"
+            f"formations QML dans le JSON et valide chacune.\n"
             f"⏳ <b>Ordre limite</b> : QML valides non mitigés, EN ATTENTE de mitigation.\n"
             f"⚡ <b>Entrée directe</b> : prix dans la zone + dernière bougie clôturée en rejet.")
 
 
 def _qmlg_keyboard():
+    tfs = get_qmlg_alert_tfs()
     return _with_back({"inline_keyboard": [
+        [{"text": f"🔔 Alerte réaction : {'ON ✅' if get_qmlg_alert_on() else 'OFF'}", "callback_data": "qmlg:alert"}],
+        [{"text": f"{'✅ ' if t in tfs else ''}{_tf_lbl(t)}", "callback_data": f"qmlg:tf:{t}"} for t in QMLG_ALERT_TF_CHOICES],
         [{"text": "🔍 Analyse", "callback_data": "qmlg:analyse"}],
         [{"text": "⏳ Ordre limite", "callback_data": "qmlg:limit"}, {"text": "⚡ Entrée directe", "callback_data": "qmlg:direct"}],
     ]})
@@ -14190,7 +14622,7 @@ def _qmlg_job(chat_id, kind):
     try:
         if kind == "analyse":
             data = qmlg_scan()
-            txt = qmlg_analyse_text(data, qmlg_place_alerts(data))   # alerte de zone sur chaque QML valide non mitigé
+            txt = qmlg_analyse_text(data)   # les alertes se règlent avec le bouton 🔔 Alerte réaction
         elif kind == "limit":
             txt = qmlg_limit_text(qmlg_data(QMLG_MAX_AGE_MIN * 60))
         else:
@@ -14209,8 +14641,16 @@ def _qmlg_callback(cq, arg):
         _edit(cq, f"⏳ {_QMLG_JOBS[arg]} en cours… le résultat arrive dans un instant.", None)
         threading.Thread(target=_qmlg_job, args=(cq["message"]["chat"]["id"], arg), daemon=True, name=f"qmlg-{arg}").start()
         return "Scan lancé"
+    toast = ""
+    if arg == "alert":   # 🔔 Alerte réaction ON / OFF : repart de zéro, les boucles (déjà lancées au démarrage) font le reste
+        on = not get_qmlg_alert_on()
+        set_qmlg_alert_on(on)
+        toast = "Alerte réaction : " + ("ON" if on else "OFF")
+    elif arg.startswith("tf:") and arg[3:].isdigit():
+        tfs = toggle_qmlg_alert_tf(int(arg[3:]))
+        toast = "TF : " + ", ".join(_tf_lbl(t) for t in tfs)
     _edit(cq, _qmlg_menu_text(), _qmlg_keyboard())
-    return ""
+    return toast
 
 
 # ============================================================================
@@ -14800,6 +15240,5 @@ if __name__ == "__main__":
     if "--selftest" in sys.argv:
         sys.exit(_selftest())
     main()
-
 
 
