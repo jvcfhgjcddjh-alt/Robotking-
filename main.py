@@ -1,6 +1,7 @@
 
 
 
+
 #!/usr/bin/env python3
 """AlphaBot BOS + CHoCH — Gold & BTC — version en un seul fichier.
 
@@ -9,14 +10,13 @@ entrée directe sur CHoCH.
 Prix : Gold via l'API publique Deriv (WebSocket), BTC via l'API publique Binance. Aucune clé de prix.
 
 Lancer :
-    pip install requests python-dotenv matplotlib pillow websocket-client flask metaapi-cloud-sdk
+    pip install requests python-dotenv matplotlib websocket-client flask metaapi-cloud-sdk
     python main.py
 
 Déploiement Render (Web Service) : le process écoute sur $PORT et expose GET /health,
 pendant que la boucle de trading et le polling Telegram tournent en arrière-plan.
 Variables utiles : TELEGRAM_TOKEN, CHAT_ID_GROUPE, CHAT_ID_ADMIN, TIMEFRAME,
-DEFAULT_RISK_USD, DEFAULT_LEVERAGE, PORT, METAAPI_TOKEN, METAAPI_ACCOUNT_ID,
-RESULT_IMAGE_ENABLED, RESULT_IMAGE_KINDS, RESULT_IMAGE_SHOW_LOT (image de résultat QML, section 7ter).
+DEFAULT_RISK_USD, DEFAULT_LEVERAGE, PORT, METAAPI_TOKEN, METAAPI_ACCOUNT_ID.
 
 Le bot tourne en permanence ; /stop et /start (ou le bouton du menu) coupent / rétablissent les NOUVEAUX signaux, le suivi des positions ne s'arrête jamais : scan continu, une analyse à chaque
 nouvelle bougie clôturée du timeframe choisi.
@@ -37,7 +37,7 @@ Stickers / images / GIF du groupe (TP, SL, BE, motivation) : envoyer le média a
 catégorie (gestion via /medias). Optionnel : variables MEDIA_TP, MEDIA_SL, MEDIA_BE, MEDIA_MOTIV.
 Auto-tests du moteur H1 -> M15 -> M5 -> M1 (sans réseau ni base de prod) :  python main.py --selftest
 Sommaire : 1 Configuration · 2 Base de données · 3 Données de prix · 4 Signaux
-           5 Risque · 6 Suivi des positions · 7 Graphique · 7ter Image de résultat QML · 8 Telegram · 9 Boucle principale
+           5 Risque · 6 Suivi des positions · 7 Graphique · 8 Telegram · 9 Boucle principale
            10 Serveur web (Render) · 11 Auto-tests · 12 Module QML (Quasimodo) · 13 Module FIBTREND · 14 Moteur SMC · 15 Stratégie QML GAGNANT
 """
 import json
@@ -75,11 +75,6 @@ try:
     from flask import Flask  # serveur /health pour Render (Web Service)
 except ImportError:
     Flask = None
-
-try:
-    from PIL import Image, ImageDraw, ImageFont  # pillow : image de résultat QML (section 7ter), optionnel
-except ImportError:
-    Image = ImageDraw = ImageFont = None
 
 
 # ============================================================================
@@ -2717,52 +2712,21 @@ class DerivError(RuntimeError):
 _deriv_ws = None      # connexion WebSocket publique, réutilisée d'un appel à l'autre
 _deriv_req_id = 0
 
-# --- Circuit breaker : évite de marteler l'API pendant une panne Deriv -----------------------
-# Après plusieurs échecs consécutifs, on arrête d'essayer pendant DERIV_BREAKER_COOLDOWN
-# secondes : les appels échouent instantanément (pas d'attente réseau, pas de requête inutile)
-# le temps que l'API Deriv se rétablisse. Un seul succès referme le disjoncteur.
-DERIV_BREAKER_THRESHOLD = _env_int("DERIV_BREAKER_THRESHOLD", 3)
-DERIV_BREAKER_COOLDOWN = _env_int("DERIV_BREAKER_COOLDOWN", 20)
-_deriv_fail_streak = 0
-_deriv_down_until = 0.0
-
-
-def _deriv_breaker_ok():
-    """True si on peut tenter Deriv maintenant (disjoncteur fermé ou cooldown écoulé)."""
-    return time.time() >= _deriv_down_until
-
-
-def _deriv_breaker_report(success, err=None):
-    global _deriv_fail_streak, _deriv_down_until
-    if success:
-        _deriv_fail_streak = 0
-        _deriv_down_until = 0.0
-        return
-    _deriv_fail_streak += 1
-    if _deriv_fail_streak >= DERIV_BREAKER_THRESHOLD:
-        _deriv_down_until = time.time() + DERIV_BREAKER_COOLDOWN
-        print(f"[deriv] panne persistante ({_deriv_fail_streak} échecs) : pause de "
-              f"{DERIV_BREAKER_COOLDOWN}s avant nouvel essai — {err}")
-
 
 def _deriv_request(payload):
     """Envoie une requête sur le WebSocket public Deriv et retourne la réponse (bougies).
 
     La connexion est réutilisée ; si elle est tombée (inactivité, réseau), une reconnexion
-    est tentée avant d'abandonner. Un disjoncteur évite de marteler l'API en cas de panne
-    prolongée (voir _deriv_breaker_*).
+    est tentée une fois avant d'abandonner.
     """
     global _deriv_ws, _deriv_req_id
     if websocket is None:
         raise RuntimeError("module manquant : pip install websocket-client")
-    if not _deriv_breaker_ok():
-        raise RuntimeError("Deriv indisponible : pause (panne récente), nouvel essai bientôt")
     last_err = None
-    attempts = 2
-    for attempt in range(attempts):
+    for _ in range(2):
         try:
             if _deriv_ws is None:
-                _deriv_ws = websocket.create_connection(DERIV_WS_URL, timeout=10)
+                _deriv_ws = websocket.create_connection(DERIV_WS_URL, timeout=15)
             _deriv_req_id += 1
             rid = _deriv_req_id
             _deriv_ws.send(json.dumps({**payload, "req_id": rid}))
@@ -2774,10 +2738,8 @@ def _deriv_request(payload):
                     err = msg["error"]
                     raise DerivError(err.get("message", err) if isinstance(err, dict) else err)
                 if "candles" in msg or "history" in msg:
-                    _deriv_breaker_report(True)
                     return msg
         except DerivError:
-            _deriv_breaker_report(True)  # réponse reçue : la connexion fonctionne, seule la requête est invalide
             raise
         except Exception as e:  # connexion morte / timeout : on repart sur une connexion neuve
             last_err = e
@@ -2787,9 +2749,6 @@ def _deriv_request(payload):
             except Exception:
                 pass
             _deriv_ws = None
-            if attempt < attempts - 1:
-                time.sleep(0.3)  # courte pause avant la reconnexion
-    _deriv_breaker_report(False, last_err)
     raise RuntimeError(f"Deriv indisponible : {last_err}")
 
 
@@ -5533,8 +5492,7 @@ def sync_mt5_positions():
                     tr["result_r"] = {"TP": trade_tp_rr(tr), "SL": -1.0, "BE": 0.0}[outcome]
                 ev = {"name": outcome, "trade": tr}
                 dec = SYMBOLS[t["symbol"]]["decimals"]
-                if not send_result_image(ev, dec):   # image de résultat QML (section 7ter) ; sinon envoi habituel
-                    to_group(group_event(ev, dec), reply_to_message_id=tr.get("signal_message_id"))
+                to_group(group_event(ev, dec), reply_to_message_id=tr.get("signal_message_id"))
                 group_event_media(outcome)
             except Exception:
                 traceback.print_exc()
@@ -5664,343 +5622,6 @@ def make_event_chart(symbol, candles, events, trade, dec):
     except Exception as e:
         print(f"[{symbol}] make_event_chart a échoué ({type(e).__name__}) : notification envoyée sans image")
         return None
-
-
-# ============================================================================
-# 7ter. IMAGE DE RÉSULTAT QML (SL touché, RR1, RR2, TP final)
-#
-# Image « carte résultat » (pillow) envoyée dans le GROUPE uniquement, en réponse au signal d'ouverture
-# du trade, à la place du graphique habituel. Ne s'applique qu'aux trades des stratégies listées dans
-# RESULT_IMAGE_KINDS (QML, QMLG par défaut ; "ALL" = toutes). BE, BE armé, RR3+, partiels : inchangés.
-# Si pillow est absent, ou si la génération / l'envoi échoue, le message habituel part comme avant.
-# Aucun lot dans le groupe (RESULT_IMAGE_SHOW_LOT=1 pour l'afficher). Anti-doublon par (trade, événement).
-# ============================================================================
-RESULT_IMAGE_ENABLED = os.getenv("RESULT_IMAGE_ENABLED", "1").strip().lower() in ("1", "on", "true", "yes", "oui")
-RESULT_IMAGE_KINDS = {k.strip().upper() for k in os.getenv("RESULT_IMAGE_KINDS", "QML,QMLG").split(",") if k.strip()}
-RESULT_IMAGE_SHOW_LOT = os.getenv("RESULT_IMAGE_SHOW_LOT", "0").strip().lower() in ("1", "on", "true", "yes", "oui")
-RI_DEDUP_FILE = os.getenv("RESULT_DEDUP_FILE", os.path.join(os.path.dirname(os.path.abspath(DB_PATH)), "results_sent.json"))
-RI_BRAND = "AlphaBot • QML"
-RI_W, RI_H = 1080, 1350
-
-RI_C_BG = (11, 15, 25)
-RI_C_CARD = (20, 27, 43)
-RI_C_TEXT = (240, 244, 250)
-RI_C_MUTED = (130, 142, 165)
-RI_C_GREEN = (22, 190, 110)
-RI_C_GOLD = (246, 190, 40)
-RI_C_RED = (235, 64, 72)
-
-RI_EVENTS = {
-    #  clé     titre              couleur       rang  emoji (légende Telegram)
-    "SL":  {"title": "STOP LOSS TOUCHÉ", "color": RI_C_RED,   "rank": -1, "emoji": "🔴"},
-    "RR1": {"title": "RR1 ATTEINT",      "color": RI_C_GREEN, "rank": 1,  "emoji": "✅"},
-    "RR2": {"title": "RR2 ATTEINT",      "color": RI_C_GREEN, "rank": 2,  "emoji": "✅✅"},
-    "TP3": {"title": "TP FINAL ATTEINT", "color": RI_C_GOLD,  "rank": 3,  "emoji": "🏆"},
-}
-_RI_EVENT_OF = {"SL": "SL", "RR1": "RR1", "RR2": "RR2", "TP": "TP3"}   # événement du suivi -> événement image
-
-_RI_FONTS_BOLD = [
-    "DejaVuSans-Bold.ttf",
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",   # Render / Linux
-    "/system/fonts/Roboto-Bold.ttf",                          # Android / Pydroid3
-    "/system/fonts/DroidSans-Bold.ttf",
-    "arialbd.ttf",
-]
-_RI_FONTS_REG = [
-    "DejaVuSans.ttf",
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-    "/system/fonts/Roboto-Regular.ttf",
-    "/system/fonts/DroidSans.ttf",
-    "arial.ttf",
-]
-_ri_lock = threading.Lock()
-
-
-def _ri_font(size, bold=True):
-    for p in (_RI_FONTS_BOLD if bold else _RI_FONTS_REG):
-        try:
-            return ImageFont.truetype(p, size)
-        except Exception:
-            continue
-    return ImageFont.load_default()
-
-
-def _ri_fmt(p, digits=None):
-    if digits is None:
-        digits = 5 if p < 10 else (3 if p < 500 else 2)
-    return f"{p:.{digits}f}"
-
-
-def _ri_text_w(d, t, f):
-    return d.textlength(t, font=f)
-
-
-def _ri_center(d, cx, y, t, f, fill):
-    d.text((cx - _ri_text_w(d, t, f) / 2, y), t, font=f, fill=fill)
-
-
-def _ri_r_value(trade, event):
-    """Résultat en R : SL = -1R, sinon le RR du niveau touché. Le résultat réel du trade (result_r, partiels
-    inclus) prévaut pour SL et TP final quand il est connu."""
-    rr = trade.get("result_r")
-    if event in ("SL", "TP3") and rr is not None:
-        return float(rr)
-    if event == "SL":
-        return -1.0
-    key = {"RR1": "rr1", "RR2": "rr2", "TP3": "rr3"}[event]
-    return float(trade.get(key, {"RR1": 1, "RR2": 2, "TP3": 3}[event]))
-
-
-def _ri_badge_check(d, cx, cy, r, color):
-    d.ellipse((cx - r, cy - r, cx + r, cy + r), fill=color)
-    w = max(6, r // 6)
-    d.line([(cx - r * .45, cy + r * .02), (cx - r * .1, cy + r * .38),
-            (cx + r * .5, cy - r * .35)], fill=(255, 255, 255), width=w, joint="curve")
-
-
-def _ri_badge_cross(d, cx, cy, r, color):
-    d.ellipse((cx - r, cy - r, cx + r, cy + r), fill=color)
-    w = max(6, r // 6)
-    k = r * .38
-    d.line([(cx - k, cy - k), (cx + k, cy + k)], fill=(255, 255, 255), width=w)
-    d.line([(cx - k, cy + k), (cx + k, cy - k)], fill=(255, 255, 255), width=w)
-
-
-def _ri_badge_trophy(d, cx, cy, r, color):
-    d.ellipse((cx - r, cy - r, cx + r, cy + r), fill=color)
-    k = r * .45
-    d.polygon([(cx - k, cy - k), (cx + k, cy - k), (cx + k * .6, cy + k * .2),
-               (cx - k * .6, cy + k * .2)], fill=(255, 255, 255))
-    d.rectangle((cx - k * .15, cy + k * .2, cx + k * .15, cy + k * .75), fill=(255, 255, 255))
-    d.rectangle((cx - k * .6, cy + k * .75, cx + k * .6, cy + k * .95), fill=(255, 255, 255))
-
-
-def make_result_image(trade, event, touch_price=None, when=None):
-    """Retourne un io.BytesIO (PNG). `trade` : id, symbol, side, entry, sl, tf, digits, rr3 (RR de la TP finale) ;
-    optionnels : tp1 / tp2 (paliers RR1 / RR2), tp3 (TP finale), lot, result_r. `event` : SL | RR1 | RR2 | TP3."""
-    import io as _io
-    ev = RI_EVENTS[event]
-    color = ev["color"]
-    W, H = RI_W, RI_H
-    is_buy = trade["side"].upper() in ("BUY", "ACHAT", "LONG")
-    digits = trade.get("digits")
-    r_val = _ri_r_value(trade, event)
-    when = when or datetime.now(timezone.utc)
-
-    img = Image.new("RGBA", (W, H), RI_C_BG + (255,))
-    d = ImageDraw.Draw(img)
-
-    # Bandeau titre
-    d.rectangle((0, 0, W, 250), fill=color)
-    cx_badge, cy_badge = 150, 125
-    if event == "SL":
-        _ri_badge_cross(d, cx_badge, cy_badge, 68, (0, 0, 0, 70))
-    elif event == "TP3":
-        _ri_badge_trophy(d, cx_badge, cy_badge, 68, (0, 0, 0, 70))
-    else:
-        _ri_badge_check(d, cx_badge, cy_badge, 68, (0, 0, 0, 70))
-    d.text((250, 70), ev["title"], font=_ri_font(58), fill=(255, 255, 255))
-    d.text((250, 148), f"{trade['symbol']}  •  {trade.get('tf', 'M1')}  •  QML",
-           font=_ri_font(36, False), fill=(255, 255, 255))
-
-    # Carte principale
-    d.rounded_rectangle((40, 280, W - 40, 560), radius=36, fill=RI_C_CARD)
-
-    # Pastille ACHAT / VENTE
-    pill_col = RI_C_GREEN if is_buy else RI_C_RED
-    pill_txt = "ACHAT" if is_buy else "VENTE"
-    d.rounded_rectangle((80, 312, 330, 382), radius=35, fill=pill_col)
-    _ri_center(d, 205, 326, pill_txt, _ri_font(40), (255, 255, 255))
-    d.text((360, 328), trade["symbol"], font=_ri_font(44), fill=RI_C_TEXT)
-
-    # Gros résultat en R
-    sign = "+" if r_val > 0 else ""
-    _ri_center(d, W / 2, 400, f"{sign}{r_val:g}R", _ri_font(120), color)
-
-    # Ligne infos
-    info = []
-    if trade.get("lot") is not None:
-        info.append(f"LOT {trade['lot']:g}")
-    info.append(f"Entrée {_ri_fmt(trade['entry'], digits)}")
-    _ri_center(d, W / 2, 520, "   |   ".join(info), _ri_font(30, False), RI_C_MUTED)
-
-    # ───── Échelle de prix (SL / Entrée / paliers / TP final) ─────
-    levels = [("SL", trade["sl"], RI_C_RED), ("ENTRÉE", trade["entry"], (120, 170, 255))]
-    if trade.get("tp1") is not None:
-        levels.append(("RR1", trade["tp1"], RI_C_GREEN))
-    if trade.get("tp2") is not None:
-        levels.append(("RR2", trade["tp2"], RI_C_GREEN))
-    if trade.get("tp3"):
-        levels.append(("TP FINAL", trade["tp3"], RI_C_GOLD))
-
-    reached = {"ENTRÉE"}
-    if event == "SL":
-        reached.add("SL")
-    else:
-        if ev["rank"] >= 1:
-            reached.add("RR1")
-        if ev["rank"] >= 2:
-            reached.add("RR2")
-        if ev["rank"] >= 3:
-            reached.add("TP FINAL")
-
-    top, bottom = 620, 1170
-    prices = [p for _, p, _ in levels]
-    pmin, pmax = min(prices), max(prices)
-    span = (pmax - pmin) or 1.0
-
-    def y_of(p):
-        return bottom - (p - pmin) / span * (bottom - top)
-
-    # Zones colorées (SL <-> entrée = rouge ; entrée <-> dernier TP = vert)
-    ov = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    od = ImageDraw.Draw(ov)
-    x0, x1 = 80, W - 80
-    last_tp = trade.get("tp3") or trade.get("tp2") or trade.get("tp1") or trade["entry"]
-    y_e, y_sl, y_tp = y_of(trade["entry"]), y_of(trade["sl"]), y_of(last_tp)
-    od.rectangle((x0, min(y_e, y_sl), x1, max(y_e, y_sl)), fill=RI_C_RED + (55,))
-    od.rectangle((x0, min(y_e, y_tp), x1, max(y_e, y_tp)), fill=RI_C_GREEN + (45,))
-    img = Image.alpha_composite(img, ov)
-    d = ImageDraw.Draw(img)
-
-    # Étiquettes (anti-chevauchement vertical)
-    placed = sorted([(y_of(p), n, p, c) for n, p, c in levels], key=lambda t: t[0])
-    ys, min_gap = [], 52
-    for y, *_ in placed:
-        if ys and y - ys[-1] < min_gap:
-            y = ys[-1] + min_gap
-        ys.append(y)
-
-    for (y_real, name, p, c), y_lbl in zip(placed, ys):
-        done = name in reached
-        col = c if done else (95, 105, 128)
-        d.line([(x0, y_real), (x1, y_real)], fill=col, width=3)
-        d.rounded_rectangle((x0, y_lbl - 24, x0 + 190, y_lbl + 24), radius=14, fill=col)
-        d.text((x0 + 16, y_lbl - 18), name, font=_ri_font(30), fill=(255, 255, 255))
-        d.text((x0 + 215, y_lbl - 18), _ri_fmt(p, digits), font=_ri_font(32), fill=RI_C_TEXT)
-        if done and name != "ENTRÉE":
-            if name == "SL":
-                _ri_badge_cross(d, x1 - 40, y_lbl, 26, col)
-            else:
-                _ri_badge_check(d, x1 - 40, y_lbl, 26, col)
-
-    if touch_price is not None:
-        d.text((80, 1190), f"Prix de touche : {_ri_fmt(touch_price, digits)}",
-               font=_ri_font(30, False), fill=RI_C_MUTED)
-
-    # Pied de page
-    d.line([(60, 1255), (W - 60, 1255)], fill=(40, 50, 72), width=2)
-    d.text((70, 1275), RI_BRAND, font=_ri_font(34), fill=RI_C_TEXT)
-    stamp = when.strftime("%d/%m/%Y  %H:%M UTC")
-    d.text((W - 70 - _ri_text_w(d, stamp, _ri_font(28, False)), 1281), stamp,
-           font=_ri_font(28, False), fill=RI_C_MUTED)
-
-    out = _io.BytesIO()
-    img.convert("RGB").save(out, format="PNG", optimize=True)
-    out.seek(0)
-    return out
-
-
-def build_result_caption(trade, event):
-    ev = RI_EVENTS[event]
-    is_buy = trade["side"].upper() in ("BUY", "ACHAT", "LONG")
-    sens = "🟢 <b>ACHAT</b>" if is_buy else "🔴 <b>VENTE</b>"
-    r_val = _ri_r_value(trade, event)
-    sign = "+" if r_val > 0 else ""
-    lines = [
-        f"{ev['emoji']} <b>{ev['title']}</b> {ev['emoji']}",
-        f"{sens} • <b>{trade['symbol']}</b>",
-        f"📊 Résultat : <b>{sign}{r_val:g}R</b>",
-    ]
-    if trade.get("lot") is not None:
-        lines.append(f"💰 Lot : <b>{trade['lot']:g}</b>")
-    return "\n".join(lines)
-
-
-def _ri_load_dedup():
-    try:
-        with open(RI_DEDUP_FILE, "r", encoding="utf-8") as f:
-            return set(json.load(f))
-    except Exception:
-        return set()
-
-
-def _ri_save_dedup(s):
-    try:
-        with open(RI_DEDUP_FILE, "w", encoding="utf-8") as f:
-            json.dump(sorted(s), f)
-    except Exception:
-        pass
-
-
-def _ri_trade_view(t, dec):
-    """Trade de la base (dict) -> dict attendu par make_result_image. Niveaux recalculés depuis l'entrée / SL
-    initial : RR1 / RR2 n'existent que s'ils sont AVANT la TP finale de CE trade (même règle que track_trade)."""
-    side = t["side"]
-    sgn = 1 if side == "BUY" else -1
-    entry = float(t["entry"])
-    sl0 = float(t.get("sl_initial") if t.get("sl_initial") is not None else t["sl"])
-    risk = abs(entry - sl0)
-    tp_rr = trade_tp_rr(t)
-    d = {"id": t["id"], "symbol": t["symbol"], "side": side, "entry": entry, "sl": sl0,
-         "tf": t.get("timeframe") or TF_LABEL, "digits": dec, "rr3": tp_rr, "result_r": t.get("result_r")}
-    if risk > 0:
-        for lvl in (1, 2):
-            if lvl < tp_rr - 1e-9:
-                d[f"tp{lvl}"] = entry + sgn * lvl * risk
-                d[f"rr{lvl}"] = lvl
-    if t.get("tp") is not None:
-        d["tp3"] = float(t["tp"])
-    if RESULT_IMAGE_SHOW_LOT and t.get("lot") is not None:
-        d["lot"] = t["lot"]
-    return d
-
-
-def send_result_image(ev, dec):
-    """Envoie l'image de résultat au GROUPE pour un événement du suivi (SL / RR1 / RR2 / TP).
-    Retourne True si l'annonce est faite (ou déjà faite) ; False -> l'appelant garde son envoi habituel.
-    Ne lève jamais."""
-    path = None
-    try:
-        if not (RESULT_IMAGE_ENABLED and Image is not None and CHAT_ID_GROUPE and TELEGRAM_TOKEN):
-            return False
-        event = _RI_EVENT_OF.get(ev.get("name"))
-        t = ev.get("trade") or {}
-        if not event or not t:
-            return False
-        if "ALL" not in RESULT_IMAGE_KINDS and str(t.get("kind") or "").upper() not in RESULT_IMAGE_KINDS:
-            return False
-        view = _ri_trade_view(t, dec)
-        if event in ("RR1", "RR2") and f"tp{event[-1]}" not in view:
-            return False
-        key = f"{t['id']}:{event}"
-        with _ri_lock:
-            if key in _ri_load_dedup():
-                return True
-        buf = make_result_image(view, event, touch_price=t.get("tp") if event == "TP3" else None)
-        os.makedirs(CHART_DIR, exist_ok=True)
-        path = os.path.join(CHART_DIR, f"result_{t['id']}_{event}.png")
-        with open(path, "wb") as f:
-            f.write(buf.getvalue())
-        res = to_group(build_result_caption(view, event), photo=path,
-                       reply_to_message_id=t.get("signal_message_id"))
-        if not (res and res.get("ok")):
-            return False
-        with _ri_lock:
-            s = _ri_load_dedup()
-            s.add(key)
-            _ri_save_dedup(s)
-        return True
-    except Exception as e:
-        print(f"[result_image] échec ({type(e).__name__}: {e}) : envoi habituel")
-        return False
-    finally:
-        if path:
-            try:
-                os.remove(path)
-            except OSError:
-                pass
-
 
 
 # ============================================================================
@@ -7526,7 +7147,6 @@ def handle_command(text):
                "/entree [direct|limit|both] — type d'entrée : direct, limit sur OB/FVG, ou les deux\n"
                "/session [all|londres|ny|both] — n'accepter que les CHoCH d'une session · /zone [ob|fvg|both] — zone du limit\n"
                "/modesl [struct|zone|sweep] — SL de l'entrée directe · /modetp [rr|target|swing] — mode du TP\n"
-               "/qmlsl [sweep|buffer|extreme|candle|atr] — SL du QML gagnant (défaut sweep) · /qmlatr 2.3 — multiplicateur ATR\n"
                "/strategie [main|crt|both] · /crt [on|off|h1|h4|d1|range|mid|rr] — module CRT (désactivé par défaut)\n"
                "/mtffib [on|off] — filtre Fibonacci HTF Premium/Discount\n"
                "/m15imp [on|off] — filtre M15 vraie impulsion + structure + Fibonacci\n"
@@ -7706,19 +7326,6 @@ def handle_command(text):
         if len(parts) > 1 and not set_choice("limit_zone", parts[1], LIMIT_ZONES):
             return ("Valeur invalide. Exemple : /zone ob | fvg | both", None)
         return (_signal_entry_text(), _signal_entry_keyboard())
-    if cmd == "/qmlatr":
-        try:
-            v = float(parts[1].replace(",", "."))
-            assert 0.1 <= v <= 20
-        except (IndexError, ValueError, AssertionError):
-            return ("Exemple : /qmlatr 2.3 (multiplicateur ATR du mode atr, entre 0.1 et 20)", None)
-        set_setting("qmlg_atr_mult", v)
-        return (f"✅ SL ATR x {v:g} (actif si /qmlsl atr)", None)
-    if cmd == "/qmlsl":
-        if len(parts) > 1 and not set_choice("qmlg_sl_mode", parts[1], QMLG_SL_MODES):
-            return (f"Valeur invalide. Choix : {' | '.join(k.lower() for k in QMLG_SL_MODES)}", None)
-        return (f"🛡 SL QML gagnant : <b>{get_qmlg_sl_mode()}</b> (ATR x {get_qmlg_atr_mult():g})\n"
-                f"Changer : /qmlsl {' | '.join(k.lower() for k in QMLG_SL_MODES)} · /qmlatr 2.3", None)
     if cmd in ("/modesl", "/modetp"):
         key, choices, lbl = ("sl_mode", SL_MODES, _SL_LBL) if cmd == "/modesl" else ("tp_mode", TP_MODES, _TP_LBL)
         if len(parts) > 1 and not set_choice(key, parts[1], choices):
@@ -9224,13 +8831,12 @@ def process_symbol(symbol):
     for trade in open_trades(symbol):
         for ev in track_trade_verified(trade, candles):
             setup_engine_report(ev["trade"], ev["name"])
-            if not send_result_image(ev, dec):   # image de résultat QML (section 7ter) ; sinon envoi habituel
-                chart = make_event_chart(symbol, candles, events, ev["trade"], dec) \
-                    if ev["name"] in CHART_ON_EVENTS else None
-                # Réponse au message Telegram EXACT du signal d'ouverture de CE trade (jamais le dernier
-                # message du groupe) : évite tout mélange entre trades ouverts simultanément (ex. XAUUSD / BTCUSD).
-                to_group(group_event(ev, dec), photo=chart,
-                         reply_to_message_id=ev["trade"].get("signal_message_id"))
+            chart = make_event_chart(symbol, candles, events, ev["trade"], dec) \
+                if ev["name"] in CHART_ON_EVENTS else None
+            # Réponse au message Telegram EXACT du signal d'ouverture de CE trade (jamais le dernier
+            # message du groupe) : évite tout mélange entre trades ouverts simultanément (ex. XAUUSD / BTCUSD).
+            to_group(group_event(ev, dec), photo=chart,
+                     reply_to_message_id=ev["trade"].get("signal_message_id"))
             group_event_media(ev["name"])
             txt = admin_event(ev)
             if txt:
@@ -9340,104 +8946,6 @@ def _be_watch_loop():
         time.sleep(BE_WATCH_INTERVAL)
 
 
-# --- Double vérification SL / RR1 / RR2 en direct (annonce immédiate, groupe UNIQUEMENT) -------------------
-#
-# Objectif : dès que le prix LIVE touche un niveau connu du trade (SL, RR1, RR2), le groupe est prévenu
-# tout de suite, sans attendre la clôture de bougie. C'est une simple ANNONCE anticipée au tick, pas une
-# clôture : track_trade_verified() reste seul maître du résultat officiel (TP/SL/BE), avec ses 4 contrôles,
-# à la clôture de bougie. Donc :
-#   - on ne touche JAMAIS trade["status"], trade["sl"], trade["result_r"], etc.
-#   - on n'envoie RIEN à l'admin / au bot (privé) : uniquement au groupe, et une seule fois par niveau.
-#   - "double vérification" = 2 lectures du prix live qui doivent concorder avant d'annoncer, pour ne pas
-#     signaler sur un tick aberrant (glitch de flux prix).
-RT_WATCH_INTERVAL = _env_int("RT_WATCH_INTERVAL", 5)     # secondes entre deux passages de cette boucle
-RT_DOUBLE_CHECK_DELAY = _env_float("RT_DOUBLE_CHECK_DELAY", 1.5)   # secondes entre les 2 lectures de prix
-
-# Mémorise, par trade, les niveaux déjà annoncés en direct : {trade_id: {"SL", "RR1", "RR2", ...}}
-_rt_announced = {}
-
-
-def _rt_levels(trade):
-    """Niveaux connus du trade : SL (prix), RR1 (prix), RR2 (prix) — uniquement ceux atteignables par CE trade
-    (un RR au-delà de la TP finale du trade n'existe pas pour lui)."""
-    side = 1 if trade["side"] == "BUY" else -1
-    entry = trade["entry"]
-    risk = abs(entry - trade["sl_initial"])
-    if risk <= 0:
-        return {}
-    tp_rr = trade_tp_rr(trade)
-    levels = {"SL": trade["sl"]}   # SL courant (initial, ou déplacé à l'entrée si BE déjà armé)
-    for lvl in (1, 2):
-        if lvl <= tp_rr:
-            levels[f"RR{lvl}"] = entry + side * lvl * risk
-    return levels
-
-
-def _rt_touched(trade, name, price):
-    side = 1 if trade["side"] == "BUY" else -1
-    lvl_price = _rt_levels(trade).get(name)
-    if lvl_price is None:
-        return False
-    if name == "SL":
-        return (price <= lvl_price) if side == 1 else (price >= lvl_price)
-    return (price >= lvl_price) if side == 1 else (price <= lvl_price)   # RR1 / RR2 : sens favorable
-
-
-def _rt_group_text(trade, name):
-    head = f"{trade['symbol']} {trade['side']}"
-    if name == "SL":
-        return f"🔴 <b>SL touché (prix en direct)</b> — {head} · confirmation à la clôture de bougie"
-    return f"🟡 <b>{name} touché (prix en direct)</b> — {head} · confirmation à la clôture de bougie"
-
-
-def check_rt_levels():
-    """Pour chaque trade ouvert : relit le prix live, et si un niveau connu (SL, RR1, RR2) vient d'être
-    touché, le CONFIRME avec une 2e lecture avant d'annoncer au groupe. Un niveau n'est annoncé qu'une
-    seule fois par trade. Ne modifie jamais l'état du trade (aucune écriture en base) : purement informatif."""
-    for trade in open_trades():
-        if trade["status"] != "OPEN":
-            continue
-        levels = _rt_levels(trade)
-        if not levels:
-            continue
-        seen = _rt_announced.setdefault(trade["id"], set())
-        price1 = get_live_price(trade["symbol"])
-        if price1 is None:
-            continue
-        for name in levels:
-            if name in seen:
-                continue
-            if not _rt_touched(trade, name, price1):
-                continue
-            # double vérification : une 2e lecture du prix, après un court délai, doit confirmer le niveau
-            time.sleep(RT_DOUBLE_CHECK_DELAY)
-            price2 = get_live_price(trade["symbol"])
-            if price2 is None or not _rt_touched(trade, name, price2):
-                continue   # tick isolé non confirmé : on ne signale rien, un prochain passage retentera
-            seen.add(name)
-            print(f"[rt-watch] {trade['symbol']} {trade['side']} #{trade['id']} : {name} touché en direct "
-                  f"(prix {price1:g} puis {price2:g}, confirmé) — annonce groupe seule, rien à l'admin/bot.")
-            to_group(_rt_group_text(trade, name))
-            # volontairement : pas de to_admin(), pas d'écriture base — le résultat officiel reste celui
-            # de track_trade_verified() à la clôture de bougie.
-    # nettoyage mémoire : les trades fermés/disparus n'ont plus besoin d'être suivis ici
-    open_ids = {t["id"] for t in open_trades()}
-    for tid in [tid for tid in _rt_announced if tid not in open_ids]:
-        _rt_announced.pop(tid, None)
-
-
-def _rt_watch_loop():
-    """Boucle dédiée à l'annonce anticipée SL/RR1/RR2, en parallèle de _trading_loop et _be_watch_loop :
-    tourne toutes les RT_WATCH_INTERVAL secondes, n'envoie qu'au groupe, jamais à l'admin, et n'écrit
-    jamais en base — ne peut donc jamais interférer avec le résultat officiel du trade."""
-    while True:
-        try:
-            check_rt_levels()
-        except Exception:
-            traceback.print_exc()
-        time.sleep(RT_WATCH_INTERVAL)
-
-
 def _trading_loop():
     """La boucle de scan (symboles + rapport quotidien), tourne en continu en arrière-plan."""
     try:
@@ -9498,7 +9006,6 @@ def _run(port):
     if Flask is None:
         print("⚠️  Flask absent (pip install flask) : pas de serveur /health, boucle en direct.")
         threading.Thread(target=_be_watch_loop, daemon=True).start()
-        threading.Thread(target=_rt_watch_loop, daemon=True).start()
         _trading_loop()
         return
     app = Flask(__name__)
@@ -9513,7 +9020,6 @@ def _run(port):
 
     threading.Thread(target=_trading_loop, daemon=True).start()
     threading.Thread(target=_be_watch_loop, daemon=True).start()
-    threading.Thread(target=_rt_watch_loop, daemon=True).start()
     app.run(host="0.0.0.0", port=port)
 
 
@@ -12217,59 +11723,6 @@ class TestQmlGagnantAlertes(unittest.TestCase):
         self.assertLess(be, tp_rr)
         self.assertGreater(be, 0)
 
-    def test_be_propre_et_desactivable(self):
-        ev = self._ev()
-        _E.set_setting("be_rr", 0.5)                       # le /be de Fibotrain ne doit PAS influencer QML GAGNANT
-        _E.set_setting("qmlg_be_on", "1")
-        _E.set_setting("qmlg_be_rr", 1)
-        _, tp_rr, be = _E._qmlg_trade_levels(ev["alert"], ev)
-        self.assertEqual(be, min(1.0, round(tp_rr - 0.01, 2)), "BE QML = réglage QML, pas /be")
-        _E.set_setting("qmlg_be_on", "0")
-        _, _, be = _E._qmlg_trade_levels(ev["alert"], ev)
-        self.assertIsNone(be, "BE OFF : aucun BE")
-        _E._q("DELETE FROM settings WHERE key IN ('be_rr','qmlg_be_on','qmlg_be_rr')", commit=True)
-
-    def test_sl_derriere_bougie_entree(self):
-        a = self._alert()
-        a["atr"] = 1.0
-        buy_c = self._c(108.5, 109.5, 106.0, 109.2, 1000)          # mèche (106) sous le SL de la zone
-        out = _E._qmlg_sl_behind_candle(a, buy_c)
-        self.assertLess(out["sl"], buy_c["l"], "SL derrière la mèche de la bougie d'entrée")
-        self.assertLessEqual(out["sl"], a["sl"], "jamais plus proche que le SL de la zone")
-        shallow = self._c(108.5, 109.5, 109.0, 109.2, 1000)         # mèche peu profonde : le SL de la zone reste
-        self.assertEqual(_E._qmlg_sl_behind_candle(a, shallow)["sl"], a["sl"])
-
-    def test_tendance_de_fond(self):
-        _E._q("DELETE FROM settings WHERE key IN ('qmlg_trend_on','qmlg_trend_refs')", commit=True)
-        _E._qmlg_trend_cache.clear()
-        saved = _E.qmlg_trend
-        try:
-            _E.qmlg_trend = lambda sym, ref: "bullish"
-            self.assertEqual(_E.qmlg_trend_check("XAUUSD", 1, "bear"), (True, ""), "filtre OFF : tout passe")
-            _E.set_setting("qmlg_trend_on", "1")
-            self.assertTrue(_E.qmlg_trend_check("XAUUSD", 1, "bull")[0])
-            self.assertFalse(_E.qmlg_trend_check("XAUUSD", 1, "bear")[0], "vente contre tendance haussière : bloquée")
-            _E.qmlg_trend = lambda sym, ref: "bearish"
-            self.assertFalse(_E.qmlg_trend_check("XAUUSD", 5, "bull")[0])
-            self.assertTrue(_E.qmlg_trend_check("XAUUSD", 5, "bear")[0])
-            _E.qmlg_trend = lambda sym, ref: "range"
-            self.assertTrue(_E.qmlg_trend_check("XAUUSD", 5, "bull")[0], "range : passe")
-            _E.qmlg_trend = lambda sym, ref: None
-            self.assertTrue(_E.qmlg_trend_check("XAUUSD", 5, "bull")[0], "indisponible : passe")
-        finally:
-            _E.qmlg_trend = saved
-        self.assertTrue(_E.set_qmlg_trend_ref(1, 240))
-        self.assertTrue(_E.set_qmlg_trend_ref(5, 1440))
-        self.assertFalse(_E.set_qmlg_trend_ref(60, 15), "référence <= TF d'entrée refusée")
-        refs = _E.get_qmlg_trend_refs()
-        self.assertEqual((refs[1], refs[5]), (240, 1440))
-        _E.set_setting("qmlg_alert_tfs", "1,5,15")
-        kb = str(_E._qmlg_trend_keyboard())
-        for cb in ("qmlg:tro", "qmlg:trr:1:240", "qmlg:trr:5:1440"):
-            self.assertIn(cb, kb)
-        self.assertIn("qmlg:trend", str(_E._qmlg_keyboard()))
-        _E._q("DELETE FROM settings WHERE key IN ('qmlg_trend_on','qmlg_trend_refs')", commit=True)
-
     def test_cadence_m1_5s(self):
         _E.set_setting("qmlg_alert_tfs", "1,15")
         self.assertEqual(_E._qmlg_loop_delay(), 5)
@@ -14495,26 +13948,8 @@ QMLG_FRACTAL_N = _env_int("QMLG_FRACTAL_N", 3)           # fractals de detect_st
 QMLG_MIN_RR = _env_float("QMLG_MIN_RR", 2.0)             # RR minimum passé à detect_qml
 QMLG_MIN_BARS = _env_int("QMLG_MIN_BARS", 50)            # en dessous : « NO_DATA », pas d'analyse
 QMLG_ATR_PERIOD = _env_int("QMLG_ATR_PERIOD", 14)        # ATR (Wilder) du TF analysé, pour le buffer du SL et la tolérance EQH / EQL
-QMLG_SL_MODE = os.getenv("QMLG_SL_MODE", "SWEEP").strip().upper()   # BUFFER : SL = bord lointain de la zone + buffer ; EXTREME : pile sur ce bord
+QMLG_SL_MODE = os.getenv("QMLG_SL_MODE", "BUFFER").strip().upper()   # BUFFER : SL = bord lointain de la zone + buffer ; EXTREME : pile sur ce bord
 QMLG_SL_BUFFER_ATR = _env_float("QMLG_SL_BUFFER_ATR", 0.05)          # buffer derrière la zone, en ATR
-# SL fusionné depuis qml_sl.py. SWEEP (PAR DÉFAUT) = derrière le sweep (extrême de la tête, du sweep jusqu'au début du QML) + buffer. CANDLE = derrière la bougie de rejet (entrée directe ; sans bougie -> ATR) ;
-# ATR = entrée -/+ QMLG_SL_ATR_MULT x ATR. Ces 2 modes sont SKIP si le SL est hors [QMLG_SL_MIN_ATR ; QMLG_SL_MAX_ATR] x ATR. Telegram : /qmlsl
-QMLG_SL_MODES = ("SWEEP", "BUFFER", "EXTREME", "CANDLE", "ATR")
-QMLG_SL_ATR_MULT = _env_float("QMLG_SL_ATR_MULT", 1.5)
-QMLG_SL_MIN_ATR = _env_float("QMLG_SL_MIN_ATR", 0.3)
-QMLG_SL_MAX_ATR = _env_float("QMLG_SL_MAX_ATR", 4.0)
-
-
-def get_qmlg_sl_mode():
-    return _get_choice("qmlg_sl_mode", QMLG_SL_MODE, QMLG_SL_MODES)
-
-
-def get_qmlg_atr_mult():
-    try:
-        v = float(str(get_setting("qmlg_atr_mult") or QMLG_SL_ATR_MULT).replace(",", "."))
-    except (TypeError, ValueError):
-        v = QMLG_SL_ATR_MULT
-    return v if 0.1 <= v <= 20 else QMLG_SL_ATR_MULT
 QMLG_EQ_TOL_ATR = _env_float("QMLG_EQ_TOL_ATR", 0.10)    # deux sommets / creux à moins de N x ATR forment un EQH / EQL
 QMLG_TFS = tuple(int(x) for x in re.findall(r"\d+", os.getenv("QMLG_TFS", "5,15,30,60"))) or (5, 15, 30, 60)   # TF scannés (minutes)
 QMLG_KEEP = _env_int("QMLG_KEEP", 300)                   # événements / swings gardés par detect_structure (historique des formations)
@@ -14534,12 +13969,6 @@ QMLG_ALERT_MAX_BARS = _env_int("QMLG_ALERT_MAX_BARS", 300)   # une alerte qui n'
 QMLG_ALERT_STALE_BARS = _env_int("QMLG_ALERT_STALE_BARS", 3)   # une réaction plus vieille que N bougies (redémarrage, retard réseau) n'est plus envoyée
 QMLG_ALERT_REACT_BARS = _env_int("QMLG_ALERT_REACT_BARS", 2)   # la bougie d'avalement / pin bar peut venir jusqu'à N bougies APRÈS le toucher de la zone (0 = elle doit toucher la zone elle-même)
 QMLG_ALERT_TO_GROUP = _env_on("QMLG_ALERT_TO_GROUP", True)   # la réaction part aussi au groupe : image + entrée / SL / TP / lot + stickers
-QMLG_SL_CANDLE_BUF_ATR = _env_float("QMLG_SL_CANDLE_BUF_ATR", 0.15)   # SL des alertes : derrière la zone ET derrière la mèche de la bougie d'entrée, + N x ATR (anti-liquidation) ; 0 = SL de la zone seul
-QMLG_BE_RR = _env_float("QMLG_BE_RR", BE_RR)              # RR d'armement du BE propre à QML GAGNANT (indépendant de /be Fibotrain)
-QMLG_BE_CHOICES = (0.5, 1, 1.5, 2, 3)                      # boutons du menu BE QML GAGNANT
-QMLG_TREND_CHOICES = (15, 60, 240, 1440)                   # TF de référence proposés pour la tendance de fond (M15 / H1 / H4 / D1)
-QMLG_TREND_DEFAULT = {1: 15, 3: 15, 5: 60, 15: 240, 30: 240, 60: 240}   # référence proposée par défaut selon le TF d'entrée
-QMLG_TREND_CACHE_SEC = _env_int("QMLG_TREND_CACHE_SEC", 120)           # la tendance d'un (marché, TF de référence) est relue au plus toutes les N s
 
 
 def get_qmlg_on():
@@ -14615,7 +14044,7 @@ def _qmlg_liquidity(structure, buy, entry, tol):
     return lvls
 
 
-def compute_trade(qml, structure=None, entry_price=None, candle=None):
+def compute_trade(qml, structure=None, entry_price=None):
     """Plan de trade d'un QML (dict de detect_qml) : ENTRÉE LIMIT uniquement, jamais d'ordre à marché.
       entrée : bord PROCHE de la zone (achat : haut de la zone ; vente : bas), jamais 50 %.
       SL     : juste DERRIÈRE la zone (bord lointain +/- ATR x QMLG_SL_BUFFER_ATR), ou pile sur ce bord (QMLG_SL_MODE=EXTREME).
@@ -14644,30 +14073,12 @@ def compute_trade(qml, structure=None, entry_price=None, candle=None):
     far = bot if buy else top                        # bord lointain
     if entry_price is not None:                      # entrée directe : à la clôture de la bougie de rejet
         entry, t["order"] = float(entry_price), "DIRECT"
-    mode = get_qmlg_sl_mode()
-    buf = (atr or 0.0) * QMLG_SL_BUFFER_ATR if mode != "EXTREME" else 0.0
+    buf = (atr or 0.0) * QMLG_SL_BUFFER_ATR if QMLG_SL_MODE != "EXTREME" else 0.0
     sl = far - buf if buy else far + buf
-    alt = None
-    if mode in ("SWEEP", "CANDLE", "ATR") and atr:   # SL fusionné de qml_sl.py
-        if mode == "SWEEP":                          # derrière le sweep = extrême de la tête
-            alt = head - buf if buy else head + buf
-        elif mode == "CANDLE" and candle:
-            ext = candle.get("l" if buy else "h")
-            if ext is not None:
-                alt = float(ext) - buf if buy else float(ext) + buf
-        if alt is None or ((alt >= entry) if buy else (alt <= entry)):   # pas de bougie / mauvais côté -> repli ATR
-            d_atr = get_qmlg_atr_mult() * atr
-            alt = entry - d_atr if buy else entry + d_atr
-        dist_atr = abs(entry - alt) / atr
-        if not (QMLG_SL_MIN_ATR <= dist_atr <= QMLG_SL_MAX_ATR):
-            t["entry"], t["sl"], t["sl_mode"] = entry, alt, mode
-            t["reason"] = f"SL {mode} hors limites ({dist_atr:.2f} ATR, permis {QMLG_SL_MIN_ATR:g}-{QMLG_SL_MAX_ATR:g})"
-            return t
-        sl = alt
     behind_head = (sl <= head) if buy else (sl >= head)
-    if behind_head and alt is None:                  # jamais derrière la tête
+    if behind_head:                                  # jamais derrière la tête
         sl = far
-    t["sl_mode"] = mode if alt is not None else ("BUFFER" if (buf and sl != far) else "EXTREME")
+    t["sl_mode"] = "BUFFER" if (buf and sl != far) else "EXTREME"
     risk = (entry - sl) if buy else (sl - entry)
     t["entry"], t["sl"] = entry, sl
     if risk <= 0 or ((sl <= head) if buy else (sl >= head)):
@@ -14787,7 +14198,7 @@ def qmlg_rejection(candles, buy):
     return None
 
 
-def qmlg_validate(qml, structure, direct=False, entry_price=None, candle=None):
+def qmlg_validate(qml, structure, direct=False, entry_price=None):
     """Valide UNE formation QML. Retourne {valid, reasons, trade}. Valide = critères de detect_qml (tendance_avant, sweep,
     choch_cloture, zone_epaule) + zone fraîche (non mitigée ; ignoré en entrée directe, où le prix est justement dans la
     zone) + plan compute_trade exploitable + RR1 >= QMLG_MIN_RR (calculé sur NOTRE plan : SL derrière la zone)."""
@@ -14795,7 +14206,7 @@ def qmlg_validate(qml, structure, direct=False, entry_price=None, candle=None):
     reasons = [k for k in ("tendance_avant", "sweep", "choch_cloture", "zone_epaule") if not cr.get(k)]
     if not direct and not cr.get("zone_fraiche"):
         reasons.append("zone_fraiche")
-    tr = compute_trade(qml, structure, entry_price=entry_price, candle=candle)
+    tr = compute_trade(qml, structure, entry_price=entry_price)
     if not tr["ok"]:
         reasons.append("plan")
     elif tr["rr1"] < QMLG_MIN_RR:
@@ -14819,7 +14230,7 @@ def qmlg_direct_entry(qml, structure, candles):
     pattern = qmlg_rejection(candles, qml["dir"] == "bull")
     if pattern not in QMLG_DIRECT_PATTERNS:   # avalement ou pin bar (retournement) seulement ; le doji ne déclenche pas
         return None
-    v = qmlg_validate(qml, structure, direct=True, entry_price=close, candle=last)
+    v = qmlg_validate(qml, structure, direct=True, entry_price=close)
     if not v["valid"]:
         return None
     return {"pattern": pattern, "entry": close, "time": last["t"], "trade": v["trade"]}
@@ -14964,12 +14375,10 @@ def qmlg_place_alerts(data):
             if key in store:
                 existing += 1
                 continue
-            if not qmlg_trend_check(f["symbol"], f["tf"], f["dir"])[0]:   # contre la tendance de fond : pas d'alerte (reposée si la tendance change)
-                continue
             p = f["plan"]
             store[key] = {"key": key, "symbol": f["symbol"], "tf": f["tf"], "dir": f["dir"],
                           "zone": {"top": f["zone"]["top"], "bottom": f["zone"]["bottom"]},
-                          "sl": p["sl"], "atr": p.get("atr"), "tp1": p["tp1"], "tp1_kind": p["tp1_kind"], "tp2": p["tp2"], "tp2_kind": p["tp2_kind"],
+                          "sl": p["sl"], "tp1": p["tp1"], "tp1_kind": p["tp1_kind"], "tp2": p["tp2"], "tp2_kind": p["tp2_kind"],
                           "last_t": f["last_t"], "entered": False, "created_ts": time.time()}
             placed += 1
         if placed:
@@ -14980,93 +14389,6 @@ def qmlg_place_alerts(data):
 QMLG_ALERT_TF_CHOICES = (1, 5, 15, 30, 60)   # TF proposés dans le menu (minutes)
 _QMLG_PAT_FR = {"ENGULFING": "AVALEMENT", "PIN_BAR": "PIN BAR", "DOJI": "DOJI"}
 _qmlg_refresh_due = {}                         # (marché, TF) -> instant du prochain scan des zones
-
-
-def get_qmlg_be_on():
-    """BE de QML GAGNANT activé ? Réglage PROPRE à cette stratégie (bouton du menu), indépendant de Fibotrain. ON par défaut."""
-    return _get_bool_setting("qmlg_be_on", True)
-
-
-def get_qmlg_be_rr():
-    """RR d'armement du BE de QML GAGNANT (menu), sinon QMLG_BE_RR. Ne suit JAMAIS le /be de Fibotrain."""
-    try:
-        v = float(get_setting("qmlg_be_rr", QMLG_BE_RR))
-    except (TypeError, ValueError):
-        return QMLG_BE_RR
-    return v if v > 0 else QMLG_BE_RR
-
-
-def get_qmlg_trend_on():
-    """Filtre « tendance de fond » de QML GAGNANT activé ? OFF par défaut (bouton du menu)."""
-    return _get_bool_setting("qmlg_trend_on", False)
-
-
-def get_qmlg_trend_refs():
-    """{TF d'entrée: TF de référence} choisis dans le menu. Une référence invalide (pas plus grande que le TF d'entrée,
-    ou hors choix) est remplacée par la valeur par défaut du TF."""
-    try:
-        raw = json.loads(get_setting("qmlg_trend_refs", "{}") or "{}")
-        raw = raw if isinstance(raw, dict) else {}
-    except ValueError:
-        raw = {}
-    out = {}
-    for tf in QMLG_ALERT_TF_CHOICES:
-        try:
-            ref = int(raw.get(str(tf), 0))
-        except (TypeError, ValueError):
-            ref = 0
-        if ref not in QMLG_TREND_CHOICES or ref <= tf:
-            ref = QMLG_TREND_DEFAULT.get(tf) or next((r for r in QMLG_TREND_CHOICES if r > tf), QMLG_TREND_CHOICES[-1])
-        out[tf] = ref
-    return out
-
-
-def set_qmlg_trend_ref(tf, ref):
-    """Choisit le TF de référence de la tendance pour un TF d'entrée. Retourne True si accepté."""
-    if tf not in QMLG_ALERT_TF_CHOICES or ref not in QMLG_TREND_CHOICES or ref <= tf:
-        return False
-    refs = get_qmlg_trend_refs()
-    refs[tf] = ref
-    set_setting("qmlg_trend_refs", json.dumps({str(k): v for k, v in refs.items()}))
-    return True
-
-
-_qmlg_trend_cache = {}   # (marché, TF de référence) -> (instant, tendance)
-
-
-def qmlg_trend(symbol, ref):
-    """Tendance de fond du marché sur le TF `ref` d'après detect_structure : 'bullish' | 'bearish' | 'range' ; None si les bougies
-    sont indisponibles (le filtre laisse alors passer : une panne réseau ne bloque pas les signaux)."""
-    now = time.time()
-    hit = _qmlg_trend_cache.get((symbol, ref))
-    if hit and now - hit[0] < QMLG_TREND_CACHE_SEC:
-        return hit[1]
-    try:
-        candles = get_candles(symbol, minutes=ref) or []
-        if len(candles) < 30:
-            return hit[1] if hit else None
-        trend = detect_structure(candles, f"M{ref}", n=QMLG_FRACTAL_N, keep=QMLG_KEEP).get("trend")
-    except Exception as e:
-        print(f"[qmlg-tendance] {symbol} {_tf_lbl(ref)} : lecture impossible ({type(e).__name__})")
-        return hit[1] if hit else None
-    _qmlg_trend_cache[(symbol, ref)] = (now, trend)
-    return trend
-
-
-_QMLG_TREND_FR = {"bullish": "haussière 📈", "bearish": "baissière 📉", "range": "indécise (range)"}
-
-
-def qmlg_trend_check(symbol, tf, direction):
-    """(autorisé, texte) : le signal `direction` ('bull' / 'bear') sur le TF d'entrée `tf` suit-il la tendance du TF de référence ?
-    Filtre OFF, tendance 'range' ou indisponible : autorisé. Texte = ligne pour la légende ('' si filtre OFF)."""
-    if not get_qmlg_trend_on():
-        return True, ""
-    ref = get_qmlg_trend_refs().get(tf) or QMLG_TREND_DEFAULT.get(tf, 60)
-    trend = qmlg_trend(symbol, ref)
-    if trend is None:
-        return True, f"🧭 Tendance {_tf_lbl(ref)} : indisponible (signal non filtré)"
-    ok = trend == "range" or (trend == "bullish") == (direction == "bull")
-    return ok, f"🧭 Tendance {_tf_lbl(ref)} : {_QMLG_TREND_FR.get(trend, trend)} {'✅' if ok else '⛔'}"
 
 
 def get_qmlg_alert_on():
@@ -15124,21 +14446,6 @@ def _qmlg_alert_rr(a, close):
     return risk, rr(a.get("tp1")), rr(a.get("tp2"))
 
 
-def _qmlg_sl_behind_candle(a, c):
-    """Copie de l'alerte avec un SL anti-liquidation : le plus éloigné entre le SL de la zone et la mèche de la bougie d'entrée,
-    puis + QMLG_SL_CANDLE_BUF_ATR x ATR derrière (sans ATR connu : 0.05 % du prix). QMLG_SL_CANDLE_BUF_ATR = 0 : SL de la zone seul.
-    Jamais rapproché de l'entrée : le SL ne peut que s'éloigner."""
-    if QMLG_SL_CANDLE_BUF_ATR <= 0:
-        return a
-    buy = a["dir"] == "bull"
-    atr = a.get("atr") or 0.0
-    buf = atr * QMLG_SL_CANDLE_BUF_ATR if atr else abs(c["c"]) * 0.0005
-    sl = min(a["sl"], c["l"] - buf) if buy else max(a["sl"], c["h"] + buf)
-    out = dict(a)
-    out["sl_zone"], out["sl"] = a["sl"], sl
-    return out
-
-
 def qmlg_alert_eval(a, candles, now=None):
     """Fait avancer UNE alerte (fonction pure, sans réseau). candles : bougies clôturées (la plus récente en dernier).
     Aucun message quand le prix ENTRE dans la zone. Une RÉACTION = bougie qui touche la zone, ne l'invalide pas et forme un
@@ -15165,10 +14472,9 @@ def qmlg_alert_eval(a, candles, now=None):
             pattern = qmlg_rejection(candles[:k + 1], buy)
             fresh = now is None or now - (c["t"] + tf_sec) <= QMLG_ALERT_STALE_BARS * tf_sec
             if pattern in QMLG_ALERT_PATTERNS and fresh:
-                a_sl = _qmlg_sl_behind_candle(a, c)   # SL derrière la zone ET derrière la mèche de la bougie d'entrée
-                risk, rr1, rr2 = _qmlg_alert_rr(a_sl, c["c"])
+                risk, rr1, rr2 = _qmlg_alert_rr(a, c["c"])
                 if rr1 is not None and rr1 >= QMLG_ALERT_MIN_RR:
-                    evs.append({"type": "reaction", "alert": dict(a_sl), "pattern": pattern, "close": c["c"], "t": c["t"],
+                    evs.append({"type": "reaction", "alert": dict(a), "pattern": pattern, "close": c["c"], "t": c["t"],
                                 "risk": risk, "rr1": rr1, "rr2": rr2})
                     return None, evs   # réaction envoyée : l'alerte est terminée
         a["last_t"] = c["t"]
@@ -15187,8 +14493,7 @@ def qmlg_alert_text(ev, li, be_rr=None):
            f"réaction {_QMLG_PAT_FR.get(ev['pattern'], ev['pattern'])}\n"
            f"📍 Entrée {px(ev['close'])}\n🛡 SL {px(a['sl'])}\n"
            f"🎯 TP1 {tp('tp1', ev['rr1'])}\n🎯 TP2 {tp('tp2', ev['rr2'])}\n"
-           + (f"🔒 BE → RR{be_rr:g}\n" if be_rr else "🔓 BE désactivé (SL fixe)\n")
-           + (ev["trend_line"] + "\n" if ev.get("trend_line") else "")
+           + (f"🔒 BE → RR{be_rr:g}\n" if be_rr else "")
            + f"💰 Lot <b>{li['lot']:g}</b> · risque {li['real_risk']:.2f} $")
     if li.get("raised_to_min"):
         txt += "\n⚠️ lot minimum du broker : risque réel plus élevé que prévu"
@@ -15216,15 +14521,12 @@ def _qmlg_alert_chart(ev):
 
 
 def _qmlg_trade_levels(a, ev):
-    """(TP final, RR du TP final, RR du BE ou None) du trade suivi. TP final = TP2 s'il existe, sinon TP1.
-    BE = réglage PROPRE à QML GAGNANT (get_qmlg_be_on / get_qmlg_be_rr), jamais le /be de Fibotrain. BE désactivé -> None.
-    Si le RR du BE n'est pas sous le TP final : RR1 (TP1 atteint -> SL à l'entrée) quand TP2 existe, sinon la moitié du RR final."""
+    """(TP final, RR du TP final, RR du BE) du trade suivi. TP final = TP2 s'il existe, sinon TP1. BE = RR réglé avec /be ;
+    s'il n'est pas sous le TP final : RR1 (TP1 atteint -> SL à l'entrée) quand TP2 existe, sinon la moitié du RR final."""
     has_tp2 = a.get("tp2") is not None and ev.get("rr2") is not None
     tp_final = a["tp2"] if has_tp2 else a["tp1"]
     tp_rr = round(ev["rr2"] if has_tp2 else ev["rr1"], 2)
-    if not get_qmlg_be_on():
-        return tp_final, tp_rr, None
-    be = get_qmlg_be_rr()
+    be = get_be_rr()
     if be >= tp_rr:
         be = ev["rr1"] if (has_tp2 and ev["rr1"] < tp_rr) else tp_rr / 2
     return tp_final, tp_rr, round(min(be, tp_rr - 0.01), 2)
@@ -15272,11 +14574,6 @@ def qmlg_alert_deliver(ev):
     key = f"QMLG:{a['key']}:{ev['t']}"
     if signal_exists(key):   # déjà livrée (anti-doublon)
         return False
-    t_ok, t_line = qmlg_trend_check(sym, a["tf"], a["dir"])   # contrôle n°1 bis : tendance de fond (si activée)
-    if not t_ok:
-        print(f"[qmlg-alertes] {sym} {_tf_lbl(a['tf'])} : réaction ignorée (contre la tendance de fond) — {t_line}")
-        return False
-    ev["trend_line"] = t_line
     li = calc_lot(sym, get_risk(), ev["risk"], price=ev["close"])
     if li["lot"] <= 0:
         why = li.get("rejected_reason") or "lot invalide (risque ou distance SL)"
@@ -15290,7 +14587,6 @@ def qmlg_alert_deliver(ev):
         return False
     tp_final, tp_rr, be_rr = _qmlg_trade_levels(a, ev)
     caption = qmlg_alert_text(ev, li, be_rr=be_rr)
-    be_store = be_rr if be_rr else round(tp_rr + 1.0, 2)   # be_rr >= tp_rr : le suivi n'arme jamais le BE pour ce trade
     path = None
     try:
         path = _qmlg_alert_chart(ev)
@@ -15303,7 +14599,7 @@ def qmlg_alert_deliver(ev):
                 status="OPEN", order_type="DIRECT", placed_ts=ev["t"], ref_price=ev["close"],
                 sent_admin=1, sent_group=0,   # sent_group passe à 1 quand Telegram a confirmé (sinon renvoi automatique)
                 signal_key=key, symbol=sym, side="BUY" if buy else "SELL", kind="QMLG", timeframe=_tf_lbl(a["tf"]),
-                entry=ev["close"], sl=a["sl"], sl_initial=a["sl"], tp=tp_final, be_rr=be_store,
+                entry=ev["close"], sl=a["sl"], sl_initial=a["sl"], tp=tp_final, be_rr=be_rr,
                 risk_usd=li["real_risk"], lot=li["lot"], leverage=get_leverage(), opened_ts=now_ts(),
                 last_ts=ev["t"] + a["tf"] * 60 - 1,   # le suivi commence APRÈS la clôture de la bougie de réaction
                 exec_status=None, part_cfg=None)
@@ -15562,11 +14858,6 @@ def _qmlg_menu_text():
     return (f"🏆 <b>QML GAGNANT</b> — {'🟢 ON' if get_qmlg_on() else '🔴 OFF'}\n\n"
             f"🔔 <b>Alerte réaction</b> : {'🟢 ON' if get_qmlg_alert_on() else '🔴 OFF'} · TF "
             f"{', '.join(_tf_lbl(t) for t in get_qmlg_alert_tfs())} · {len(qmlg_alert_symbols())} marché(s) (menu 🌍 ACTIFS)\n"
-            f"🔒 <b>BE QML GAGNANT</b> : {'🟢 ON à RR' + format(get_qmlg_be_rr(), 'g') if get_qmlg_be_on() else '🔴 OFF (SL fixe)'} — indépendant de /be Fibotrain. "
-            f"🛡 SL : derrière la zone ET la mèche de la bougie d'entrée (+{QMLG_SL_CANDLE_BUF_ATR:g} ATR).\n"
-            f"🧭 <b>Tendance de fond</b> : {'🟢 ON' if get_qmlg_trend_on() else '🔴 OFF'}"
-            + (" · " + " · ".join(f"{_tf_lbl(t)}→{_tf_lbl(get_qmlg_trend_refs()[t])}" for t in get_qmlg_alert_tfs()) if get_qmlg_trend_on() else "")
-            + " (signaux seulement dans le sens de la tendance du TF de référence).\n"
             f"C'est toi qui l'actives. Elle alerte seulement sur une RÉACTION dans une zone QML (avalement ou pin bar), pas quand le prix "
             f"y entre. Entrée, SL, TP1 / TP2 (RR), BE, lot, image et stickers partent au groupe, puis RR / BE / TP / SL en réponse. "
             f"Seuls les TF cochés ci-dessous sont scannés (chaque TF à chaque clôture de bougie : M1 = 1 min, M5 = 5 min, M15 = 15 min).\n\n"
@@ -15581,33 +14872,9 @@ def _qmlg_keyboard():
     return _with_back({"inline_keyboard": [
         [{"text": f"🔔 Alerte réaction : {'ON ✅' if get_qmlg_alert_on() else 'OFF'}", "callback_data": "qmlg:alert"}],
         [{"text": f"{'✅ ' if t in tfs else ''}{_tf_lbl(t)}", "callback_data": f"qmlg:tf:{t}"} for t in QMLG_ALERT_TF_CHOICES],
-        [{"text": f"🧭 Tendance de fond : {'ON ✅' if get_qmlg_trend_on() else 'OFF'}", "callback_data": "qmlg:tro"},
-         {"text": "⚙️ Réf. tendance", "callback_data": "qmlg:trend"}],
-        [{"text": f"🔒 BE QML GAGNANT : {'ON ✅' if get_qmlg_be_on() else 'OFF'}", "callback_data": "qmlg:be"}],
-        [{"text": ("✅ " if abs(get_qmlg_be_rr() - v) < 1e-9 else "") + f"RR{v:g}", "callback_data": f"qmlg:ber:{v}"} for v in QMLG_BE_CHOICES],
         [{"text": "🔍 Analyse", "callback_data": "qmlg:analyse"}],
         [{"text": "⏳ Ordre limite", "callback_data": "qmlg:limit"}, {"text": "⚡ Entrée directe", "callback_data": "qmlg:direct"}],
     ]})
-
-
-def _qmlg_trend_text():
-    on = get_qmlg_trend_on()
-    refs = get_qmlg_trend_refs()
-    lines = "\n".join(f"• {_tf_lbl(t)} → tendance {_tf_lbl(refs[t])}" for t in get_qmlg_alert_tfs())
-    return (f"🧭 <b>Tendance de fond — QML GAGNANT</b> : {'🟢 ON' if on else '🔴 OFF'}\n\n"
-            f"Pour chaque TF coché, choisis le TF de référence : le signal n'est envoyé que s'il va dans le sens de la tendance "
-            f"(structure BOS / CHoCH) de ce TF. Tendance indécise (range) ou indisponible : le signal passe.\n\n{lines}")
-
-
-def _qmlg_trend_keyboard():
-    refs = get_qmlg_trend_refs()
-    rows = [[{"text": f"🧭 Filtre tendance : {'ON ✅' if get_qmlg_trend_on() else 'OFF'}", "callback_data": "qmlg:tro"}]]
-    for t in get_qmlg_alert_tfs():
-        rows.append([{"text": f"{_tf_lbl(t)} →", "callback_data": "qmlg:trend"}]
-                    + [{"text": ("✅ " if refs[t] == r else "") + _tf_lbl(r), "callback_data": f"qmlg:trr:{t}:{r}"}
-                       for r in QMLG_TREND_CHOICES if r > t])
-    rows.append([{"text": "⬅️ QML GAGNANT", "callback_data": "qmlg:home"}])
-    return {"inline_keyboard": rows}
 
 
 _qmlg_lock = threading.Lock()   # un seul scan à la fois
@@ -15658,38 +14925,9 @@ def _qmlg_callback(cq, arg):
         on = not get_qmlg_alert_on()
         set_qmlg_alert_on(on)
         toast = "Alerte réaction : " + ("ON" if on else "OFF")
-    elif arg in ("trend", "tro") or arg.startswith("trr:"):   # tendance de fond : ON/OFF + TF de référence (page dédiée)
-        if arg == "tro":
-            on = not get_qmlg_trend_on()
-            set_setting("qmlg_trend_on", "1" if on else "0")
-            toast = "Tendance de fond : " + ("ON" if on else "OFF")
-        elif arg.startswith("trr:"):
-            try:
-                _, t_, r_ = arg.split(":")
-                if set_qmlg_trend_ref(int(t_), int(r_)):
-                    toast = f"{_tf_lbl(int(t_))} suit la tendance {_tf_lbl(int(r_))}"
-            except ValueError:
-                pass
-        _edit(cq, _qmlg_trend_text(), _qmlg_trend_keyboard())
-        return toast
-    elif arg == "be":   # BE QML GAGNANT ON / OFF : indépendant de Fibotrain, ne touche que les NOUVEAUX signaux
-        on = not get_qmlg_be_on()
-        set_setting("qmlg_be_on", "1" if on else "0")
-        toast = "BE QML GAGNANT : " + ("ON" if on else "OFF (SL fixe)")
-    elif arg.startswith("ber:"):
-        try:
-            v = float(arg[4:])
-            if v > 0:
-                set_setting("qmlg_be_rr", v)
-                toast = f"BE QML GAGNANT → RR{v:g}"
-        except ValueError:
-            pass
     elif arg.startswith("tf:") and arg[3:].isdigit():
         tfs = toggle_qmlg_alert_tf(int(arg[3:]))
         toast = "TF : " + ", ".join(_tf_lbl(t) for t in tfs)
-        if get_qmlg_trend_on() and int(arg[3:]) in tfs:   # TF qui vient d'être coché : on demande sa tendance de référence
-            _edit(cq, _qmlg_trend_text(), _qmlg_trend_keyboard())
-            return toast + " — choisis la tendance de référence"
     _edit(cq, _qmlg_menu_text(), _qmlg_keyboard())
     return toast
 
@@ -16198,31 +15436,29 @@ def verify_outcome(trade, outcome):
         votes.append(("M1", None if rp is None else rp == outcome, f"M1 -> {rp}"))
     except Exception as e:
         votes.append(("M1", None, f"indisponible ({type(e).__name__})"))
-    pos = trade.get("mt5_position_id") if mt5_orders_allowed() else None
+    pos = trade.get("mt5_position_id")
     deals = None
     if pos:
         try:
             deals = _run_mt5(_mt5_position_deals_async(str(pos)))
         except Exception:
             deals = None
-    # 2) deals MT5 (raison de sortie SL / TP) — ignoré si exécution MT5 désactivée (rien à vérifier côté broker)
-    if mt5_orders_allowed():
-        if pos and deals:
-            o2, _r, _p = _mt5_close_outcome(trade, deals)
-            votes.append(("Deals MT5", None if o2 == "CLOSED_EXT" else o2 == outcome, f"MT5 -> {o2}"))
-        else:
-            votes.append(("Deals MT5", None, "pas de position MT5" if not pos else "deals indisponibles"))
-    # 3) position réellement fermée côté broker — idem, ignoré si MT5 désactivé
-    if mt5_orders_allowed():
-        if pos:
-            try:
-                ids = _run_mt5(_mt5_open_position_ids_async())
-            except Exception:
-                ids = None
-            votes.append(("Position MT5", None if ids is None else str(pos) not in ids,
-                          "indisponible" if ids is None else ("fermée" if str(pos) not in ids else "encore ouverte")))
-        else:
-            votes.append(("Position MT5", None, "n/a"))
+    # 2) deals MT5 (raison de sortie SL / TP)
+    if pos and deals:
+        o2, _r, _p = _mt5_close_outcome(trade, deals)
+        votes.append(("Deals MT5", None if o2 == "CLOSED_EXT" else o2 == outcome, f"MT5 -> {o2}"))
+    else:
+        votes.append(("Deals MT5", None, "pas de position MT5" if not pos else "deals indisponibles"))
+    # 3) position réellement fermée côté broker
+    if pos:
+        try:
+            ids = _run_mt5(_mt5_open_position_ids_async())
+        except Exception:
+            ids = None
+        votes.append(("Position MT5", None if ids is None else str(pos) not in ids,
+                      "indisponible" if ids is None else ("fermée" if str(pos) not in ids else "encore ouverte")))
+    else:
+        votes.append(("Position MT5", None, "n/a"))
     # 4) cohérence : niveaux, signe du R, horodatage
     try:
         side, entry, risk, sl0, tp = _vf_levels(trade)
@@ -16283,6 +15519,5 @@ if __name__ == "__main__":
     if "--selftest" in sys.argv:
         sys.exit(_selftest())
     main()
-
 
 
