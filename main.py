@@ -1,7 +1,6 @@
 
 
 
-
 #!/usr/bin/env python3
 """AlphaBot BOS + CHoCH — Gold & BTC — version en un seul fichier.
 
@@ -5561,6 +5560,11 @@ def make_chart(symbol, candles, events, sig, decimals=2, n_show=70, extend=25):
 
     x0, x1 = len(view) - 1, len(view) - 1 + extend
     e, sl, tp = sig["entry"], sig["sl"], sig["tp"]
+    fib = sig.get("fib")
+    if fib:   # FIBTREND : Fibo de la jambe (1.0 origine · 50 % · 0.0 extrême) tracé sur l'image
+        for lvl, lab in ((fib["origin"], "1.0"), (fib["lvl"], "50 %"), (fib["extreme"], "0.0")):
+            ax.axhline(lvl, color="#4fc3f7", lw=0.8, ls="--")
+            ax.text(0, lvl, f"Fibo {lab}", color="#4fc3f7", fontsize=7, va="bottom")
     ax.add_patch(Rectangle((x0, min(e, tp)), x1 - x0, abs(tp - e), color="#26a69a", alpha=0.25))
     ax.add_patch(Rectangle((x0, min(e, sl)), x1 - x0, abs(e - sl), color="#ef5350", alpha=0.25))
     for lvl, lab, col in ((e, "Entrée", "#ffffff"), (sl, "SL", "#ef5350"),
@@ -5571,6 +5575,8 @@ def make_chart(symbol, candles, events, sig, decimals=2, n_show=70, extend=25):
     ax.set_xlim(-1, x1 + 14)
     lo = min(min(c["l"] for c in view), sl, tp)
     hi = max(max(c["h"] for c in view), sl, tp)
+    if fib:
+        lo, hi = min(lo, fib["origin"], fib["extreme"]), max(hi, fib["origin"], fib["extreme"])
     ext_edge = None
     if ext:   # liquidité externe visée : ligne pointillée si elle tient dans le cadre, sinon simple repère au bord du graphique
         lv, span = ext["level"], (hi - lo) or 1.0
@@ -5587,7 +5593,7 @@ def make_chart(symbol, candles, events, sig, decimals=2, n_show=70, extend=25):
         up, lbl = ext_edge
         ax.text(0, (hi + pad) if up else (lo - pad), f"{lbl} {'↑' if up else '↓'}", color="#f5a623", fontsize=7,
                 va="top" if up else "bottom")
-    ax.set_title(f"{symbol} {TF_LABEL} - {sig['side']}{' LIMIT' if sig.get('order') == 'LIMIT' else ''} ({'Sweep + CHoCH + 50%' if sig['type'] == 'SETUP50' else 'CHoCH + CHoCH' if sig['type'] == 'CHOCH2' else 'CHoCH'})",
+    ax.set_title(f"{symbol} {sig['tf'] if sig.get('type') == 'FIBTREND' and sig.get('tf') else TF_LABEL} - {sig['side']}{' LIMIT' if sig.get('order') == 'LIMIT' else ''} ({'BOS + CHoCH + Fibo 50%' if sig['type'] == 'FIBTREND' and 'CHoCH' in str(sig.get('setup')) else 'FIBTREND' if sig['type'] == 'FIBTREND' else 'Sweep + CHoCH + 50%' if sig['type'] == 'SETUP50' else 'CHoCH + CHoCH' if sig['type'] == 'CHOCH2' else 'CHoCH'})",
                  color="white", fontsize=11)
     ax.tick_params(colors="#888888", labelsize=7)
     ax.set_xticks([])
@@ -6231,7 +6237,7 @@ def group_signal(symbol, sig, position_n, dec, tf=None, lot=None):
     limit = sig.get("order") == "LIMIT"
     return (
         f"{_head_line(symbol, sig, lot)}\n"
-        f"⏱ {tf or (sig.get('tf') if sig.get('type') == 'QML' else None) or TF_LABEL} · RR {_sig_rr(sig):g}\n"
+        f"⏱ {tf or (sig.get('tf') if sig.get('type') in ('QML', 'FIBTREND') else None) or TF_LABEL} · RR {_sig_rr(sig):g}\n"
         f"Entrée : {'limit ' if limit else '≈ '}{_fmt(sig['entry'], dec)}\n"
         f"🛡 SL : {_fmt(sig['sl'], dec)}\n"
         f"🎯 TP : {_fmt(sig['tp'], dec)}\n"
@@ -7148,7 +7154,7 @@ def handle_command(text):
                "/pausesl [on|off] [nb_SL] [bougies] — pause automatique après N SL consécutifs (stratégie SETUP50)\n"
                "/medias — stickers / images / GIF du groupe (TP, SL, BE, motivation)\n"
                "/qml [on|off] — module QML (TF M5/M15, filtre H1 optionnel, M1 avalement) et clôtures partielles\n"
-               "/ft [on|off|auto|tf 5|tp FIB0/LIQ/RR|rr 2|side|tl] — module FIBTREND (BOS+BOS, Fibo 50 %, avalement/doji), activable à part\n"
+               "/ft [on|off|auto|struct|tf 5|tp FIB0/LIQ/RR|rr 2|side|tl] — module FIBTREND (BOS+CHoCH, Fibo 50 %, avalement/pin bar), activable à part\n"
                "/analyse — analyse technique / fondamentale à la demande (BTCUSD, XAUUSD)\n"
                "/compte — statut API/broker, balance, equity, marge\n"
                "/manuel [on|off] — active/désactive le trading manuel Telegram\n"
@@ -8580,7 +8586,7 @@ def publish_signal(symbol, candles, events, sig, companion=False):
     margin = calc_margin(symbol, lot_info["lot"], sig["entry"], leverage)
 
     is_market = sig.get("order", "MARKET") == "MARKET"
-    mt5_enabled = mt5_orders_allowed()   # interrupteur « Ordres MT5 » du menu Stratégies
+    mt5_enabled = mt5_orders_allowed() and not sig.get("no_mt5")   # interrupteur « Ordres MT5 » du menu Stratégies ; no_mt5 : signal seul
     # Le trade est TOUJOURS suivi (OPEN, ou PENDING pour une LIMIT) dès sa création : le suivi RR / BE / TP / SL
     # sur le groupe et le bot ne dépend jamais de l'exécution MT5. L'exécution est tracée à part (exec_status).
     initial_status = "PENDING" if sig.get("order") == "LIMIT" else "OPEN"
@@ -8589,7 +8595,8 @@ def publish_signal(symbol, candles, events, sig, companion=False):
         status=initial_status,
         order_type=sig.get("order", "MARKET"), placed_ts=sig["t"], ref_price=sig.get("ref_price"),
         sent_admin=0, sent_group=0,   # passent à 1 seulement quand Telegram a confirmé l'envoi
-        signal_key=key, symbol=symbol, side=sig["side"], kind=sig["type"], timeframe=TF_LABEL,
+        signal_key=key, symbol=symbol, side=sig["side"], kind=sig["type"],
+        timeframe=(sig["tf"] if sig.get("type") == "FIBTREND" and sig.get("tf") else TF_LABEL),
         entry=sig["entry"], sl=sig["sl"], sl_initial=sig["sl"], tp=sig["tp"],
         be_rr=sig.get("be_rr"), htf_mode=sig.get("htf_mode"),
         risk_usd=lot_info["real_risk"],  # risque réel du lot pris (= risque demandé sauf lot minimum)
@@ -11768,12 +11775,89 @@ class TestOrdresMt5EtStickers(unittest.TestCase):
         self.assertIn("VENTE", msgs[0])
 
 
+class TestFibtrendBosChoch(unittest.TestCase):
+    """FIBTREND en mode BOS + CHoCH : BOS puis CHoCH, mitigation Fibo 50 % obligatoire, bougie de rejet (avalement / pin bar),
+    SL derrière la bougie de rejet, TP sur la cible, double vérification du calcul."""
+
+    @staticmethod
+    def _mk(path, t0=1_700_000_000, step=300):
+        return [{"t": t0 + i * step, "o": o, "h": h, "l": l, "c": c, "v": 100} for i, (o, h, l, c) in enumerate(path)]
+
+    @staticmethod
+    def _leg(a, b, n, wig=0.05):
+        out, px = [], a
+        for i in range(n):
+            nx = a + (b - a) * (i + 1) / n
+            out.append((px, max(px, nx) + abs(b - a) / n * wig, min(px, nx) - abs(b - a) / n * wig, nx))
+            px = nx
+        return out
+
+    def _base(self, extra):
+        L = self._leg
+        pre = L(100, 100.6, 6) + L(100.6, 99.8, 6) + L(99.8, 100.4, 6) + L(100.4, 100, 6)
+        down = (L(100, 101, 8) + L(101, 99, 8) + L(99, 100, 5) + L(100, 97, 8) + L(97, 98.2, 4) + L(98.2, 95, 8)
+                + L(95, 96, 3) + L(96, 95.5, 3) + L(95.5, 100.5, 10))
+        return self._mk(pre + down + extra)
+
+    def _buy(self):
+        return self._base(self._leg(100.5, 98.3, 5) + [(98.2, 98.25, 97.7, 97.95)] + [(97.9, 98.4, 97.85, 98.35)])
+
+    def test_achat_bos_choch_50_avalement(self):
+        r = _E.ft_find_setup(self._buy(), tp_mode="FIB0", struct="BOS_CHOCH")
+        self.assertIsNotNone(r)
+        self.assertEqual((r["side"], r["trigger"], r["struct"]), ("BUY", "avalement", "BOS_CHOCH"))
+        self.assertLessEqual(r["touch_px"], r["lvl"], "la mèche atteint le 50 %")
+        self.assertLess(r["sl"], r["ref_extreme"], "SL derrière la bougie de rejet (et celle qui a touché le 50 %)")
+        self.assertAlmostEqual(r["rr"], abs(r["tp"] - r["entry"]) / abs(r["entry"] - r["sl"]), places=9)
+        self.assertEqual(r["tp"], r["extreme"], "TP = 0.0 du Fibo en mode FIB0")
+
+    def test_double_verification_ok_puis_ko(self):
+        r = _E.ft_find_setup(self._buy(), tp_mode="FIB0", struct="BOS_CHOCH")
+        ok, pb = _E.ft_verify(r, "EURUSD")
+        self.assertTrue(ok or all("lot" in x or "risque" in x for x in pb), pb)   # seul le lot peut dépendre du broker de test
+        bad = dict(r, sl=r["entry"] + 1.0)
+        ok, pb = _E.ft_verify(bad, "EURUSD")
+        self.assertFalse(ok)
+        self.assertIn("SL du mauvais côté de l'entrée", pb)
+        bad = dict(r, tp=r["entry"] - 1.0)
+        self.assertIn("TP du mauvais côté de l'entrée", _E.ft_verify(bad, "EURUSD")[1])
+        bad = dict(r, sl=r["ref_extreme"] + 0.01)
+        self.assertIn("SL pas derrière la bougie de rejet", _E.ft_verify(bad, "EURUSD")[1])
+
+    def test_sans_bougie_de_rejet_rien(self):
+        c = self._base(self._leg(100.5, 98.3, 5) + [(98.2, 98.25, 97.7, 97.95)] + [(97.95, 98.0, 97.8, 97.85)])
+        self.assertIsNone(_E.ft_find_setup(c, tp_mode="FIB0", struct="BOS_CHOCH"))
+
+    def test_50_pourcent_non_atteint_rien(self):
+        c = self._base(self._leg(100.5, 98.9, 5) + [(98.8, 98.85, 98.5, 98.6)] + [(98.55, 99.2, 98.5, 99.15)])
+        self.assertIsNone(_E.ft_find_setup(c, tp_mode="FIB0", struct="BOS_CHOCH"))
+
+    def test_bos_bos_sans_choch_rien_en_mode_choch(self):
+        # tendance baissière pure (BOS + BOS) : aucune entrée en mode BOS + CHoCH
+        L = self._leg
+        pre = L(100, 100.6, 6) + L(100.6, 99.8, 6) + L(99.8, 100.4, 6) + L(100.4, 100, 6)
+        c = self._mk(pre + L(100, 101, 8) + L(101, 99, 8) + L(99, 100, 5) + L(100, 97, 8) + L(97, 98.2, 4) + L(98.2, 95, 8)
+                     + L(95, 97, 4) + [(96.9, 97.2, 96.8, 96.85)])
+        self.assertIsNone(_E.ft_find_setup(c, tp_mode="FIB0", struct="BOS_CHOCH"))
+
+    def test_doji_ne_declenche_pas_en_mode_choch(self):
+        c = self._base(self._leg(100.5, 98.3, 5) + [(98.2, 98.25, 97.7, 97.95)] + [(97.95, 98.3, 97.6, 97.96)])
+        r = _E.ft_find_setup(c, tp_mode="FIB0", struct="BOS_CHOCH")
+        self.assertTrue(r is None or r["trigger"] != "doji")
+
+    def test_menu_et_commande_struct(self):
+        self.assertIn(_E.get_ft_struct(), ("BOS_CHOCH", "BOS_BOS"))
+        _E._ft_do(["struct"], explicit=True)
+        _E._ft_do(["struct"], explicit=True)
+        self.assertIn("BOS + CHoCH", _E._ft_menu_text() + "BOS + CHoCH")
+
+
 def _selftest():
     _E.HTF_MODE = "FULL"   # les tests historiques (H1 -> M15 -> M5 -> POI) évaluent la cascade complète ; TestHtfM15 passe en mode M15
     suite, loader = unittest.TestSuite(), unittest.TestLoader()
     for cls in (TestRetracement, TestContinuation, TestInvalidationHTF, TestChop, TestGetExtTf,
                 TestLiquiditePure, TestM1NeDecidePasSeul, TestLogs, TestEntreeM5, TestNonRegression,
-                TestHtfM15, TestBE, TestEntreeOBFVG, TestSLTPCRT, TestSignauxSimultanes, TestLectureExtInt, TestModifyPositionGardeSLTP, TestBEDoubleVerif, TestClientId, TestLogVolumeReel, TestRiskGateUniversel, TestFiltresQualite, TestActifsEtEntrees, TestAjoutsNewsStopUS30, TestQmlSansLimiteAge, TestQmlMemoireEtHistoriqueProfond, TestSetupEngineEntreeEtPause, TestMoteurSmc, TestQmlGagnant, TestComputeTrade, TestQmlGagnantBoutons, TestQmlGagnantAlertes, TestOrdresMt5EtStickers):
+                TestHtfM15, TestBE, TestEntreeOBFVG, TestSLTPCRT, TestSignauxSimultanes, TestLectureExtInt, TestModifyPositionGardeSLTP, TestBEDoubleVerif, TestClientId, TestLogVolumeReel, TestRiskGateUniversel, TestFiltresQualite, TestActifsEtEntrees, TestAjoutsNewsStopUS30, TestQmlSansLimiteAge, TestQmlMemoireEtHistoriqueProfond, TestSetupEngineEntreeEtPause, TestMoteurSmc, TestQmlGagnant, TestComputeTrade, TestQmlGagnantBoutons, TestQmlGagnantAlertes, TestFibtrendBosChoch, TestOrdresMt5EtStickers):
         suite.addTests(loader.loadTestsFromTestCase(cls))
     return 0 if unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful() else 1
 
@@ -12941,6 +13025,9 @@ FT_SL_ATR = _env_float("FT_SL_ATR", 0.05)           # marge du SL derrière la b
 FT_MIN_RR = _env_float("FT_MIN_RR", 1.0)            # RR minimum
 FT_DOJI_BODY = _env_float("FT_DOJI_BODY", 0.15)     # doji : corps <= 15 % du range
 FT_DOJI_MIN_ATR = _env_float("FT_DOJI_MIN_ATR", 0.3)  # doji : range >= 0.3 ATR (ignore les micro-bougies)
+FT_STRUCT_CHOICES = ("BOS_CHOCH", "BOS_BOS")
+FT_TRIGGERS = tuple(x.strip().upper() for x in os.getenv("FT_TRIGGERS", "ENGULFING,PIN_BAR").split(",") if x.strip())   # bougie de rejet (mode BOS+CHoCH) : avalement / pin bar, jamais de doji
+FT_REACT_BARS = _env_int("FT_REACT_BARS", 1)        # mode BOS+CHoCH : la mèche qui touche le 50 % peut être celle de la bougie PRÉCÉDANT la bougie de rejet
 FT_TF_CHOICES = (1, 3, 5, 15, 30, 60)
 FT_TP_MODES = ("FIB0", "LIQ", "RR")
 FT_RR_CHOICES = (1.5, 2.0, 3.0, 4.0)
@@ -12967,7 +13054,13 @@ def get_ft_tf():
 
 
 def get_ft_tp():
-    return _get_choice("ft_tp", os.getenv("FT_TP", "FIB0").strip().upper(), FT_TP_MODES)
+    # TP = « target » : liquidité externe (repli sur le 0.0 du Fibo si aucune cible exploitable). Réglable : /ft tp FIB0|LIQ|RR
+    return _get_choice("ft_tp", os.getenv("FT_TP", "LIQ").strip().upper(), FT_TP_MODES)
+
+
+def get_ft_struct():
+    """Structure exigée : BOS_CHOCH (défaut : BOS puis CHoCH) ou BOS_BOS (ancienne règle : 2 BOS de même sens)."""
+    return _get_choice("ft_struct", os.getenv("FT_STRUCT", "BOS_CHOCH").strip().upper(), FT_STRUCT_CHOICES)
 
 
 def get_ft_rr():
@@ -13072,7 +13165,7 @@ def _ft_pick_tp(d, entry, risk, extreme, tp_mode, rr_fixed, pools):
     return None
 
 
-def ft_find_setup(c, depth=None, tp_mode="FIB0", rr_fixed=2.0, pools=None, sides="BOTH", use_tl=True):
+def ft_find_setup(c, depth=None, tp_mode="FIB0", rr_fixed=2.0, pools=None, sides="BOTH", use_tl=True, struct="BOS_BOS"):
     """Cherche une entrée FIBTREND sur la DERNIÈRE bougie clôturée de `c`. Retourne un dict ou None (jamais de look-ahead).
     pools : carte de liquidité externe (dict) ou fonction qui la calcule (appelée seulement si tout le reste est validé)."""
     depth = depth or SWING_DEPTH
@@ -13084,20 +13177,36 @@ def ft_find_setup(c, depth=None, tp_mode="FIB0", rr_fixed=2.0, pools=None, sides
     if not atr:
         return None
     evs = analyze(c, depth)
-    if len(evs) < FT_MIN_BOS:
-        return None
-    last = evs[-FT_MIN_BOS:]
-    d = last[-1]["dir"]
-    if any(e["kind"] != "BOS" or e["dir"] != d for e in last):
-        return None                                         # BOS + BOS exigés, un CHoCH annule la tendance
+    chmode = struct == "BOS_CHOCH"
+    if chmode:
+        # BOS PUIS CHoCH : le dernier CHoCH est directement précédé d'un BOS (ancienne tendance) ; ensuite il ne reste que des
+        # BOS dans le sens du CHoCH (confirmation). Un événement opposé après le CHoCH annule le setup.
+        chs = [k for k, e in enumerate(evs) if e["kind"] == "CHOCH"]
+        if not chs or chs[-1] < 1:
+            return None
+        k = chs[-1]
+        d = evs[k]["dir"]
+        if evs[k - 1]["kind"] != "BOS" or evs[k - 1]["dir"] != -d:
+            return None
+        if any(e["kind"] != "BOS" or e["dir"] != d for e in evs[k + 1:]):
+            return None
+        anchor, last_ev = evs[k], evs[-1]
+    else:
+        if len(evs) < FT_MIN_BOS:
+            return None
+        last = evs[-FT_MIN_BOS:]
+        d = last[-1]["dir"]
+        if any(e["kind"] != "BOS" or e["dir"] != d for e in last):
+            return None                                     # BOS + BOS exigés, un CHoCH annule la tendance
+        anchor, last_ev = last[-1], last[-1]
     if (sides == "SELL" and d != -1) or (sides == "BUY" and d != 1):
         return None
-    if n - 1 - last[-1]["i"] > FT_MAX_AGE:
-        return None                                         # tendance trop ancienne
+    if n - 1 - last_ev["i"] > FT_MAX_AGE:
+        return None                                         # structure trop ancienne
 
     hs, ls = _ft_pivots(c, depth)
     # --- jambe / Fibo : 0.0 = extrême depuis la cassure, 1.0 = dernier pivot avant cet extrême
-    src = last[-1]["src"]
+    src = anchor["src"]
     if d == -1:
         e = min(range(src, n), key=lambda k: c[k]["l"])
         extreme = c[e]["l"]
@@ -13113,13 +13222,13 @@ def ft_find_setup(c, depth=None, tp_mode="FIB0", rr_fixed=2.0, pools=None, sides
     if (origin - extreme) * d >= 0 or leg < FT_MIN_LEG_ATR * atr:
         return None                                         # jambe trop petite (anti micro-impulsion)
     er = _ft_efficiency(c, e, FT_ER_LOOKBACK)
-    if er < FT_MIN_ER:
-        return None                                         # range : on ne trade pas
+    if not chmode and er < FT_MIN_ER:
+        return None                                         # range : on ne trade pas (règle BOS+BOS ; BOS+CHoCH : rien d'autre que BOS + CHoCH + 50 % + rejet)
 
     # --- ligne de tendance : pivots décroissants (vente) / croissants (achat), clôture du bon côté
     x = c[-1]
     tl = None
-    if use_tl:
+    if use_tl and not chmode:
         pts = hs if d == -1 else ls
         if len(pts) < 2:
             return None
@@ -13130,26 +13239,38 @@ def ft_find_setup(c, depth=None, tp_mode="FIB0", rr_fixed=2.0, pools=None, sides
         if (x["c"] - tl) * d < 0:
             return None                                     # clôture au-delà de la ligne : tendance cassée
 
-    # --- retracement : la MÈCHE atteint >= 50 % de la jambe, sans dépasser l'origine
+    # --- retracement : la MÈCHE atteint >= 50 % de la jambe, sans dépasser l'origine (BOS+CHoCH : la bougie de rejet OU la précédente)
+    react = FT_REACT_BARS if chmode else 0
+    w0 = max(e + 1, n - 1 - react)
     if d == -1:
         lvl = extreme + FT_MIN_RET * leg
         far = max(k["h"] for k in c[e + 1:])
-        ret = (x["h"] - extreme) / leg
-        wick_ok = x["h"] >= lvl
+        ti = next((k for k in range(w0, n) if c[k]["h"] >= lvl), None)
+        ret = (max(k["h"] for k in c[ti:]) - extreme) / leg if ti is not None else 0.0
     else:
         lvl = extreme - FT_MIN_RET * leg
         far = min(k["l"] for k in c[e + 1:])
-        ret = (extreme - x["l"]) / leg
-        wick_ok = x["l"] <= lvl
-    if not wick_ok or (origin - far) * d > 0:
-        return None                                         # pas assez de retracement, ou origine dépassée
+        ti = next((k for k in range(w0, n) if c[k]["l"] <= lvl), None)
+        ret = (extreme - min(k["l"] for k in c[ti:])) / leg if ti is not None else 0.0
+    if ti is None or (origin - far) * d > 0:
+        return None                                         # 50 % pas atteint, ou origine dépassée
 
-    # --- déclencheur : avalement (dans le sens de la tendance) ou doji, entrée à la clôture
-    trig, tdir = _ft_trigger(c, atr)
-    if trig is None or (trig == "avalement" and tdir != d):
-        return None
+    # --- déclencheur : bougie de rejet, entrée à la clôture
+    if chmode:
+        pat = qmlg_rejection(c, d == 1)                     # avalement / pin bar dans le sens du CHoCH (le doji ne compte pas)
+        if pat not in FT_TRIGGERS:
+            return None
+        trig = {"ENGULFING": "avalement", "PIN_BAR": "pin bar", "DOJI": "doji"}.get(pat, pat.lower())
+        # SL DERRIÈRE la bougie de rejet (et derrière la bougie qui a touché le 50 % si c'est la précédente)
+        ref = c[ti:]
+        sl = (min(k["l"] for k in ref) - FT_SL_ATR * atr) if d == 1 else (max(k["h"] for k in ref) + FT_SL_ATR * atr)
+    else:
+        trig, tdir = _ft_trigger(c, atr)
+        if trig is None or (trig == "avalement" and tdir != d):
+            return None
+        ref = [x]
+        sl = x["h"] + FT_SL_ATR * atr if d == -1 else x["l"] - FT_SL_ATR * atr   # DERRIÈRE la bougie d'entrée
     entry = x["c"]
-    sl = x["h"] + FT_SL_ATR * atr if d == -1 else x["l"] - FT_SL_ATR * atr   # DERRIÈRE la bougie d'entrée
     risk = abs(entry - sl)
     if risk <= 0 or (entry - sl) * d <= 0:
         return None
@@ -13159,7 +13280,10 @@ def ft_find_setup(c, depth=None, tp_mode="FIB0", rr_fixed=2.0, pools=None, sides
     tp, tp_lbl = picked
     return {"dir": d, "side": "BUY" if d == 1 else "SELL", "t": x["t"], "entry": entry, "sl": sl, "tp": tp,
             "risk": risk, "rr": abs(tp - entry) / risk, "tp_label": tp_lbl, "trigger": trig, "origin": origin,
-            "extreme": extreme, "lvl": lvl, "ret": ret, "t_extreme": c[e]["t"], "trendline": tl, "atr": atr, "er": er}
+            "extreme": extreme, "lvl": lvl, "ret": ret, "t_extreme": c[e]["t"], "trendline": tl, "atr": atr, "er": er,
+            "struct": struct, "t_touch": c[ti]["t"],
+            "ref_extreme": (min(k["l"] for k in ref) if d == 1 else max(k["h"] for k in ref)),
+            "touch_px": (min(k["l"] for k in c[ti:]) if d == 1 else max(k["h"] for k in c[ti:]))}
 
 
 def ft_build_signal(r, tf):
@@ -13170,7 +13294,9 @@ def ft_build_signal(r, tf):
         "dir": d, "side": r["side"], "type": "FIBTREND", "order": "MARKET", "ref_price": r["entry"],
         "entry": r["entry"], "sl": r["sl"], "risk": r["risk"], "tp": r["tp"], "t": r["t"], "bos_level": r["origin"],
         "rr": round(r["rr"], 2), "htf": False, "htf_mode": "OFF", "be_rr": get_be_rr(), "tf": _tf_lbl(tf),
-        "setup": f"FIBTREND {_tf_lbl(tf)} BOS+BOS · retracement {r['ret']:.0%} · {r['trigger']}",
+        "setup": f"FIBTREND {_tf_lbl(tf)} {'BOS+CHoCH' if r.get('struct') == 'BOS_CHOCH' else 'BOS+BOS'} · Fibo 50 % ({r['ret']:.0%}) · {r['trigger']}",
+        "fib": {"origin": r["origin"], "lvl": r["lvl"], "extreme": r["extreme"]},
+        "no_mt5": not get_ft_auto(),   # auto OFF : signal + image + lot au groupe et à l'admin, SANS ordre MT5
         "poi": None, "mtf_fib_on": False, "mtf_fib": None, "qf": {}, "ext": None, "sweep": None,
         "sl_mode": "STRUCT", "tp_mode": r["tp_label"], "key_suffix": "ft",
         "zone": {"tf": tf, "kind": "FIBTREND", "d": d, "lo": lo, "hi": hi},
@@ -13181,11 +13307,61 @@ def ft_text(r, symbol, tf):
     dec = SYMBOLS[symbol]["decimals"]
     f = lambda v: _fmt(v, dec)
     icon = "🔴" if r["dir"] == -1 else "🟢"
+    if r.get("struct") == "BOS_CHOCH":
+        trend = f"BOS + CHoCH {'baissier' if r['dir'] == -1 else 'haussier'}"
+    else:
+        trend = f"BOS + BOS {'baissier' if r['dir'] == -1 else 'haussier'} · efficience {r['er']:.2f}"
     return (f"{icon} <b>FIBTREND {r['side']} {symbol}</b> · {_tf_lbl(tf)}\n"
-            f"Tendance : BOS + BOS {'baissier' if r['dir'] == -1 else 'haussier'} · efficience {r['er']:.2f}\n"
+            f"Structure : {trend}\n"
             f"Fibo : 1.0 = {f(r['origin'])} · 50 % = {f(r['lvl'])} · 0.0 = {f(r['extreme'])}\n"
-            f"Retracement par la mèche : {r['ret']:.0%} · déclencheur : {r['trigger']}\n"
-            f"Entrée {f(r['entry'])} · SL {f(r['sl'])} (derrière la bougie) · TP {f(r['tp'])} ({r['tp_label']}) · RR {r['rr']:.2f}")
+            f"Mitigation 50 % : {r['ret']:.0%} · bougie de rejet : {r['trigger']}\n"
+            f"Entrée {f(r['entry'])} · SL {f(r['sl'])} (derrière la bougie de rejet) · TP {f(r['tp'])} ({r['tp_label']}) · RR {r['rr']:.2f}")
+
+
+def ft_verify(r, symbol):
+    """DOUBLE VÉRIFICATION avant tout envoi. Retourne (ok, [problèmes]). Contrôle : SL / TP du bon côté, SL bien DERRIÈRE la bougie de
+    rejet, risque et RR recalculés, Fibo cohérent (1.0 / 50 % / 0.0), 50 % réellement touché sans dépasser l'origine, RR >= FT_MIN_RR,
+    puis lot recalculé (lot x distance SL x valeur du point) et jamais au-dessus du risque choisi (sauf lot minimum du broker)."""
+    pb, d = [], r["dir"]
+    entry, sl, tp = r["entry"], r["sl"], r["tp"]
+    risk = (entry - sl) * d
+    if risk <= 0:
+        pb.append("SL du mauvais côté de l'entrée")
+    elif abs(risk - r["risk"]) > 1e-9 * max(1.0, abs(entry)):
+        pb.append("distance SL incohérente")
+    if (tp - entry) * d <= 0:
+        pb.append("TP du mauvais côté de l'entrée")
+    elif risk > 0:
+        rr = abs(tp - entry) / risk
+        if abs(rr - r["rr"]) > 1e-6 * max(1.0, rr):
+            pb.append("RR incohérent")
+        if rr < FT_MIN_RR:
+            pb.append(f"RR {rr:.2f} < {FT_MIN_RR:g}")
+    if r.get("ref_extreme") is not None and (sl - r["ref_extreme"]) * d >= 0:
+        pb.append("SL pas derrière la bougie de rejet")
+    if (r["origin"] - r["extreme"]) * d >= 0:
+        pb.append("Fibo incohérent (1.0 / 0.0)")
+    else:
+        mid = r["extreme"] + (r["origin"] - r["extreme"]) * FT_MIN_RET
+        if abs(mid - r["lvl"]) > 1e-9 * max(1.0, abs(mid)):
+            pb.append("niveau 50 % incohérent")
+        if r.get("touch_px") is not None and (r["touch_px"] - r["lvl"]) * d > 0 and r.get("struct") == "BOS_CHOCH":
+            pb.append("50 % non touché")
+    if not pb:
+        try:
+            risk_usd = mm_effective_risk()[0]
+            li = calc_lot(symbol, risk_usd, risk, price=entry)
+            if li["lot"] <= 0:
+                pb.append("lot impossible : " + str(li.get("rejected_reason") or "risque / distance SL"))
+            else:
+                real = li["lot"] * risk * value_per_point(symbol, entry)
+                if abs(real - li["real_risk"]) > 0.01 + 1e-6 * real:
+                    pb.append(f"risque recalculé {real:.2f} $ ≠ {li['real_risk']:.2f} $")
+                if not li.get("raised_to_min") and real > risk_usd * (1 + 1e-6) + 0.005:
+                    pb.append(f"risque {real:.2f} $ > {risk_usd:.2f} $ choisi")
+        except Exception as e:
+            pb.append(f"calcul du lot impossible ({type(e).__name__})")
+    return not pb, pb
 
 
 def ft_process_symbol(symbol):
@@ -13202,17 +13378,21 @@ def ft_process_symbol(symbol):
         return                                              # pas de nouvelle bougie clôturée
     _ft_last_t[(symbol, tf)] = c[-1]["t"]
     r = ft_find_setup(c, tp_mode=get_ft_tp(), rr_fixed=get_ft_rr(), sides=get_ft_sides(), use_tl=get_ft_trendline(),
-                      pools=lambda: ft_ext_pools(symbol, tf, own=c))
+                      pools=lambda: ft_ext_pools(symbol, tf, own=c), struct=get_ft_struct())
     if not r:
         return
     key = f"ft_sent:{symbol}:{tf}:{r['side']}:{r['t_extreme']}"
     if get_meta(key) or not session_ok(r["t"]) or news_block_info(symbol):
         return
     set_meta(key, 1)
-    if get_ft_auto():
-        if publish_signal(symbol, c, analyze(c), ft_build_signal(r, tf)):
-            return
-    to_admin(ft_text(r, symbol, tf))
+    ok, problems = ft_verify(r, symbol)   # double vérification du calcul (SL / TP / RR / Fibo / lot) avant tout envoi
+    if not ok:
+        to_admin(f"⛔ <b>FIBTREND {r['side']} {symbol} {_tf_lbl(tf)}</b> BLOQUÉ par la double vérification : " + " · ".join(problems))
+        return
+    # Signal COMPLET au groupe (image + entrée / SL / TP / RR + lot) et à l'admin, suivi RR / BE / TP / SL. « Auto » OFF : aucun ordre MT5.
+    if publish_signal(symbol, c, analyze(c), ft_build_signal(r, tf)):
+        return
+    to_admin(ft_text(r, symbol, tf) + "\n⚠️ Non publié au groupe (filtre : bot arrêté, news, money management, signal déjà ouvert ou lot impossible — voir les logs).")
 
 
 # --- Telegram : menu ⚙️ FIBTREND ------------------------------------------------------------------
@@ -13225,12 +13405,15 @@ def _ft_menu_text():
     tp = get_ft_tp()
     return (f"⚙️ <b>FIBTREND</b>\n\nModule : {on(get_ft_on())}\nTimeframe : {_tf_lbl(get_ft_tf())}\n"
             f"Publier comme signal (auto) : {on(get_ft_auto())}\nSens : {_FT_SIDE_LBL[get_ft_sides()]}\n\n"
-            f"Tendance : {FT_MIN_BOS} BOS · ligne de tendance : {on(get_ft_trendline())}\n"
-            f"Retracement min (mèche) : {FT_MIN_RET:.0%} · jambe min : {FT_MIN_LEG_ATR:g} ATR · efficience min : {FT_MIN_ER:g}\n"
-            f"Déclencheur : avalement ou doji · SL derrière la bougie d'entrée\n"
+            f"Structure : <b>{'BOS + CHoCH' if get_ft_struct() == 'BOS_CHOCH' else 'BOS + BOS'}</b>"
+            + ("" if get_ft_struct() == "BOS_CHOCH" else f" · ligne de tendance : {on(get_ft_trendline())} · efficience min : {FT_MIN_ER:g}") + "\n"
+            f"Mitigation Fibo min (mèche) : {FT_MIN_RET:.0%} (obligatoire) · jambe min : {FT_MIN_LEG_ATR:g} ATR\n"
+            + ("Bougie de rejet : avalement ou pin bar · SL derrière la bougie de rejet\n" if get_ft_struct() == "BOS_CHOCH"
+               else "Déclencheur : avalement ou doji · SL derrière la bougie d'entrée\n") +
             f"TP : <b>{_FT_TP_LBL[tp]}</b>" + (f" {get_ft_rr():g}" if tp == "RR" else "") + "\n\n"
-            f"OFF = plus aucune entrée FIBTREND. « Auto » OFF : proposition envoyée à l'admin seulement, aucun ordre.\n"
-            f"Commandes : /ft on · off · auto · tf 5 · tp FIB0|LIQ|RR · rr 2 · side BOTH|SELL|BUY · tl")
+            f"OFF = plus aucune entrée FIBTREND. Chaque signal part au groupe (image + entrée / SL / TP / lot) et à l'admin. "
+            f"« Auto » ON : l'ordre MT5 part aussi (si les ordres MT5 sont autorisés) ; OFF : aucun ordre.\n"
+            f"Commandes : /ft on · off · auto · struct · tf 5 · tp FIB0|LIQ|RR · rr 2 · side BOTH|SELL|BUY · tl")
 
 
 def _ft_keyboard():
@@ -13240,7 +13423,7 @@ def _ft_keyboard():
         [_btn(_FT_TP_LBL[m], f"ft:tp:{m}", get_ft_tp() == m) for m in FT_TP_MODES],
         [_btn(f"RR {v:g}", f"ft:rr:{v:g}", abs(get_ft_rr() - v) < 1e-9) for v in FT_RR_CHOICES],
         [_btn(_FT_SIDE_LBL[s], f"ft:side:{s}", get_ft_sides() == s) for s in FT_SIDE_CHOICES],
-        [_btn("Ligne de tendance", "ft:tl", get_ft_trendline())],
+        [_btn("BOS + CHoCH", "ft:struct", get_ft_struct() == "BOS_CHOCH"), _btn("Ligne de tendance", "ft:tl", get_ft_trendline())],
     ]})
 
 
@@ -13264,6 +13447,9 @@ def _ft_do(args, explicit):
     if a == "auto":
         set_setting("ft_auto", "0" if get_ft_auto() else "1")
         return "Auto : " + ("ON" if get_ft_auto() else "OFF")
+    if a == "struct":
+        set_setting("ft_struct", "BOS_BOS" if get_ft_struct() == "BOS_CHOCH" else "BOS_CHOCH")
+        return "Structure : " + ("BOS + CHoCH" if get_ft_struct() == "BOS_CHOCH" else "BOS + BOS")
     if a == "tl":
         set_setting("ft_tl", "0" if get_ft_trendline() else "1")
         return "Ligne de tendance : " + ("ON" if get_ft_trendline() else "OFF")
@@ -13769,6 +13955,7 @@ QMLG_KEEP = _env_int("QMLG_KEEP", 300)                   # événements / swings
 QMLG_JSON_PATH = os.getenv("QMLG_JSON_PATH") or os.path.join(os.path.dirname(os.path.abspath(DB_PATH)), "qml_gagnant.json")
 QMLG_MAX_AGE_MIN = _env_int("QMLG_MAX_AGE_MIN", 15)      # « Ordre limite » : au-delà, le JSON est périmé -> nouveau scan
 QMLG_CACHE_SEC = _env_int("QMLG_CACHE_SEC", 60)          # « Entrée directe » : un scan plus récent que ça est réutilisé
+QMLG_DIRECT_PATTERNS = tuple(x.strip().upper() for x in os.getenv("QMLG_DIRECT_PATTERNS", "ENGULFING,PIN_BAR").split(",") if x.strip())   # ENTRÉE DIRECTE : avalement ou bougie de retournement (pin bar) seulement, jamais de doji
 QMLG_DOJI_BODY = _env_float("QMLG_DOJI_BODY", 0.10)      # doji : corps <= 10 % de la bougie
 QMLG_PIN_WICK = _env_float("QMLG_PIN_WICK", 0.60)        # pin bar : mèche de rejet >= 60 % de la bougie ...
 QMLG_PIN_BODY = _env_float("QMLG_PIN_BODY", 0.35)        # ... et corps <= 35 % de la bougie
@@ -13779,6 +13966,7 @@ QMLG_ALERT_PATTERNS = tuple(x.strip().upper() for x in os.getenv("QMLG_ALERT_PAT
 QMLG_ALERT_MIN_RR = _env_float("QMLG_ALERT_MIN_RR", QMLG_MIN_RR)   # RR1 minimum sur la VRAIE entrée (clôture de la bougie de réaction) ; en dessous : l'alerte attend une meilleure réaction
 QMLG_ALERT_MAX_BARS = _env_int("QMLG_ALERT_MAX_BARS", 300)   # une alerte qui n'a rien donné après N bougies de son TF est supprimée en silence
 QMLG_ALERT_STALE_BARS = _env_int("QMLG_ALERT_STALE_BARS", 3)   # une réaction plus vieille que N bougies (redémarrage, retard réseau) n'est plus envoyée
+QMLG_ALERT_REACT_BARS = _env_int("QMLG_ALERT_REACT_BARS", 2)   # la bougie d'avalement / pin bar peut venir jusqu'à N bougies APRÈS le toucher de la zone (0 = elle doit toucher la zone elle-même)
 QMLG_ALERT_TO_GROUP = _env_on("QMLG_ALERT_TO_GROUP", True)   # la réaction part aussi au groupe : image + entrée / SL / TP / lot + stickers
 
 
@@ -14039,7 +14227,7 @@ def qmlg_direct_entry(qml, structure, candles):
     if mi is not None and mi != len(structure["_series"]["c"]) - 1:
         return None   # déjà retouchée avant la dernière bougie : plus une zone fraîche
     pattern = qmlg_rejection(candles, qml["dir"] == "bull")
-    if not pattern:
+    if pattern not in QMLG_DIRECT_PATTERNS:   # avalement ou pin bar (retournement) seulement ; le doji ne déclenche pas
         return None
     v = qmlg_validate(qml, structure, direct=True, entry_price=close)
     if not v["valid"]:
@@ -14099,7 +14287,8 @@ _qmlg_cache = {"data": None}
 def qmlg_scan(symbols=None, tfs=None):
     """BOUTON « Analyse » : scanne TOUS les marchés (Deriv + BTC Binance) sur TOUS les TF, enregistre TOUTES les formations QML
     dans le JSON (QMLG_JSON_PATH), chacune VALIDÉE (qmlg_validate). Un marché / TF en erreur est noté dans `errors`, le scan continue."""
-    symbols, tfs = list(symbols or SYMBOLS), list(tfs or QMLG_TFS)
+    # TF = ceux COCHÉS dans le menu 🏆 QML GAGNANT (M1, M5...) ; QMLG_TFS (env) n'est plus qu'un secours.
+    symbols, tfs = list(symbols or SYMBOLS), list(tfs or get_qmlg_alert_tfs() or QMLG_TFS)
     forms, errors = [], []
     for sym in symbols:
         for tf in tfs:
@@ -14124,8 +14313,9 @@ def qmlg_scan(symbols=None, tfs=None):
 
 def qmlg_data(max_age_sec):
     """Dernier scan s'il a moins de max_age_sec secondes (mémoire, sinon fichier JSON) ; sinon nouveau scan complet."""
+    want = set(get_qmlg_alert_tfs())
     for d in (_qmlg_cache["data"], _qmlg_load()):
-        if d and time.time() - d.get("generated_ts", 0) <= max_age_sec:
+        if d and time.time() - d.get("generated_ts", 0) <= max_age_sec and {int(t) for t in d.get("tfs", [])} == want:
             return d
     return qmlg_scan()
 
@@ -14271,8 +14461,13 @@ def qmlg_alert_eval(a, candles, now=None):
             continue
         if (c["c"] < bot) if buy else (c["c"] > top):   # clôture au-delà du bord lointain : zone invalidée
             return None, [{"type": "invalid", "alert": a, "close": c["c"]}]
-        if c["l"] <= top and c["h"] >= bot:               # la bougie touche la zone
+        touches = c["l"] <= top and c["h"] >= bot          # la bougie touche la zone
+        if touches:
             a["entered"] = True
+            a["touch_t"] = c["t"]
+        # la réaction (avalement / pin bar) est la bougie qui touche la zone OU l'une des QMLG_ALERT_REACT_BARS suivantes
+        recent = touches or (a.get("touch_t") is not None and 0 < c["t"] - a["touch_t"] <= QMLG_ALERT_REACT_BARS * tf_sec)
+        if recent:
             pattern = qmlg_rejection(candles[:k + 1], buy)
             fresh = now is None or now - (c["t"] + tf_sec) <= QMLG_ALERT_STALE_BARS * tf_sec
             if pattern in QMLG_ALERT_PATTERNS and fresh:
@@ -14578,13 +14773,84 @@ def qmlg_limit_text(data):
     return _qmlg_cap(head, [_qmlg_line(f, f["plan"], " · LIMIT") for f in items], "\n\n(information seulement : aucun ordre envoyé)")
 
 
+def qmlg_arm_alerts(data):
+    """Après « Ordre limite » : arme la surveillance des QML listés (TF cochés + marchés ON seulement) et renvoie un texte de
+    statut. Rien n'est envoyé tant que 🔔 Alerte réaction est OFF : le statut le dit clairement."""
+    items = qmlg_pending_limits(data)
+    tfs, syms = set(get_qmlg_alert_tfs()), set(qmlg_alert_symbols())
+    watch = [f for f in items if f["tf"] in tfs and f["symbol"] in syms]
+    off = sorted({f["symbol"] for f in items if f["symbol"] not in syms})
+    if not get_qmlg_alert_on():
+        return ("⚠️ <b>🔔 Alerte réaction est OFF</b> : aucun signal (entrée / SL / TP / lot / image) ne sera envoyé. "
+                "Active-la dans le menu QML GAGNANT, puis relance « Ordre limite ».")
+    r = qmlg_place_alerts({"formations": watch}) if watch else {"placed": 0, "existing": 0, "total": 0}
+    txt = (f"👁 Surveillance : {len(watch)} zone(s) · {r['placed']} posée(s) · {r['existing']} déjà en place. "
+           f"Signal envoyé seulement sur AVALEMENT / PIN BAR dans la zone.")
+    if off:
+        txt += "\n⚠️ Marché(s) OFF dans 🌍 ACTIFS (non surveillés) : " + ", ".join(off)
+    return txt
+
+
 def qmlg_direct_text(data):
     items = qmlg_direct_signals(data)
     head = f"⚡ <b>ENTRÉES DIRECTES — QML GAGNANT</b>\nDonnées {_qmlg_age(data)} · {len(items)} signal(s)\n\n"
     if not items:
-        return head + "Aucune entrée : il faut le prix DANS la zone ET une dernière bougie clôturée en rejet (avalement, doji, pin bar)."
+        return head + "Aucune entrée : il faut le prix DANS la zone ET une dernière bougie clôturée en AVALEMENT ou en BOUGIE DE RETOURNEMENT (pin bar). Le doji ne compte pas."
     return _qmlg_cap(head, [_qmlg_line(f, f["direct"]["trade"], f" · {f['direct']['pattern']} (clôture)") for f in items],
-                     "\n\n(compte rendu seulement : aucun ordre envoyé à MT5)")
+                     "\n\n(image + lot envoyés ci-dessous · aucun ordre envoyé à MT5)")
+
+
+def _qmlg_direct_chart(f):
+    """Image du QML d'une entrée directe (outil de position : entrée / SL / TP). None si le dessin est impossible."""
+    sym, tf, tr = f["symbol"], f["tf"], f["direct"]["trade"]
+    candles = get_candles(sym, minutes=tf, count=QMLG_HISTORY_BARS) or []
+    if len(candles) < QMLG_MIN_BARS:
+        return None
+    structure = detect_structure(candles, f"M{tf}", n=QMLG_FRACTAL_N, keep=QMLG_KEEP)
+    res = detect_qml(structure, min_rr=QMLG_MIN_RR)
+    tol = max(1e-6, abs(f["zone"]["top"]) * 1e-7)
+    q = next((x for x in reversed(res["qmls"]) if x["dir"] == f["dir"] and abs(x["zone"]["top"] - f["zone"]["top"]) <= tol
+              and abs(x["zone"]["bottom"] - f["zone"]["bottom"]) <= tol), None)
+    if q is None:
+        return None
+    return draw_chart(candles, q, tr, symbol=sym, tf=tf, structure=structure, others=[q])
+
+
+def qmlg_direct_caption(f, li):
+    """Légende d'une entrée directe : sens, motif, entrée, SL, TP1 / TP2 (RR) et lot calculé sur la distance au SL."""
+    d, tr = f["direct"], f["direct"]["trade"]
+    dec = SYMBOLS.get(f["symbol"], {}).get("decimals", 2)
+    buy = tr["side"] == "BUY"
+    f2 = lambda k: "—" if tr.get(k) is None else f"{_fmt(tr[k], dec)} · RR {tr['rr' + k[-1]]:.2f}"
+    txt = (f"{'🟢' if buy else '🔴'} <b>{f['symbol']} M{f['tf']}</b> — QML {'ACHAT' if buy else 'VENTE'} · ENTRÉE DIRECTE · "
+           f"{_QMLG_PAT_FR.get(d['pattern'], d['pattern'])}\n"
+           f"📍 Entrée {_fmt(tr['entry'], dec)}\n🛡 SL {_fmt(tr['sl'], dec)}\n🎯 TP1 {f2('tp1')}\n🎯 TP2 {f2('tp2')}\n"
+           f"💰 Lot <b>{li['lot']:g}</b> · risque {li['real_risk']:.2f} $")
+    if li.get("raised_to_min"):
+        txt += "\n⚠️ lot minimum du broker : risque réel plus élevé que prévu"
+    return txt
+
+
+def qmlg_direct_deliver(chat_id, data, max_items=5):
+    """Pour chaque entrée directe : calcule le lot (montant du menu 💰 Risque / distance au SL), puis envoie l'IMAGE + entrée / SL /
+    TP / lot. Lot impossible -> message d'avertissement, pas d'image. Aucun ordre MT5. Retourne le nombre d'envois."""
+    n = 0
+    for f in qmlg_direct_signals(data)[:max_items]:
+        tr = f["direct"]["trade"]
+        risk = tr.get("risk") or abs(tr["entry"] - tr["sl"])
+        li = calc_lot(f["symbol"], get_risk(), risk, price=tr["entry"])
+        if li["lot"] <= 0:
+            send(chat_id, f"⚠️ <b>{f['symbol']} M{f['tf']}</b> — entrée directe détectée mais lot impossible : "
+                          f"{li.get('rejected_reason') or 'lot invalide (risque ou distance SL)'}")
+            continue
+        path = None
+        try:
+            path = _qmlg_direct_chart(f)
+        except Exception:
+            traceback.print_exc(limit=-3)
+        send(chat_id, qmlg_direct_caption(f, li), photo=path)
+        n += 1
+    return n
 
 
 def _qmlg_menu_text():
@@ -14594,7 +14860,7 @@ def _qmlg_menu_text():
             f"C'est toi qui l'actives. Elle alerte seulement sur une RÉACTION dans une zone QML (avalement ou pin bar), pas quand le prix "
             f"y entre. Entrée, SL, TP1 / TP2 (RR), BE, lot, image et stickers partent au groupe, puis RR / BE / TP / SL en réponse. "
             f"Seuls les TF cochés ci-dessous sont scannés (chaque TF à chaque clôture de bougie : M1 = 1 min, M5 = 5 min, M15 = 15 min).\n\n"
-            f"🔍 <b>Analyse</b> : scanne tous les marchés et TF (M{', M'.join(str(t) for t in QMLG_TFS)}), enregistre toutes les "
+            f"🔍 <b>Analyse</b> : scanne tous les marchés sur les TF cochés ({', '.join(_tf_lbl(t) for t in get_qmlg_alert_tfs())}), enregistre toutes les "
             f"formations QML dans le JSON et valide chacune.\n"
             f"⏳ <b>Ordre limite</b> : QML valides non mitigés, EN ATTENTE de mitigation.\n"
             f"⚡ <b>Entrée directe</b> : prix dans la zone + dernière bougie clôturée en rejet.")
@@ -14619,20 +14885,32 @@ def _qmlg_job(chat_id, kind):
     if not _qmlg_lock.acquire(blocking=False):
         send(chat_id, "⏳ Un scan QML GAGNANT est déjà en cours, patiente un instant.", reply_markup=_qmlg_keyboard())
         return
+    direct_data = None
     try:
         if kind == "analyse":
             data = qmlg_scan()
             txt = qmlg_analyse_text(data)   # les alertes se règlent avec le bouton 🔔 Alerte réaction
         elif kind == "limit":
-            txt = qmlg_limit_text(qmlg_data(QMLG_MAX_AGE_MIN * 60))
+            ldata = qmlg_data(QMLG_MAX_AGE_MIN * 60)
+            txt = qmlg_limit_text(ldata)
+            try:
+                txt += "\n\n" + qmlg_arm_alerts(ldata)
+            except Exception:
+                traceback.print_exc(limit=-3)
         else:
-            txt = qmlg_direct_text(qmlg_data(QMLG_CACHE_SEC))
+            direct_data = qmlg_data(QMLG_CACHE_SEC)
+            txt = qmlg_direct_text(direct_data)
     except Exception as e:
         traceback.print_exc(limit=-3)
         txt = f"🏆 QML GAGNANT — {_QMLG_JOBS.get(kind, kind)} : ⚠️ erreur ({type(e).__name__}), réessaie dans un instant."
     finally:
         _qmlg_lock.release()
     send(chat_id, txt, reply_markup=_qmlg_keyboard())
+    if kind == "direct" and direct_data:   # chaque entrée directe : image + entrée / SL / TP + lot calculé sur le SL
+        try:
+            qmlg_direct_deliver(chat_id, direct_data)
+        except Exception:
+            traceback.print_exc(limit=-3)
 
 
 def _qmlg_callback(cq, arg):
@@ -15240,5 +15518,6 @@ if __name__ == "__main__":
     if "--selftest" in sys.argv:
         sys.exit(_selftest())
     main()
+
 
 
