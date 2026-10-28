@@ -1,7 +1,6 @@
 
 
 
-
 #!/usr/bin/env python3
 """AlphaBot BOS + CHoCH — Gold & BTC — version en un seul fichier.
 
@@ -11382,6 +11381,163 @@ class TestQmlGagnantBoutons(unittest.TestCase):
             _E.send, _E.qmlg_data, _E.qmlg_scan = saved
 
 
+class TestQmlGagnantHtfEtRegles(unittest.TestCase):
+    """Biais H1 de QML GAGNANT (OFF par défaut, ne bloque jamais faute de données) + règle d'entrée _qmlg_rules (= entrée directe)."""
+
+    def setUp(self):
+        self._old_htf = _E.get_setting("qmlg_htf")
+        self._bias, self._gc, self._ag = _E.qml_htf_bias, _E.get_candles, _E.QMLG_AGENTS
+        _E._q("DELETE FROM settings WHERE key=?", ("qmlg_htf",), commit=True)
+        _E._qmlg_htf_cache.clear()
+
+    def tearDown(self):
+        _E.qml_htf_bias, _E.get_candles, _E.QMLG_AGENTS = self._bias, self._gc, self._ag
+        self.tearDown_rules()
+        if self._old_htf is None:
+            _E._q("DELETE FROM settings WHERE key=?", ("qmlg_htf",), commit=True)
+        else:
+            _E.set_setting("qmlg_htf", self._old_htf)
+        _E._qmlg_htf_cache.clear()
+
+    def test_off_par_defaut_ne_filtre_rien(self):
+        self.assertFalse(_E.get_qmlg_htf_on())
+        _E.qml_htf_bias = lambda s: 1
+        self.assertTrue(_E.qmlg_htf_ok("XAUUSD", False), "OFF : une vente contre un biais haussier passe")
+        self.assertTrue(_E.qmlg_htf_ok("XAUUSD", True))
+
+    def test_on_bloque_contre_biais_et_jamais_faute_de_donnees(self):
+        _E.set_setting("qmlg_htf", "1")
+        _E.qml_htf_bias = lambda s: 1
+        self.assertTrue(_E.qmlg_htf_ok("XAUUSD", True))
+        self.assertFalse(_E.qmlg_htf_ok("XAUUSD", False))
+        _E._qmlg_htf_cache.clear()
+        _E.qml_htf_bias = lambda s: -1
+        self.assertTrue(_E.qmlg_htf_ok("XAUUSD", False))
+        self.assertFalse(_E.qmlg_htf_ok("XAUUSD", True))
+        _E._qmlg_htf_cache.clear()
+        _E.qml_htf_bias = lambda s: None            # biais indisponible : on ne bloque pas
+        self.assertTrue(_E.qmlg_htf_ok("XAUUSD", True) and _E.qmlg_htf_ok("XAUUSD", False))
+
+        def boom(s):
+            raise RuntimeError("réseau")
+        _E._qmlg_htf_cache.clear()
+        _E.qml_htf_bias = boom                      # erreur H1 : on ne bloque pas non plus
+        self.assertTrue(_E.qmlg_htf_ok("XAUUSD", True))
+
+    def test_bouton_et_callback_htf(self):
+        self.assertIn("qmlg:htf", str(_E._qmlg_keyboard()))
+        self.assertIn("Biais H1", _E._qmlg_menu_text())
+        self.assertFalse(_E.get_qmlg_htf_on())
+
+    def test_scan_marque_htf_les_formations_contre_biais(self):
+        cs = TestQmlSansLimiteAge._walk(2, n=1500, tf=900)
+        _E.get_candles = lambda symbol, minutes=None, count=None: list(cs)
+        _E.QMLG_AGENTS = False
+        off, _n = _E._qmlg_scan_one("XAUUSD", 15)
+        self.assertTrue(off and not any("htf" in f["validation"]["reasons"] for f in off), "OFF : jamais de raison htf")
+        _E.set_setting("qmlg_htf", "1")
+        _E.qml_htf_bias = lambda s: 1               # biais haussier : toutes les ventes sont « contre biais »
+        _E._qmlg_htf_cache.clear()
+        on, _n = _E._qmlg_scan_one("XAUUSD", 15)
+        bears = [f for f in on if f["dir"] == "bear"]
+        bulls = [f for f in on if f["dir"] == "bull"]
+        self.assertTrue(bears and bulls)
+        for f in bears:
+            self.assertIn("htf", f["validation"]["reasons"])
+            self.assertFalse(f["validation"]["valid"])
+            self.assertIsNone(f["direct"])
+        self.assertFalse(any("htf" in f["validation"]["reasons"] for f in bulls), "les achats dans le sens du biais restent intacts")
+        self.assertEqual({f["id"]: f["validation"]["valid"] for f in off if f["dir"] == "bull"},
+                         {f["id"]: f["validation"]["valid"] for f in bulls}, "le filtre ne change rien pour les achats")
+
+    # --- _qmlg_rules : même règle que l'alerte de réaction ---------------------------------------------------
+    @staticmethod
+    def _ctx(qmls):
+        return {"symbol": "XAUUSD", "tf_minutes": 15, "structure": {"_series": {"c": [1.0]}}, "qml": {"qmls": qmls},
+                "candles": [{"t": 900, "o": 1, "h": 1, "l": 1, "c": 1}]}
+
+    @staticmethod
+    def _q(buy, bt):
+        return {"dir": "bull" if buy else "bear", "zone": {"top": 110.0, "bottom": 108.0, "mode": "HEAD"}, "choch": {"break_time": bt}}
+
+    @staticmethod
+    def _plan(side):
+        return {"ok": True, "side": side, "entry": 109.0, "sl": 112.0 if side == "SELL" else 106.0, "tp1": 100.0, "tp2": None,
+                "tp1_kind": "SWING", "tp2_kind": None, "rr1": 3.0, "rr2": None}
+
+    def _stub(self, react_for=(), valid=True):
+        """qmlg_validate -> valide avec un plan ; qmlg_alert_eval -> « réaction » pour les QML dont le temps de cassure est dans react_for."""
+        self._o_val, self._o_eval = _E.qmlg_validate, _E.qmlg_alert_eval
+        _E.qmlg_validate = lambda q, st, direct=False, entry_price=None: {
+            "valid": valid, "reasons": [], "trade": self._plan("BUY" if q["dir"] == "bull" else "SELL")}
+
+        def ev(a, candles, now=None):
+            if a["last_t"] in react_for:
+                return None, [{"type": "reaction", "alert": dict(a, tp1=100.0), "pattern": "ENGULFING", "close": 109.0, "t": 900,
+                               "risk": 3.0, "rr1": 3.0, "rr2": None}]
+            return a, []
+        _E.qmlg_alert_eval = ev
+
+    def tearDown_rules(self):
+        if hasattr(self, "_o_val"):
+            _E.qmlg_validate, _E.qmlg_alert_eval = self._o_val, self._o_eval
+
+    def test_rules_sans_qml_ou_sans_reaction_aucun_signal(self):
+        self.assertIsNone(_E._qmlg_rules(self._ctx([])))
+        self._stub(react_for=())
+        try:
+            self.assertIsNone(_E._qmlg_rules(self._ctx([self._q(False, 1)])))
+            self.assertIsNone(_E._qmlg_rules({"symbol": "X", "tf_minutes": 15, "structure": None, "qml": {"qmls": [self._q(True, 1)]}, "candles": []}))
+        finally:
+            self.tearDown_rules()
+
+    def test_rules_qml_non_valide_aucun_signal(self):
+        self._stub(react_for=(1, 2), valid=False)
+        try:
+            self.assertIsNone(_E._qmlg_rules(self._ctx([self._q(False, 1), self._q(False, 2)])))
+        finally:
+            self.tearDown_rules()
+
+    def test_rules_signal_sur_reaction(self):
+        self._stub(react_for=(2,))
+        try:
+            sig = _E._qmlg_rules(self._ctx([self._q(False, 1), self._q(False, 2), self._q(True, 3)]))
+        finally:
+            self.tearDown_rules()
+        self.assertEqual((sig["side"], sig["order"], sig["pattern"], sig["entry"], sig["sl"], sig["rr1"], sig["qml_id"]),
+                         ("SELL", "REACTION", "ENGULFING", 109.0, 112.0, 3.0, 2))
+        self.assertEqual(sig["zone"], {"top": 110.0, "bottom": 108.0, "mode": "HEAD"})
+
+    def test_rules_respecte_le_biais_h1_et_la_fenetre(self):
+        self._stub(react_for=(1,))
+        old = _E.QMLG_RULES_LOOKBACK
+        try:
+            _E.set_setting("qmlg_htf", "1")
+            _E.qml_htf_bias = lambda s: 1
+            _E._qmlg_htf_cache.clear()
+            self.assertIsNone(_E._qmlg_rules(self._ctx([self._q(False, 1)])), "vente contre biais haussier : aucun signal")
+            _E.set_setting("qmlg_htf", "0")
+            self.assertIsNotNone(_E._qmlg_rules(self._ctx([self._q(False, 1)])), "filtre OFF : le même QML donne un signal")
+            _E.QMLG_RULES_LOOKBACK = 2
+            qm = [self._q(False, 1), self._q(False, 2), self._q(False, 3)]
+            self.assertIsNone(_E._qmlg_rules(self._ctx(qm)), "seuls les 2 QML les plus récents sont examinés")
+        finally:
+            _E.QMLG_RULES_LOOKBACK = old
+            self.tearDown_rules()
+
+    def test_analyse_remonte_le_signal(self):
+        cs = TestQmlSansLimiteAge._walk(2, n=1500, tf=900)
+        _E.get_candles = lambda symbol, minutes=None, count=None: list(cs)
+        orig = _E._qmlg_rules
+        try:
+            _E._qmlg_rules = lambda ctx: {"side": "SELL", "entry": 1.0}
+            r = _E.qml_gagnant_analyze("XAUUSD", 15)
+            self.assertEqual((r["status"], r["signal"]["side"]), ("SIGNAL", "SELL"))
+            self.assertIn("signal en cours", _E.qml_gagnant_text(r))
+        finally:
+            _E._qmlg_rules = orig
+
+
 class TestQmlGagnantAlertes(unittest.TestCase):
     """Alertes de réaction : rien quand le prix entre dans la zone ; alerte seulement sur avalement / pin bar qui touche la zone ;
     lot calculé ; image + entrée / SL / TP / lot + stickers au groupe ; anti-doublon ; suppression si zone invalidée."""
@@ -11904,7 +12060,7 @@ def _selftest():
     suite, loader = unittest.TestSuite(), unittest.TestLoader()
     for cls in (TestRetracement, TestContinuation, TestInvalidationHTF, TestChop, TestGetExtTf,
                 TestLiquiditePure, TestM1NeDecidePasSeul, TestLogs, TestEntreeM5, TestNonRegression,
-                TestHtfM15, TestBE, TestEntreeOBFVG, TestSLTPCRT, TestSignauxSimultanes, TestLectureExtInt, TestModifyPositionGardeSLTP, TestBEDoubleVerif, TestClientId, TestLogVolumeReel, TestRiskGateUniversel, TestFiltresQualite, TestActifsEtEntrees, TestAjoutsNewsStopUS30, TestQmlSansLimiteAge, TestQmlMemoireEtHistoriqueProfond, TestSetupEngineEntreeEtPause, TestMoteurSmc, TestQmlGagnant, TestComputeTrade, TestQmlGagnantBoutons, TestQmlGagnantAlertes, TestFibtrendBosChoch, TestOrdresMt5EtStickers):
+                TestHtfM15, TestBE, TestEntreeOBFVG, TestSLTPCRT, TestSignauxSimultanes, TestLectureExtInt, TestModifyPositionGardeSLTP, TestBEDoubleVerif, TestClientId, TestLogVolumeReel, TestRiskGateUniversel, TestFiltresQualite, TestActifsEtEntrees, TestAjoutsNewsStopUS30, TestQmlSansLimiteAge, TestQmlMemoireEtHistoriqueProfond, TestSetupEngineEntreeEtPause, TestMoteurSmc, TestQmlGagnant, TestComputeTrade, TestQmlGagnantBoutons, TestQmlGagnantHtfEtRegles, TestQmlGagnantAlertes, TestFibtrendBosChoch, TestOrdresMt5EtStickers):
         suite.addTests(loader.loadTestsFromTestCase(cls))
     return 0 if unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful() else 1
 
@@ -12226,7 +12382,10 @@ QML_HTF_EMA = _env_int("QML_HTF_EMA", 200)                # biais HTF : clôture
 QML_SCAN_SEC = _env_int("QML_SCAN_SEC", 15)               # pas minimal entre 2 analyses d'un même actif
 QML_ANALYSE_TFS = (5, 15, 30, 60)                         # TF proposés au bouton Analyse (le scan auto reste sur QML_TF_CHOICES)
 QML_CONF_MODES = ("ENGULFING", "CHOCH", "ENGULFING_OR_CHOCH")
-QML_PARAMS = Params(first_touch_only=False) if "Params" in globals() else None   # la zone reste valable tant que le M15 ne la traverse pas
+QML_ZONE_MODE = os.getenv("QML_ZONE_MODE", "head").strip().lower()   # head : zone = bougie de tête (comme tracée à la main) | level : ancien (L1 + 0,5 ATR)
+if QML_ZONE_MODE not in ("head", "level"):
+    QML_ZONE_MODE = "head"
+QML_PARAMS = Params(first_touch_only=False, zone_mode=QML_ZONE_MODE) if "Params" in globals() else None   # la zone reste valable tant que le M15 ne la traverse pas
 _qml_cache, _qml_last_scan = {}, {}
 _qml_ref_px = {}
 
@@ -13585,8 +13744,9 @@ def _smc_ts(x):
     return x
 
 
-def _smc_load(df):
-    """-> (temps, high, low, close) : listes nettoyées (NaN retirés, triées, sans doublon de temps)."""
+def _smc_load(df, with_open=False):
+    """-> (temps, high, low, close) : listes nettoyées (NaN retirés, triées, sans doublon de temps).
+    with_open=True : renvoie en plus la liste des OUVERTURES (5e élément ; = clôture si la colonne open est absente)."""
     if df is None:
         raise ValueError("df est None")
     if hasattr(df, "columns"):
@@ -13596,6 +13756,8 @@ def _smc_load(df):
         if kh is None or kl is None or kc is None:
             raise ValueError("df doit avoir des colonnes high/low/close (ou h/l/c)")
         h, l, c = (df[k].tolist() for k in (kh, kl, kc))
+        ko = pick("open", "o")
+        op = df[ko].tolist() if ko is not None else list(c)
         kt = pick("time", "t", "timestamp", "datetime", "date", "open_time")
         if kt is not None:
             t = df[kt].tolist()
@@ -13610,15 +13772,22 @@ def _smc_load(df):
         h = [g(r, "h", "high") for r in rows]
         l = [g(r, "l", "low") for r in rows]
         c = [g(r, "c", "close") for r in rows]
+        op = [g(r, "o", "open") for r in rows]
 
     rows = []
-    for ti, hi, li, ci in zip(t, h, l, c):
+    for ti, hi, li, ci, oi in zip(t, h, l, c, op):
         try:
             hi, li, ci = float(hi), float(li), float(ci)
         except (TypeError, ValueError):
             continue
+        try:
+            oi = float(oi)
+            if not math.isfinite(oi):
+                oi = ci
+        except (TypeError, ValueError):
+            oi = ci
         if math.isfinite(hi) and math.isfinite(li) and math.isfinite(ci):
-            rows.append((ti, hi, li, ci))
+            rows.append((ti, hi, li, ci, oi))
     if rows and all(r[0] is not None for r in rows):
         try:
             rows.sort(key=lambda r: r[0])            # tri stable
@@ -13631,6 +13800,8 @@ def _smc_load(df):
             rows = out
         except TypeError:
             pass
+    if with_open:
+        return ([r[0] for r in rows], [r[1] for r in rows], [r[2] for r in rows], [r[3] for r in rows], [r[4] for r in rows])
     return ([r[0] for r in rows], [r[1] for r in rows], [r[2] for r in rows], [r[3] for r in rows])
 
 
@@ -13673,12 +13844,12 @@ def detect_structure(df, tf=None, n=SMC_FRACTAL_N, keep=50, drop_last=False, clo
         raise ValueError("n doit être >= 1")
     tf_min = smc_parse_tf(tf)
     try:
-        t, h, l, c = _smc_load(df)
+        t, h, l, c, op = _smc_load(df, with_open=True)
     except (ValueError, TypeError, KeyError, AttributeError):
-        t, h, l, c = [], [], [], []                  # données illisibles : "données insuffisantes", pas d'exception
+        t, h, l, c, op = [], [], [], [], []                  # données illisibles : "données insuffisantes", pas d'exception
     n_before = len(c)
     if drop_last and t:
-        t, h, l, c = t[:-1], h[:-1], l[:-1], c[:-1]
+        t, h, l, c, op = t[:-1], h[:-1], l[:-1], c[:-1], op[:-1]
     if closed_only and t and tf_min:
         def _open_epoch(x):
             try:
@@ -13695,7 +13866,7 @@ def detect_structure(df, tf=None, n=SMC_FRACTAL_N, keep=50, drop_last=False, clo
             o = _open_epoch(t[-1])
             if o is None or o + tf_min * 60 + CLOSE_GRACE_SEC <= _now:
                 break
-            t, h, l, c = t[:-1], h[:-1], l[:-1], c[:-1]
+            t, h, l, c, op = t[:-1], h[:-1], l[:-1], c[:-1], op[:-1]
     dropped = n_before - len(c)
     N = len(c)
     last = N - 1
@@ -13797,7 +13968,7 @@ def detect_structure(df, tf=None, n=SMC_FRACTAL_N, keep=50, drop_last=False, clo
         "event_on_last_bar": ev_last if ev_last and ev_last["bars_ago"] == 0 else None,
         "swings": [_sw(s) for s in swings[-keep:]],
         "events": [_ev(e) for e in events[-keep:]],
-        "_series": {"t": [_smc_ts(x) for x in t], "h": h, "l": l, "c": c},
+        "_series": {"t": [_smc_ts(x) for x in t], "h": h, "l": l, "c": c, "o": op},
     }
 
 
@@ -13806,11 +13977,27 @@ SMC_QML_MIN_RR = 2.0
 
 
 SMC_QML_MAX_ZONE_ATR = 1.0        # zone (épaule) rejetée si sa taille (haut-bas de la bougie d'origine) > N x ATR M15
+# --- ZONE QML : quelle bougie définit la zone ? --------------------------------------------------------------
+#   HEAD     (défaut) : la bougie de TÊTE, celle qui a pris la liquidité (le sweep), comme tracée à la main.
+#   SHOULDER          : ancien comportement (bougie d'origine de l'épaule gauche).
+# QMLG_HEAD_ZONE (mode HEAD) : BODY = du haut de la mèche au bas du corps (vente) / du bas de la mèche au haut du corps (achat) ;
+#   MID = jusqu'à 50 % de la bougie ; FULL = bougie entière (mèche à mèche).
+# QMLG_HEAD_MIN_ATR : épaisseur minimale de la zone en ATR (évite une mini-zone sur une bougie de tête presque sans mèche) ; 0 = off.
+QMLG_ZONE_MODE = os.getenv("QMLG_ZONE_MODE", "HEAD").strip().upper()
+if QMLG_ZONE_MODE not in ("HEAD", "SHOULDER"):
+    QMLG_ZONE_MODE = "HEAD"
+QMLG_HEAD_ZONE = os.getenv("QMLG_HEAD_ZONE", "BODY").strip().upper()
+if QMLG_HEAD_ZONE not in ("BODY", "MID", "FULL"):
+    QMLG_HEAD_ZONE = "BODY"
+try:
+    QMLG_HEAD_MIN_ATR = float(os.getenv("QMLG_HEAD_MIN_ATR", "0.25"))
+except ValueError:
+    QMLG_HEAD_MIN_ATR = 0.25
 SMC_QML_DISPLACEMENT_LOOKAHEAD = 5    # nb de bougies après la cassure du HL/LH où chercher le déplacement net
 SMC_QML_IMPULSE_ATR_MULT = 1.0        # impulsion = bougie dont le range >= N x ATR, close dans le sens du mouvement
 
 
-def detect_qml(structure, min_rr=SMC_QML_MIN_RR):
+def detect_qml(structure, min_rr=SMC_QML_MIN_RR, zone_mode=None):
     """QML (Quasimodo) à partir de la sortie de detect_structure. Retourne un dict :
 
       tf, min_rr
@@ -13857,6 +14044,8 @@ def detect_qml(structure, min_rr=SMC_QML_MIN_RR):
     if ser is None:
         raise ValueError("structure doit venir de detect_structure() (clé '_series' absente)")
     H, L, C, T = ser["h"], ser["l"], ser["c"], ser["t"]
+    O = ser.get("o")                                      # ouvertures (absentes de certaines structures de test -> repli épaule)
+    zm = str(zone_mode or QMLG_ZONE_MODE).upper()
     swings, events = structure["swings"], structure["events"]
     last = len(C) - 1
     atr = _qmlg_atr(ser, QMLG_ATR_PERIOD)       # ATR (proxy M15) ; None = données insuffisantes
@@ -13904,7 +14093,24 @@ def detect_qml(structure, min_rr=SMC_QML_MIN_RR):
         trend_before = bool(prev and prev["type"] == "BOS" and prev["dir"] != e["dir"])   # BOS de tendance OPPOSÉE à e["dir"] : le CHoCH la retourne
 
         origin = ls.get("origin") or {"high": ls["price"], "low": ls["price"]}
-        zt, zb = origin["high"], origin["low"]               # zone = bougie d'ORIGINE de l'épaule gauche
+        zt, zb = origin["high"], origin["low"]               # zone = bougie d'ORIGINE de l'épaule gauche (mode SHOULDER)
+        z_idx, z_time, z_mode = ls["idx"], ls["time"], "SHOULDER"
+        if zm == "HEAD" and O is not None and 0 <= hd < len(O) and len(O) == len(H):
+            # mode HEAD : zone = bougie de TÊTE (celle qui a pris la liquidité). Le côté PROCHE du prix (bas pour une vente,
+            # haut pour un achat) est le bas / haut du corps (BODY), le milieu de la bougie (MID) ou l'autre mèche (FULL).
+            body_lo, body_hi = min(O[hd], C[hd]), max(O[hd], C[hd])
+            if d == -1:   # SELL : tête = sommet
+                zt = H[hd]
+                zb = {"BODY": body_lo, "MID": (H[hd] + L[hd]) / 2.0, "FULL": L[hd]}[QMLG_HEAD_ZONE]
+            else:         # BUY : tête = creux
+                zb = L[hd]
+                zt = {"BODY": body_hi, "MID": (H[hd] + L[hd]) / 2.0, "FULL": H[hd]}[QMLG_HEAD_ZONE]
+            if atr and QMLG_HEAD_MIN_ATR > 0 and (zt - zb) < QMLG_HEAD_MIN_ATR * atr:   # pas de mini-zone
+                if d == -1:
+                    zb = zt - QMLG_HEAD_MIN_ATR * atr
+                else:
+                    zt = zb + QMLG_HEAD_MIN_ATR * atr
+            z_idx, z_time, z_mode = hd, T[hd], "HEAD"
         zone_size = zt - zb
         mit = next((j for j in range(k + 1, last + 1) if (L[j] <= zt if d == 1 else H[j] >= zb)), None)
 
@@ -13932,7 +14138,8 @@ def detect_qml(structure, min_rr=SMC_QML_MIN_RR):
             "neckline": {"idx": nk, "time": e["pivot_time"], "price": e["level"]},
             "head": {"idx": hd, "time": T[hd], "price": ext[hd]},
             "choch": e,
-            "zone": {"top": zt, "bottom": zb, "idx": ls["idx"], "time": ls["time"]},
+            "zone": {"top": zt, "bottom": zb, "idx": z_idx, "time": z_time, "mode": z_mode},
+            "qml_line": ls["price"],                          # ligne QML : niveau de l'épaule gauche (H1 vente / L1 achat)
             "statut": "mitigé" if mit is not None else "non mitigé",
             "mitigated_idx": mit, "mitigated_time": None if mit is None else T[mit],
             "entry": entry, "sl": sl, "tp": tp, "rr": rr,
@@ -14016,7 +14223,7 @@ def smc_selftest():
         return [{**b, "h": K - b["l"], "l": K - b["h"], "c": K - b["c"], "o": K - b["o"]} for b in bars]
 
     def _qml(bars, **kw):
-        return detect_qml(detect_structure(bars, "M5", keep=10_000), **kw)
+        return detect_qml(detect_structure(bars, "M5", keep=10_000), **{"zone_mode": "SHOULDER", **kw})
 
     near = lambda a, b: abs(a - b) < 1e-6
     rev = _smc_path([100, 110, 104, 116, 108, 120, 106])           # épaule 116, tête 120 (balaie), CHoCH sous 108
@@ -14142,9 +14349,78 @@ def _qmlg_tf_minutes(tf):
     return QMLG_TF
 
 
+# --- BIAIS H1 (EMA200) POUR QML GAGNANT ------------------------------------------------------------------------
+# OFF par défaut : décision « pas de filtre de tendance » (un QML est un retournement, il va souvent CONTRE le biais).
+# Bouton 📈 Biais H1 du menu QML GAGNANT, ou variable QMLG_HTF_FILTER=1. ON : un QML dans le sens CONTRAIRE du biais H1
+# (clôture H1 vs EMA200, bougies H1 clôturées) est marqué non valide (raison « htf ») : ni alerte, ni entrée directe.
+# Biais indisponible (pas assez de bougies H1, erreur réseau) : on NE bloque PAS (le filtre ne coupe jamais un signal faute de données).
+# Pour savoir si le filtre aide VRAIMENT : qml_compare.py compare les trades dans le sens / contre le biais.
+QMLG_HTF_TTL = _env_int("QMLG_HTF_TTL", 120)   # secondes : biais H1 mémorisé par marché (un seul appel H1 par scan)
+_qmlg_htf_cache = {}
+
+
+def get_qmlg_htf_on():
+    """Biais H1 de QML GAGNANT activé ? (clé « qmlg_htf »). OFF par défaut. N'affecte pas le module QML (section 12) ni les autres stratégies."""
+    return _get_bool_setting("qmlg_htf", _env_on("QMLG_HTF_FILTER", False))
+
+
+def qmlg_htf_ok(symbol, buy):
+    """True si le filtre est OFF, si le biais H1 est indisponible, ou si le QML va dans le sens du biais H1."""
+    if not get_qmlg_htf_on():
+        return True
+    now = time.time()
+    hit = _qmlg_htf_cache.get(symbol)
+    if hit and now - hit[0] < QMLG_HTF_TTL:
+        bias = hit[1]
+    else:
+        try:
+            bias = qml_htf_bias(symbol)
+        except Exception:
+            bias = None
+        _qmlg_htf_cache[symbol] = (now, bias)
+    return True if bias is None else ((bias == 1) == bool(buy))
+
+
+QMLG_RULES_LOOKBACK = _env_int("QMLG_RULES_LOOKBACK", 5)   # nb de QML récents examinés par la règle d'entrée du bouton Analyse
+
+
 def _qmlg_rules(ctx):
-    """RÈGLES DE SIGNAL — VIDES pour l'instant. ctx = {symbol, tf_minutes, structure, qml, candles}.
-    À remplir plus tard : renvoyer un dict de signal (sens, entrée, SL, TP...) ou None. None = aucun signal."""
+    """RÈGLE D'ENTRÉE du bouton 📊 Analyse (information seulement : ce chemin ne publie et n'exécute RIEN ; les vrais signaux
+    partent des alertes de réaction). C'est la MÊME règle que l'alerte de réaction (qmlg_alert_eval), pour un seul actif :
+      QML valide (BOS avant, sweep, CHoCH clôturé par le corps, zone selon QMLG_ZONE_MODE, plan SL derrière le sweep, RR1 >= QMLG_MIN_RR
+      ou TP fixe du menu ; la fraîcheur de la zone se juge à la touche) + une bougie qui touche la zone sans l'invalider (clôture au-delà du
+      bord lointain) + AVALEMENT ou PIN BAR (jamais un doji) sur cette bougie ou l'une des QMLG_ALERT_REACT_BARS suivantes, pas plus vieille
+      que QMLG_ALERT_STALE_BARS bougies + biais H1 respecté si le filtre est ON.
+    (L'ancienne règle « la 1re touche doit elle-même être un rejet » ne se déclenchait presque jamais : 0 fois sur 934 scans de test.)
+    ctx = {symbol, tf_minutes, structure, qml, candles}. Retourne un dict de signal, ou None (= aucune entrée en ce moment)."""
+    structure, candles = ctx.get("structure"), ctx.get("candles")
+    qmls = (ctx.get("qml") or {}).get("qmls") or []
+    if not structure or not candles or not qmls:
+        return None
+    tf_sec = int(ctx.get("tf_minutes") or QMLG_TF) * 60
+    now = candles[-1]["t"] + tf_sec          # l'instant où la dernière bougie vient de se clôturer
+    for q in reversed(qmls[-QMLG_RULES_LOOKBACK:]):
+        v = qmlg_validate(q, structure, direct=True)   # critères du QML + plan ; zone « fraîche » : jugée à la touche, pas au scan
+        if not v["valid"]:
+            continue
+        buy = q["dir"] == "bull"
+        if not qmlg_htf_ok(ctx.get("symbol"), buy):
+            continue
+        tr, z = v["trade"], q["zone"]
+        a = {"key": "analyse", "symbol": ctx.get("symbol"), "tf": tf_sec // 60, "dir": q["dir"],
+             "zone": {"top": z["top"], "bottom": z["bottom"]}, "sl": tr["sl"], "tp1": tr["tp1"], "tp1_kind": tr["tp1_kind"],
+             "tp2": tr["tp2"], "tp2_kind": tr["tp2_kind"], "last_t": q["choch"]["break_time"], "entered": False}
+        _, evs = qmlg_alert_eval(a, candles, now=now)
+        ev = next((e for e in evs if e["type"] == "reaction"), None)
+        if not ev:
+            continue
+        al = ev["alert"]
+        return {"strategy": "QML_GAGNANT", "symbol": ctx.get("symbol"), "tf_minutes": tf_sec // 60,
+                "side": "BUY" if buy else "SELL", "order": "REACTION", "pattern": ev["pattern"], "time": ev["t"],
+                "entry": ev["close"], "sl": al["sl"], "tp1": al["tp1"], "tp2": al["tp2"],
+                "tp1_kind": al["tp1_kind"], "tp2_kind": al["tp2_kind"], "rr1": ev["rr1"], "rr2": ev["rr2"],
+                "zone": {"top": z["top"], "bottom": z["bottom"], "mode": z.get("mode")},
+                "qml_id": q["choch"]["break_time"]}
     return None
 
 
@@ -14262,8 +14538,8 @@ def qml_gagnant_analyze(symbol, tf):
     """Analyse QML GAGNANT d'un actif (toujours possible, ON ou OFF). Appelle detect_structure puis detect_qml et
     renvoie un dict de statut :
       strategy, symbol, tf, tf_minutes, enabled (réglage ON/OFF), status, signal, bars, trend, n_qml, last_qml, trade, error
-    status : NO_RULES (analyse faite, règles vides) · NO_DATA · ERROR · SIGNAL (futur).
-    signal est None tant que _qmlg_rules() ne renvoie rien. Ne lève jamais : toute erreur finit dans status/error."""
+    status : NO_RULES (analyse faite, aucune entrée en ce moment) · NO_DATA · ERROR · SIGNAL (réaction dans la zone, voir _qmlg_rules).
+    signal est None tant que _qmlg_rules() ne renvoie rien (information seulement : rien n'est publié d'ici). Ne lève jamais : toute erreur finit dans status/error."""
     tf_min = _qmlg_tf_minutes(tf)
     out = {"strategy": "QML_GAGNANT", "symbol": symbol, "tf": tf, "tf_minutes": tf_min,
            "enabled": get_qmlg_on(), "status": "NO_DATA", "signal": None,
@@ -14296,7 +14572,8 @@ _QMLG_TREND_LBL = {"bullish": "haussière 📈", "bearish": "baissière 📉", "
 def qml_gagnant_text(res):
     """Texte Telegram de l'analyse QML GAGNANT (information seulement : aucune règle d'entrée n'existe encore)."""
     head = (f"🏆 <b>ANALYSE QML GAGNANT — {res['symbol']}</b> · M{res['tf_minutes']}\n"
-            f"Stratégie : {'🟢 ON' if res['enabled'] else '🔴 OFF'} · règles d'entrée : <b>aucune</b> (aucun signal)\n")
+            f"Stratégie : {'🟢 ON' if res['enabled'] else '🔴 OFF'} · règle d'entrée : réaction dans la zone (avalement / pin bar) · "
+            + ("<b>signal en cours</b>\n" if res.get("signal") else "<b>aucune</b> entrée en ce moment\n"))
     if res["status"] == "ERROR":
         return head + f"\n⚠️ Analyse impossible : {res['error']}"
     if res["status"] == "NO_DATA":
@@ -14325,7 +14602,7 @@ def qml_gagnant_text(res):
 # --- REJET, VALIDATION, SCAN MULTI-MARCHÉS / MULTI-TF, JSON ----------------------------------------------
 _QMLG_REASON_LBL = {"tendance_avant": "pas de BOS avant", "sweep": "pas de sweep", "choch_cloture": "CHoCH non clôturé",
                     "zone_epaule": "zone ≠ épaule", "zone_fraiche": "zone mitigée", "plan": "plan de trade impossible",
-                    "rr1": f"RR1 < {QMLG_MIN_RR:g}"}
+                    "rr1": f"RR1 < {QMLG_MIN_RR:g}", "htf": "contre biais H1"}
 
 
 def qmlg_rejection(candles, buy):
@@ -14398,6 +14675,9 @@ def _qmlg_record(symbol, tf, q, structure, candles):
     """Une formation, prête pour le JSON : données du QML + validation + plan limite + entrée directe éventuelle."""
     v = qmlg_validate(q, structure)
     direct = qmlg_direct_entry(q, structure, candles)
+    if not qmlg_htf_ok(symbol, q["dir"] == "bull"):   # biais H1 (OFF par défaut) : QML contre le biais -> non valide, pas d'entrée directe
+        v = dict(v, valid=False, reasons=list(v["reasons"]) + ["htf"])
+        direct = None
     ag = None
     if QMLG_AGENTS and (v["valid"] or direct):   # 3 agents : aucun QML n'est validé / envoyé sans leur accord
         ag = qmlg_agents(symbol, tf, q, structure, candles, (direct or v)["trade"])
@@ -15071,6 +15351,7 @@ def _qmlg_menu_text():
             f"🔔 <b>Alerte réaction</b> : {'🟢 ON' if get_qmlg_alert_on() else '🔴 OFF'} · TF "
             f"{', '.join(_tf_lbl(t) for t in get_qmlg_alert_tfs())} · {len(qmlg_alert_symbols())} marché(s) (menu 🌍 ACTIFS)\n"
             f"🔒 <b>BE</b> : {'🟢 ON' if get_qmlg_be_on() else '🔴 OFF'} (SL → entrée à RR{get_be_rr():g}) · SL toujours derrière le sweep\n"
+            f"📈 <b>Biais H1</b> : {'🟢 ON (QML contre le biais ignorés)' if get_qmlg_htf_on() else '🔴 OFF (aucun filtre de tendance)'}\n"
             f"🎯 <b>TP</b> : {'AUTO (prochaines liquidités)' if get_qmlg_tp_rr() is None else 'FIXE RR%g (pas de TP2)' % get_qmlg_tp_rr()}\n"
             f"C'est toi qui l'actives. Elle alerte seulement sur une RÉACTION dans une zone QML (avalement ou pin bar), pas quand le prix "
             f"y entre. Entrée, SL, TP1 / TP2 (RR), BE, lot, image et stickers partent au groupe, puis RR / BE / TP / SL en réponse. "
@@ -15085,7 +15366,8 @@ def _qmlg_keyboard():
     tfs = get_qmlg_alert_tfs()
     return _with_back({"inline_keyboard": [
         [{"text": f"🔔 Alerte réaction : {'ON ✅' if get_qmlg_alert_on() else 'OFF'}", "callback_data": "qmlg:alert"}],
-        [{"text": f"🔒 BE : {'ON ✅' if get_qmlg_be_on() else 'OFF'}", "callback_data": "qmlg:be"}],
+        [{"text": f"🔒 BE : {'ON ✅' if get_qmlg_be_on() else 'OFF'}", "callback_data": "qmlg:be"},
+         {"text": f"📈 Biais H1 : {'ON ✅' if get_qmlg_htf_on() else 'OFF'}", "callback_data": "qmlg:htf"}],
         [{"text": f"{'✅ ' if get_qmlg_tp_rr() is None else ''}TP auto", "callback_data": "qmlg:tp:auto"}]
         + [{"text": f"{'✅ ' if get_qmlg_tp_rr() == float(r) else ''}RR{r}", "callback_data": f"qmlg:tp:{r}"} for r in QMLG_TP_CHOICES],
         [{"text": f"{'✅ ' if t in tfs else ''}{_tf_lbl(t)}", "callback_data": f"qmlg:tf:{t}"} for t in QMLG_ALERT_TF_CHOICES],
@@ -15146,6 +15428,12 @@ def _qmlg_callback(cq, arg):
         on = not get_qmlg_be_on()
         set_setting("qmlg_be_on", "1" if on else "0")
         toast = "BE QML GAGNANT : " + ("ON" if on else "OFF")
+    elif arg == "htf":   # 📈 Biais H1 ON / OFF : les alertes déjà posées sont effacées (elles seront reposées au prochain scan avec le nouveau filtre)
+        on = not get_qmlg_htf_on()
+        set_setting("qmlg_htf", "1" if on else "0")
+        _qmlg_htf_cache.clear()
+        qmlg_alerts_clear()
+        toast = "Biais H1 QML GAGNANT : " + ("ON" if on else "OFF")
     elif arg.startswith("tp:"):   # 🎯 TP auto / RR fixe : ne touche que les NOUVEAUX signaux
         v = arg[3:]
         if v == "auto":
@@ -15341,6 +15629,15 @@ def draw_chart(df, qml, trade=None, symbol=None, tf=None, structure=None, path=N
             ax.add_patch(plt.Rectangle((xa, zb), xb - xa, zt - zb, fill=False, edgecolor=col, lw=2.2, zorder=5))
             ax.plot([xa, xb], [near, near], color=col, lw=2.2, zorder=5)
             ax.axvline(xm, ymin=0, ymax=1, color=col, lw=0.8, ls=":", zorder=2)   # 1re retouche de la zone
+        # --- ligne QML : niveau de l'épaule gauche, prolongé vers la droite (affichée seulement si hors de la zone)
+        try:
+            ql = float(qml.get("qml_line", sh["price"]))
+            if not (zb <= ql <= zt):
+                xq = max(X(sh["idx"]), 0)
+                ax.plot([xq, x1], [ql, ql], color="#6a1b9a", lw=1.5, ls="--", zorder=4)
+                ax.text(x1 + 0.4, ql, f"Ligne QML {px(ql)}", fontsize=7, fontweight="bold", color="#6a1b9a", ha="left", va="center", zorder=7)
+        except (TypeError, ValueError, KeyError):
+            pass
         ax.text(x0 - 1, zt if not buy else zb, f"QML {'ACHAT' if buy else 'VENTE'} · {'NON MITIGÉ' if fresh else 'mitigé'}",
                 fontsize=8, fontweight="bold", color=C["BLACK"] if fresh else C[side], ha="right", va="bottom" if not buy else "top",
                 bbox=dict(boxstyle="round,pad=0.2", fc="white", ec=C["BLACK"] if fresh else C[side], lw=1.0, alpha=0.95), zorder=7)
@@ -15748,5 +16045,6 @@ if __name__ == "__main__":
     if "--selftest" in sys.argv:
         sys.exit(_selftest())
     main()
+
 
 
