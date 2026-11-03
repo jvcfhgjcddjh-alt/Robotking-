@@ -1,6 +1,7 @@
 
 
 
+
 #!/usr/bin/env python3
 """AlphaBot BOS + CHoCH — Gold & BTC — version en un seul fichier.
 
@@ -7124,12 +7125,13 @@ def _home_text():
 
 def _strategies_text():
     on = lambda b: "🟢 ON" if b else "🔴 OFF"
-    live = [n for n, b in (("BOS/CHoCH", get_strat_main()), ("CRT", get_strat_crt()), ("QML", get_qml_on()), ("FIBTREND", get_ft_on())) if b]
+    live = [n for n, b in (("BOS/CHoCH", get_strat_main()), ("CRT", get_strat_crt()), ("QML", get_qml_on()), ("FIBTREND", get_ft_on()), ("VRAI CRT", get_strat_vcrt())) if b]
     return (f"🧩 <b>STRATÉGIES</b>\n\n"
             f"BOS / CHoCH : {on(get_strat_main())}\nCRT : {on(get_strat_crt())}\nQML : {on(get_qml_on())}"
             f" · publication auto : {on(get_qml_auto())}\n"
             f"FIBTREND : {on(get_ft_on())} · publication auto : {on(get_ft_auto())}\n"
             f"QML GAGNANT : {on(get_qmlg_on())} (règles à venir : aucun signal pour l'instant)\n"
+            f"🕯 VRAI CRT : {on(get_strat_vcrt())} · UT {vcrt_config()[0]} → entrée {vcrt_config()[2]} (⚙️ : UT H4/H1/M15/M5, TP auto ou RR fixe, SL, BE)\n"
             f"📈 Ordres MT5 (API) : {on(get_mt5_orders_on())}"
             f"{'' if get_mt5_orders_on() else ' — signaux publiés et suivis, AUCUN ordre envoyé au broker'}\n\n"
             f"Actives : {', '.join(live) if live else 'aucune ⚠️ (plus aucun signal automatique)'}\n"
@@ -7145,6 +7147,7 @@ def _strategies_keyboard():
         [_btn("QML", "str:qml", get_qml_on()), _btn("QML auto (signal)", "str:qmlauto", get_qml_auto())],
         [_btn("FIBTREND", "str:ft", get_ft_on()), _btn("FIBTREND auto (signal)", "str:ftauto", get_ft_auto())],
         [_btn("QML GAGNANT", "str:qmlg", get_qmlg_on()), {"text": "⚙️ QML GAGNANT", "callback_data": "qmlg:home"}],
+        [_btn("🕯 VRAI CRT", "str:vcrt", get_strat_vcrt()), {"text": "⚙️ VRAI CRT", "callback_data": "vcrtm:home"}],
         [_btn("📈 Ordres MT5 (API)", "str:mt5", get_mt5_orders_on())],
         [{"text": "📊 Analyse (point potentiel)", "callback_data": "ana:home"}, {"text": "⚙️ QML", "callback_data": "qml:home"}],
         [{"text": "⚙️ FIBTREND", "callback_data": "ft:home"}],
@@ -7197,7 +7200,7 @@ def handle_command(text):
                "/session [all|londres|ny|both] — n'accepter que les CHoCH d'une session · /zone [ob|fvg|both] — zone du limit\n"
                "/modesl [struct|zone|sweep] — SL de l'entrée directe · /modetp [rr|target|swing] — mode du TP\n"
                "/strategie [main|crt|both] · /crt [on|off|h1|h4|d1|range|mid|rr] — module CRT (désactivé par défaut)\n"
-               "/vcrt_tf [H4|H1|M15|M5] — UT du vrai CRT (entrée auto : H4→M15, H1→M5, M15→M1, M5→M1)\n"
+               "/vcrt [on|off] · /vcrt_tf [H4|H1|M15|M5] — activer le vrai CRT · UT du vrai CRT (entrée auto : H4→M15, H1→M5, M15→M1, M5→M1)\n"
                "/vcrt_tp [fixe|auto|mid|extreme] · /vcrt_rr [RR_final] ou [RR1 RR2] — TP du vrai CRT (auto = CRH/CRL, fixe = RR3/RR4…)\n"
                "/vcrt_sl [0.6|0.8|1|off] — plafond du SL du vrai CRT (x ATR) · /vcrt_be [auto|off|1|2] — BE du vrai CRT\n"
                "/mtffib [on|off] — filtre Fibonacci HTF Premium/Discount\n"
@@ -7267,6 +7270,9 @@ def handle_command(text):
             set_choice("vcrt_tp_mode", "FIXE", VCRT_TP_MODES)   # un RR réglé à la main = TP fixe
         return (_vcrt_tf_text(), _vcrt_tf_keyboard())
     if cmd in ("/vcrt_tf", "/vcrttf", "/vcrt"):
+        if len(parts) > 1 and parts[1].lower() in ("on", "off"):
+            set_setting("strat_vcrt", "1" if parts[1].lower() == "on" else "0")
+            return (_vcrt_tf_text(), _vcrt_tf_keyboard())
         if len(parts) > 1:
             ok, changed = set_vcrt_tf(parts[1])
             if not ok:
@@ -7990,6 +7996,11 @@ def _handle_update(u):
                     send(chat_id, f"🎯 {sym} — zones QML {_tf_lbl(a_tf)}", photo=chart)
                 send(chat_id, txt, reply_markup=_analyse_symbol_keyboard(sym))
                 ack = "Analyse envoyée"
+        elif data.startswith("vcrtm:"):   # panneau du vrai CRT : ON/OFF, UT du CRT, TP auto / RR fixe, SL plafonné, BE
+            if data == "vcrtm:toggle":
+                set_setting("strat_vcrt", "0" if get_strat_vcrt() else "1")
+                ack = "Vrai CRT : " + ("ON" if get_strat_vcrt() else "OFF")
+            _edit(cq, _vcrt_tf_text(), _vcrt_tf_keyboard())
         elif data.startswith("qml:"):
             ack = _qml_callback(cq, data[4:])
         elif data.startswith("qmlg:"):
@@ -8140,6 +8151,8 @@ def _handle_update(u):
                 set_setting("mt5_orders", "0" if get_mt5_orders_on() else "1"); ack = "Ordres MT5 : " + ("ON" if get_mt5_orders_on() else "OFF")
             elif a_ == "qmlg":
                 set_setting("qmlg_on", "0" if get_qmlg_on() else "1"); ack = "QML GAGNANT : " + ("ON" if get_qmlg_on() else "OFF")
+            elif a_ == "vcrt":
+                set_setting("strat_vcrt", "0" if get_strat_vcrt() else "1"); ack = "Vrai CRT : " + ("ON" if get_strat_vcrt() else "OFF")
             _edit(cq, _strategies_text(), _strategies_keyboard())
         elif data.startswith("news:"):
             if data == "news:on":
@@ -16552,7 +16565,8 @@ def _vcrt_tf_text(note=""):
 def _vcrt_tf_keyboard():
     cur = get_vcrt_tf()
     mode, pos, (r1, r2) = get_vcrt_tp_mode(), get_vcrt_tp1_pos(), (get_vcrt_rr(1), get_vcrt_rr(2))
-    rows = [[_btn(k, f"svcrt:{k}", cur == k) for k in VCRT_TFS],
+    rows = [[_btn("🕯 VRAI CRT : " + ("ON" if get_strat_vcrt() else "OFF"), "vcrtm:toggle", get_strat_vcrt())],
+            [_btn(k, f"svcrt:{k}", cur == k) for k in VCRT_TFS],
             [_btn("TP fixe (RR3 / RR4…)", "svtp:FIXE", mode == "FIXE"), _btn("TP auto (CRH / CRL)", "svtp:PROPOSE", mode == "PROPOSE")]]
     if mode == "PROPOSE":
         rows.append([_btn("TP1 à 50 % du range", "svp1:MID", pos == "MID"), _btn("TP = CRH / CRL (extrême)", "svp1:EXTREME", pos == "EXTREME")])
@@ -16564,7 +16578,7 @@ def _vcrt_tf_keyboard():
     be = get_vcrt_be()
     rows.append([_btn("BE auto", "svbe:AUTO", be == "AUTO"), _btn("BE OFF", "svbe:OFF", be == "OFF")]
                 + [_btn(f"BE RR{v:g}", f"svbe:{v:g}", isinstance(be, float) and abs(be - v) < 1e-9) for v in (1, 2)])
-    return _signal_back(rows)
+    return {"inline_keyboard": rows + [[{"text": "🔙 Stratégies", "callback_data": "str:home"}]]}
 
 
 def vcrt_find_signals(h, tf_min, last_only=False):
@@ -17437,6 +17451,20 @@ class TestVcrtSlBeRr(unittest.TestCase):
         _E.track_trade(tr, [{"t": 2, "o": 101.0, "h": 101.5, "l": 98.9, "c": 99.0}])
         self.assertEqual((tr["outcome"], tr["result_r"]), ("SL", -1.0))                         # retour au SL initial : -1R
 
+    def test_menu_strategies_et_panneau_vrai_crt(self):
+        kb = str(_E._strategies_keyboard())
+        self.assertIn("str:vcrt", kb)
+        self.assertIn("vcrtm:home", kb)
+        self.assertIn("VRAI CRT", _E._strategies_text())
+        pk = str(_E._vcrt_tf_keyboard())
+        for d in ("vcrtm:toggle", "svcrt:M5", "svtp:FIXE", "svtp:PROPOSE", "svsl:0.8", "svbe:OFF", "svbe:AUTO", "str:home"):
+            self.assertIn(d, pk)
+        _E.handle_command("/vcrt on")
+        self.assertTrue(_E.get_strat_vcrt())
+        _E.handle_command("/vcrt off")
+        self.assertFalse(_E.get_strat_vcrt())
+        _E._q("DELETE FROM settings WHERE key='strat_vcrt'", commit=True)
+
     def test_crt_m5_entree_m1(self):
         _E.set_vcrt_tf("M5")
         try:
@@ -17824,6 +17852,5 @@ if __name__ == "__main__":
     if "--selftest" in sys.argv:
         sys.exit(_selftest())
     main()
-
 
 
