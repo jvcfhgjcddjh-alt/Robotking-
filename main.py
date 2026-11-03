@@ -5151,7 +5151,7 @@ def risk_strategy_label(sig):
     if not isinstance(sig, dict):
         return str(sig or "?")
     typ = sig.get("type")
-    if sig.get("strategy") == "VCRT" or sig.get("key_suffix") == "vcrt":
+    if sig.get("strategy") == "VCRT" or str(sig.get("key_suffix") or "").startswith("vcrt"):
         base = "VCRT"
     elif sig.get("strategy") == "CRT" or sig.get("key_suffix") == "crt":
         base = "CRT"
@@ -6457,7 +6457,7 @@ def _signal_text():
             f"📍 Signaux ouverts max par actif : {get_max_positions()}")
 
 
-_SL_LBL = {"STRUCT": "structure (BOS)", "ZONE": "derrière OB/FVG", "SWEEP": "derrière le sweep"}
+_SL_LBL = {"STRUCT": "structure (BOS)", "ZONE": "derrière OB/FVG", "SWEEP": "derrière le sweep", "MSS": "juste derrière le MSS / la zone d'entrée"}
 _TP_LBL = {"RR": "RR fixe", "TARGET": "liquidité ext.", "SWING": "swing H/L"}
 _CRT_TP_LBL = {"RANGE": "autre bout du range", "MID": "50 % du range", "RR": "RR fixe"}
 _SESS_LBL = {"ALL": "toutes", "LONDON": "Londres", "NY": "New York", "BOTH": "Londres + New York"}
@@ -7131,7 +7131,7 @@ def _strategies_text():
             f" · publication auto : {on(get_qml_auto())}\n"
             f"FIBTREND : {on(get_ft_on())} · publication auto : {on(get_ft_auto())}\n"
             f"QML GAGNANT : {on(get_qmlg_on())} (règles à venir : aucun signal pour l'instant)\n"
-            f"🕯 VRAI CRT : {on(get_strat_vcrt())} · UT {vcrt_config()[0]} → entrée {vcrt_config()[2]} (⚙️ : UT H4/H1/M15/M5, TP auto ou RR fixe, SL, BE)\n"
+            f"🕯 VRAI CRT : {on(get_strat_vcrt())} · UT {vcrt_active_lbl()} (⚙️ : UT H4/H1/M15/M5 cumulables, TP R1-R4 ou auto, SL, BE)\n"
             f"📈 Ordres MT5 (API) : {on(get_mt5_orders_on())}"
             f"{'' if get_mt5_orders_on() else ' — signaux publiés et suivis, AUCUN ordre envoyé au broker'}\n\n"
             f"Actives : {', '.join(live) if live else 'aucune ⚠️ (plus aucun signal automatique)'}\n"
@@ -7200,9 +7200,9 @@ def handle_command(text):
                "/session [all|londres|ny|both] — n'accepter que les CHoCH d'une session · /zone [ob|fvg|both] — zone du limit\n"
                "/modesl [struct|zone|sweep] — SL de l'entrée directe · /modetp [rr|target|swing] — mode du TP\n"
                "/strategie [main|crt|both] · /crt [on|off|h1|h4|d1|range|mid|rr] — module CRT (désactivé par défaut)\n"
-               "/vcrt [on|off] · /vcrt_tf [H4|H1|M15|M5] — activer le vrai CRT · UT du vrai CRT (entrée auto : H4→M15, H1→M5, M15→M1, M5→M1)\n"
-               "/vcrt_tp [fixe|auto|mid|extreme] · /vcrt_rr [RR_final] ou [RR1 RR2] — TP du vrai CRT (auto = CRH/CRL, fixe = RR3/RR4…)\n"
-               "/vcrt_sl [0.6|0.8|1|off] — plafond du SL du vrai CRT (x ATR) · /vcrt_be [auto|off|1|2] — BE du vrai CRT\n"
+               "/vcrt [on|off] · /vcrt_tf [H4|H1|M15|M5] ou /vcrt_tf M5 M15 — activer le vrai CRT · UT du vrai CRT (plusieurs en même temps ; entrée auto : H4→M15, H1→M5, M15→M1, M5→M1)\n"
+               "/vcrt_tp [fixe|auto|mid|extreme] · /vcrt_rr [RR_final] ou [RR1 RR2] — TP du vrai CRT (auto = CRH/CRL, fixe = R1/R2/R3/R4…)\n"
+               "/vcrt_sl [0.6|0.8|1|off] — plafond du SL du vrai CRT (x ATR) · /vcrt_sl [mss|sweep] — SL serré derrière le MSS ou derrière le sweep · /vcrt_be [auto|off|1|2|3|4] — BE du vrai CRT\n"
                "/mtffib [on|off] — filtre Fibonacci HTF Premium/Discount\n"
                "/m15imp [on|off] — filtre M15 vraie impulsion + structure + Fibonacci\n"
                "/bos [on|off] [40|45|50] — vrai BOS : retracement mini après la cassure\n"
@@ -7226,12 +7226,14 @@ def handle_command(text):
     if cmd == "/testgroupe":
         return (check_group(send_test=True)[1], None)
     if cmd in ("/statut", "/status", "/prix"):
-        _vk, _vm, _ve, _vem = vcrt_config()
         return ("📡 <b>Scan en cours</b> — " + TF_LABEL + "\n" + "\n".join(scan_status_lines())
-                + f"\n🕯 Vrai CRT : {'ON' if get_strat_vcrt() else 'OFF'} · UT {_vk} → entrée {_ve}", None)
+                + f"\n🕯 Vrai CRT : {'ON' if get_strat_vcrt() else 'OFF'} · UT {vcrt_active_lbl()}", None)
     if cmd in ("/vcrt_sl", "/vcrtsl"):
-        if len(parts) > 1 and not set_vcrt_sl_cap(parts[1]):
-            return ("Valeur invalide. Exemples : /vcrt_sl 0.8 | /vcrt_sl 0.6 | /vcrt_sl off  (0.2 à 5 × ATR)", None)
+        _slm = {"mss": "MSS", "serre": "MSS", "serré": "MSS", "sweep": "SWEEP"}.get(parts[1].lower()) if len(parts) > 1 else None
+        if _slm:
+            set_choice("vcrt_sl_mode", _slm, VCRT_SL_MODES)
+        elif len(parts) > 1 and not set_vcrt_sl_cap(parts[1]):
+            return ("Valeur invalide. Exemples : /vcrt_sl mss (SL serré) | /vcrt_sl sweep | /vcrt_sl 0.8 | /vcrt_sl off  (plafond 0.2 à 5 × ATR)", None)
         return (_vcrt_tf_text(), _vcrt_tf_keyboard())
     if cmd in ("/vcrt_be", "/vcrtbe"):
         if len(parts) > 1 and not set_vcrt_be(parts[1]):
@@ -7259,8 +7261,8 @@ def handle_command(text):
     if cmd in ("/vcrt_rr", "/vcrtrr"):
         if len(parts) > 1:
             try:
-                if len(parts) == 2:   # /vcrt_rr 4 : TP final à RR4 (RR1 conservé), calculé depuis le SL
-                    ok = set_vcrt_rr_final(float(parts[1].replace(",", ".")))
+                if len(parts) == 2:   # /vcrt_rr 4 (ou r4) : TP final à R4 (RR1 conservé), calculé depuis le SL
+                    ok = set_vcrt_rr_pick(parts[1].lower().lstrip("r").replace(",", "."))
                 else:
                     ok = set_vcrt_rr(float(parts[1].replace(",", ".")), float(parts[2].replace(",", ".")))
             except (ValueError, IndexError):
@@ -7274,11 +7276,12 @@ def handle_command(text):
             set_setting("strat_vcrt", "1" if parts[1].lower() == "on" else "0")
             return (_vcrt_tf_text(), _vcrt_tf_keyboard())
         if len(parts) > 1:
-            ok, changed = set_vcrt_tf(parts[1])
+            multi = len(parts) > 2 or re.search(r"[,;+/]", parts[1])   # /vcrt_tf M5 M15 : plusieurs UT en même temps
+            ok, changed = set_vcrt_tfs(" ".join(parts[1:])) if multi else set_vcrt_tf(parts[1])
             if not ok:
-                return ("Valeur invalide. Exemple : /vcrt_tf H4  |  /vcrt_tf H1  |  /vcrt_tf M15  |  /vcrt_tf M5", None)
-            note = ("✅ UT du CRT changée, état CRT réinitialisé.\n\n" if changed
-                    else "ℹ️ Déjà sur cette UT, rien à changer.\n\n")
+                return ("Valeur invalide. Exemples : /vcrt_tf H4  |  /vcrt_tf M5  |  /vcrt_tf M5 M15 (plusieurs UT en même temps)", None)
+            note = ("✅ UT du CRT changée (le CRT des UT retirées est réinitialisé).\n\n" if changed
+                    else "ℹ️ Déjà sur ces UT, rien à changer.\n\n")
             return (_vcrt_tf_text(note), _vcrt_tf_keyboard())
         return (_vcrt_tf_text(), _vcrt_tf_keyboard())
     if cmd == "/menu":
@@ -7755,9 +7758,13 @@ def _handle_update(u):
             if ok:
                 _edit(cq, _signal_strat_text(), _signal_strat_keyboard())
                 ack = "CRT : " + _strat_txt()
-        elif data.startswith(("svtp:", "svp1:", "svrr:", "svsl:", "svbe:")):
+        elif data.startswith(("svtp:", "svp1:", "svrr:", "svsl:", "svbe:", "svrf:", "svsm:")):
             if data.startswith("svsl:"):
                 ok = set_vcrt_sl_cap(data[5:])
+            elif data.startswith("svsm:"):
+                ok = set_choice("vcrt_sl_mode", data[5:], VCRT_SL_MODES)
+            elif data.startswith("svrf:"):   # bouton « TP R1 / R2 / R3 / R4 » : le RR est choisi par l'utilisateur
+                ok = set_vcrt_rr_pick(data[5:])
             elif data.startswith("svbe:"):
                 ok = set_vcrt_be(data[5:])
             elif data.startswith("svtp:"):
@@ -7772,14 +7779,14 @@ def _handle_update(u):
                     ok = False
             if ok:
                 _edit(cq, _vcrt_tf_text(), _vcrt_tf_keyboard())
-                ack = ("SL vrai CRT : " + _vcrt_sl_txt() if data.startswith("svsl:") else
+                ack = ("SL vrai CRT : " + _vcrt_sl_txt() if data.startswith(("svsl:", "svsm:")) else
                        "BE vrai CRT : " + _vcrt_be_txt() if data.startswith("svbe:") else
                        "TP vrai CRT : " + _vcrt_tp_txt())
-        elif data.startswith("svcrt:"):
-            ok, changed = set_vcrt_tf(data[6:])
+        elif data.startswith("svcrt:"):   # chaque tap active / désactive CETTE UT : M5 et M15 peuvent tourner ensemble
+            ok, _acts, _msg = toggle_vcrt_tf(data[6:])
             if ok:
-                _edit(cq, _vcrt_tf_text("✅ UT du CRT changée, état CRT réinitialisé.\n\n" if changed else ""), _vcrt_tf_keyboard())
-                ack = f"UT du CRT : {get_vcrt_tf()} → entrée {vcrt_config()[2]}"
+                _edit(cq, _vcrt_tf_text(), _vcrt_tf_keyboard())
+            ack = f"{_msg} · actifs : {vcrt_active_lbl()}"
         elif data in ("sentd", "sentl"):
             d, l = get_entry_direct(), get_entry_limit()
             if set_entry_types(not d if data == "sentd" else d, not l if data == "sentl" else l):
@@ -12275,7 +12282,7 @@ def _selftest():
     _E.HTF_MODE = "FULL"   # les tests historiques (H1 -> M15 -> M5 -> POI) évaluent la cascade complète ; TestHtfM15 passe en mode M15
     suite, loader = unittest.TestSuite(), unittest.TestLoader()
     for cls in (TestRetracement, TestContinuation, TestInvalidationHTF, TestChop, TestGetExtTf,
-                TestLiquiditePure, TestM1NeDecidePasSeul, TestLogs, TestEntreeM5, TestNonRegression, TestVraiCRT, TestVcrtSlBeRr, TestVcrtTf, TestVcrtSuivi, TestVcrtTp, TestVcrtEntry, TestVcrtImages,
+                TestLiquiditePure, TestM1NeDecidePasSeul, TestLogs, TestEntreeM5, TestNonRegression, TestVraiCRT, TestVcrtSlBeRr, TestVcrtTf, TestVcrtSuivi, TestVcrtTp, TestVcrtEntry, TestVcrtImages, TestVcrtMultiUtRrSl,
                 TestHtfM15, TestBE, TestEntreeOBFVG, TestSLTPCRT, TestSignauxSimultanes, TestLectureExtInt, TestModifyPositionGardeSLTP, TestBEDoubleVerif, TestClientId, TestLogVolumeReel, TestRiskGateUniversel, TestFiltresQualite, TestActifsEtEntrees, TestAjoutsNewsStopUS30, TestQmlSansLimiteAge, TestQmlMemoireEtHistoriqueProfond, TestSetupEngineEntreeEtPause, TestMoteurSmc, TestQmlGagnant, TestComputeTrade, TestQmlGagnantBoutons, TestQmlGagnantHtfEtRegles, TestQmlGagnantAlertes, TestFibtrendBosChoch, TestOrdresMt5EtStickers):
         suite.addTests(loader.loadTestsFromTestCase(cls))
     return 0 if unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful() else 1
@@ -16265,7 +16272,8 @@ def track_trade_verified(trade, candles):
 #   Bougie 1 = référence : high / low = CRH / CRL.
 #   Bougie 2 = manipulation : balaye UN seul côté puis CLÔTURE de nouveau dans le range de la bougie 1.
 #   Bougie 3 = distribution : le prix part vers l'autre extrémité du range.
-# SL : derrière l'extrême du sweep (+ marge en ATR). Cette section ne fait QUE détecter (pas d'entrée, pas de signal
+# SL : derrière l'extrême du sweep (+ marge en ATR), ou « serré » juste derrière le MSS / la zone d'entrée (voir VCRT_SL_MODES).
+# Plusieurs UT de CRT peuvent tourner en même temps (get_vcrt_tfs). Cette section ne fait QUE détecter (pas d'entrée, pas de signal
 # Telegram, pas de suivi) : l'entrée sur UT basse, le TP, le suivi et l'image viennent dans les étapes suivantes.
 # Bougies = dicts {t, o, h, l, c} clôturées, t = ouverture en secondes (même format que get_candles).
 # Activation : STRAT_VCRT (défaut OFF) ou réglage « strat_vcrt » en base. Seuils modifiables via variables VCRT_*.
@@ -16276,6 +16284,12 @@ VCRT_MIN_RANGE_ATR = float(os.getenv("VCRT_MIN_RANGE_ATR", "0.5"))    # range de
 VCRT_MAX_RANGE_ATR = float(os.getenv("VCRT_MAX_RANGE_ATR", "4.0"))    # ... ni trop grand (x ATR)
 VCRT_SL_BUFFER_ATR = float(os.getenv("VCRT_SL_BUFFER_ATR", "0.05"))   # marge derrière l'extrême du sweep (x ATR)
 VCRT_MAX_SL_ATR = float(os.getenv("VCRT_MAX_SL_ATR", "3.0"))          # SL maximum (x ATR), vérifié à l'entrée (étape suivante)
+# Plancher du SL propre au vrai CRT (en % du prix). L'ancien plancher global (min_sl_pct, 0.10 % = ~3.9 pts sur l'or à 3 900)
+# ÉLARGISSAIT le SL serré jusqu'à 3.9 pts : bien plus loin que le sweep. Ici : juste de quoi éviter le bruit / spread
+# (0.02 % = ~0.8 pt sur l'or). 0 = aucun plancher. Le stopsLevel du broker reste vérifié à l'envoi (rejet net, jamais déplacé).
+VCRT_MIN_SL_PCT = _env_float("VCRT_MIN_SL_PCT", 0.0002)
+# Risque maximal accepté (x ATR de l'UT du CRT) : au-delà, le signal est ignoré (jamais de SL très large).
+VCRT_MAX_RISK_ATR = _env_float("VCRT_MAX_RISK_ATR", 1.5)
 
 
 def get_strat_vcrt():
@@ -16290,7 +16304,8 @@ def get_strat_vcrt():
 # déjà utilisés par les autres stratégies). Niveaux figés dans le trade à l'ouverture.
 VCRT_TP_MODES, VCRT_TP1_POS = ("FIXE", "PROPOSE"), ("MID", "EXTREME")
 VCRT_RR1_DEFAULT, VCRT_RR2_DEFAULT = 1.0, 2.0
-VCRT_RR_PRESETS = ((1, 2), (1, 3), (1, 4), (2, 4))
+VCRT_RR_PRESETS = ((1, 2), (1, 3), (1, 4), (2, 4))   # anciens boutons « paire RR1 / RR final » (callback svrr: conservé pour les vieux messages)
+VCRT_RR_PICKS = (1, 2, 3, 4)                         # boutons « TP R1 / R2 / R3 / R4 » et « BE R1 / R2 / R3 / R4 » (callbacks svrf: / svbe:)
 
 
 def get_vcrt_tp_mode():
@@ -16327,6 +16342,26 @@ def set_vcrt_rr_final(rr2):
     if rr1 >= rr2:
         rr1 = 1.0 if rr2 > 1 else round(rr2 / 2, 2)
     return set_vcrt_rr(rr1, rr2)
+
+
+def set_vcrt_rr_pick(n):
+    """Bouton « TP R<n> » : c'est l'utilisateur qui choisit le RR du TP final (R1, R2, R3, R4...) -> mode TP fixe.
+    R2 / R3 / R4 : RR1 (palier intermédiaire = BE auto) est conservé tant qu'il reste inférieur au TP final, sinon ramené à 1.
+    R1 : TP unique à 1R, sans palier intermédiaire (RR1 = RR final). Valeur hors 0.2-20 : refusée, rien n'est modifié."""
+    x = _vcrt_num(n, 0.2, 20.0)
+    if x is None:
+        return False
+    if x <= 1:
+        set_setting("vcrt_rr1", f"{x:g}")
+        set_setting("vcrt_rr2", f"{x:g}")
+    else:
+        rr1 = get_vcrt_rr(1)
+        if rr1 >= x:
+            rr1 = 1.0
+        if not set_vcrt_rr(rr1, x):
+            return False
+    set_choice("vcrt_tp_mode", "FIXE", VCRT_TP_MODES)   # un RR choisi à la main = TP fixe
+    return True
 
 
 # --- SL plafonné (jamais de SL très large) et BE du vrai CRT -------------------------------------------------------
@@ -16393,10 +16428,27 @@ def set_vcrt_be(v):
     return True
 
 
+# SL « SERRÉ » (MSS) : quand un déclencheur d'entrée existe (MSS+FVG, avalement+OB, réaction FVG/OB), le SL se place JUSTE
+# légèrement derrière lui (le bas de la jambe du MSS, ou la zone / la bougie de réaction) au lieu du bout du sweep, souvent
+# loin. Marge = VCRT_MSS_SL_BUFFER_ATR x ATR de l'UT d'ENTRÉE. Jamais plus large que le SL derrière le sweep (qui reste le repli).
+# Réglable : /vcrt_sl mss | sweep, ou les boutons « SL serré (MSS) » / « SL derrière sweep ». Le plafond x ATR s'applique aux deux.
+VCRT_SL_MODES = ("SWEEP", "MSS")
+VCRT_SL_MODE_ENV = os.getenv("VCRT_SL_MODE", "MSS").strip().upper()
+if VCRT_SL_MODE_ENV not in VCRT_SL_MODES:
+    VCRT_SL_MODE_ENV = "MSS"
+VCRT_MSS_SL_BUFFER_ATR = _env_float("VCRT_MSS_SL_BUFFER_ATR", 0.1)
+
+
+def get_vcrt_sl_mode():
+    """'MSS' (SL serré derrière le MSS / la zone d'entrée) ou 'SWEEP' (derrière le sweep). Réglage Telegram, sinon VCRT_SL_MODE."""
+    return _get_choice("vcrt_sl_mode", VCRT_SL_MODE_ENV, VCRT_SL_MODES)
+
+
 def _vcrt_sl_txt():
     cap = get_vcrt_sl_cap()
-    return (f"SL derrière le sweep, plafonné à {cap:g} × ATR (UT du CRT)" if cap > 0
-            else "SL derrière le sweep (plafond OFF : refusé seulement au-delà de VCRT_MAX_SL_ATR × ATR)")
+    base = ("SL serré : juste derrière le MSS / la zone d'entrée (jamais plus large que le sweep)"
+            if get_vcrt_sl_mode() == "MSS" else "SL derrière le sweep")
+    return base + (f", plafond {cap:g} × ATR" if cap > 0 else ", plafond OFF")
 
 
 def _vcrt_be_txt():
@@ -16405,7 +16457,7 @@ def _vcrt_be_txt():
         return "BE désactivé"
     if m == "AUTO":
         return "BE automatique : SL à l'entrée au palier RR1 (TP1)"
-    return f"BE à RR{m:g}"
+    return f"BE à R{m:g}"
 
 
 def vcrt_cap_sl(crt, price, sl):
@@ -16428,7 +16480,10 @@ def vcrt_be_rr(tps):
 
 def _vcrt_tp_txt():
     if get_vcrt_tp_mode() == "FIXE":
-        return f"TP fixe : RR1 {get_vcrt_rr(1):g} · RR2 (final) {get_vcrt_rr(2):g}"
+        r1, r2 = get_vcrt_rr(1), get_vcrt_rr(2)
+        if abs(r1 - r2) < 1e-9:
+            return f"TP fixe : R{r2:g} (TP unique, pas de palier intermédiaire)"
+        return f"TP fixe : final R{r2:g} · palier RR1 {r1:g}"
     return ("TP proposé : TP1 = 50 % du range, TP2 = autre bout du range" if get_vcrt_tp1_pos() == "MID"
             else "TP proposé : TP1 = autre bout du range (pas de TP2 intermédiaire)")
 
@@ -16492,9 +16547,29 @@ if _VCRT_TF_ENV_RAW and _vcrt_norm_tf(_VCRT_TF_ENV_RAW) is None:
     print(f"[vcrt] VCRT_TF={_VCRT_TF_ENV_RAW!r} invalide (H4 / H1 / M15) -> {VCRT_TF_DEFAULT} utilisé")
 
 
+def _vcrt_parse_tfs(raw, strict=False):
+    """'M5,M15' / 'M5 M15' / 'M5+M15' / liste -> libellés valides, sans doublon, dans l'ordre H4, H1, M15, M5.
+    Valeur vide -> []. strict=True : un seul élément invalide -> None (la commande est refusée en entier)."""
+    if raw is None:
+        return []
+    items = [x for x in re.split(r"[\s,;+/]+", raw) if x] if isinstance(raw, str) else list(raw)
+    norm = [_vcrt_norm_tf(x) for x in items]
+    if strict and (not norm or any(k is None for k in norm)):
+        return None
+    ok = {k for k in norm if k}
+    return [k for k in VCRT_TFS if k in ok]
+
+
+def get_vcrt_tfs():
+    """UT de CRT ACTIVES — PLUSIEURS à la fois possibles (ex. M5 ET M15) : réglage « vcrt_tfs » (Telegram), sinon l'ancien
+    réglage « vcrt_tf » / variable VCRT_TF. Toujours au moins une, dans l'ordre H4, H1, M15, M5."""
+    tfs = _vcrt_parse_tfs(get_setting("vcrt_tfs"))
+    return tfs or [_vcrt_norm_tf(get_setting("vcrt_tf") or "") or VCRT_TF]
+
+
 def get_vcrt_tf():
-    """UT du CRT courante : 'H4' / 'H1' / 'M15' (réglage Telegram, sinon variable VCRT_TF, sinon H4)."""
-    return _vcrt_norm_tf(get_setting("vcrt_tf") or "") or VCRT_TF
+    """UT du CRT « principale » : la première UT active (compatibilité : affichages / suivi d'anciens trades)."""
+    return get_vcrt_tfs()[0]
 
 
 def get_vcrt_tf_min():
@@ -16502,23 +16577,28 @@ def get_vcrt_tf_min():
 
 
 def get_entry_tf(vcrt_tf=None):
-    """UT d'entrée automatique (EN MINUTES) pour l'UT du CRT `vcrt_tf` (libellé 'H4'/'H1'/'M15' ou minutes ;
-    défaut : UT du CRT courante). H4 -> 15, H1 -> 5, M15 -> 1. UT inconnue -> None (jamais d'exception)."""
+    """UT d'entrée automatique (EN MINUTES) pour l'UT du CRT `vcrt_tf` (libellé 'H4'/'H1'/'M15'/'M5' ou minutes ;
+    défaut : UT du CRT principale). H4 -> 15, H1 -> 5, M15 -> 1, M5 -> 1. UT inconnue -> None (jamais d'exception)."""
     k = _vcrt_norm_tf(vcrt_tf) if vcrt_tf is not None else get_vcrt_tf()
     return VCRT_ENTRY_TFS.get(k) if k else None
 
 
 def vcrt_config():
-    """(UT du CRT, minutes, UT d'entrée, minutes) — ex. ('H4', 240, 'M15', 15)."""
+    """(UT du CRT principale, minutes, UT d'entrée, minutes) — ex. ('H4', 240, 'M15', 15)."""
     k = get_vcrt_tf()
     e = VCRT_ENTRY_TFS[k]
     return k, VCRT_TFS[k], _tf_lbl(e), e
 
 
+def vcrt_active_lbl():
+    """Toutes les UT de CRT actives avec leur UT d'entrée — ex. 'M15→M1 + M5→M1'."""
+    return " + ".join(f"{k}→{_tf_lbl(VCRT_ENTRY_TFS[k])}" for k in get_vcrt_tfs())
+
+
 # État du CRT en cours par actif (rempli à l'étape suivante : CRT détecté, verrou « un seul trade par CRT »...).
 # Il appartient à UNE UT de CRT : changer d'UT le vide, pour ne jamais garder un CRT / verrou d'une autre UT.
 # Les positions DÉJÀ ouvertes ne sont pas touchées : elles gardent leur propre suivi (BE / TP / SL).
-_VCRT_STATE = {}
+_VCRT_STATE = {}   # clé = (actif, UT du CRT) : chaque UT de CRT active a SON état et SON verrou « un seul trade par CRT »
 _vcrt_lock = threading.RLock()
 
 
@@ -16533,51 +16613,109 @@ def vcrt_reset_state(reason=""):
     print(f"[vcrt] état CRT réinitialisé ({n} actif(s)){' — ' + reason if reason else ''}")
 
 
+def vcrt_drop_state(tf_label):
+    """Oublie l'état CRT d'UNE UT (ex. 'M5') pour tous les actifs ; les autres UT gardent le leur."""
+    with _vcrt_lock:
+        for k in [k for k in _VCRT_STATE if isinstance(k, tuple) and len(k) > 1 and k[1] == tf_label]:
+            del _VCRT_STATE[k]
+
+
+def _vcrt_store_tfs(tfs):
+    set_setting("vcrt_tfs", ",".join(tfs))
+    set_setting("vcrt_tf", tfs[0])   # ancien réglage, gardé cohérent (première UT active)
+
+
 def set_vcrt_tf(v):
-    """Change l'UT du CRT à chaud. Retourne (ok, changé). Valeur invalide : (False, False), rien n'est modifié.
-    Si l'UT change, l'état CRT en cours est réinitialisé ; même valeur : rien à faire."""
+    """UT du CRT UNIQUE (ancien comportement, /vcrt_tf M5) : remplace toutes les UT actives par celle-ci.
+    Retourne (ok, changé). Valeur invalide : (False, False), rien n'est modifié. Si l'UT change, l'état CRT en cours est
+    réinitialisé ; même valeur : rien à faire."""
     k = _vcrt_norm_tf(v)
     if k is None:
         return False, False
     with _vcrt_lock:
-        old = get_vcrt_tf()
-        if k == old:
+        old = get_vcrt_tfs()
+        if old == [k]:
             return True, False
-        set_setting("vcrt_tf", k)
-        vcrt_reset_state(f"UT du CRT {old} -> {k}")
+        _vcrt_store_tfs([k])
+        vcrt_reset_state(f"UT du CRT {'+'.join(old)} -> {k}")
     return True, True
 
 
+def set_vcrt_tfs(v):
+    """Plusieurs UT de CRT actives en même temps (/vcrt_tf M5 M15). Retourne (ok, changé). Valeur invalide : (False, False).
+    Seules les UT RETIRÉES perdent leur état CRT en cours ; les UT conservées gardent le leur (verrou inclus)."""
+    tfs = _vcrt_parse_tfs(v, strict=True)
+    if not tfs:
+        return False, False
+    with _vcrt_lock:
+        old = get_vcrt_tfs()
+        if tfs == old:
+            return True, False
+        _vcrt_store_tfs(tfs)
+        for k in old:
+            if k not in tfs:
+                vcrt_drop_state(k)
+    print(f"[vcrt] UT de CRT actives : {'+'.join(old)} -> {'+'.join(tfs)}")
+    return True, True
+
+
+def toggle_vcrt_tf(v):
+    """Bouton d'UT : active ou désactive CETTE UT de CRT sans toucher aux autres (M5 et M15 peuvent tourner ensemble).
+    Retourne (ok, UT actives, message). La dernière UT active ne peut pas être retirée (OFF = bouton « VRAI CRT »)."""
+    k = _vcrt_norm_tf(v)
+    if k is None:
+        return False, get_vcrt_tfs(), "UT invalide"
+    with _vcrt_lock:
+        act = get_vcrt_tfs()
+        if k in act:
+            if len(act) == 1:
+                return False, act, "Au moins une UT de CRT doit rester active"
+            new = [x for x in act if x != k]
+            _vcrt_store_tfs(new)
+            vcrt_drop_state(k)
+            return True, new, f"CRT {k} désactivé"
+        new = [x for x in VCRT_TFS if x in act or x == k]
+        _vcrt_store_tfs(new)
+    return True, new, f"CRT {k} activé"
+
+
 def _vcrt_tf_text(note=""):
-    k, _m, e_lbl, _e = vcrt_config()
+    acts = get_vcrt_tfs()
+    warn = ""
+    if len(acts) > get_max_positions():
+        warn = (f"⚠️ {len(acts)} UT actives mais positions max = {get_max_positions()} : un seul trade à la fois par actif. "
+                f"Pour un trade par CRT en même temps : /maxpos {len(acts)}\n")
     return (f"{note}🕯 <b>Vrai CRT</b> : {'🟢 ON' if get_strat_vcrt() else '🔴 OFF'}\n"
-            f"UT du CRT : <b>{k}</b> → UT d'entrée : <b>{e_lbl}</b> (automatique)\n"
+            f"UT des CRT actives : <b>{vcrt_active_lbl()}</b> (entrée automatique)\n"
+            f"Tape une UT pour l'activer / la désactiver : plusieurs en même temps (ex. M5 + M15), chacune avec son propre CRT.\n"
             f"Correspondance : H4→M15 · H1→M5 · M15→M1 · M5→M1\n"
-            f"Changer l'UT du CRT réinitialise le CRT en cours (les trades déjà ouverts restent suivis).\n"
+            f"Retirer une UT réinitialise seulement son CRT en cours (les trades déjà ouverts restent suivis).\n"
+            f"{warn}"
             f"🎯 {_vcrt_tp_txt()}\n"
             f"🛡 {_vcrt_sl_txt()}\n"
             f"🔒 {_vcrt_be_txt()}\n"
             f"Les niveaux (TP, SL, BE) sont figés à l'ouverture : changer le réglage n'affecte pas les trades en cours.\n"
-            f"Aussi : /vcrt_tf H4|H1|M15|M5 · /vcrt_tp fixe|auto|mid · /vcrt_rr 4 (TP final) ou /vcrt_rr 1 4 · "
-            f"/vcrt_sl 0.8|0.6|off · /vcrt_be auto|off|1|2 · variable Render VCRT_TF")
+            f"Aussi : /vcrt_tf M5 M15 (plusieurs UT) · /vcrt_tp fixe|auto|mid · /vcrt_rr 3 (TP final R3) ou /vcrt_rr 1 4 · "
+            f"/vcrt_sl 0.8|0.6|off|mss|sweep · /vcrt_be auto|off|1|2|3|4 · variable Render VCRT_TF")
 
 
 def _vcrt_tf_keyboard():
-    cur = get_vcrt_tf()
+    acts = get_vcrt_tfs()
     mode, pos, (r1, r2) = get_vcrt_tp_mode(), get_vcrt_tp1_pos(), (get_vcrt_rr(1), get_vcrt_rr(2))
     rows = [[_btn("🕯 VRAI CRT : " + ("ON" if get_strat_vcrt() else "OFF"), "vcrtm:toggle", get_strat_vcrt())],
-            [_btn(k, f"svcrt:{k}", cur == k) for k in VCRT_TFS],
-            [_btn("TP fixe (RR3 / RR4…)", "svtp:FIXE", mode == "FIXE"), _btn("TP auto (CRH / CRL)", "svtp:PROPOSE", mode == "PROPOSE")]]
+            [_btn(k, f"svcrt:{k}", k in acts) for k in VCRT_TFS],   # plusieurs UT possibles : chaque tap active / désactive
+            [_btn("TP fixe (RR choisi)", "svtp:FIXE", mode == "FIXE"), _btn("TP auto (CRH / CRL)", "svtp:PROPOSE", mode == "PROPOSE")],
+            [_btn(f"TP R{n}", f"svrf:{n}", mode == "FIXE" and abs(r2 - n) < 1e-9) for n in VCRT_RR_PICKS]]   # c'est toi qui choisis
     if mode == "PROPOSE":
         rows.append([_btn("TP1 à 50 % du range", "svp1:MID", pos == "MID"), _btn("TP = CRH / CRL (extrême)", "svp1:EXTREME", pos == "EXTREME")])
-    else:
-        rows.append([_btn(f"{a:g} / {b:g}", f"svrr:{a:g}:{b:g}", (r1, r2) == (a, b)) for a, b in VCRT_RR_PRESETS])
     cap = get_vcrt_sl_cap()
+    sm = get_vcrt_sl_mode()
+    rows.append([_btn("SL serré (MSS)", "svsm:MSS", sm == "MSS"), _btn("SL derrière sweep", "svsm:SWEEP", sm == "SWEEP")])
     rows.append([_btn("SL max OFF", "svsl:off", cap == 0)]
                 + [_btn(f"{v:g} ATR", f"svsl:{v:g}", abs(cap - v) < 1e-9) for v in (0.6, 0.8, 1.0)])
     be = get_vcrt_be()
-    rows.append([_btn("BE auto", "svbe:AUTO", be == "AUTO"), _btn("BE OFF", "svbe:OFF", be == "OFF")]
-                + [_btn(f"BE RR{v:g}", f"svbe:{v:g}", isinstance(be, float) and abs(be - v) < 1e-9) for v in (1, 2)])
+    rows.append([_btn("BE auto", "svbe:AUTO", be == "AUTO"), _btn("BE OFF", "svbe:OFF", be == "OFF")])
+    rows.append([_btn(f"BE R{n}", f"svbe:{n}", isinstance(be, float) and abs(be - n) < 1e-9) for n in VCRT_RR_PICKS])
     return {"inline_keyboard": rows + [[{"text": "🔙 Stratégies", "callback_data": "str:home"}]]}
 
 
@@ -16719,16 +16857,58 @@ def vcrt_sl_behind_sweep(crt, ec, idx):
     return ext + VCRT_SL_BUFFER_ATR * at
 
 
+def vcrt_sl_behind_mss(crt, entry_tf, trig, ec, idx, sl_sweep=None):
+    """SL « SERRÉ » du vrai CRT : JUSTE légèrement derrière le déclencheur d'entrée au lieu du bout du sweep.
+      a) MSS + FVG        : derrière le plus bas (BUY) / plus haut (SELL) de la jambe qui a cassé la structure, ou de la zone FVG
+                            / de la bougie de cassure si c'est plus loin ;
+      b) avalement + OB   : derrière l'OB ou la bougie d'avalement (le plus loin des deux) ;
+      c) réaction FVG/OB  : derrière la zone touchée ou la mèche de réaction (le plus loin des deux).
+    Marge = VCRT_MSS_SL_BUFFER_ATR x ATR de l'UT d'ENTRÉE. Jamais plus large que `sl_sweep` (SL derrière le sweep).
+    None si rien d'exploitable (ATR nul, SL du mauvais côté du prix...) : l'appelant garde alors le SL derrière le sweep.
+    Ne regarde jamais au-delà de ec[idx] (anti-look-ahead)."""
+    d = crt["dir"]
+    seg = ec[:idx + 1]
+    a = atr_series(seg)[-1] if seg else 0
+    if not a or a <= 0:
+        return None
+    buf = VCRT_MSS_SL_BUFFER_ATR * a
+    x = ec[idx]
+    try:
+        z = vcrt_entry_zone(crt, entry_tf, trig, ec, idx)
+    except Exception:
+        z = None
+    if d == 1:
+        cand = [x["l"]]
+        if z:
+            cand.append(z["lo"])
+            if z.get("mss"):
+                cand.append(min(k["l"] for k in ec[z["mss"]["i_src"]:z["mss"]["i_brk"] + 1]))
+        sl = min(cand) - buf
+        if sl_sweep is not None:
+            sl = max(sl, sl_sweep)   # jamais plus large que derrière le sweep
+    else:
+        cand = [x["h"]]
+        if z:
+            cand.append(z["hi"])
+            if z.get("mss"):
+                cand.append(max(k["h"] for k in ec[z["mss"]["i_src"]:z["mss"]["i_brk"] + 1]))
+        sl = max(cand) + buf
+        if sl_sweep is not None:
+            sl = min(sl, sl_sweep)
+    return sl if (x["c"] - sl) * d > 0 else None
+
+
 def vcrt_make_signal(symbol, crt, entry_tf, trig, price, sl, t):
     """Signal vrai CRT au format commun (même clés que crt_build) : publié par publish_signal -> Risk Gate, add_trade,
     message groupe, puis suivi par track_trade (RR1 = BE, paliers RR, TP final, SL) avec les messages / stickers existants."""
     d = crt["dir"]
-    min_pct = SYMBOLS.get(symbol, {}).get("min_sl_pct", MIN_SL_PCT)
+    min_pct = VCRT_MIN_SL_PCT   # plancher PROPRE au vrai CRT (le plancher global élargissait le SL serré)
     risk = abs(price - sl)
-    if (price - sl) * d <= 0 or risk > VCRT_MAX_SL_ATR * crt["atr"]:
-        print(f"[{symbol}] vrai CRT ignoré : SL trop large ({risk:.2f} pts > {VCRT_MAX_SL_ATR:g}xATR) ou mal placé")
+    max_risk = min(VCRT_MAX_SL_ATR, VCRT_MAX_RISK_ATR) * crt["atr"] if VCRT_MAX_RISK_ATR > 0 else VCRT_MAX_SL_ATR * crt["atr"]
+    if (price - sl) * d <= 0 or risk > max_risk:
+        print(f"[{symbol}] vrai CRT ignoré : SL trop large ({risk:.2f} pts > {max_risk:.2f}) ou mal placé")
         return None
-    if risk < price * min_pct:   # plancher de SL commun à toutes les stratégies
+    if min_pct > 0 and risk < price * min_pct:   # plancher serré (bruit / spread), pas le plancher global
         risk = price * min_pct
         sl = price - d * risk
     tps = vcrt_build_tps(crt, price, sl)
@@ -16739,7 +16919,7 @@ def vcrt_make_signal(symbol, crt, entry_tf, trig, price, sl, t):
     return {"dir": d, "side": side, "type": "VCRT", "order": "MARKET", "ref_price": price, "entry": price, "sl": tps["sl"],
             "risk": risk, "tp": tps["tp2"], "tp1": tps["tp1"], "tp2": tps["tp2"], "rr1": tps["rr1"], "rr2": tps["rr2"],
             "rr": tps["rr2"], "be_rr": be_rr, "be_off": be_off, "t": t, "bos_level": crt["l2"] if d == 1 else crt["h2"], "tf": TF_LABEL,
-            "key_suffix": "vcrt", "sl_mode": "SWEEP", "strategy": "VCRT", "tp_mode": tps["tp_mode"],
+            "key_suffix": f"vcrt_{_tf_lbl(crt['tf'])}", "sl_mode": "SWEEP", "strategy": "VCRT", "tp_mode": tps["tp_mode"],   # clé distincte par UT de CRT
             "htf": False, "htf_mode": "OFF", "poi": None, "mtf_fib_on": False, "mtf_fib": None, "m15_imp_on": False,
             "m15_imp": None, "setup": f"VCRT {_tf_lbl(crt['tf'])} -> {_tf_lbl(entry_tf)} · {VCRT_TRIGGER_LBL[trig]}"}
 
@@ -16752,7 +16932,8 @@ def vcrt_log_signal(symbol, crt, entry_tf, trig, price, sl_sweep, sig):
     be = "OFF" if sig.get("be_off") else f"RR{sig['be_rr']:g}"
     print(f"[{symbol}] [vcrt] SIGNAL {sig['side']} | CRT {_tf_lbl(crt['tf'])} -> {_tf_lbl(entry_tf)} | "
           f"déclencheur {trig}) {VCRT_TRIGGER_LBL[trig]} | CRH={crt['h1']:.5g} CRL={crt['l1']:.5g} ATR_CRT={at:.5g} | "
-          f"ENTRY={price:.5g} SL_SWEEP={sl_sweep:.5g} SL={sig['sl']:.5g} (plafond {cap:g}xATR"
+          f"ENTRY={price:.5g} SL_SWEEP={sl_sweep:.5g}{(' SL_MSS=%.5g' % sig['sl_mss']) if sig.get('sl_mss') is not None else ''} "
+          f"SL[{sig.get('sl_mode')}]={sig['sl']:.5g} (plafond {cap:g}xATR"
           f"{' APPLIQUÉ' if sig.get('sl_capped') else ''}) RISK={risk:.5g} ({(risk / at if at else 0):.2f}xATR) | "
           f"TP1={sig['tp1']:.5g} (RR{sig['rr1']:g}) TP={sig['tp2']:.5g} (RR{sig['rr2']:g}) | BE={be} | {sig.get('tp_mode')}")
 
@@ -16820,21 +17001,34 @@ def vcrt_track_symbol(symbol):
 
 
 def vcrt_process_symbol(symbol):
-    """Une passe par symbole : suit le CRT en cours sur VCRT_TF, et cherche une entrée sur l'UT basse (get_entry_tf)
-    UNIQUEMENT pendant la bougie 3, bougie clôturée après bougie clôturée (anti-look-ahead). Un seul trade par CRT :
-    verrou posé dès le premier signal, remis à zéro automatiquement au CRT suivant (t2 différent)."""
+    """Une passe par symbole : pour CHAQUE UT de CRT active (plusieurs en même temps possibles, ex. M5 ET M15), suit le CRT
+    en cours et cherche une entrée sur l'UT basse correspondante. Chaque UT a son propre état et son verrou « un seul trade
+    par CRT » ; une erreur sur une UT n'empêche jamais les autres."""
     if not get_strat_vcrt() or not get_symbol_on(symbol) or not get_bot_on():
         return
-    vcrt_tf = get_vcrt_tf_min()
-    entry_tf = get_entry_tf()
+    for tf_label in get_vcrt_tfs():
+        try:
+            _vcrt_process_one(symbol, tf_label)
+        except Exception:
+            print(f"[{symbol}] vrai CRT {tf_label} : erreur (ignorée, les autres UT continuent)")
+            traceback.print_exc(limit=-3)
+
+
+def _vcrt_process_one(symbol, tf_label):
+    """CRT d'UNE UT (`tf_label` : 'H4' / 'H1' / 'M15' / 'M5') sur `symbol` : cherche une entrée sur l'UT basse (VCRT_ENTRY_TFS)
+    UNIQUEMENT pendant la bougie 3, bougie clôturée après bougie clôturée (anti-look-ahead). Un seul trade par CRT :
+    verrou posé dès le premier signal, remis à zéro automatiquement au CRT suivant (t2 différent)."""
+    vcrt_tf = VCRT_TFS[tf_label]
+    entry_tf = VCRT_ENTRY_TFS[tf_label]
+    skey = (symbol, tf_label)
     crt = vcrt_detect(symbol, vcrt_tf)
     if not crt:
         return
     with _vcrt_lock:
-        st = _VCRT_STATE.get(symbol)
+        st = _VCRT_STATE.get(skey)
         if not st or st.get("t2") != crt["t2"]:            # nouveau CRT -> nouvel état, verrou remis à zéro
             st = {"t2": crt["t2"], "crt": crt, "locked": False, "dead": False, "last_idx": -1}
-            _VCRT_STATE[symbol] = st
+            _VCRT_STATE[skey] = st
         if st["locked"] or st["dead"]:
             return
     try:
@@ -16862,17 +17056,26 @@ def vcrt_process_symbol(symbol):
         if status == "signal":
             d = crt["dir"]
             price = ec[i]["c"]
-            sl_sweep = vcrt_sl_behind_sweep(crt, ec, i)         # SL derrière le sweep, jamais sur le MSS
-            sl, capped = vcrt_cap_sl(crt, price, sl_sweep)      # ... mais plafonné (x ATR) : jamais de SL très large
+            sl_sweep = vcrt_sl_behind_sweep(crt, ec, i)         # SL derrière le sweep (repli, et borne du SL serré)
+            sl_mss = None
+            if get_vcrt_sl_mode() == "MSS":                     # SL serré : juste derrière le MSS / la zone d'entrée
+                try:
+                    sl_mss = vcrt_sl_behind_mss(crt, entry_tf, info, ec, i, sl_sweep)
+                except Exception:
+                    print(f"[{symbol}] vrai CRT : SL serré indisponible, SL derrière le sweep utilisé")
+                    traceback.print_exc(limit=-3)
+            sl_base = sl_mss if sl_mss is not None else sl_sweep
+            sl, capped = vcrt_cap_sl(crt, price, sl_base)       # ... plafonné (x ATR) : jamais de SL très large
             with _vcrt_lock:
                 if st["locked"]:
                     break
                 st["locked"] = True
             _vcrt_notify_signal(symbol, crt, entry_tf, info, price, sl,
-                                note=f" (plafonné à {get_vcrt_sl_cap():g}×ATR, sweep à {sl_sweep:.5g})" if capped else "")
+                                note=f" (plafonné à {get_vcrt_sl_cap():g}×ATR, SL avant plafond {sl_base:.5g})" if capped else "")
             sig = vcrt_make_signal(symbol, crt, entry_tf, info, price, sl, ec[i]["t"])
             if sig:
-                sig["sl_sweep"], sig["sl_capped"] = sl_sweep, capped
+                sig["sl_sweep"], sig["sl_capped"], sig["sl_mss"] = sl_sweep, capped, sl_mss
+                sig["sl_mode"] = "MSS" if sl_mss is not None else "SWEEP"
                 try:
                     vcrt_log_signal(symbol, crt, entry_tf, info, price, sl_sweep, sig)
                 except Exception:
@@ -17398,7 +17601,7 @@ class TestVcrtSlBeRr(unittest.TestCase):
     CRT = dict(dir=1, atr=10.0, h1=120.0, l1=100.0, h2=105.0, l2=95.0, tf=5)
 
     def tearDown(self):
-        for k in ("vcrt_sl_cap", "vcrt_be", "vcrt_tp_mode", "vcrt_rr1", "vcrt_rr2"):
+        for k in ("vcrt_sl_cap", "vcrt_be", "vcrt_tp_mode", "vcrt_rr1", "vcrt_rr2", "vcrt_sl_mode"):
             _E._q("DELETE FROM settings WHERE key=?", (k,), commit=True)
 
     def test_sl_plafonne(self):
@@ -17471,17 +17674,18 @@ class TestVcrtSlBeRr(unittest.TestCase):
             self.assertEqual((_E.get_vcrt_tf(), _E.get_vcrt_tf_min(), _E.get_entry_tf()), ("M5", 5, 1))
         finally:
             _E.set_vcrt_tf("H4")
+            _E._q("DELETE FROM settings WHERE key IN ('vcrt_tf','vcrt_tfs')", commit=True)
 
 
 class TestVcrtTf(unittest.TestCase):
     """Réglage VCRT_TF (H4 / H1 / M15), UT d'entrée automatique, réinitialisation de l'état CRT."""
 
     def setUp(self):
-        _q("DELETE FROM settings WHERE key='vcrt_tf'", commit=True)
+        _q("DELETE FROM settings WHERE key IN ('vcrt_tf','vcrt_tfs')", commit=True)
         _E._VCRT_STATE.clear()
 
     def tearDown(self):
-        _q("DELETE FROM settings WHERE key='vcrt_tf'", commit=True)
+        _q("DELETE FROM settings WHERE key IN ('vcrt_tf','vcrt_tfs')", commit=True)
         _E._VCRT_STATE.clear()
 
     def test_table_ut_entree(self):
@@ -17676,7 +17880,7 @@ class TestVcrtImages(unittest.TestCase):
         self.assertLess(z["lo"], z["hi"])
         self.assertEqual(z["mss"]["i_brk"], len(ec) - 1)
         self.assertAlmostEqual(z["mss"]["level"], 100.9, places=6)
-        crt["atr"] = 3.0   # SL de 6.4 pts <= 3 x ATR : le signal se construit
+        crt["atr"] = 5.0   # SL de 6.4 pts <= 1.5 x ATR (VCRT_MAX_RISK_ATR) : le signal se construit
         sig = _E.vcrt_make_signal("XAUUSD", crt, 1, "a", ec[-1]["c"], crt["sl"], ec[-1]["t"])
         self.assertIsNotNone(sig)
         ctx = _E.vcrt_build_ctx("XAUUSD", crt, 1, "a", ec, len(ec) - 1, sig)
@@ -17846,6 +18050,233 @@ class TestVcrtImages(unittest.TestCase):
             self.assertEqual(sent, [("admin", "ADMIN", None), ("group", "GROUPE", "/tmp/y.png")])
         finally:
             _E._q, _E.update_trade, _E.to_admin, _E.to_group, _E.send, _E._delivered = saved
+
+class TestVcrtMultiUtRrSl(unittest.TestCase):
+    """Vrai CRT : plusieurs UT de CRT en même temps (M5 + M15), boutons TP / BE R1-R4 choisis par l'utilisateur,
+    SL serré juste derrière le MSS (jamais plus large que derrière le sweep)."""
+    _KEYS = ("vcrt_tf", "vcrt_tfs", "vcrt_sl_mode", "vcrt_rr1", "vcrt_rr2", "vcrt_tp_mode", "vcrt_be", "vcrt_sl_cap", "strat_vcrt")
+    CRT = dict(dir=1, atr=10.0, h1=120.0, l1=100.0, h2=105.0, l2=95.0, tf=5)
+
+    def _clean(self):
+        for k in self._KEYS:
+            _E._q("DELETE FROM settings WHERE key=?", (k,), commit=True)
+        _E._VCRT_STATE.clear()
+
+    def setUp(self):
+        self._clean()
+
+    def tearDown(self):
+        self._clean()
+
+    @staticmethod
+    def _c(t, o, h, l, c):
+        return {"t": t, "o": o, "h": h, "l": l, "c": c}
+
+    def _ec_mss(self, mirror=False):
+        """Même structure que TestVcrtEntry.test_mss_fvg_declenche_a : swing haut ~100.9 cassé par un déplacement avec FVG."""
+        rows = [(0, 100.0, 100.3, 99.8, 100.1), (60, 100.1, 100.4, 99.9, 100.2), (120, 100.2, 100.6, 100.0, 100.3),
+                (180, 100.3, 100.9, 100.1, 100.5), (240, 100.5, 100.7, 100.2, 100.3), (300, 100.3, 100.5, 100.0, 100.2),
+                (360, 100.2, 100.4, 99.9, 100.1), (420, 100.1, 100.6, 100.05, 100.5), (480, 100.5, 101.0, 100.45, 100.9),
+                (540, 100.9, 102.5, 100.85, 102.4)]
+        if mirror:   # miroir (200 - prix) : même scénario côté SELL
+            rows = [(t, 200 - o, 200 - l, 200 - h, 200 - c) for t, o, h, l, c in rows]
+        return [self._c(*r) for r in rows]
+
+    def _crt(self, d=1, tf=15, t_entry=540, l2=99.0, atr=3.0):
+        crt = dict(i=10, t2=t_entry - tf * 60, t_entry=t_entry, dir=d, h1=110.0, l1=100.0, h2=108.0, l2=l2, c2=102.0,
+                   sl=l2 - 1.0, atr=atr, tf=tf)
+        if d == -1:
+            crt.update(h1=100.0, l1=90.0, h2=200 - l2, l2=92.0, c2=98.0)
+        return crt
+
+    # --- plusieurs UT de CRT en même temps ---------------------------------------------------------------------------
+    def test_plusieurs_ut_actives_en_meme_temps(self):
+        _E.set_vcrt_tf("M5")
+        self.assertEqual(_E.get_vcrt_tfs(), ["M5"])
+        self.assertEqual(_E.toggle_vcrt_tf("M15")[:2], (True, ["M15", "M5"]))        # M5 ET M15 ensemble
+        self.assertEqual(_E.get_vcrt_tfs(), ["M15", "M5"])
+        self.assertEqual(_E.vcrt_active_lbl(), "M15→M1 + M5→M1")
+        kb = str(_E._vcrt_tf_keyboard())
+        self.assertIn("✅ M15", kb)
+        self.assertIn("✅ M5", kb)
+        self.assertNotIn("✅ H4", kb)
+        ok, acts, _m = _E.toggle_vcrt_tf("M5")                                       # on retire M5 : M15 reste
+        self.assertEqual((ok, acts, _E.get_vcrt_tf()), (True, ["M15"], "M15"))
+
+    def test_la_derniere_ut_ne_peut_pas_etre_retiree(self):
+        _E.set_vcrt_tf("M5")
+        ok, acts, msg = _E.toggle_vcrt_tf("M5")
+        self.assertFalse(ok)
+        self.assertEqual((acts, _E.get_vcrt_tfs()), (["M5"], ["M5"]))
+        self.assertIn("Au moins une", msg)
+        self.assertEqual(_E.toggle_vcrt_tf("D1")[0], False)                          # UT inconnue refusée
+
+    def test_retirer_une_ut_ne_vide_que_son_etat(self):
+        _E.set_vcrt_tfs("M5 M15")
+        _E._VCRT_STATE[("XAUUSD", "M5")] = {"locked": True}
+        _E._VCRT_STATE[("XAUUSD", "M15")] = {"locked": True}
+        _E.toggle_vcrt_tf("M5")
+        self.assertEqual(list(_E._VCRT_STATE), [("XAUUSD", "M15")])                  # l'autre UT garde son verrou
+        self.assertEqual(_E.set_vcrt_tfs("M15 H1"), (True, True))
+        self.assertEqual(_E.set_vcrt_tfs("M15 H1"), (True, False))
+        self.assertEqual(_E.set_vcrt_tfs("M15 D1"), (False, False))                  # une valeur invalide refuse tout
+        self.assertEqual(_E.get_vcrt_tfs(), ["H1", "M15"])
+
+    def test_commande_vcrt_tf_plusieurs_ut(self):
+        _E.handle_command("/vcrt_tf M5 M15")
+        self.assertEqual(_E.get_vcrt_tfs(), ["M15", "M5"])
+        _E.handle_command("/vcrt_tf M5+H1")
+        self.assertEqual(_E.get_vcrt_tfs(), ["H1", "M5"])
+        txt, _kb = _E.handle_command("/vcrt_tf M5 D1")
+        self.assertIn("invalide", txt)
+        self.assertEqual(_E.get_vcrt_tfs(), ["H1", "M5"])
+        _E.handle_command("/vcrt_tf M5")                                             # une seule UT : ancien comportement
+        self.assertEqual(_E.get_vcrt_tfs(), ["M5"])
+
+    def test_avertissement_positions_max(self):
+        _E.set_vcrt_tfs("M5 M15")
+        saved = _E.get_max_positions
+        try:
+            _E.get_max_positions = lambda: 1
+            self.assertIn("/maxpos 2", _E._vcrt_tf_text())
+            _E.get_max_positions = lambda: 2
+            self.assertNotIn("/maxpos", _E._vcrt_tf_text())
+        finally:
+            _E.get_max_positions = saved
+
+    def test_cle_de_signal_distincte_par_ut_de_crt(self):
+        a = _E.vcrt_make_signal("XAUUSD", dict(self.CRT, tf=5), 1, "a", 110.0, 102.0, 1234)
+        b = _E.vcrt_make_signal("XAUUSD", dict(self.CRT, tf=15), 1, "a", 110.0, 102.0, 1234)   # même bougie M1, autre CRT
+        self.assertEqual((a["key_suffix"], b["key_suffix"]), ("vcrt_M5", "vcrt_M15"))
+        self.assertEqual((_E.risk_strategy_label(a), _E.risk_strategy_label(b)), ("VCRT", "VCRT"))
+
+    # --- boutons R1 / R2 / R3 / R4 -------------------------------------------------------------------------------------
+    def test_boutons_tp_r1_a_r4(self):
+        kb = str(_E._vcrt_tf_keyboard())
+        for n in (1, 2, 3, 4):
+            self.assertIn(f"svrf:{n}", kb)
+            self.assertIn(f"svbe:{n}", kb)
+        for n in (2, 3, 4):
+            self.assertTrue(_E.set_vcrt_rr_pick(n))
+            self.assertEqual((_E.get_vcrt_tp_mode(), _E.get_vcrt_rr(1), _E.get_vcrt_rr(2)), ("FIXE", 1.0, float(n)))
+            r = _E.vcrt_build_tps(self.CRT, 110.0, 102.0, mode="FIXE")                # risque 8
+            self.assertEqual((r["tp1"], r["tp2"], r["rr2"]), (118.0, 110.0 + 8 * n, float(n)))
+            self.assertIn(f"✅ TP R{n}", str(_E._vcrt_tf_keyboard()))
+        self.assertTrue(_E.set_vcrt_rr_pick(1))                                       # R1 : TP unique, pas de palier intermédiaire
+        r = _E.vcrt_build_tps(self.CRT, 110.0, 102.0, mode="FIXE")
+        self.assertEqual((r["tp1"], r["tp2"]), (118.0, 118.0))
+        self.assertIn("TP unique", _E._vcrt_tp_txt())
+        self.assertFalse(_E.set_vcrt_rr_pick("abc"))
+        self.assertFalse(_E.set_vcrt_rr_pick(50))
+
+    def test_un_rr_choisi_passe_le_tp_en_fixe(self):
+        _E.set_choice("vcrt_tp_mode", "PROPOSE", _E.VCRT_TP_MODES)
+        _E.set_vcrt_rr_pick(3)
+        self.assertEqual(_E.get_vcrt_tp_mode(), "FIXE")
+        _E.handle_command("/vcrt_rr r4")
+        self.assertEqual((_E.get_vcrt_tp_mode(), _E.get_vcrt_rr(2)), ("FIXE", 4.0))
+
+    def test_be_r1_a_r4(self):
+        tps = dict(tp1=104.0, tp2=108.0, rr1=1.0, rr2=4.0)
+        for n in (1, 2, 3, 4):
+            self.assertTrue(_E.set_vcrt_be(str(n)))
+            self.assertEqual(_E.vcrt_be_rr(tps), (float(n), False))
+            self.assertIn(f"✅ BE R{n}", str(_E._vcrt_tf_keyboard()))
+
+    # --- SL serré derrière le MSS --------------------------------------------------------------------------------------
+    def test_sl_mss_buy_juste_derriere_le_mss_et_jamais_plus_large_que_le_sweep(self):
+        ec, crt = self._ec_mss(), self._crt()
+        idx = len(ec) - 1
+        self.assertEqual(_E.vcrt_entry_check("X", crt, 1, ec, idx), ("signal", "a"))
+        sl_sweep = _E.vcrt_sl_behind_sweep(crt, ec, idx)
+        sl_mss = _E.vcrt_sl_behind_mss(crt, 1, "a", ec, idx, sl_sweep)
+        leg_low = min(x["l"] for x in ec[3:idx + 1])                                  # bas de la jambe du MSS (99.9)
+        at = _E.atr_series(ec)[-1]
+        self.assertAlmostEqual(sl_mss, leg_low - _E.VCRT_MSS_SL_BUFFER_ATR * at, places=6)
+        self.assertGreater(sl_mss, sl_sweep)                                          # plus serré que derrière le sweep
+        self.assertLess(sl_mss, ec[idx]["c"])
+        self.assertEqual(_E.vcrt_sl_behind_mss(crt, 1, "a", ec, idx, sl_mss + 1.0), sl_mss + 1.0)   # borne : jamais plus large que le sweep
+        self.assertEqual(_E.vcrt_sl_behind_mss(crt, 1, "a", ec, idx, None), sl_mss)
+
+    def test_sl_mss_sell_miroir(self):
+        ec, crt = self._ec_mss(mirror=True), self._crt(d=-1)
+        idx = len(ec) - 1
+        crt["h2"] = 200 - 99.0
+        self.assertEqual(_E.vcrt_entry_check("X", crt, 1, ec, idx), ("signal", "a"))
+        sl_sweep = _E.vcrt_sl_behind_sweep(crt, ec, idx)
+        sl_mss = _E.vcrt_sl_behind_mss(crt, 1, "a", ec, idx, sl_sweep)
+        self.assertLess(sl_mss, sl_sweep)                                             # SELL : SL plus bas = plus serré
+        self.assertGreater(sl_mss, ec[idx]["c"])                                      # et toujours au-dessus du prix
+        self.assertAlmostEqual(sl_mss, 200 - (min(x["l"] for x in self._ec_mss()[3:]) - _E.VCRT_MSS_SL_BUFFER_ATR * _E.atr_series(ec)[-1]), places=6)
+
+    def test_sl_mss_repli_si_inexploitable(self):
+        ec = [self._c(0, 100.0, 100.0, 100.0, 100.0)] * 3                              # ATR nul -> None : l'appelant garde le SL sweep
+        self.assertIsNone(_E.vcrt_sl_behind_mss(self._crt(), 1, "a", ec, 2, 90.0))
+
+    def test_boutons_et_commande_du_mode_de_sl(self):
+        kb = str(_E._vcrt_tf_keyboard())
+        self.assertIn("svsm:MSS", kb)
+        self.assertIn("svsm:SWEEP", kb)
+        self.assertEqual(_E.get_vcrt_sl_mode(), _E.VCRT_SL_MODE_ENV)
+        _E.handle_command("/vcrt_sl sweep")
+        self.assertEqual(_E.get_vcrt_sl_mode(), "SWEEP")
+        self.assertIn("✅ SL derrière sweep", str(_E._vcrt_tf_keyboard()))
+        _E.handle_command("/vcrt_sl mss")
+        self.assertEqual(_E.get_vcrt_sl_mode(), "MSS")
+        self.assertIn("serré", _E._vcrt_sl_txt())
+        txt, _k = _E.handle_command("/vcrt_sl nimporte")
+        self.assertIn("invalide", txt)
+        self.assertIn("MSS", _E._SL_LBL)
+
+    # --- bout en bout : deux CRT (M15 + M5) sur la même bougie d'entrée M1 -------------------------------------------
+    def _run_process(self, sl_mode):
+        sym = next(iter(_E.SYMBOLS))
+        ec = self._ec_mss()
+        crts = {15: self._crt(tf=15, t_entry=540), 5: self._crt(tf=5, t_entry=540)}
+        crts[5]["t2"] = 540 - 300
+        got = []
+        saved = {n: getattr(_E, n) for n in ("vcrt_detect", "_ctx_candles", "publish_signal", "get_candles",
+                                             "get_strat_vcrt", "get_symbol_on", "get_bot_on")}
+        _E.vcrt_detect = lambda s_, tf: crts.get(tf)
+        _E._ctx_candles = lambda s_, tf: ec
+        _E.publish_signal = lambda s_, c, e, sig, companion=False: got.append(sig) or True
+        _E.get_candles = lambda *a, **k: []
+        _E.get_strat_vcrt, _E.get_symbol_on, _E.get_bot_on = (lambda: True), (lambda s_: True), (lambda: True)
+        try:
+            _E.set_vcrt_tfs("M5 M15")
+            _E.set_choice("vcrt_sl_mode", sl_mode, _E.VCRT_SL_MODES)
+            _E.set_vcrt_sl_cap("off")
+            _E.set_vcrt_rr_pick(3)
+            _E.vcrt_process_symbol(sym)
+            first = list(got)
+            _E.vcrt_process_symbol(sym)                                               # 2e passe : verrou « un seul trade par CRT »
+            return sym, ec, first, list(got)
+        finally:
+            for n, f in saved.items():
+                setattr(_E, n, f)
+
+    def test_deux_crt_m5_et_m15_donnent_deux_signaux_distincts_sl_mss(self):
+        sym, ec, first, after = self._run_process("MSS")
+        self.assertEqual(sorted(x["key_suffix"] for x in first), ["vcrt_M15", "vcrt_M5"])
+        self.assertEqual(len(after), 2)                                               # rien de plus à la 2e passe
+        self.assertEqual({k for k in _E._VCRT_STATE}, {(sym, "M5"), (sym, "M15")})
+        idx = len(ec) - 1
+        for sig in first:
+            self.assertEqual(sig["sl_mode"], "MSS")
+            self.assertAlmostEqual(sig["sl"], _E.vcrt_sl_behind_mss(self._crt(tf=sig["key_suffix"] == "vcrt_M15" and 15 or 5), 1, "a", ec, idx,
+                                   _E.vcrt_sl_behind_sweep(self._crt(), ec, idx)), places=6)
+            self.assertAlmostEqual(sig["rr2"], 3.0)                                   # TP final R3 choisi
+            self.assertGreater(sig["sl"], _E.vcrt_sl_behind_sweep(self._crt(), ec, idx))
+        keys = {f"{sym}:{_E.TF_LABEL}:{x['t']}:{x['key_suffix']}" for x in first}
+        self.assertEqual(len(keys), 2)                                                # publish_signal ne les prend pas pour un doublon
+
+    def test_mode_sweep_garde_le_sl_historique(self):
+        _sym, ec, first, _after = self._run_process("SWEEP")
+        idx = len(ec) - 1
+        self.assertEqual(len(first), 2)
+        for sig in first:
+            self.assertEqual(sig["sl_mode"], "SWEEP")
+            self.assertAlmostEqual(sig["sl"], _E.vcrt_sl_behind_sweep(self._crt(), ec, idx), places=6)
 
 
 if __name__ == "__main__":
