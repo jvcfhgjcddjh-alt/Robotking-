@@ -2084,8 +2084,6 @@ _ensure_column("trades", "part_cfg", "TEXT")
 _ensure_column("trades", "part_done", "INTEGER DEFAULT 0")
 _ensure_column("trades", "part_r", "REAL DEFAULT 0")
 _ensure_column("trades", "part_pct", "REAL DEFAULT 0")
-# Vrai CRT : TP1 intermédiaire FIGÉ à l'ouverture (NULL = pas de TP1 intermédiaire : TP1 = extrême, ou autre stratégie).
-_ensure_column("trades", "tp1", "REAL")
 
 
 # --- paramètres / méta -------------------------------------------------------
@@ -5151,7 +5149,7 @@ def risk_strategy_label(sig):
     if not isinstance(sig, dict):
         return str(sig or "?")
     typ = sig.get("type")
-    if sig.get("strategy") == "VCRT" or str(sig.get("key_suffix") or "").startswith("vcrt"):
+    if sig.get("strategy") == "VCRT" or sig.get("key_suffix") == "vcrt":
         base = "VCRT"
     elif sig.get("strategy") == "CRT" or sig.get("key_suffix") == "crt":
         base = "CRT"
@@ -5297,21 +5295,6 @@ def manual_sweep_sl(symbol, side, spread=0.0):
 # Si SL et objectif sont touchés dans la même bougie, le SL est compté en premier (prudent).
 # ============================================================================
 
-def _rr_steps(trade, tp_rr):
-    """Paliers RR annoncés au groupe pour CE trade : [(niveau en R, n de l'événement RRn)].
-    Vrai CRT avec TP1 intermédiaire : RR1 au niveau du TP1 figé à l'ouverture, puis RR2, RR3... (RR_LEVELS) tant qu'ils sont
-    sous le TP final, qui est annoncé par l'événement TP (ex. TP final RR4 : RR1, RR2, RR3 puis TP). Le BE est indépendant
-    (réglage /vcrt_be : auto = au palier RR1, OFF, ou RRn). Sans TP1 intermédiaire (TP1 = extrême) et pour toutes les autres
-    stratégies : RR_LEVELS, comme avant."""
-    if trade.get("kind") == "VCRT" and trade.get("tp1") is not None:
-        try:   # palier 1 = niveau réel du TP1 figé ; puis RR2, RR3... annoncés en route jusqu'au TP final (indépendant du BE)
-            tp1_rr = round(abs(trade["tp1"] - trade["entry"]) / abs(trade["entry"] - trade["sl_initial"]), 2)
-        except (KeyError, TypeError, ZeroDivisionError):
-            tp1_rr = trade_be_rr(trade)
-        return [(tp1_rr, 1)] + [(lvl, int(lvl)) for lvl in RR_LEVELS if int(lvl) >= 2 and lvl > tp1_rr + 1e-9]
-    return [(lvl, int(lvl)) for lvl in RR_LEVELS]
-
-
 def track_trade(trade, candles):
     """Fait avancer un trade avec les nouvelles bougies. Retourne la liste des événements.
 
@@ -5383,17 +5366,17 @@ def track_trade(trade, candles):
             if pos_id:   # position réellement exécutée côté broker (MetaApi) : on synchronise son SL
                 move_to_breakeven(pos_id, entry, trade["side"], trade["symbol"], trade["lot"])
         be_told = False   # ... et il est annoncé avec un palier RR (sinon : événement BE_MOVED seul)
-        for lvl, n in _rr_steps(trade, tp_rr):
+        for lvl in RR_LEVELS:
             if lvl > tp_rr:
                 continue   # palier au-delà de la TP de ce trade : jamais atteint (trade clôturé avant)
-            field = f"rr{n}_hit"
+            field = f"rr{int(lvl)}_hit"
             if not trade[field] and r_fav >= lvl:
                 trade[field] = 1
                 if lvl >= tp_rr:
                     continue   # palier = TP finale : annoncé par l'événement TP, pas en double
                 be_now = be_arm and not be_told and lvl >= be_rr
                 be_told = be_told or be_now
-                events.append({"name": f"RR{n}", "be_moved": be_now, "trade": dict(trade)})
+                events.append({"name": f"RR{int(lvl)}", "be_moved": be_now, "trade": dict(trade)})
         # BE armé à un RR qui n'est pas un palier annoncé (ex. 0.5, 1.5) : message dédié
         if be_arm and not be_told and r_fav < tp_rr:
             events.append({"name": "BE_MOVED", "trade": dict(trade)})
@@ -5511,10 +5494,7 @@ def sync_mt5_positions():
                     tr["result_r"] = {"TP": trade_tp_rr(tr), "SL": -1.0, "BE": 0.0}[outcome]
                 ev = {"name": outcome, "trade": tr}
                 dec = SYMBOLS[t["symbol"]]["decimals"]
-                vchart = vcrt_event_chart(tr, outcome) if tr.get("kind") == "VCRT" else None   # image de résultat (groupe + bot)
-                to_group(group_event(ev, dec), photo=vchart, reply_to_message_id=tr.get("signal_message_id"))
-                if vchart:
-                    to_admin(admin_event(ev) or f"📒 {t['symbol']} {t['side']} clôturé ({outcome})", photo=vchart)
+                to_group(group_event(ev, dec), reply_to_message_id=tr.get("signal_message_id"))
                 group_event_media(outcome)
             except Exception:
                 traceback.print_exc()
@@ -5631,16 +5611,9 @@ def make_chart(symbol, candles, events, sig, decimals=2, n_show=70, extend=25):
 CHART_ON_EVENTS = {"SL", "BE", "TP", "RR1", "RR2", "RR3", "RR4"}  # événements accompagnés d'une image
 
 
-def make_event_chart(symbol, candles, events, trade, dec, ev_name=None):
+def make_event_chart(symbol, candles, events, trade, dec):
     """Même rendu que le graphique d'entrée (bougies + niveaux), mais recentré sur la bougie la
     plus récente : sert à montrer où le SL / RR / TP vient d'être touché, comme pour un signal."""
-    if trade.get("kind") == "VCRT":   # VRAI CRT : image de résultat au style de l'image d'entrée (bougies 1 / 2, zone, niveaux, résultat)
-        try:
-            path = vcrt_event_chart(trade, ev_name)
-            if path:
-                return path
-        except Exception:
-            traceback.print_exc(limit=-3)
     if trade.get("kind") == "QMLG":   # QML GAGNANT : même image que celle du signal (QML + outil de position), pas le graphique CHoCH
         try:
             path = qmlg_event_chart(trade)
@@ -6096,8 +6069,8 @@ def to_group(text, photo=None, reply_to_message_id=None):
     return send(CHAT_ID_GROUPE, text, photo, reply_to_message_id=reply_to_message_id)
 
 
-def to_admin(text, reply_markup=None, photo=None):
-    return send(CHAT_ID_ADMIN, text, photo=photo, reply_markup=reply_markup)
+def to_admin(text, reply_markup=None):
+    return send(CHAT_ID_ADMIN, text, reply_markup=reply_markup)
 
 
 # --- stickers / images / GIF du groupe (TP, SL, BE, motivation) --------------------------------
@@ -6257,8 +6230,6 @@ def _mtf_fib_line(sig):
 
 def _be_line(sig):
     """Ligne « BE → RRx » d'un signal ; « BE : non utilisé » si le RR du BE n'est pas sous la TP finale."""
-    if sig.get("be_off"):
-        return "BE : désactivé"
     be_rr = sig.get("be_rr") or BE_RR
     return f"BE → RR{be_rr:g}" if be_rr < _sig_rr(sig) else "BE : non utilisé (RR du BE ≥ TP)"
 
@@ -6271,26 +6242,19 @@ def _head_line(symbol, sig, lot=None):
     return f"{'🟢🟢🟢' if buy else '🔴🔴🔴'} <b>{lbl} {symbol}{lot_txt}</b>"
 
 
-def _tp_levels_line(sig, dec=None):
-    """Ligne « TP1 / TP2 » d'un signal vrai CRT (vide pour toutes les autres stratégies)."""
-    if not sig.get("tp1"):
-        return ""
-    d = dec if dec is not None else 5
-    if sig.get("tp2") and abs(sig["tp2"] - sig["tp1"]) > 1e-12:
-        return f"🎯 TP1 {_fmt(sig['tp1'], d)} (RR{sig['rr1']:g}) · TP2 {_fmt(sig['tp2'], d)} (RR{sig['rr2']:g})\n"
-    return f"🎯 TP1 = TP final (RR{sig['rr1']:g}) · {sig.get('tp_mode', '')}\n"
-
-
 def group_signal(symbol, sig, position_n, dec, tf=None, lot=None):
     """Message groupe court : 1re ligne sens + LOT (visible dans la notification), puis entrée, SL, TP et RR."""
     limit = sig.get("order") == "LIMIT"
+    if sig.get("tp1"):   # vrai CRT, mode PROPOSÉ : TP1 (50 % du range) + TP2 (autre bout du range = TP final suivi)
+        tp_lines = f"🎯 TP1 : {_fmt(sig['tp1'], dec)}\n🎯 TP2 : {_fmt(sig['tp'], dec)}\n"
+    else:
+        tp_lines = f"🎯 TP : {_fmt(sig['tp'], dec)}\n"
     return (
         f"{_head_line(symbol, sig, lot)}\n"
-        f"⏱ {tf or (sig.get('tf') if sig.get('type') in ('QML', 'FIBTREND') else None) or TF_LABEL} · RR {_sig_rr(sig):g}\n"
+        f"⏱ {tf or (sig.get('tf') if sig.get('type') in ('QML', 'FIBTREND', 'VCRT') else None) or TF_LABEL} · RR {_sig_rr(sig):g}\n"
         f"Entrée : {'limit ' if limit else '≈ '}{_fmt(sig['entry'], dec)}\n"
         f"🛡 SL : {_fmt(sig['sl'], dec)}\n"
-        f"🎯 TP : {_fmt(sig['tp'], dec)}\n"
-        f"{_tp_levels_line(sig, dec)}"
+        f"{tp_lines}"
         f"{_be_line(sig)}"
     )
 
@@ -6303,10 +6267,10 @@ def admin_signal(symbol, sig, risk_usd, leverage, lot_info, margin, dec):
     txt = (
         f"{_head_line(symbol, sig, lot_info['lot'])}\n"
         f"{icon} {label} · Entrée ≈ {_fmt(sig['entry'], dec)}\n"
-        f"🛡 SL {_fmt(sig['sl'], dec)} · 🎯 TP {_fmt(sig['tp'], dec)} (RR{_sig_rr(sig):g})\n"
+        f"🛡 SL {_fmt(sig['sl'], dec)} · " + (f"🎯 TP1 {_fmt(sig['tp1'], dec)} · TP2 " if sig.get("tp1") else "🎯 TP ")
+        + f"{_fmt(sig['tp'], dec)} (RR{_sig_rr(sig):g})\n"
         f"📐 Depuis {base} : SL {_dist(sig, sig['sl'], dec)} pts / TP {_dist(sig, sig['tp'], dec)} pts\n"
         f"Risque {risk_usd:g} $ · Levier {leverage:g}x · Marge ≈ {margin:.2f} $\n"
-        f"{_tp_levels_line(sig, dec)}"
         f"{_be_line(sig)}"
     )
     if lot_info["raised_to_min"]:
@@ -6457,7 +6421,7 @@ def _signal_text():
             f"📍 Signaux ouverts max par actif : {get_max_positions()}")
 
 
-_SL_LBL = {"STRUCT": "structure (BOS)", "ZONE": "derrière OB/FVG", "SWEEP": "derrière le sweep", "MSS": "juste derrière le MSS / la zone d'entrée"}
+_SL_LBL = {"STRUCT": "structure (BOS)", "ZONE": "derrière OB/FVG", "SWEEP": "derrière le sweep"}
 _TP_LBL = {"RR": "RR fixe", "TARGET": "liquidité ext.", "SWING": "swing H/L"}
 _CRT_TP_LBL = {"RANGE": "autre bout du range", "MID": "50 % du range", "RR": "RR fixe"}
 _SESS_LBL = {"ALL": "toutes", "LONDON": "Londres", "NY": "New York", "BOTH": "Londres + New York"}
@@ -7125,13 +7089,12 @@ def _home_text():
 
 def _strategies_text():
     on = lambda b: "🟢 ON" if b else "🔴 OFF"
-    live = [n for n, b in (("BOS/CHoCH", get_strat_main()), ("CRT", get_strat_crt()), ("QML", get_qml_on()), ("FIBTREND", get_ft_on()), ("VRAI CRT", get_strat_vcrt())) if b]
+    live = [n for n, b in (("BOS/CHoCH", get_strat_main()), ("CRT", get_strat_crt()), ("QML", get_qml_on()), ("FIBTREND", get_ft_on())) if b]
     return (f"🧩 <b>STRATÉGIES</b>\n\n"
             f"BOS / CHoCH : {on(get_strat_main())}\nCRT : {on(get_strat_crt())}\nQML : {on(get_qml_on())}"
             f" · publication auto : {on(get_qml_auto())}\n"
             f"FIBTREND : {on(get_ft_on())} · publication auto : {on(get_ft_auto())}\n"
             f"QML GAGNANT : {on(get_qmlg_on())} (règles à venir : aucun signal pour l'instant)\n"
-            f"🕯 VRAI CRT : {on(get_strat_vcrt())} · UT {vcrt_active_lbl()} (⚙️ : UT H4/H1/M15/M5 cumulables, TP R1-R4 ou auto, SL, BE)\n"
             f"📈 Ordres MT5 (API) : {on(get_mt5_orders_on())}"
             f"{'' if get_mt5_orders_on() else ' — signaux publiés et suivis, AUCUN ordre envoyé au broker'}\n\n"
             f"Actives : {', '.join(live) if live else 'aucune ⚠️ (plus aucun signal automatique)'}\n"
@@ -7147,7 +7110,6 @@ def _strategies_keyboard():
         [_btn("QML", "str:qml", get_qml_on()), _btn("QML auto (signal)", "str:qmlauto", get_qml_auto())],
         [_btn("FIBTREND", "str:ft", get_ft_on()), _btn("FIBTREND auto (signal)", "str:ftauto", get_ft_auto())],
         [_btn("QML GAGNANT", "str:qmlg", get_qmlg_on()), {"text": "⚙️ QML GAGNANT", "callback_data": "qmlg:home"}],
-        [_btn("🕯 VRAI CRT", "str:vcrt", get_strat_vcrt()), {"text": "⚙️ VRAI CRT", "callback_data": "vcrtm:home"}],
         [_btn("📈 Ordres MT5 (API)", "str:mt5", get_mt5_orders_on())],
         [{"text": "📊 Analyse (point potentiel)", "callback_data": "ana:home"}, {"text": "⚙️ QML", "callback_data": "qml:home"}],
         [{"text": "⚙️ FIBTREND", "callback_data": "ft:home"}],
@@ -7200,9 +7162,8 @@ def handle_command(text):
                "/session [all|londres|ny|both] — n'accepter que les CHoCH d'une session · /zone [ob|fvg|both] — zone du limit\n"
                "/modesl [struct|zone|sweep] — SL de l'entrée directe · /modetp [rr|target|swing] — mode du TP\n"
                "/strategie [main|crt|both] · /crt [on|off|h1|h4|d1|range|mid|rr] — module CRT (désactivé par défaut)\n"
-               "/vcrt [on|off] · /vcrt_tf [H4|H1|M15|M5] ou /vcrt_tf M5 M15 — activer le vrai CRT · UT du vrai CRT (plusieurs en même temps ; entrée auto : H4→M15, H1→M5, M15→M1, M5→M1)\n"
-               "/vcrt_tp [fixe|auto|mid|extreme] · /vcrt_rr [RR_final] ou [RR1 RR2] — TP du vrai CRT (auto = CRH/CRL, fixe = R1/R2/R3/R4…)\n"
-               "/vcrt_sl [0.6|0.8|1|off] — plafond du SL du vrai CRT (x ATR) · /vcrt_sl [mss|sweep] — SL serré derrière le MSS ou derrière le sweep · /vcrt_be [auto|off|1|2|3|4] — BE du vrai CRT\n"
+               "/vcrt_tf [H4|H1|M15] — UT du vrai CRT (entrée auto : H4→M15, H1→M5, M15→M1)\n"
+               "/vcrt_tp [fixe|mid|extreme|propose] · /vcrt_rr [RR] — TP du vrai CRT (RR fixe, 50 % du range, autre bout, TP1+TP2)\n"
                "/mtffib [on|off] — filtre Fibonacci HTF Premium/Discount\n"
                "/m15imp [on|off] — filtre M15 vraie impulsion + structure + Fibonacci\n"
                "/bos [on|off] [40|45|50] — vrai BOS : retracement mini après la cassure\n"
@@ -7226,63 +7187,29 @@ def handle_command(text):
     if cmd == "/testgroupe":
         return (check_group(send_test=True)[1], None)
     if cmd in ("/statut", "/status", "/prix"):
+        _vk, _vm, _ve, _vem = vcrt_config()
         return ("📡 <b>Scan en cours</b> — " + TF_LABEL + "\n" + "\n".join(scan_status_lines())
-                + f"\n🕯 Vrai CRT : {'ON' if get_strat_vcrt() else 'OFF'} · UT {vcrt_active_lbl()}", None)
-    if cmd in ("/vcrt_sl", "/vcrtsl"):
-        _slm = {"mss": "MSS", "serre": "MSS", "serré": "MSS", "sweep": "SWEEP"}.get(parts[1].lower()) if len(parts) > 1 else None
-        if _slm:
-            set_choice("vcrt_sl_mode", _slm, VCRT_SL_MODES)
-        elif len(parts) > 1 and not set_vcrt_sl_cap(parts[1]):
-            return ("Valeur invalide. Exemples : /vcrt_sl mss (SL serré) | /vcrt_sl sweep | /vcrt_sl 0.8 | /vcrt_sl off  (plafond 0.2 à 5 × ATR)", None)
-        return (_vcrt_tf_text(), _vcrt_tf_keyboard())
-    if cmd in ("/vcrt_be", "/vcrtbe"):
-        if len(parts) > 1 and not set_vcrt_be(parts[1]):
-            return ("Valeur invalide. Exemples : /vcrt_be auto | /vcrt_be off | /vcrt_be 1 | /vcrt_be 2", None)
+                + f"\n🕯 Vrai CRT : {'ON' if get_strat_vcrt() else 'OFF'} · UT {_vk} → entrée {_ve} · TP {VCRT_TP_LBL[get_vcrt_tp()]}", None)
+    if cmd in ("/vcrt_tf", "/vcrttf", "/vcrt"):
+        if len(parts) > 1:
+            ok, changed = set_vcrt_tf(parts[1])
+            if not ok:
+                return ("Valeur invalide. Exemple : /vcrt_tf H4  |  /vcrt_tf H1  |  /vcrt_tf M15", None)
+            note = ("✅ UT du CRT changée, état CRT réinitialisé.\n\n" if changed
+                    else "ℹ️ Déjà sur cette UT, rien à changer.\n\n")
+            return (_vcrt_tf_text(note), _vcrt_tf_keyboard())
         return (_vcrt_tf_text(), _vcrt_tf_keyboard())
     if cmd in ("/vcrt_tp", "/vcrttp"):
-        for a in parts[1:]:
-            a = a.lower().replace("é", "e")
-            if a in ("fixe", "fixed"):
-                set_choice("vcrt_tp_mode", "FIXE", VCRT_TP_MODES)
-            elif a in ("propose", "range"):
-                set_choice("vcrt_tp_mode", "PROPOSE", VCRT_TP_MODES)
-            elif a in ("mid", "50", "50%"):
-                set_choice("vcrt_tp1_pos", "MID", VCRT_TP1_POS)
-            elif a in ("extreme", "extr"):
-                set_choice("vcrt_tp1_pos", "EXTREME", VCRT_TP1_POS)
-            elif a in ("auto", "crh", "crl", "crh/crl", "crl/crh"):   # TP automatique = autre bout du range (CRH pour un BUY, CRL pour un SELL)
-                set_choice("vcrt_tp_mode", "PROPOSE", VCRT_TP_MODES)
-                set_choice("vcrt_tp1_pos", "EXTREME", VCRT_TP1_POS)
-            elif a == "rr":
-                set_choice("vcrt_tp_mode", "FIXE", VCRT_TP_MODES)
-            else:
-                return ("Valeur invalide. Exemples : /vcrt_tp fixe | auto | propose | mid | extreme", None)
+        if len(parts) > 1:
+            if not set_vcrt_tp(parts[1]):
+                return ("Valeur invalide. Exemple : /vcrt_tp fixe  |  /vcrt_tp mid  |  /vcrt_tp extreme  |  /vcrt_tp propose", None)
+            return (_vcrt_tf_text(f"✅ TP du vrai CRT : {VCRT_TP_LBL[get_vcrt_tp()]}\n\n"), _vcrt_tf_keyboard())
         return (_vcrt_tf_text(), _vcrt_tf_keyboard())
     if cmd in ("/vcrt_rr", "/vcrtrr"):
         if len(parts) > 1:
-            try:
-                if len(parts) == 2:   # /vcrt_rr 4 (ou r4) : TP final à R4 (RR1 conservé), calculé depuis le SL
-                    ok = set_vcrt_rr_pick(parts[1].lower().lstrip("r").replace(",", "."))
-                else:
-                    ok = set_vcrt_rr(float(parts[1].replace(",", ".")), float(parts[2].replace(",", ".")))
-            except (ValueError, IndexError):
-                ok = False
-            if not ok:
-                return ("Valeur invalide. Exemples : /vcrt_rr 4 (TP final RR4)  |  /vcrt_rr 1 4  (RR1 < RR2, entre 0.2 et 20)", None)
-            set_choice("vcrt_tp_mode", "FIXE", VCRT_TP_MODES)   # un RR réglé à la main = TP fixe
-        return (_vcrt_tf_text(), _vcrt_tf_keyboard())
-    if cmd in ("/vcrt_tf", "/vcrttf", "/vcrt"):
-        if len(parts) > 1 and parts[1].lower() in ("on", "off"):
-            set_setting("strat_vcrt", "1" if parts[1].lower() == "on" else "0")
-            return (_vcrt_tf_text(), _vcrt_tf_keyboard())
-        if len(parts) > 1:
-            multi = len(parts) > 2 or re.search(r"[,;+/]", parts[1])   # /vcrt_tf M5 M15 : plusieurs UT en même temps
-            ok, changed = set_vcrt_tfs(" ".join(parts[1:])) if multi else set_vcrt_tf(parts[1])
-            if not ok:
-                return ("Valeur invalide. Exemples : /vcrt_tf H4  |  /vcrt_tf M5  |  /vcrt_tf M5 M15 (plusieurs UT en même temps)", None)
-            note = ("✅ UT du CRT changée (le CRT des UT retirées est réinitialisé).\n\n" if changed
-                    else "ℹ️ Déjà sur ces UT, rien à changer.\n\n")
-            return (_vcrt_tf_text(note), _vcrt_tf_keyboard())
+            if not set_vcrt_rr(parts[1]):
+                return ("Valeur invalide (0.1 à 20). Exemple : /vcrt_rr 2  |  /vcrt_rr 1.5", None)
+            return (_vcrt_tf_text(f"✅ RR fixe du vrai CRT : {get_vcrt_rr():g}\n\n"), _vcrt_tf_keyboard())
         return (_vcrt_tf_text(), _vcrt_tf_keyboard())
     if cmd == "/menu":
         return (_home_text(), _menu_keyboard())
@@ -7758,35 +7685,16 @@ def _handle_update(u):
             if ok:
                 _edit(cq, _signal_strat_text(), _signal_strat_keyboard())
                 ack = "CRT : " + _strat_txt()
-        elif data.startswith(("svtp:", "svp1:", "svrr:", "svsl:", "svbe:", "svrf:", "svsm:")):
-            if data.startswith("svsl:"):
-                ok = set_vcrt_sl_cap(data[5:])
-            elif data.startswith("svsm:"):
-                ok = set_choice("vcrt_sl_mode", data[5:], VCRT_SL_MODES)
-            elif data.startswith("svrf:"):   # bouton « TP R1 / R2 / R3 / R4 » : le RR est choisi par l'utilisateur
-                ok = set_vcrt_rr_pick(data[5:])
-            elif data.startswith("svbe:"):
-                ok = set_vcrt_be(data[5:])
-            elif data.startswith("svtp:"):
-                ok = set_choice("vcrt_tp_mode", data[5:], VCRT_TP_MODES)
-            elif data.startswith("svp1:"):
-                ok = set_choice("vcrt_tp1_pos", data[5:], VCRT_TP1_POS)
-            else:
-                try:
-                    _a, _b = data[5:].split(":")
-                    ok = set_vcrt_rr(float(_a), float(_b))
-                except ValueError:
-                    ok = False
+        elif data.startswith("svcrt:"):
+            ok, changed = set_vcrt_tf(data[6:])
+            if ok:
+                _edit(cq, _vcrt_tf_text("✅ UT du CRT changée, état CRT réinitialisé.\n\n" if changed else ""), _vcrt_tf_keyboard())
+                ack = f"UT du CRT : {get_vcrt_tf()} → entrée {vcrt_config()[2]}"
+        elif data.startswith("svcrtp:") or data.startswith("svcrr:"):
+            ok = set_vcrt_tp(data[7:]) if data.startswith("svcrtp:") else set_vcrt_rr(data[6:])
             if ok:
                 _edit(cq, _vcrt_tf_text(), _vcrt_tf_keyboard())
-                ack = ("SL vrai CRT : " + _vcrt_sl_txt() if data.startswith(("svsl:", "svsm:")) else
-                       "BE vrai CRT : " + _vcrt_be_txt() if data.startswith("svbe:") else
-                       "TP vrai CRT : " + _vcrt_tp_txt())
-        elif data.startswith("svcrt:"):   # chaque tap active / désactive CETTE UT : M5 et M15 peuvent tourner ensemble
-            ok, _acts, _msg = toggle_vcrt_tf(data[6:])
-            if ok:
-                _edit(cq, _vcrt_tf_text(), _vcrt_tf_keyboard())
-            ack = f"{_msg} · actifs : {vcrt_active_lbl()}"
+                ack = f"TP vrai CRT : {VCRT_TP_LBL[get_vcrt_tp()]} · RR fixe {get_vcrt_rr():g}"
         elif data in ("sentd", "sentl"):
             d, l = get_entry_direct(), get_entry_limit()
             if set_entry_types(not d if data == "sentd" else d, not l if data == "sentl" else l):
@@ -8003,11 +7911,6 @@ def _handle_update(u):
                     send(chat_id, f"🎯 {sym} — zones QML {_tf_lbl(a_tf)}", photo=chart)
                 send(chat_id, txt, reply_markup=_analyse_symbol_keyboard(sym))
                 ack = "Analyse envoyée"
-        elif data.startswith("vcrtm:"):   # panneau du vrai CRT : ON/OFF, UT du CRT, TP auto / RR fixe, SL plafonné, BE
-            if data == "vcrtm:toggle":
-                set_setting("strat_vcrt", "0" if get_strat_vcrt() else "1")
-                ack = "Vrai CRT : " + ("ON" if get_strat_vcrt() else "OFF")
-            _edit(cq, _vcrt_tf_text(), _vcrt_tf_keyboard())
         elif data.startswith("qml:"):
             ack = _qml_callback(cq, data[4:])
         elif data.startswith("qmlg:"):
@@ -8158,8 +8061,6 @@ def _handle_update(u):
                 set_setting("mt5_orders", "0" if get_mt5_orders_on() else "1"); ack = "Ordres MT5 : " + ("ON" if get_mt5_orders_on() else "OFF")
             elif a_ == "qmlg":
                 set_setting("qmlg_on", "0" if get_qmlg_on() else "1"); ack = "QML GAGNANT : " + ("ON" if get_qmlg_on() else "OFF")
-            elif a_ == "vcrt":
-                set_setting("strat_vcrt", "0" if get_strat_vcrt() else "1"); ack = "Vrai CRT : " + ("ON" if get_strat_vcrt() else "OFF")
             _edit(cq, _strategies_text(), _strategies_keyboard())
         elif data.startswith("news:"):
             if data == "news:on":
@@ -8745,10 +8646,9 @@ def publish_signal(symbol, candles, events, sig, companion=False):
         order_type=sig.get("order", "MARKET"), placed_ts=sig["t"], ref_price=sig.get("ref_price"),
         sent_admin=0, sent_group=0,   # passent à 1 seulement quand Telegram a confirmé l'envoi
         signal_key=key, symbol=symbol, side=sig["side"], kind=sig["type"],
-        timeframe=(sig["tf"] if sig.get("type") == "FIBTREND" and sig.get("tf") else TF_LABEL),
+        timeframe=(sig["tf"] if sig.get("type") in ("FIBTREND", "VCRT") and sig.get("tf") else TF_LABEL),
         entry=sig["entry"], sl=sig["sl"], sl_initial=sig["sl"], tp=sig["tp"],
         be_rr=sig.get("be_rr"), htf_mode=sig.get("htf_mode"),
-        tp1=(sig.get("tp1") if sig.get("strategy") == "VCRT" and sig.get("tp1") != sig.get("tp") else None),   # VCRT : TP1 intermédiaire figé
         risk_usd=lot_info["real_risk"],  # risque réel du lot pris (= risque demandé sauf lot minimum)
         lot=lot_info["lot"], leverage=leverage, opened_ts=now_ts(), last_ts=sig["t"],
         exec_status="PENDING" if (is_market and mt5_enabled) else None,
@@ -8762,12 +8662,7 @@ def publish_signal(symbol, candles, events, sig, companion=False):
 
     # 1) ENVOI IMMÉDIAT du signal (admin + groupe), AVANT toute tentative d'exécution MT5.
     try:
-        chart = None
-        if sig.get("strategy") == "VCRT" and sig.get("vcrt_ctx"):   # vrai CRT : image dédiée (bougies 1 / 2, zone d'entrée, niveaux)
-            vcrt_ctx_save(key, sig["vcrt_ctx"])                     # figé : l'image de résultat est redessinée à l'identique
-            chart = vcrt_signal_chart(sig["vcrt_ctx"])
-        if chart is None:
-            chart = make_chart(symbol, candles, events, sig, dec)
+        chart = make_chart(symbol, candles, events, sig, dec)
     except Exception as e:   # un souci de graphique ne doit JAMAIS empêcher l'envoi du signal
         print(f"[{symbol}] make_chart a échoué ({type(e).__name__}) : signal envoyé sans image")
         if isinstance(e, RecursionError):
@@ -8779,7 +8674,7 @@ def publish_signal(symbol, candles, events, sig, companion=False):
     _deliver_signal(trade_id, symbol,
                     admin_txt=admin_signal(symbol, sig, risk_usd, leverage, lot_info, margin, dec) + mm_note,
                     group_txt=group_signal(symbol, sig, n_open + 1, dec, lot=lot_info["lot"]),
-                    chart=chart, admin_chart=chart if sig.get("strategy") == "VCRT" else None)
+                    chart=chart)
     entry_media_and_lot(symbol, sig, lot_info["lot"])
 
     # 2) Exécution MT5 ensuite, dans un thread dédié : n'interrompt ni le scan ni le suivi des autres trades.
@@ -8880,10 +8775,8 @@ def _run_mt5_execution(trade_id, symbol, sig, lot):
              f"Ordre à ouvrir manuellement si besoin.")
 
 
-def _deliver_signal(trade_id, symbol, admin_txt, group_txt, chart=None, only_missing=None, admin_chart=None):
-    """Envoie le signal d'ouverture (admin d'abord, puis groupe) et note en base ce qui est bien parti.
-    chart = image du groupe ; admin_chart = image envoyée AUSSI dans le bot (vrai CRT). Légende d'une photo : 1000 caractères
-    max -> texte admin plus long : texte d'abord (c'est lui qui est confirmé), image juste après, sans nouvel essai."""
+def _deliver_signal(trade_id, symbol, admin_txt, group_txt, chart=None, only_missing=None):
+    """Envoie le signal d'ouverture (admin d'abord, puis groupe) et note en base ce qui est bien parti."""
     row = _q("SELECT sent_admin, sent_group FROM trades WHERE id=?", (trade_id,)).fetchone()
     if row is None:
         return
@@ -8893,15 +8786,7 @@ def _deliver_signal(trade_id, symbol, admin_txt, group_txt, chart=None, only_mis
         if row[f"sent_{who}"]:
             continue
         try:
-            if who == "admin" and admin_chart and len(txt) <= 1000:
-                res = to_admin(txt, photo=admin_chart)
-            else:
-                res = sender(txt, photo=photo) if who == "group" else sender(txt)
-            if _delivered(chat_id, res) and who == "admin" and admin_chart and len(txt) > 1000:
-                try:
-                    send(chat_id, "🕯 Graphique du signal", photo=admin_chart)
-                except Exception:
-                    traceback.print_exc(limit=-3)
+            res = sender(txt, photo=photo) if who == "group" else sender(txt)
             if _delivered(chat_id, res):
                 fields = {f"sent_{who}": 1}
                 if who == "group" and res:
@@ -8944,14 +8829,9 @@ def retry_unsent_signals():
         lev = t["leverage"] or get_leverage()
         margin = calc_margin(sym, t["lot"], t["entry"], lev)
         late = "⏱ <i>Envoi différé</i>\n"
-        vchart = None
-        if t.get("kind") == "VCRT":   # signal vrai CRT renvoyé : même image qu'à l'envoi normal (contexte relu en base)
-            vctx = vcrt_ctx_load(t.get("signal_key"))
-            vchart = vcrt_signal_chart(vctx) if vctx else None
         _deliver_signal(t["id"], sym,
                         admin_txt=late + admin_signal(sym, sig, t["risk_usd"], lev, lot_info, margin, dec),
-                        group_txt=late + group_signal(sym, sig, None, dec, tf=t["timeframe"], lot=t["lot"]),
-                        chart=vchart, admin_chart=vchart)
+                        group_txt=late + group_signal(sym, sig, None, dec, tf=t["timeframe"], lot=t["lot"]))
 
 
 def _publish_group(symbol, candles, events, sigs):
@@ -8998,11 +8878,9 @@ def process_symbol(symbol):
     # 1) suivi des positions ouvertes (BE / TP / SL)
     events = analyze(candles)
     for trade in open_trades(symbol):
-        if trade.get("kind") == "VCRT":
-            continue   # vrai CRT : suivi dédié sur l'UT d'entrée (vcrt_track_symbol), pas sur l'UT principale
         for ev in track_trade_verified(trade, candles):
             setup_engine_report(ev["trade"], ev["name"])
-            chart = make_event_chart(symbol, candles, events, ev["trade"], dec, ev_name=ev["name"]) \
+            chart = make_event_chart(symbol, candles, events, ev["trade"], dec) \
                 if ev["name"] in CHART_ON_EVENTS else None
             # Réponse au message Telegram EXACT du signal d'ouverture de CE trade (jamais le dernier
             # message du groupe) : évite tout mélange entre trades ouverts simultanément (ex. XAUUSD / BTCUSD).
@@ -9011,8 +8889,7 @@ def process_symbol(symbol):
             group_event_media(ev["name"])
             txt = admin_event(ev)
             if txt:
-                # vrai CRT : l'image de résultat part AUSSI dans le bot à la clôture (TP / SL / BE)
-                to_admin(txt, photo=chart if (chart and ev["trade"].get("kind") == "VCRT" and ev["name"] in ("TP", "SL", "BE")) else None)
+                to_admin(txt)
             if ev["name"] == "FILLED":
                 _exec_filled_limit(ev["trade"], dec)
 
@@ -9152,11 +9029,6 @@ def _trading_loop():
                     print(f"[{symbol}] module FIBTREND : erreur (ignorée)")
                     traceback.print_exc(limit=-3)
                 try:
-                    vcrt_track_symbol(symbol)    # suivi des trades vrai CRT ouverts (UT d'entrée), même si la stratégie est coupée
-                except Exception:
-                    print(f"[{symbol}] suivi Vrai CRT : erreur (ignorée)")
-                    traceback.print_exc(limit=-3)
-                try:
                     vcrt_process_symbol(symbol)  # stratégie Vrai CRT séparée (OFF par défaut) : jamais bloquante
                 except Exception:
                     print(f"[{symbol}] module Vrai CRT : erreur (ignorée)")
@@ -9249,7 +9121,6 @@ def main():
 import contextlib
 import importlib.util
 import io
-import tempfile
 import unittest
 from collections import Counter
 
@@ -12232,57 +12103,11 @@ class TestFibtrendBosChoch(unittest.TestCase):
         self.assertIn("BOS + CHoCH", _E._ft_menu_text() + "BOS + CHoCH")
 
 
-class TestVcrtTp(unittest.TestCase):
-    """TP du vrai CRT : modes FIXE / PROPOSE (50 % ou extrême), repli, signal au format commun."""
-    CRT = dict(dir=1, h1=110.0, l1=100.0, h2=105.0, l2=98.0, c2=102.0, sl=97.5, atr=2.0, tf=60, t2=0, t_entry=3600)
-
-    def test_fixe(self):
-        r = _E.vcrt_build_tps(self.CRT, 101.0, 99.0, mode="FIXE", rr1=1, rr2=2)
-        self.assertEqual((r["tp1"], r["tp2"], r["rr1"], r["rr2"]), (103.0, 105.0, 1.0, 2.0))
-
-    def test_propose_mid_et_extreme(self):
-        r = _E.vcrt_build_tps(self.CRT, 101.0, 99.0, mode="PROPOSE", tp1_pos="MID")
-        self.assertEqual((r["tp1"], r["tp2"]), (105.0, 110.0))
-        r = _E.vcrt_build_tps(self.CRT, 101.0, 99.0, mode="PROPOSE", tp1_pos="EXTREME")
-        self.assertEqual((r["tp1"], r["tp2"], r["rr1"], r["rr2"]), (110.0, 110.0, 4.5, 4.5))
-
-    def test_vente_miroir(self):
-        c = dict(self.CRT, dir=-1, sl=112.5)
-        r = _E.vcrt_build_tps(c, 109.0, 111.0, mode="PROPOSE", tp1_pos="MID")
-        self.assertEqual((r["tp1"], r["tp2"]), (105.0, 100.0))
-
-    def test_repli_si_cible_depassee(self):
-        r = _E.vcrt_build_tps(self.CRT, 106.0, 104.0, mode="PROPOSE", tp1_pos="MID", rr1=1, rr2=2)   # milieu (105) derrière l'entrée
-        self.assertEqual((r["tp1"], r["tp2"]), (108.0, 110.0))   # repli RR fixe 1 / 2
-
-    def test_reglages_et_signal(self):
-        _E.set_setting("vcrt_tp_mode", "FIXE")
-        self.assertTrue(_E.set_vcrt_rr(1.5, 3))
-        self.assertFalse(_E.set_vcrt_rr(3, 2))
-        self.assertEqual((_E.get_vcrt_rr(1), _E.get_vcrt_rr(2)), (1.5, 3.0))
-        sig = _E.vcrt_make_signal("XAUUSD" if "XAUUSD" in _E.SYMBOLS else next(iter(_E.SYMBOLS)), self.CRT, 5, "a", 101.0, 99.0, 1234)
-        self.assertEqual((sig["tp"], sig["be_rr"], sig["rr"], sig["type"]), (107.0, 1.5, 3.0, "VCRT"))
-        self.assertEqual(_E.risk_strategy_label(sig), "VCRT")
-        _E.set_setting("vcrt_tp_mode", "PROPOSE")
-
-    def test_suivi_track_trade(self):
-        tr = dict(id=0, symbol="X", side="BUY", entry=101.0, sl=99.0, sl_initial=99.0, tp=105.0, be_hit=0, be_rr=1.0,
-                  status="OPEN", last_ts=0, closed_ts=None, filled_ts=None, result_r=None, pnl_usd=None, outcome=None,
-                  rr1_hit=0, rr2_hit=0, rr3_hit=0, risk_usd=1.0, part_cfg=None)
-        up = lambda t, h, l: {"t": t, "o": 101.0, "h": h, "l": l, "c": 101.0}
-        ev = _E.track_trade(tr, [up(1, 103.1, 100.5)])
-        self.assertEqual([e["name"] for e in ev], ["RR1"])
-        self.assertEqual(tr["sl"], 101.0)
-        ev = _E.track_trade(tr, [up(2, 105.2, 102.0)])
-        self.assertEqual([e["name"] for e in ev], ["RR2"] if False else [e["name"] for e in ev])
-        self.assertEqual(tr["outcome"], "TP")
-
-
 def _selftest():
     _E.HTF_MODE = "FULL"   # les tests historiques (H1 -> M15 -> M5 -> POI) évaluent la cascade complète ; TestHtfM15 passe en mode M15
     suite, loader = unittest.TestSuite(), unittest.TestLoader()
     for cls in (TestRetracement, TestContinuation, TestInvalidationHTF, TestChop, TestGetExtTf,
-                TestLiquiditePure, TestM1NeDecidePasSeul, TestLogs, TestEntreeM5, TestNonRegression, TestVraiCRT, TestVcrtSlBeRr, TestVcrtTf, TestVcrtSuivi, TestVcrtTp, TestVcrtEntry, TestVcrtImages, TestVcrtMultiUtRrSl,
+                TestLiquiditePure, TestM1NeDecidePasSeul, TestLogs, TestEntreeM5, TestNonRegression, TestVraiCRT, TestVcrtTf, TestVcrtTp,
                 TestHtfM15, TestBE, TestEntreeOBFVG, TestSLTPCRT, TestSignauxSimultanes, TestLectureExtInt, TestModifyPositionGardeSLTP, TestBEDoubleVerif, TestClientId, TestLogVolumeReel, TestRiskGateUniversel, TestFiltresQualite, TestActifsEtEntrees, TestAjoutsNewsStopUS30, TestQmlSansLimiteAge, TestQmlMemoireEtHistoriqueProfond, TestSetupEngineEntreeEtPause, TestMoteurSmc, TestQmlGagnant, TestComputeTrade, TestQmlGagnantBoutons, TestQmlGagnantHtfEtRegles, TestQmlGagnantAlertes, TestFibtrendBosChoch, TestOrdresMt5EtStickers):
         suite.addTests(loader.loadTestsFromTestCase(cls))
     return 0 if unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful() else 1
@@ -16272,9 +16097,8 @@ def track_trade_verified(trade, candles):
 #   Bougie 1 = référence : high / low = CRH / CRL.
 #   Bougie 2 = manipulation : balaye UN seul côté puis CLÔTURE de nouveau dans le range de la bougie 1.
 #   Bougie 3 = distribution : le prix part vers l'autre extrémité du range.
-# SL : derrière l'extrême du sweep (+ marge en ATR), ou « serré » juste derrière le MSS / la zone d'entrée (voir VCRT_SL_MODES).
-# Plusieurs UT de CRT peuvent tourner en même temps (get_vcrt_tfs). Cette section ne fait QUE détecter (pas d'entrée, pas de signal
-# Telegram, pas de suivi) : l'entrée sur UT basse, le TP, le suivi et l'image viennent dans les étapes suivantes.
+# SL : derrière l'extrême du sweep (+ marge en ATR). Détection, entrée sur UT basse, TP réglable (vcrt_plan) et publication
+# via publish_signal (Risk Gate commun) sont ici ; le suivi RR1/RR2/TP/SL passe par track_trade (étape suivante : TP1).
 # Bougies = dicts {t, o, h, l, c} clôturées, t = ouverture en secondes (même format que get_candles).
 # Activation : STRAT_VCRT (défaut OFF) ou réglage « strat_vcrt » en base. Seuils modifiables via variables VCRT_*.
 # ============================================================================
@@ -16284,248 +16108,19 @@ VCRT_MIN_RANGE_ATR = float(os.getenv("VCRT_MIN_RANGE_ATR", "0.5"))    # range de
 VCRT_MAX_RANGE_ATR = float(os.getenv("VCRT_MAX_RANGE_ATR", "4.0"))    # ... ni trop grand (x ATR)
 VCRT_SL_BUFFER_ATR = float(os.getenv("VCRT_SL_BUFFER_ATR", "0.05"))   # marge derrière l'extrême du sweep (x ATR)
 VCRT_MAX_SL_ATR = float(os.getenv("VCRT_MAX_SL_ATR", "3.0"))          # SL maximum (x ATR), vérifié à l'entrée (étape suivante)
-# Plancher du SL propre au vrai CRT (en % du prix). L'ancien plancher global (min_sl_pct, 0.10 % = ~3.9 pts sur l'or à 3 900)
-# ÉLARGISSAIT le SL serré jusqu'à 3.9 pts : bien plus loin que le sweep. Ici : juste de quoi éviter le bruit / spread
-# (0.02 % = ~0.8 pt sur l'or). 0 = aucun plancher. Le stopsLevel du broker reste vérifié à l'envoi (rejet net, jamais déplacé).
-VCRT_MIN_SL_PCT = _env_float("VCRT_MIN_SL_PCT", 0.0002)
-# Risque maximal accepté (x ATR de l'UT du CRT) : au-delà, le signal est ignoré (jamais de SL très large).
-VCRT_MAX_RISK_ATR = _env_float("VCRT_MAX_RISK_ATR", 1.5)
 
 
 def get_strat_vcrt():
     return _get_bool_setting("strat_vcrt", STRAT_VCRT)
 
 
-# --- TP du vrai CRT (réglables depuis le bot) ---------------------------------------------------------------------
-# FIXE    : TP final = RR2, RR1 = palier intermédiaire (SL -> BE) ; les deux RR sont réglables (/vcrt_rr, boutons).
-# PROPOSE : logique « _plan » de crt_vrai.py. TP1 = 50 % du range (MID) et TP2 = autre bout du range ; ou, avec
-#           TP1 = EXTREME, TP1 = autre bout du range sans TP2 intermédiaire (TP final = TP1).
-# Sur le suivi existant (track_trade) : TP final -> trade["tp"] ; RR1 -> be_rr du trade (SL à l'entrée + message RR/BE
-# déjà utilisés par les autres stratégies). Niveaux figés dans le trade à l'ouverture.
-VCRT_TP_MODES, VCRT_TP1_POS = ("FIXE", "PROPOSE"), ("MID", "EXTREME")
-VCRT_RR1_DEFAULT, VCRT_RR2_DEFAULT = 1.0, 2.0
-VCRT_RR_PRESETS = ((1, 2), (1, 3), (1, 4), (2, 4))   # anciens boutons « paire RR1 / RR final » (callback svrr: conservé pour les vieux messages)
-VCRT_RR_PICKS = (1, 2, 3, 4)                         # boutons « TP R1 / R2 / R3 / R4 » et « BE R1 / R2 / R3 / R4 » (callbacks svrf: / svbe:)
-
-
-def get_vcrt_tp_mode():
-    return _get_choice("vcrt_tp_mode", "PROPOSE", VCRT_TP_MODES)
-
-
-def get_vcrt_tp1_pos():
-    return _get_choice("vcrt_tp1_pos", "MID", VCRT_TP1_POS)
-
-
-def get_vcrt_rr(n):
-    """RR1 (n=1) ou RR2 (n=2) du mode FIXE ; repli sur les valeurs par défaut si la base est invalide."""
-    dflt = VCRT_RR1_DEFAULT if n == 1 else VCRT_RR2_DEFAULT
-    try:
-        v = float(get_setting(f"vcrt_rr{n}") or dflt)
-    except (TypeError, ValueError):
-        return dflt
-    return v if 0.2 <= v <= 20 else dflt
-
-
-def set_vcrt_rr(rr1, rr2):
-    if not (0.2 <= rr1 < rr2 <= 20):
-        return False
-    set_setting("vcrt_rr1", f"{rr1:g}")
-    set_setting("vcrt_rr2", f"{rr2:g}")
-    return True
-
-
-def set_vcrt_rr_final(rr2):
-    """Règle seulement le TP FINAL (ex. 4 -> RR4) ; RR1 est conservé s'il reste inférieur, sinon ramené à 1."""
-    if not (0.4 <= rr2 <= 20):
-        return False
-    rr1 = get_vcrt_rr(1)
-    if rr1 >= rr2:
-        rr1 = 1.0 if rr2 > 1 else round(rr2 / 2, 2)
-    return set_vcrt_rr(rr1, rr2)
-
-
-def set_vcrt_rr_pick(n):
-    """Bouton « TP R<n> » : c'est l'utilisateur qui choisit le RR du TP final (R1, R2, R3, R4...) -> mode TP fixe.
-    R2 / R3 / R4 : RR1 (palier intermédiaire = BE auto) est conservé tant qu'il reste inférieur au TP final, sinon ramené à 1.
-    R1 : TP unique à 1R, sans palier intermédiaire (RR1 = RR final). Valeur hors 0.2-20 : refusée, rien n'est modifié."""
-    x = _vcrt_num(n, 0.2, 20.0)
-    if x is None:
-        return False
-    if x <= 1:
-        set_setting("vcrt_rr1", f"{x:g}")
-        set_setting("vcrt_rr2", f"{x:g}")
-    else:
-        rr1 = get_vcrt_rr(1)
-        if rr1 >= x:
-            rr1 = 1.0
-        if not set_vcrt_rr(rr1, x):
-            return False
-    set_choice("vcrt_tp_mode", "FIXE", VCRT_TP_MODES)   # un RR choisi à la main = TP fixe
-    return True
-
-
-# --- SL plafonné (jamais de SL très large) et BE du vrai CRT -------------------------------------------------------
-# SL : toujours derrière l'extrême du sweep (+ marge), MAIS plafonné à VCRT_SL_CAP_ATR x ATR de l'UT du CRT : si la distance
-#      entrée -> sweep dépasse le plafond, le SL est ramené à entrée -/+ plafond (0 = plafond désactivé). Réglable : /vcrt_sl.
-# BE  : AUTO = SL à l'entrée au palier RR1 (TP1) · OFF = jamais de BE · nombre = BE à RRn (ex. 1, 1.5, 2). Réglable : /vcrt_be.
-VCRT_SL_CAP_ATR = _env_float("VCRT_SL_CAP_ATR", 0.8)
-VCRT_BE_ENV = os.getenv("VCRT_BE", "AUTO").strip().upper() or "AUTO"
-VCRT_BE_OFF_RR = 99.0   # « BE désactivé » : RR du BE hors d'atteinte (be_rr >= TP => jamais armé, voir _be_line / track_trade)
-
-
-def _vcrt_num(v, lo, hi):
-    try:
-        x = float(str(v).strip().lower().replace("rr", "").replace("atr", "").replace("x", "").replace(",", "."))
-    except (TypeError, ValueError):
-        return None
-    return x if lo <= x <= hi else None
-
-
-def get_vcrt_sl_cap():
-    """Plafond du SL en x ATR (UT du CRT) ; 0.0 = pas de plafond."""
-    raw = get_setting("vcrt_sl_cap")
-    if raw is None or str(raw).strip() == "":
-        return VCRT_SL_CAP_ATR if VCRT_SL_CAP_ATR > 0 else 0.0
-    if str(raw).strip().lower() in ("off", "0", "none"):
-        return 0.0
-    v = _vcrt_num(raw, 0.2, 5.0)
-    return v if v is not None else (VCRT_SL_CAP_ATR if VCRT_SL_CAP_ATR > 0 else 0.0)
-
-
-def set_vcrt_sl_cap(v):
-    s = str(v).strip().lower()
-    if s in ("off", "non", "0", "none", "aucun"):
-        set_setting("vcrt_sl_cap", "off")
-        return True
-    x = _vcrt_num(s, 0.2, 5.0)
-    if x is None:
-        return False
-    set_setting("vcrt_sl_cap", f"{x:g}")
-    return True
-
-
-def get_vcrt_be():
-    """'AUTO' | 'OFF' | RR (float) du BE du vrai CRT."""
-    raw = str(get_setting("vcrt_be") or VCRT_BE_ENV).strip().upper()
-    if raw in ("AUTO", "OFF"):
-        return raw
-    v = _vcrt_num(raw, 0.2, 20.0)
-    return v if v is not None else "AUTO"
-
-
-def set_vcrt_be(v):
-    s = str(v).strip().upper().replace("RR", "")
-    if s in ("AUTO", "A"):
-        set_setting("vcrt_be", "AUTO")
-        return True
-    if s in ("OFF", "NON", "0", "DESACTIVE", "DÉSACTIVÉ", "STOP"):
-        set_setting("vcrt_be", "OFF")
-        return True
-    x = _vcrt_num(s, 0.2, 20.0)
-    if x is None:
-        return False
-    set_setting("vcrt_be", f"{x:g}")
-    return True
-
-
-# SL « SERRÉ » (MSS) : quand un déclencheur d'entrée existe (MSS+FVG, avalement+OB, réaction FVG/OB), le SL se place JUSTE
-# légèrement derrière lui (le bas de la jambe du MSS, ou la zone / la bougie de réaction) au lieu du bout du sweep, souvent
-# loin. Marge = VCRT_MSS_SL_BUFFER_ATR x ATR de l'UT d'ENTRÉE. Jamais plus large que le SL derrière le sweep (qui reste le repli).
-# Réglable : /vcrt_sl mss | sweep, ou les boutons « SL serré (MSS) » / « SL derrière sweep ». Le plafond x ATR s'applique aux deux.
-VCRT_SL_MODES = ("SWEEP", "MSS")
-VCRT_SL_MODE_ENV = os.getenv("VCRT_SL_MODE", "MSS").strip().upper()
-if VCRT_SL_MODE_ENV not in VCRT_SL_MODES:
-    VCRT_SL_MODE_ENV = "MSS"
-VCRT_MSS_SL_BUFFER_ATR = _env_float("VCRT_MSS_SL_BUFFER_ATR", 0.1)
-
-
-def get_vcrt_sl_mode():
-    """'MSS' (SL serré derrière le MSS / la zone d'entrée) ou 'SWEEP' (derrière le sweep). Réglage Telegram, sinon VCRT_SL_MODE."""
-    return _get_choice("vcrt_sl_mode", VCRT_SL_MODE_ENV, VCRT_SL_MODES)
-
-
-def _vcrt_sl_txt():
-    cap = get_vcrt_sl_cap()
-    base = ("SL serré : juste derrière le MSS / la zone d'entrée (jamais plus large que le sweep)"
-            if get_vcrt_sl_mode() == "MSS" else "SL derrière le sweep")
-    return base + (f", plafond {cap:g} × ATR" if cap > 0 else ", plafond OFF")
-
-
-def _vcrt_be_txt():
-    m = get_vcrt_be()
-    if m == "OFF":
-        return "BE désactivé"
-    if m == "AUTO":
-        return "BE automatique : SL à l'entrée au palier RR1 (TP1)"
-    return f"BE à R{m:g}"
-
-
-def vcrt_cap_sl(crt, price, sl):
-    """Plafonne le SL : (sl, plafonné ?). Distance max = plafond x ATR de l'UT du CRT ; jamais d'élargissement."""
-    cap, at = get_vcrt_sl_cap(), crt.get("atr") or 0
-    if cap > 0 and at > 0 and abs(price - sl) > cap * at:
-        return price - crt["dir"] * cap * at, True
-    return sl, False
-
-
-def vcrt_be_rr(tps):
-    """(be_rr, be_off) d'un nouveau trade vrai CRT selon le réglage BE."""
-    m = get_vcrt_be()
-    if m == "OFF":
-        return VCRT_BE_OFF_RR, True
-    if m == "AUTO":
-        return (tps["rr1"] if tps["tp1"] != tps["tp2"] else get_be_rr()), False
-    return float(m), False
-
-
-def _vcrt_tp_txt():
-    if get_vcrt_tp_mode() == "FIXE":
-        r1, r2 = get_vcrt_rr(1), get_vcrt_rr(2)
-        if abs(r1 - r2) < 1e-9:
-            return f"TP fixe : R{r2:g} (TP unique, pas de palier intermédiaire)"
-        return f"TP fixe : final R{r2:g} · palier RR1 {r1:g}"
-    return ("TP proposé : TP1 = 50 % du range, TP2 = autre bout du range" if get_vcrt_tp1_pos() == "MID"
-            else "TP proposé : TP1 = autre bout du range (pas de TP2 intermédiaire)")
-
-
-def vcrt_build_tps(crt, entry, sl, mode=None, tp1_pos=None, rr1=None, rr2=None):
-    """Niveaux d'un trade vrai CRT, quel que soit le mode : {entry, sl, tp1, tp2, rr1, rr2, tp_mode}.
-    tp2 est le TP FINAL (= tp1 quand TP1 = extrême). Repli sur le mode FIXE si une cible du range est mal placée
-    (déjà dépassée) ou trop proche (RR < TP_MIN_RR). Ne modifie ni l'entrée ni le SL."""
-    mode = mode or get_vcrt_tp_mode()
-    tp1_pos = tp1_pos or get_vcrt_tp1_pos()
-    rr1 = rr1 if rr1 is not None else get_vcrt_rr(1)
-    rr2 = rr2 if rr2 is not None else get_vcrt_rr(2)
-    d, risk = crt["dir"], abs(entry - sl)
-    if risk <= 0:
-        return None
-    label = f"TP fixe RR{rr1:g}/RR{rr2:g}"
-    tp1, tp2 = entry + d * risk * rr1, entry + d * risk * rr2
-    if mode == "PROPOSE":
-        far = crt["h1"] if d == 1 else crt["l1"]                 # autre bout du range de la bougie 1
-        mid = (crt["h1"] + crt["l1"]) / 2
-        if tp1_pos == "EXTREME":
-            t1, t2, lbl = far, far, "TP1 = autre bout du range"
-        else:
-            t1, t2, lbl = mid, far, "TP1 = 50 % du range · TP2 = autre bout"
-        ok = ((t1 - entry) * d > 0 and (t2 - t1) * d >= 0 and abs(t1 - entry) / risk >= 0.2
-              and abs(t2 - entry) / risk >= TP_MIN_RR)
-        if ok:
-            tp1, tp2, label = t1, t2, lbl
-        else:
-            print(f"[vcrt] TP proposé ({lbl}) : cible mal placée ou trop proche -> {label}")
-            label += " (repli : cible du range inutilisable)"
-    return {"entry": entry, "sl": sl, "tp1": tp1, "tp2": tp2,
-            "rr1": round(abs(tp1 - entry) / risk, 2), "rr2": round(abs(tp2 - entry) / risk, 2), "tp_mode": label}
-
-
 # --- UT du CRT (VCRT_TF) et UT d'entrée automatique ---------------------------------------------------------------
-# VCRT_TF = UT sur laquelle le CRT (bougies 1-2-3) est cherché : H4 / H1 / M15 / M5 (M5 -> entrée en M1).
+# VCRT_TF = UT sur laquelle le CRT (bougies 1-2-3) est cherché : H4 / H1 / M15.
 #   Valeur de départ : variable Render VCRT_TF (absente ou invalide -> H4). Modifiable à chaud depuis Telegram
 #   (/vcrt_tf H4|H1|M15 ou boutons) : le dernier choix Telegram (réglage « vcrt_tf » en base) prime sur la variable.
 # UT d'entrée automatique (cherchée PENDANT la bougie 3, étape suivante) : H4 -> M15, H1 -> M5, M15 -> M1.
-VCRT_TFS = {"H4": 240, "H1": 60, "M15": 15, "M5": 5}   # libellé -> minutes
-VCRT_ENTRY_TFS = {"H4": 15, "H1": 5, "M15": 1, "M5": 1}   # UT du CRT -> UT d'entrée (minutes)
+VCRT_TFS = {"H4": 240, "H1": 60, "M15": 15}          # libellé -> minutes
+VCRT_ENTRY_TFS = {"H4": 15, "H1": 5, "M15": 1}       # UT du CRT -> UT d'entrée (minutes)
 VCRT_TF_DEFAULT = "H4"
 
 
@@ -16547,29 +16142,9 @@ if _VCRT_TF_ENV_RAW and _vcrt_norm_tf(_VCRT_TF_ENV_RAW) is None:
     print(f"[vcrt] VCRT_TF={_VCRT_TF_ENV_RAW!r} invalide (H4 / H1 / M15) -> {VCRT_TF_DEFAULT} utilisé")
 
 
-def _vcrt_parse_tfs(raw, strict=False):
-    """'M5,M15' / 'M5 M15' / 'M5+M15' / liste -> libellés valides, sans doublon, dans l'ordre H4, H1, M15, M5.
-    Valeur vide -> []. strict=True : un seul élément invalide -> None (la commande est refusée en entier)."""
-    if raw is None:
-        return []
-    items = [x for x in re.split(r"[\s,;+/]+", raw) if x] if isinstance(raw, str) else list(raw)
-    norm = [_vcrt_norm_tf(x) for x in items]
-    if strict and (not norm or any(k is None for k in norm)):
-        return None
-    ok = {k for k in norm if k}
-    return [k for k in VCRT_TFS if k in ok]
-
-
-def get_vcrt_tfs():
-    """UT de CRT ACTIVES — PLUSIEURS à la fois possibles (ex. M5 ET M15) : réglage « vcrt_tfs » (Telegram), sinon l'ancien
-    réglage « vcrt_tf » / variable VCRT_TF. Toujours au moins une, dans l'ordre H4, H1, M15, M5."""
-    tfs = _vcrt_parse_tfs(get_setting("vcrt_tfs"))
-    return tfs or [_vcrt_norm_tf(get_setting("vcrt_tf") or "") or VCRT_TF]
-
-
 def get_vcrt_tf():
-    """UT du CRT « principale » : la première UT active (compatibilité : affichages / suivi d'anciens trades)."""
-    return get_vcrt_tfs()[0]
+    """UT du CRT courante : 'H4' / 'H1' / 'M15' (réglage Telegram, sinon variable VCRT_TF, sinon H4)."""
+    return _vcrt_norm_tf(get_setting("vcrt_tf") or "") or VCRT_TF
 
 
 def get_vcrt_tf_min():
@@ -16577,28 +16152,23 @@ def get_vcrt_tf_min():
 
 
 def get_entry_tf(vcrt_tf=None):
-    """UT d'entrée automatique (EN MINUTES) pour l'UT du CRT `vcrt_tf` (libellé 'H4'/'H1'/'M15'/'M5' ou minutes ;
-    défaut : UT du CRT principale). H4 -> 15, H1 -> 5, M15 -> 1, M5 -> 1. UT inconnue -> None (jamais d'exception)."""
+    """UT d'entrée automatique (EN MINUTES) pour l'UT du CRT `vcrt_tf` (libellé 'H4'/'H1'/'M15' ou minutes ;
+    défaut : UT du CRT courante). H4 -> 15, H1 -> 5, M15 -> 1. UT inconnue -> None (jamais d'exception)."""
     k = _vcrt_norm_tf(vcrt_tf) if vcrt_tf is not None else get_vcrt_tf()
     return VCRT_ENTRY_TFS.get(k) if k else None
 
 
 def vcrt_config():
-    """(UT du CRT principale, minutes, UT d'entrée, minutes) — ex. ('H4', 240, 'M15', 15)."""
+    """(UT du CRT, minutes, UT d'entrée, minutes) — ex. ('H4', 240, 'M15', 15)."""
     k = get_vcrt_tf()
     e = VCRT_ENTRY_TFS[k]
     return k, VCRT_TFS[k], _tf_lbl(e), e
 
 
-def vcrt_active_lbl():
-    """Toutes les UT de CRT actives avec leur UT d'entrée — ex. 'M15→M1 + M5→M1'."""
-    return " + ".join(f"{k}→{_tf_lbl(VCRT_ENTRY_TFS[k])}" for k in get_vcrt_tfs())
-
-
 # État du CRT en cours par actif (rempli à l'étape suivante : CRT détecté, verrou « un seul trade par CRT »...).
 # Il appartient à UNE UT de CRT : changer d'UT le vide, pour ne jamais garder un CRT / verrou d'une autre UT.
 # Les positions DÉJÀ ouvertes ne sont pas touchées : elles gardent leur propre suivi (BE / TP / SL).
-_VCRT_STATE = {}   # clé = (actif, UT du CRT) : chaque UT de CRT active a SON état et SON verrou « un seul trade par CRT »
+_VCRT_STATE = {}
 _vcrt_lock = threading.RLock()
 
 
@@ -16613,110 +16183,138 @@ def vcrt_reset_state(reason=""):
     print(f"[vcrt] état CRT réinitialisé ({n} actif(s)){' — ' + reason if reason else ''}")
 
 
-def vcrt_drop_state(tf_label):
-    """Oublie l'état CRT d'UNE UT (ex. 'M5') pour tous les actifs ; les autres UT gardent le leur."""
-    with _vcrt_lock:
-        for k in [k for k in _VCRT_STATE if isinstance(k, tuple) and len(k) > 1 and k[1] == tf_label]:
-            del _VCRT_STATE[k]
-
-
-def _vcrt_store_tfs(tfs):
-    set_setting("vcrt_tfs", ",".join(tfs))
-    set_setting("vcrt_tf", tfs[0])   # ancien réglage, gardé cohérent (première UT active)
-
-
 def set_vcrt_tf(v):
-    """UT du CRT UNIQUE (ancien comportement, /vcrt_tf M5) : remplace toutes les UT actives par celle-ci.
-    Retourne (ok, changé). Valeur invalide : (False, False), rien n'est modifié. Si l'UT change, l'état CRT en cours est
-    réinitialisé ; même valeur : rien à faire."""
+    """Change l'UT du CRT à chaud. Retourne (ok, changé). Valeur invalide : (False, False), rien n'est modifié.
+    Si l'UT change, l'état CRT en cours est réinitialisé ; même valeur : rien à faire."""
     k = _vcrt_norm_tf(v)
     if k is None:
         return False, False
     with _vcrt_lock:
-        old = get_vcrt_tfs()
-        if old == [k]:
+        old = get_vcrt_tf()
+        if k == old:
             return True, False
-        _vcrt_store_tfs([k])
-        vcrt_reset_state(f"UT du CRT {'+'.join(old)} -> {k}")
+        set_setting("vcrt_tf", k)
+        vcrt_reset_state(f"UT du CRT {old} -> {k}")
     return True, True
 
 
-def set_vcrt_tfs(v):
-    """Plusieurs UT de CRT actives en même temps (/vcrt_tf M5 M15). Retourne (ok, changé). Valeur invalide : (False, False).
-    Seules les UT RETIRÉES perdent leur état CRT en cours ; les UT conservées gardent le leur (verrou inclus)."""
-    tfs = _vcrt_parse_tfs(v, strict=True)
-    if not tfs:
-        return False, False
-    with _vcrt_lock:
-        old = get_vcrt_tfs()
-        if tfs == old:
-            return True, False
-        _vcrt_store_tfs(tfs)
-        for k in old:
-            if k not in tfs:
-                vcrt_drop_state(k)
-    print(f"[vcrt] UT de CRT actives : {'+'.join(old)} -> {'+'.join(tfs)}")
-    return True, True
+# --- TP du vrai CRT : réglable depuis Telegram (/vcrt_tp, /vcrt_rr, boutons), persisté en base ------------------------
+# Range de la bougie 1 : CRL = l1 (bas), CRH = h1 (haut). Cible « autre bout du range » : CRH pour un BUY, CRL pour un SELL.
+#   FIXE    : TP à RR réglable (réglage « vcrt_rr », sinon variable VCRT_RR, sinon le RR général /rr)
+#   MID     : TP à 50 % du range CRT
+#   EXTREME : TP à l'autre bout du range
+#   PROPOSE : TP1 = 50 % du range, TP2 = autre bout du range (TP2 = TP final suivi par track_trade ; le suivi du TP1
+#             sera branché à l'étape suivante : pour l'instant TP1 est affiché sur le signal)
+# Cible mal placée (déjà dépassée) ou RR < TP_MIN_RR : repli sur le RR fixe, loggé (comme _crt_apply_tp).
+VCRT_TP_MODES = ("FIXE", "MID", "EXTREME", "PROPOSE")
+VCRT_TP_LBL = {"FIXE": "RR fixe", "MID": "50 % du range", "EXTREME": "autre bout du range", "PROPOSE": "TP1 50 % + TP2 autre bout"}
+VCRT_RR_CHOICES = (1, 1.5, 2, 3)
+VCRT_RR = _env_float("VCRT_RR", 0.0)   # 0 = suivre le RR général (get_tp_rr)
+_VCRT_TP_ALIASES = {"FIXE": "FIXE", "FIX": "FIXE", "RR": "FIXE", "MID": "MID", "50": "MID", "MILIEU": "MID",
+                    "EXTREME": "EXTREME", "RANGE": "EXTREME", "PROPOSE": "PROPOSE", "TP1TP2": "PROPOSE"}
 
 
-def toggle_vcrt_tf(v):
-    """Bouton d'UT : active ou désactive CETTE UT de CRT sans toucher aux autres (M5 et M15 peuvent tourner ensemble).
-    Retourne (ok, UT actives, message). La dernière UT active ne peut pas être retirée (OFF = bouton « VRAI CRT »)."""
-    k = _vcrt_norm_tf(v)
-    if k is None:
-        return False, get_vcrt_tfs(), "UT invalide"
-    with _vcrt_lock:
-        act = get_vcrt_tfs()
-        if k in act:
-            if len(act) == 1:
-                return False, act, "Au moins une UT de CRT doit rester active"
-            new = [x for x in act if x != k]
-            _vcrt_store_tfs(new)
-            vcrt_drop_state(k)
-            return True, new, f"CRT {k} désactivé"
-        new = [x for x in VCRT_TFS if x in act or x == k]
-        _vcrt_store_tfs(new)
-    return True, new, f"CRT {k} activé"
+def _vcrt_norm_tp(v):
+    """Mode TP normalisé ('FIXE' / 'MID' / 'EXTREME' / 'PROPOSE') ou None. Accepte 50, 50 %, extrême, proposé, rr..."""
+    s = str(v or "").strip().upper().replace("Ê", "E").replace("É", "E").replace("%", "").replace(" ", "").replace("-", "")
+    return _VCRT_TP_ALIASES.get(s)
+
+
+VCRT_TP_DEFAULT = _vcrt_norm_tp(os.getenv("VCRT_TP", "")) or "FIXE"
+
+
+def get_vcrt_tp():
+    """Mode TP du vrai CRT : dernier choix Telegram (réglage « vcrt_tp »), sinon variable VCRT_TP, sinon FIXE."""
+    return _vcrt_norm_tp(get_setting("vcrt_tp") or "") or VCRT_TP_DEFAULT
+
+
+def set_vcrt_tp(v):
+    k = _vcrt_norm_tp(v)
+    if not k:
+        return False
+    set_setting("vcrt_tp", k)
+    return True
+
+
+def get_vcrt_rr():
+    """RR du mode FIXE : réglage « vcrt_rr », sinon variable VCRT_RR, sinon RR général (get_tp_rr)."""
+    try:
+        v = float(get_setting("vcrt_rr"))
+    except (TypeError, ValueError):
+        v = 0.0
+    if v > 0:
+        return v
+    return VCRT_RR if VCRT_RR > 0 else get_tp_rr()
+
+
+def set_vcrt_rr(v):
+    try:
+        x = float(str(v).replace(",", ".").strip())
+    except ValueError:
+        return False
+    if not 0.1 <= x <= 20:
+        return False
+    set_setting("vcrt_rr", round(x, 2))
+    return True
+
+
+def vcrt_plan(crt, entry, sl, mode=None, rr_fixe=None):
+    """Plan de TP d'un vrai CRT (fonction pure). Retourne {mode, mode_used, fallback, tp, rr, tp1, rr1, mid, extreme, label}.
+    `tp` = TP final (celui que suit track_trade) ; `tp1` seulement en mode PROPOSE (50 % du range)."""
+    d = crt["dir"]
+    mode = _vcrt_norm_tp(mode) if mode else None
+    mode = mode or get_vcrt_tp()
+    rr_fixe = float(rr_fixe) if rr_fixe else get_vcrt_rr()
+    risk = abs(entry - sl)
+    mid = (crt["h1"] + crt["l1"]) / 2.0
+    extreme = crt["h1"] if d == 1 else crt["l1"]
+
+    def _good(t):   # cible du bon côté de l'entrée et assez loin
+        return risk > 0 and (t - entry) * d > 0 and abs(t - entry) / risk >= TP_MIN_RR
+
+    def _rr(t):
+        return round(abs(t - entry) / risk, 2) if risk > 0 else None
+
+    plan = {"mode": mode, "mode_used": "FIXE", "fallback": False, "tp": entry + d * risk * rr_fixe, "rr": round(rr_fixe, 2),
+            "tp1": None, "rr1": None, "mid": mid, "extreme": extreme}
+    if mode == "MID" and _good(mid):
+        plan.update(mode_used="MID", tp=mid, rr=_rr(mid))
+    elif mode == "EXTREME" and _good(extreme):
+        plan.update(mode_used="EXTREME", tp=extreme, rr=_rr(extreme))
+    elif mode == "PROPOSE" and _good(extreme):
+        plan.update(mode_used="PROPOSE", tp=extreme, rr=_rr(extreme))
+        if _good(mid) and (extreme - mid) * d > 0:
+            plan.update(tp1=mid, rr1=_rr(mid))
+        else:
+            plan["mode_used"] = "EXTREME"   # 50 % déjà dépassé / trop proche : un seul TP, à l'autre bout du range
+    elif mode != "FIXE":
+        plan["fallback"] = True
+    lbl = {"FIXE": f"RR fixe {plan['rr']:g}", "MID": "50 % du range CRT", "EXTREME": "autre bout du range CRT",
+           "PROPOSE": "TP1 50 % du range · TP2 autre bout"}[plan["mode_used"]]
+    if plan["fallback"]:
+        lbl += f" (repli : cible {VCRT_TP_LBL[mode]} inexploitable)"
+    elif mode == "PROPOSE" and plan["mode_used"] == "EXTREME":
+        lbl += " (50 % déjà dépassé)"
+    plan["label"] = lbl
+    return plan
 
 
 def _vcrt_tf_text(note=""):
-    acts = get_vcrt_tfs()
-    warn = ""
-    if len(acts) > get_max_positions():
-        warn = (f"⚠️ {len(acts)} UT actives mais positions max = {get_max_positions()} : un seul trade à la fois par actif. "
-                f"Pour un trade par CRT en même temps : /maxpos {len(acts)}\n")
+    k, _m, e_lbl, _e = vcrt_config()
     return (f"{note}🕯 <b>Vrai CRT</b> : {'🟢 ON' if get_strat_vcrt() else '🔴 OFF'}\n"
-            f"UT des CRT actives : <b>{vcrt_active_lbl()}</b> (entrée automatique)\n"
-            f"Tape une UT pour l'activer / la désactiver : plusieurs en même temps (ex. M5 + M15), chacune avec son propre CRT.\n"
-            f"Correspondance : H4→M15 · H1→M5 · M15→M1 · M5→M1\n"
-            f"Retirer une UT réinitialise seulement son CRT en cours (les trades déjà ouverts restent suivis).\n"
-            f"{warn}"
-            f"🎯 {_vcrt_tp_txt()}\n"
-            f"🛡 {_vcrt_sl_txt()}\n"
-            f"🔒 {_vcrt_be_txt()}\n"
-            f"Les niveaux (TP, SL, BE) sont figés à l'ouverture : changer le réglage n'affecte pas les trades en cours.\n"
-            f"Aussi : /vcrt_tf M5 M15 (plusieurs UT) · /vcrt_tp fixe|auto|mid · /vcrt_rr 3 (TP final R3) ou /vcrt_rr 1 4 · "
-            f"/vcrt_sl 0.8|0.6|off|mss|sweep · /vcrt_be auto|off|1|2|3|4 · variable Render VCRT_TF")
+            f"UT du CRT : <b>{k}</b> → UT d'entrée : <b>{e_lbl}</b> (automatique)\n"
+            f"Correspondance : H4→M15 · H1→M5 · M15→M1\n"
+            f"🎯 TP : <b>{VCRT_TP_LBL[get_vcrt_tp()]}</b> · RR fixe : <b>{get_vcrt_rr():g}</b>\n"
+            f"Changer l'UT du CRT réinitialise le CRT en cours (les trades déjà ouverts restent suivis ; leur TP est figé).\n"
+            f"Aussi : /vcrt_tf H4|H1|M15 · /vcrt_tp fixe|mid|extreme|propose · /vcrt_rr 2 · variable Render VCRT_TF (valeur de départ)")
 
 
 def _vcrt_tf_keyboard():
-    acts = get_vcrt_tfs()
-    mode, pos, (r1, r2) = get_vcrt_tp_mode(), get_vcrt_tp1_pos(), (get_vcrt_rr(1), get_vcrt_rr(2))
-    rows = [[_btn("🕯 VRAI CRT : " + ("ON" if get_strat_vcrt() else "OFF"), "vcrtm:toggle", get_strat_vcrt())],
-            [_btn(k, f"svcrt:{k}", k in acts) for k in VCRT_TFS],   # plusieurs UT possibles : chaque tap active / désactive
-            [_btn("TP fixe (RR choisi)", "svtp:FIXE", mode == "FIXE"), _btn("TP auto (CRH / CRL)", "svtp:PROPOSE", mode == "PROPOSE")],
-            [_btn(f"TP R{n}", f"svrf:{n}", mode == "FIXE" and abs(r2 - n) < 1e-9) for n in VCRT_RR_PICKS]]   # c'est toi qui choisis
-    if mode == "PROPOSE":
-        rows.append([_btn("TP1 à 50 % du range", "svp1:MID", pos == "MID"), _btn("TP = CRH / CRL (extrême)", "svp1:EXTREME", pos == "EXTREME")])
-    cap = get_vcrt_sl_cap()
-    sm = get_vcrt_sl_mode()
-    rows.append([_btn("SL serré (MSS)", "svsm:MSS", sm == "MSS"), _btn("SL derrière sweep", "svsm:SWEEP", sm == "SWEEP")])
-    rows.append([_btn("SL max OFF", "svsl:off", cap == 0)]
-                + [_btn(f"{v:g} ATR", f"svsl:{v:g}", abs(cap - v) < 1e-9) for v in (0.6, 0.8, 1.0)])
-    be = get_vcrt_be()
-    rows.append([_btn("BE auto", "svbe:AUTO", be == "AUTO"), _btn("BE OFF", "svbe:OFF", be == "OFF")])
-    rows.append([_btn(f"BE R{n}", f"svbe:{n}", isinstance(be, float) and abs(be - n) < 1e-9) for n in VCRT_RR_PICKS])
-    return {"inline_keyboard": rows + [[{"text": "🔙 Stratégies", "callback_data": "str:home"}]]}
+    cur, cur_tp, cur_rr = get_vcrt_tf(), get_vcrt_tp(), get_vcrt_rr()
+    return _signal_back([[_btn(k, f"svcrt:{k}", cur == k) for k in VCRT_TFS],
+                         [_btn(VCRT_TP_LBL[k], f"svcrtp:{k}", cur_tp == k) for k in ("FIXE", "MID")],
+                         [_btn(VCRT_TP_LBL[k], f"svcrtp:{k}", cur_tp == k) for k in ("EXTREME", "PROPOSE")],
+                         [_btn(f"RR {x:g}", f"svcrr:{x:g}", abs(cur_rr - x) < 1e-9) for x in VCRT_RR_CHOICES]])
 
 
 def vcrt_find_signals(h, tf_min, last_only=False):
@@ -16832,203 +16430,54 @@ def vcrt_entry_check(symbol, crt, entry_tf, ec, idx):
     return None, None
 
 
-def _vcrt_notify_signal(symbol, crt, entry_tf, trig, price, sl, note=""):
-    """Notification Telegram du signal vrai CRT : déclencheur (a/b/c), entrée, SL, UT du CRT et UT d'entrée."""
-    side = "ACHAT" if crt["dir"] == 1 else "VENTE"
-    txt = (f"🕯 <b>Vrai CRT {side} {symbol}</b>\n"
-           f"UT du CRT : {_tf_lbl(crt['tf'])} → UT d'entrée : {_tf_lbl(entry_tf)}\n"
-           f"Déclencheur : <b>{trig}) {VCRT_TRIGGER_LBL[trig]}</b>\n"
-           f"Entrée : {price:.5g}\nSL : {sl:.5g}{note}")
-    print(f"[{symbol}] {txt}".replace("\n", " · "))   # le message groupe / admin part via publish_signal (Risk Gate commun)
+def _vcrt_side(crt):
+    return "BUY" if crt["dir"] == 1 else "SELL"
 
 
-def vcrt_sl_behind_sweep(crt, ec, idx):
-    """SL du vrai CRT : TOUJOURS derrière l'extrême du sweep, quel que soit le déclencheur (MSS, avalement, réaction) et même
-    si un MSS / OB / FVG est plus proche. L'extrême retenu = le plus loin entre la mèche de la bougie 2 et les mèches des
-    bougies d'entrée déjà clôturées pendant la bougie 3 (le sweep peut se prolonger sans clôture au-delà). Même marge
-    (VCRT_SL_BUFFER_ATR x ATR) que vcrt_find_signals. Ne regarde jamais au-delà de ec[idx] (anti-look-ahead)."""
-    d, at = crt["dir"], crt["atr"]
-    t_entry = crt["t_entry"]
-    seg = [x for x in ec[:idx + 1] if x["t"] >= t_entry]
-    if d == 1:
-        ext = min([crt["l2"]] + [x["l"] for x in seg])
-        return ext - VCRT_SL_BUFFER_ATR * at
-    ext = max([crt["h2"]] + [x["h"] for x in seg])
-    return ext + VCRT_SL_BUFFER_ATR * at
-
-
-def vcrt_sl_behind_mss(crt, entry_tf, trig, ec, idx, sl_sweep=None):
-    """SL « SERRÉ » du vrai CRT : JUSTE légèrement derrière le déclencheur d'entrée au lieu du bout du sweep.
-      a) MSS + FVG        : derrière le plus bas (BUY) / plus haut (SELL) de la jambe qui a cassé la structure, ou de la zone FVG
-                            / de la bougie de cassure si c'est plus loin ;
-      b) avalement + OB   : derrière l'OB ou la bougie d'avalement (le plus loin des deux) ;
-      c) réaction FVG/OB  : derrière la zone touchée ou la mèche de réaction (le plus loin des deux).
-    Marge = VCRT_MSS_SL_BUFFER_ATR x ATR de l'UT d'ENTRÉE. Jamais plus large que `sl_sweep` (SL derrière le sweep).
-    None si rien d'exploitable (ATR nul, SL du mauvais côté du prix...) : l'appelant garde alors le SL derrière le sweep.
-    Ne regarde jamais au-delà de ec[idx] (anti-look-ahead)."""
+def vcrt_build_signal(symbol, crt, entry_tf, trig, ec, i):
+    """Signal prêt pour publish_signal à partir du CRT `crt`, du déclencheur `trig` (a/b/c) et de la bougie d'entrée ec[i]
+    (clôturée). Retourne (sig, None) ou (None, motif). Mêmes garde-fous que crt_build : SL max en ATR, SL mini."""
     d = crt["dir"]
-    seg = ec[:idx + 1]
-    a = atr_series(seg)[-1] if seg else 0
-    if not a or a <= 0:
-        return None
-    buf = VCRT_MSS_SL_BUFFER_ATR * a
-    x = ec[idx]
-    try:
-        z = vcrt_entry_zone(crt, entry_tf, trig, ec, idx)
-    except Exception:
-        z = None
-    if d == 1:
-        cand = [x["l"]]
-        if z:
-            cand.append(z["lo"])
-            if z.get("mss"):
-                cand.append(min(k["l"] for k in ec[z["mss"]["i_src"]:z["mss"]["i_brk"] + 1]))
-        sl = min(cand) - buf
-        if sl_sweep is not None:
-            sl = max(sl, sl_sweep)   # jamais plus large que derrière le sweep
-    else:
-        cand = [x["h"]]
-        if z:
-            cand.append(z["hi"])
-            if z.get("mss"):
-                cand.append(max(k["h"] for k in ec[z["mss"]["i_src"]:z["mss"]["i_brk"] + 1]))
-        sl = max(cand) + buf
-        if sl_sweep is not None:
-            sl = min(sl, sl_sweep)
-    return sl if (x["c"] - sl) * d > 0 else None
-
-
-def vcrt_make_signal(symbol, crt, entry_tf, trig, price, sl, t):
-    """Signal vrai CRT au format commun (même clés que crt_build) : publié par publish_signal -> Risk Gate, add_trade,
-    message groupe, puis suivi par track_trade (RR1 = BE, paliers RR, TP final, SL) avec les messages / stickers existants."""
-    d = crt["dir"]
-    min_pct = VCRT_MIN_SL_PCT   # plancher PROPRE au vrai CRT (le plancher global élargissait le SL serré)
-    risk = abs(price - sl)
-    max_risk = min(VCRT_MAX_SL_ATR, VCRT_MAX_RISK_ATR) * crt["atr"] if VCRT_MAX_RISK_ATR > 0 else VCRT_MAX_SL_ATR * crt["atr"]
-    if (price - sl) * d <= 0 or risk > max_risk:
-        print(f"[{symbol}] vrai CRT ignoré : SL trop large ({risk:.2f} pts > {max_risk:.2f}) ou mal placé")
-        return None
-    if min_pct > 0 and risk < price * min_pct:   # plancher serré (bruit / spread), pas le plancher global
-        risk = price * min_pct
-        sl = price - d * risk
-    tps = vcrt_build_tps(crt, price, sl)
-    if not tps:
-        return None
     side = "BUY" if d == 1 else "SELL"
-    be_rr, be_off = vcrt_be_rr(tps)   # BE auto (RR1 / TP1) · désactivé · RRn réglé à la main (/vcrt_be)
-    return {"dir": d, "side": side, "type": "VCRT", "order": "MARKET", "ref_price": price, "entry": price, "sl": tps["sl"],
-            "risk": risk, "tp": tps["tp2"], "tp1": tps["tp1"], "tp2": tps["tp2"], "rr1": tps["rr1"], "rr2": tps["rr2"],
-            "rr": tps["rr2"], "be_rr": be_rr, "be_off": be_off, "t": t, "bos_level": crt["l2"] if d == 1 else crt["h2"], "tf": TF_LABEL,
-            "key_suffix": f"vcrt_{_tf_lbl(crt['tf'])}", "sl_mode": "SWEEP", "strategy": "VCRT", "tp_mode": tps["tp_mode"],   # clé distincte par UT de CRT
-            "htf": False, "htf_mode": "OFF", "poi": None, "mtf_fib_on": False, "mtf_fib": None, "m15_imp_on": False,
-            "m15_imp": None, "setup": f"VCRT {_tf_lbl(crt['tf'])} -> {_tf_lbl(entry_tf)} · {VCRT_TRIGGER_LBL[trig]}"}
-
-
-def vcrt_log_signal(symbol, crt, entry_tf, trig, price, sl_sweep, sig):
-    """Log complet d'un signal vrai CRT : niveaux, SL (sweep / plafonné), risque en ATR, TP, RR, BE."""
-    risk = abs(price - sig["sl"])
-    at = crt.get("atr") or 0
-    cap = get_vcrt_sl_cap()
-    be = "OFF" if sig.get("be_off") else f"RR{sig['be_rr']:g}"
-    print(f"[{symbol}] [vcrt] SIGNAL {sig['side']} | CRT {_tf_lbl(crt['tf'])} -> {_tf_lbl(entry_tf)} | "
-          f"déclencheur {trig}) {VCRT_TRIGGER_LBL[trig]} | CRH={crt['h1']:.5g} CRL={crt['l1']:.5g} ATR_CRT={at:.5g} | "
-          f"ENTRY={price:.5g} SL_SWEEP={sl_sweep:.5g}{(' SL_MSS=%.5g' % sig['sl_mss']) if sig.get('sl_mss') is not None else ''} "
-          f"SL[{sig.get('sl_mode')}]={sig['sl']:.5g} (plafond {cap:g}xATR"
-          f"{' APPLIQUÉ' if sig.get('sl_capped') else ''}) RISK={risk:.5g} ({(risk / at if at else 0):.2f}xATR) | "
-          f"TP1={sig['tp1']:.5g} (RR{sig['rr1']:g}) TP={sig['tp2']:.5g} (RR{sig['rr2']:g}) | BE={be} | {sig.get('tp_mode')}")
-
-
-def _vcrt_log_event(ev):
-    """Log d'un événement de suivi (RR1 / RR2 / RR3 / BE_MOVED / TP / SL / BE) avec le résultat en R."""
-    t = ev["trade"]
-    r = t.get("result_r")
-    res = "—" if r is None else f"{r:+.2f}R"
-    print(f"[{t['symbol']}] [vcrt] #{t['id']} {t['side']} {ev['name']} | entry={t['entry']:.5g} sl={t['sl']:.5g} tp={t['tp']:.5g} | "
-          f"résultat={res} | be_hit={t.get('be_hit')} rr1/rr2/rr3={t.get('rr1_hit')}/{t.get('rr2_hit')}/{t.get('rr3_hit')}")
-
-
-def vcrt_track_symbol(symbol):
-    """Suivi des trades VCRT ouverts de `symbol`, sur l'UT D'ENTRÉE du trade (M15 / M5 / M1, relue dans son contexte figé) et non
-    sur l'UT principale du bot : le SL / BE / RR1-RR2-RR3 / TP sont donc détectés à la précision de l'entrée (M1 pour un CRT M5).
-    Mêmes événements, messages groupe + admin, images et stickers que les autres stratégies. Indépendant du réglage ON / OFF
-    de la stratégie : un trade ouvert reste suivi même si la stratégie est coupée. Jamais bloquant."""
-    trades = [t for t in open_trades(symbol) if t.get("kind") == "VCRT"]
-    if not trades:
-        return
-    dec = SYMBOLS[symbol]["decimals"]
-    cache = {}
-    for trade in trades:
-        try:
-            ctx = vcrt_ctx_load(trade.get("signal_key"))
-        except Exception:
-            ctx = None
-        etf = int((ctx or {}).get("etf") or get_entry_tf() or 1)
-        if etf not in cache:
-            try:
-                cache[etf] = _ctx_candles(symbol, etf) or []
-            except Exception as e:
-                print(f"[{symbol}] suivi vrai CRT : bougies {_tf_lbl(etf)} illisibles ({e})")
-                cache[etf] = []
-        candles = cache[etf]
-        if not candles:
-            continue
-        try:
-            evs = track_trade_verified(trade, candles)
-        except Exception:
-            print(f"[{symbol}] suivi vrai CRT #{trade.get('id')} : erreur (ignorée)")
-            traceback.print_exc(limit=-3)
-            continue
-        for ev in evs:
-            try:
-                _vcrt_log_event(ev)
-            except Exception:
-                pass
-            try:
-                setup_engine_report(ev["trade"], ev["name"])
-            except Exception:
-                pass
-            chart = None
-            if ev["name"] in CHART_ON_EVENTS:
-                try:
-                    chart = make_event_chart(symbol, candles, [], ev["trade"], dec, ev_name=ev["name"])
-                except Exception:
-                    traceback.print_exc(limit=-3)
-            to_group(group_event(ev, dec), photo=chart, reply_to_message_id=ev["trade"].get("signal_message_id"))
-            group_event_media(ev["name"])
-            txt = admin_event(ev)
-            if txt:   # l'image de résultat part aussi dans le bot à la clôture (TP / SL / BE)
-                to_admin(txt, photo=chart if (chart and ev["name"] in ("TP", "SL", "BE")) else None)
+    entry, a = ec[i]["c"], crt["atr"]
+    risk = abs(entry - crt["sl"])
+    if risk > VCRT_MAX_SL_ATR * a:
+        return None, f"SL derrière le sweep trop large ({risk:.2f} pts > {VCRT_MAX_SL_ATR:g}xATR)"
+    min_pct = SYMBOLS.get(symbol, {}).get("min_sl_pct", MIN_SL_PCT)
+    risk = max(risk, MIN_SL_ATR * a, entry * min_pct)
+    sl = entry - d * risk
+    plan = vcrt_plan(crt, entry, sl)
+    if plan["fallback"]:
+        print(f"[{symbol}] TP vrai CRT {plan['mode']} : cible mal placée ou trop proche -> RR fixe {plan['rr']:g}")
+    sig = {"dir": d, "side": side, "type": "VCRT", "order": "MARKET", "ref_price": entry, "entry": entry, "sl": sl,
+           "risk": risk, "tp": plan["tp"], "tp1": plan["tp1"], "rr": plan["rr"], "rr1": plan["rr1"], "be_rr": get_be_rr(),
+           # le suivi ne commence qu'APRÈS la clôture de la bougie d'entrée (UT basse) ; sert aussi de clé anti-doublon
+           "t": ec[i]["t"] + entry_tf * 60 - 1, "tf": _tf_lbl(entry_tf), "key_suffix": "vcrt", "strategy": "VCRT",
+           "sl_mode": "SWEEP", "tp_mode": plan["label"], "trigger": trig,
+           "htf": False, "htf_mode": "OFF", "poi": None, "mtf_fib_on": False, "mtf_fib": None, "m15_imp_on": False,
+           "m15_imp": None,
+           "setup": f"Vrai CRT {_tf_lbl(crt['tf'])} -> {_tf_lbl(entry_tf)} · {VCRT_TRIGGER_LBL[trig]}",
+           "crt": {"ref_tf": crt["tf"], "crl": crt["l1"], "crh": crt["h1"], "sweep": crt["l2"] if d == 1 else crt["h2"],
+                   "mid": plan["mid"]}}
+    return sig, None
 
 
 def vcrt_process_symbol(symbol):
-    """Une passe par symbole : pour CHAQUE UT de CRT active (plusieurs en même temps possibles, ex. M5 ET M15), suit le CRT
-    en cours et cherche une entrée sur l'UT basse correspondante. Chaque UT a son propre état et son verrou « un seul trade
-    par CRT » ; une erreur sur une UT n'empêche jamais les autres."""
-    if not get_strat_vcrt() or not get_symbol_on(symbol) or not get_bot_on():
-        return
-    for tf_label in get_vcrt_tfs():
-        try:
-            _vcrt_process_one(symbol, tf_label)
-        except Exception:
-            print(f"[{symbol}] vrai CRT {tf_label} : erreur (ignorée, les autres UT continuent)")
-            traceback.print_exc(limit=-3)
-
-
-def _vcrt_process_one(symbol, tf_label):
-    """CRT d'UNE UT (`tf_label` : 'H4' / 'H1' / 'M15' / 'M5') sur `symbol` : cherche une entrée sur l'UT basse (VCRT_ENTRY_TFS)
+    """Une passe par symbole : suit le CRT en cours sur VCRT_TF, et cherche une entrée sur l'UT basse (get_entry_tf)
     UNIQUEMENT pendant la bougie 3, bougie clôturée après bougie clôturée (anti-look-ahead). Un seul trade par CRT :
     verrou posé dès le premier signal, remis à zéro automatiquement au CRT suivant (t2 différent)."""
-    vcrt_tf = VCRT_TFS[tf_label]
-    entry_tf = VCRT_ENTRY_TFS[tf_label]
-    skey = (symbol, tf_label)
+    if not get_strat_vcrt() or not get_symbol_on(symbol) or not get_bot_on():
+        return
+    vcrt_tf = get_vcrt_tf_min()
+    entry_tf = get_entry_tf()
     crt = vcrt_detect(symbol, vcrt_tf)
     if not crt:
         return
     with _vcrt_lock:
-        st = _VCRT_STATE.get(skey)
+        st = _VCRT_STATE.get(symbol)
         if not st or st.get("t2") != crt["t2"]:            # nouveau CRT -> nouvel état, verrou remis à zéro
             st = {"t2": crt["t2"], "crt": crt, "locked": False, "dead": False, "last_idx": -1}
-            _VCRT_STATE[skey] = st
+            _VCRT_STATE[symbol] = st
         if st["locked"] or st["dead"]:
             return
     try:
@@ -17054,462 +16503,24 @@ def _vcrt_process_one(symbol, tf_label):
             print(f"[{symbol}] vrai CRT {_tf_lbl(vcrt_tf)} : setup invalidé (clôture au-delà de l'extrême du sweep)")
             break
         if status == "signal":
-            d = crt["dir"]
-            price = ec[i]["c"]
-            sl_sweep = vcrt_sl_behind_sweep(crt, ec, i)         # SL derrière le sweep (repli, et borne du SL serré)
-            sl_mss = None
-            if get_vcrt_sl_mode() == "MSS":                     # SL serré : juste derrière le MSS / la zone d'entrée
-                try:
-                    sl_mss = vcrt_sl_behind_mss(crt, entry_tf, info, ec, i, sl_sweep)
-                except Exception:
-                    print(f"[{symbol}] vrai CRT : SL serré indisponible, SL derrière le sweep utilisé")
-                    traceback.print_exc(limit=-3)
-            sl_base = sl_mss if sl_mss is not None else sl_sweep
-            sl, capped = vcrt_cap_sl(crt, price, sl_base)       # ... plafonné (x ATR) : jamais de SL très large
+            sig, why = vcrt_build_signal(symbol, crt, entry_tf, info, ec, i)
+            if not sig:   # SL trop large sur CETTE bougie : pas de verrou, une bougie suivante peut encore donner un signal valide
+                print(f"[{symbol}] vrai CRT {_vcrt_side(crt)} {info}) ignoré : {why}")
+                continue
             with _vcrt_lock:
                 if st["locked"]:
                     break
-                st["locked"] = True
-            _vcrt_notify_signal(symbol, crt, entry_tf, info, price, sl,
-                                note=f" (plafonné à {get_vcrt_sl_cap():g}×ATR, SL avant plafond {sl_base:.5g})" if capped else "")
-            sig = vcrt_make_signal(symbol, crt, entry_tf, info, price, sl, ec[i]["t"])
-            if sig:
-                sig["sl_sweep"], sig["sl_capped"], sig["sl_mss"] = sl_sweep, capped, sl_mss
-                sig["sl_mode"] = "MSS" if sl_mss is not None else "SWEEP"
-                try:
-                    vcrt_log_signal(symbol, crt, entry_tf, info, price, sl_sweep, sig)
-                except Exception:
-                    print(f"[{symbol}] vrai CRT : log du signal indisponible")
-                try:
-                    sig["vcrt_ctx"] = vcrt_build_ctx(symbol, crt, entry_tf, info, ec, i, sig)   # image : CRT + zone figés à l'entrée
-                except Exception:
-                    print(f"[{symbol}] vrai CRT : contexte d'image indisponible (le signal part avec l'image générique)")
-                    traceback.print_exc(limit=-3)
-                try:
-                    publish_signal(symbol, get_candles(symbol), [], sig)   # mêmes filtres + Risk Gate + suivi que les autres
-                except Exception:
-                    print(f"[{symbol}] vrai CRT : publication impossible")
-                    traceback.print_exc(limit=-3)
+                st["locked"] = True   # un seul trade par CRT, même si le Risk Gate / les filtres refusent ensuite
+            try:
+                evs = analyze(ec[:i + 1])
+            except Exception:
+                evs = []
+            # Chemin commun à toutes les stratégies : publish_signal (news, /mm, max positions, calc_lot, Risk Gate avant MT5,
+            # trade enregistré, message + stickers, suivi track_trade). Aucun chemin parallèle.
+            ok = publish_signal(symbol, ec[:i + 1], evs, sig)
+            print(f"[{symbol}] vrai CRT {sig['side']} {sig['setup']} · entrée {sig['entry']:.5g} SL {sig['sl']:.5g} "
+                  f"TP {sig['tp']:.5g} ({sig['tp_mode']}) -> {'publié' if ok else 'non publié (filtre / Risk Gate / doublon)'}")
             break
-
-
-# ============================================================================
-# 16bis. VRAI CRT — IMAGES (signal d'entrée + image de résultat à la clôture)
-#
-# Même style que draw_chart (QML gagnant) : fond clair, bougies vertes / rouges, outil de position (boîte rouge
-# entrée -> SL, boîte verte entrée -> TP), étiquettes de prix en pastilles dans la marge de droite.
-# Le graphique est dessiné sur l'UT D'ENTRÉE (M15 / M5 / M1) : les bougies 1 et 2 du CRT (UT H4 / H1 / M15) y sont
-# tracées comme deux boîtes (CRH / CRL = haut / bas de la bougie 1), la bougie 2 porte la flèche SWEEP, la bougie 3
-# est le bandeau où l'entrée est cherchée. Zone d'entrée : MSS + FVG (a), avalement + OB (b), réaction FVG / OB (c).
-# Niveaux : ENTRÉE, SL, RR1 (TP1), TP final (RR2). Tout le contexte du dessin est figé à l'entrée dans un petit JSON
-# (meta « vcrtctx:<signal_key> ») : l'image de résultat (RR1 / TP / SL / BE) est redessinée à l'identique, sur les
-# bougies récentes, avec le marqueur du niveau touché et le résultat en R dans le titre.
-# Aucune étiquette ne doit en chevaucher une autre : pastilles de droite écartées par vcrt_layout_pills, étiquettes
-# dans le graphique déplacées tant qu'elles se touchent (zone de texte mesurée au rendu).
-# Une image qui échoue ne bloque JAMAIS le signal : l'appelant garde l'image générique ou envoie sans image.
-# ============================================================================
-VCRT_CHART_BARS_BEFORE = _env_int("VCRT_CHART_BARS_BEFORE", 10)   # bougies d'UT d'entrée affichées avant la bougie 1
-VCRT_CHART_MAX_BARS = _env_int("VCRT_CHART_MAX_BARS", 240)        # largeur maximale de la vue (en bougies)
-VCRT_CHART_EXTEND = _env_int("VCRT_CHART_EXTEND", 20)             # largeur de l'outil de position à droite de la dernière bougie
-_VC = {"B1": "#546e7a", "B2": "#fb8c00", "B3": "#00897b", "FVG": "#1e88e5", "OB": "#8e24aa", "MSS": "#8e24aa",
-       "SWEEP": "#b71c1c", "RED": "#e53935", "GREEN": "#2e9d4f", "ENTRY": "#263238", "SLATE": "#546e7a"}
-_VCRT_LAST_DRAW = {}   # dernier dessin (boîtes de texte en pixels) : sert uniquement aux tests anti-chevauchement
-
-
-def vcrt_entry_zone(crt, entry_tf, trig, ec, idx):
-    """Zone d'entrée qui a déclenché le signal (trig a / b / c) sur la bougie d'entrée ec[idx] : mêmes règles que
-    _vcrt_mss_fvg / _vcrt_avalement_ob / _vcrt_reaction_poi, mais RENVOIE la zone (ne juge rien). Anti-look-ahead identique.
-    Retourne {kind 'FVG'|'OB', lo, hi, i0 (1re bougie de la zone), i_react, mss: {i_src, i_brk, level}|None} ou None."""
-    d, x = crt["dir"], ec[idx]
-    if trig == "a":
-        seg = ec[:idx + 1]
-        evs = analyze(seg)
-        if not evs or evs[-1]["i"] != idx:
-            return None
-        p = next((p for p in find_pois(seg, entry_tf, d) if p["kind"] == "FVG" and p["f"] == idx), None)
-        if p is None:
-            return None
-        return {"kind": "FVG", "lo": p["lo"], "hi": p["hi"], "i0": max(idx - 2, 0), "i_react": idx,
-                "mss": {"i_src": evs[-1]["src"], "i_brk": evs[-1]["i"], "level": evs[-1]["level"]}}
-    if idx < 1:
-        return None
-    pois = find_pois(ec[:idx], entry_tf, d)
-    if trig == "b":
-        lo_t, hi_t = (x["l"], x["o"]) if d == 1 else (x["o"], x["h"])
-        cands = [p for p in pois if p["kind"] == "OB" and p["lo"] <= hi_t and p["hi"] >= lo_t]
-    else:
-        cands = [p for p in pois if x["l"] <= p["hi"] and x["h"] >= p["lo"]
-                 and ((d == 1 and x["c"] > p["hi"]) or (d == -1 and x["c"] < p["lo"]))]
-    if not cands:
-        return None
-    p = cands[0]   # le plus récent d'abord
-    if p["kind"] == "OB":   # bougie de l'OB : la plus proche en amont de la bougie qui valide la zone
-        i0 = next((k for k in range(p["f"], -1, -1) if ec[k]["l"] == p["lo"] and ec[k]["h"] == p["hi"]), p["f"])
-    else:
-        i0 = max(p["f"] - 2, 0)
-    return {"kind": p["kind"], "lo": p["lo"], "hi": p["hi"], "i0": i0, "i_react": idx, "mss": None}
-
-
-def vcrt_build_ctx(symbol, crt, entry_tf, trig, ec, idx, sig):
-    """Contexte figé du dessin (JSON-able) : CRT, niveaux du signal, zone d'entrée, MSS. Une zone introuvable n'empêche
-    pas le dessin : elle est simplement omise."""
-    f = float
-    ctx = {"v": 1, "symbol": symbol, "d": int(crt["dir"]), "tf": int(crt["tf"]), "etf": int(entry_tf), "trig": trig,
-           "t1": int(crt["t2"] - crt["tf"] * 60), "t2": int(crt["t2"]), "t3": int(crt["t_entry"]),
-           "h1": f(crt["h1"]), "l1": f(crt["l1"]), "h2": f(crt["h2"]), "l2": f(crt["l2"]),
-           "entry": f(sig["entry"]), "sl": f(sig["sl"]), "tp1": f(sig["tp1"]), "tp2": f(sig["tp2"]),
-           "rr1": f(sig["rr1"]), "rr2": f(sig["rr2"]), "t_sig": int(sig["t"]), "tp_mode": sig.get("tp_mode")}
-    try:
-        z = vcrt_entry_zone(crt, entry_tf, trig, ec, idx)
-    except Exception as e:
-        print(f"[{symbol}] vrai CRT : zone d'entrée illisible pour l'image ({type(e).__name__})")
-        z = None
-    if z:
-        ctx["zone"] = {"kind": z["kind"], "lo": f(z["lo"]), "hi": f(z["hi"]),
-                       "t0": int(ec[z["i0"]]["t"]), "t_react": int(ec[z["i_react"]]["t"])}
-        if z.get("mss"):
-            ctx["mss"] = {"t_src": int(ec[z["mss"]["i_src"]]["t"]), "t_brk": int(ec[z["mss"]["i_brk"]]["t"]),
-                          "level": f(z["mss"]["level"])}
-    return ctx
-
-
-def vcrt_ctx_save(signal_key, ctx):
-    try:
-        set_meta(f"vcrtctx:{signal_key}", json.dumps(ctx))
-    except Exception as e:
-        print(f"[vcrt] contexte image non sauvegardé ({type(e).__name__}) : l'image de résultat sera générique")
-
-
-def vcrt_ctx_load(signal_key):
-    try:
-        raw = get_meta(f"vcrtctx:{signal_key}")
-        return json.loads(raw) if raw else None
-    except Exception:
-        return None
-
-
-def vcrt_layout_pills(ys, gap):
-    """Positions verticales des pastilles de la marge de droite : ordre conservé, écart >= gap entre deux pastilles
-    voisines (aucun chevauchement), chacune au plus près de son niveau réel. ys : liste de niveaux -> liste de positions."""
-    n = len(ys)
-    pos = list(ys)
-    order = sorted(range(n), key=lambda k: pos[k])   # de bas en haut
-    for _ in range(400):
-        moved = False
-        for a, b in zip(order, order[1:]):
-            need = gap - (pos[b] - pos[a])
-            if need > 1e-12:
-                pos[a] -= need / 2
-                pos[b] += need / 2
-                moved = True
-        if not moved:
-            break
-    return pos
-
-
-def _vcrt_hits(ctx, view, trade):
-    """Indices (dans `view`) du contact RR1 et de la sortie, relus sur les bougies APRÈS l'entrée, d'après le résultat
-    enregistré du trade (jamais deviné). Retourne {'rr1': k|None, 'exit': (k, 'TP'|'SL'|'BE')|None}."""
-    out = {"rr1": None, "exit": None}
-    if not trade:
-        return out
-    d, entry, sl, tp1, tp2 = ctx["d"], ctx["entry"], ctx["sl"], ctx["tp1"], ctx["tp2"]
-    two = abs(tp1 - tp2) > 1e-12
-    risk = abs(entry - sl)
-    post = [k for k, c in enumerate(view) if c["t"] > ctx["t_sig"]]
-    touch = lambda c, v: (c["h"] >= v) if d == 1 else (c["l"] <= v)          # le prix a atteint v dans le sens du trade
-    touch_back = lambda c, v: (c["l"] <= v) if d == 1 else (c["h"] >= v)     # le prix est revenu à v
-    if two:
-        out["rr1"] = next((k for k in post if touch(view[k], tp1)), None)
-    oc = trade.get("outcome")
-    if oc == "TP":
-        k = next((k for k in post if touch(view[k], tp2)), None)
-        out["exit"] = (k, "TP") if k is not None else None
-    elif oc == "SL":
-        k = next((k for k in post if touch_back(view[k], sl)), None)
-        out["exit"] = (k, "SL") if k is not None else None
-    elif oc == "BE":
-        be_rr = trade.get("be_rr")
-        k0 = out["rr1"] if out["rr1"] is not None else (
-            next((k for k in post if be_rr and touch(view[k], entry + d * risk * be_rr)), None))
-        if k0 is not None:
-            k = next((k for k in post if k > k0 and touch_back(view[k], entry)), None)
-            out["exit"] = (k, "BE") if k is not None else None
-    return out
-
-
-def vcrt_draw(ctx, candles, trade=None, ev_name=None, path=None):
-    """Image du vrai CRT (matplotlib, fond clair). `candles` : bougies de l'UT d'entrée (liste de dicts {t,o,h,l,c}).
-    trade / ev_name : image de RÉSULTAT (marqueurs RR1 / TP / SL / BE + résultat en R) ; sans eux : image d'entrée.
-    Retourne le chemin du PNG, ou None (matplotlib absent / données insuffisantes)."""
-    try:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-    except ImportError:
-        return None
-    import bisect
-    cs = _qmlc_load(candles)
-    if len(cs) < 10 or not ctx:
-        return None
-    times = [c["t"] for c in cs]
-    n = len(cs)
-    ix = lambda t: bisect.bisect_left(times, t)
-    i1 = ix(ctx["t1"])
-    if i1 >= n:
-        return None
-    left = max(0, i1 - VCRT_CHART_BARS_BEFORE)
-    if n - left > VCRT_CHART_MAX_BARS:
-        left = n - VCRT_CHART_MAX_BARS
-    view = cs[left:]
-    m = len(view)
-    X = lambda t: ix(t) - left
-    C = _VC
-    symbol, d = ctx["symbol"], ctx["d"]
-    buy = d == 1
-    side = "ACHAT" if buy else "VENTE"
-    dec = SYMBOLS.get(symbol, {}).get("decimals", 2)
-    px = lambda v: f"{v:.{dec}f}"
-    tf_s = ctx["tf"] * 60
-    entry, sl, tp1, tp2 = ctx["entry"], ctx["sl"], ctx["tp1"], ctx["tp2"]
-    h1, l1, h2, l2 = ctx["h1"], ctx["l1"], ctx["h2"], ctx["l2"]
-    two = abs(tp1 - tp2) > 1e-12
-    is_result = bool(trade) or bool(ev_name)
-    xe = min(max(X(ctx["t_sig"]), 0), m - 1)          # bougie d'entrée
-    x_end = m - 1
-    x1 = x_end + VCRT_CHART_EXTEND                      # fin de l'outil de position
-    zone, mss = ctx.get("zone"), ctx.get("mss")
-
-    # --- bornes verticales : bougies + niveaux, puis marge ; les pastilles de droite peuvent encore les élargir
-    ys = [c["l"] for c in view] + [c["h"] for c in view] + [h1, l1, h2, l2, entry, sl, tp1, tp2]
-    if zone:
-        ys += [zone["lo"], zone["hi"]]
-    lo, hi = min(ys), max(ys)
-    span0 = (hi - lo) or 1.0
-    lo, hi = lo - 0.07 * span0, hi + 0.07 * span0
-    if buy:   # place pour l'étiquette SWEEP + sa flèche (sous le plus bas balayé en achat, au-dessus du plus haut en vente)
-        lo = min(lo, l2 - 0.16 * span0)
-    else:
-        hi = max(hi, h2 + 0.16 * span0)
-
-    pills = [(f"ENTRÉE {side} {px(entry)}", entry, C["ENTRY"]), (f"SL {px(sl)} · 1R", sl, C["RED"])]
-    if two:
-        pills.append((f"RR1 {px(tp1)} · {ctx['rr1']:.2f}R", tp1, C["GREEN"]))
-    pills.append((f"{'TP (RR2)' if two else 'TP'} {px(tp2)} · {ctx['rr2']:.2f}R", tp2, C["GREEN"]))
-    pills += [(f"CRH {px(h1)}", h1, C["SLATE"]), (f"CRL {px(l1)}", l1, C["SLATE"])]
-    FIG_H, AX_H = 6.6, 0.76
-    ax_pt = FIG_H * AX_H * 72                            # hauteur de l'axe en points
-    pos = [p[1] for p in pills]
-    for _ in range(3):                                   # l'écart dépend de l'étendue verticale, qui dépend de l'écart : on itère
-        gap = 19.0 / ax_pt * (hi - lo)
-        pos = vcrt_layout_pills([p[1] for p in pills], gap)
-        lo, hi = min(lo, min(pos) - gap), max(hi, max(pos) + gap)
-
-    fig = plt.figure(figsize=(11, FIG_H), dpi=110)
-    try:
-        fig.patch.set_facecolor("white")
-        ax = fig.add_axes([0.055, 0.09, 0.745, AX_H])
-        ax.set_facecolor("white")
-        ax.grid(color="#eceff1", lw=0.6, zorder=0)
-        ax.set_xlim(-1, x1 + 2)
-        ax.set_ylim(lo, hi)
-        hdr = ax.get_xaxis_transform()                   # x en données, y en fraction de l'axe (bandeau d'en-tête)
-
-        # --- bougies
-        xs = list(range(m))
-        cols = ["#26a69a" if c["c"] >= c["o"] else "#ef5350" for c in view]
-        ax.vlines(xs, [c["l"] for c in view], [c["h"] for c in view], colors="#455a64", lw=0.9, zorder=3)
-        ax.bar(xs, [max(abs(c["c"] - c["o"]), (hi - lo) * 0.0006) for c in view], bottom=[min(c["o"], c["c"]) for c in view],
-               width=0.62, color=cols, edgecolor="#455a64", linewidth=0.6, zorder=3)
-
-        # --- bougies 1, 2 (boîtes high-low de l'UT du CRT) et bandeau de la bougie 3
-        xb1l, xb1r = max(X(ctx["t1"]) - 0.5, -0.5), X(ctx["t2"]) - 0.5
-        xb2l, xb2r = X(ctx["t2"]) - 0.5, X(ctx["t3"]) - 0.5
-        xb3l, xb3r = X(ctx["t3"]) - 0.5, min(X(ctx["t3"] + tf_s) - 0.5, (x_end + 0.5) if not is_result else x_end + 0.5)
-        if not is_result:
-            xb3r = xe + 0.5                               # image d'entrée : la bougie 3 est en cours, elle s'arrête à l'entrée
-        for xl, xr, a, b, col in ((xb1l, xb1r, l1, h1, C["B1"]), (xb2l, xb2r, l2, h2, C["B2"])):
-            if xr > xl:
-                ax.add_patch(plt.Rectangle((xl, a), xr - xl, b - a, facecolor=col, alpha=0.13, edgecolor="none", zorder=1))
-                ax.add_patch(plt.Rectangle((xl, a), xr - xl, b - a, fill=False, edgecolor=col, lw=1.4, zorder=2))
-        if xb3r > xb3l:
-            ax.axvspan(xb3l, xb3r, color=C["B3"], alpha=0.06, zorder=0)
-        for lvl, col in ((h1, C["SLATE"]), (l1, C["SLATE"])):    # CRH / CRL prolongés jusqu'à l'outil
-            ax.plot([xb1l, x1], [lvl, lvl], color=col, lw=1.1, ls="--", zorder=2)
-
-        # --- en-têtes des trois bougies (accolades au-dessus de l'axe : aucun risque de toucher les bougies)
-        span_x = (x1 + 2) - (-1)
-        ax_w_in = 11 * 0.745
-        for (xl, xr), full, short, col in (((xb1l, xb1r), "Bougie 1 · référence", "B1", C["B1"]),
-                                           ((xb2l, xb2r), "Bougie 2 · sweep", "B2", C["B2"]),
-                                           ((xb3l, xb3r), "Bougie 3 · entrée" if not is_result else "Bougie 3", "B3", C["B3"])):
-            if xr <= xl:
-                continue
-            ax.plot([xl, xr], [1.008, 1.008], transform=hdr, color=col, lw=2.6, clip_on=False, solid_capstyle="butt")
-            w_in = (xr - xl) / span_x * ax_w_in
-            if short == "B3":   # dernière bougie : rien à sa droite, l'étiquette complète peut déborder de la bande sans rien toucher
-                ax.text(xl, 1.016, full, transform=hdr, ha="left", va="bottom", fontsize=8, fontweight="bold", color=col,
-                        clip_on=False)
-                continue
-            label = full if w_in >= 1.55 else (full.split(" ·")[0] if w_in >= 0.85 else short)
-            ax.text((xl + xr) / 2, 1.016, label, transform=hdr, ha="center", va="bottom", fontsize=8,
-                    fontweight="bold", color=col, clip_on=False)
-
-        # --- zone d'entrée (+ MSS) : de sa 1re bougie jusqu'à la bougie d'entrée
-        labels = []   # (texte, sens de décalage) : étiquettes du graphique à écarter les unes des autres
-        if zone:
-            zcol = C[zone["kind"]]
-            xz0, xz1 = max(X(zone["t0"]) - 0.5, -0.5), X(zone["t_react"]) + 0.5
-            ax.add_patch(plt.Rectangle((xz0, zone["lo"]), xz1 - xz0, zone["hi"] - zone["lo"], facecolor=zcol, alpha=0.30,
-                                       edgecolor="none", zorder=1))
-            ax.add_patch(plt.Rectangle((xz0, zone["lo"]), xz1 - xz0, zone["hi"] - zone["lo"], fill=False, edgecolor=zcol,
-                                       lw=1.8, zorder=5))
-            ztxt = {"a": "FVG (MSS)", "b": "OB (avalement)", "c": f"{zone['kind']} (réaction)"}.get(ctx["trig"], zone["kind"])
-            labels.append((ax.text(xz0 - 0.4, (zone["lo"] + zone["hi"]) / 2, ztxt, fontsize=8, fontweight="bold", color=zcol,
-                                   ha="right", va="center", zorder=8,
-                                   bbox=dict(boxstyle="round,pad=0.2", fc="white", ec=zcol, lw=0.9, alpha=0.95)), 1 if buy else -1))
-        if mss:
-            xs0, xs1 = max(X(mss["t_src"]), 0), X(mss["t_brk"])
-            ax.plot([xs0, xs1], [mss["level"], mss["level"]], color=C["MSS"], lw=1.6, zorder=4)
-            labels.append((ax.text((xs0 + xs1) / 2, mss["level"], "MSS", fontsize=8, fontweight="bold", color=C["MSS"],
-                                   ha="center", va="bottom" if buy else "top", zorder=8,
-                                   bbox=dict(boxstyle="round,pad=0.15", fc="white", ec="none", alpha=0.85)), 1 if buy else -1))
-
-        # --- SWEEP sur la bougie 2 : étiquette puis flèche (tracée après l'écartement des étiquettes)
-        sweep_txt = None
-        k_in2 = [k for k, c in enumerate(view) if ctx["t2"] <= c["t"] < ctx["t3"]]
-        if k_in2:
-            k_sw = min(k_in2, key=lambda k: view[k]["l"]) if buy else max(k_in2, key=lambda k: view[k]["h"])
-            ext = l2 if buy else h2
-            y_t = ext - 0.06 * (hi - lo) if buy else ext + 0.06 * (hi - lo)
-            sweep_txt = ax.text(k_sw, y_t, f"SWEEP {px(ext)}", fontsize=8, fontweight="bold", color=C["SWEEP"], ha="center",
-                                va="top" if buy else "bottom", zorder=8,
-                                bbox=dict(boxstyle="round,pad=0.2", fc="white", ec=C["SWEEP"], lw=0.9, alpha=0.95))
-            labels.append((sweep_txt, -1 if buy else 1))
-
-        # --- outil de position : boîte rouge entrée -> SL, verte entrée -> TP final, ligne RR1
-        ax.add_patch(plt.Rectangle((xe, min(entry, sl)), x1 - xe, abs(entry - sl), facecolor=C["RED"], alpha=0.22,
-                                   edgecolor=C["RED"], lw=1.0, zorder=2))
-        ax.add_patch(plt.Rectangle((xe, min(entry, tp2)), x1 - xe, abs(tp2 - entry), facecolor=C["GREEN"], alpha=0.22,
-                                   edgecolor=C["GREEN"], lw=1.0, zorder=2))
-        if two:
-            ax.plot([xe, x1], [tp1, tp1], color=C["GREEN"], lw=1.8, ls="--", zorder=5)
-        ax.plot([xe, x1], [entry, entry], color=C["ENTRY"], lw=1.6, zorder=5)
-        ax.plot([x1, x1], [sl, tp2], color="#b0bec5", lw=0.8, zorder=1)
-
-        # --- résultat : marqueurs RR1 / sortie relus sur les bougies
-        hits = _vcrt_hits(ctx, view, trade) if is_result else {"rr1": None, "exit": None}
-        marks = []
-        if hits["rr1"] is not None:
-            marks.append((hits["rr1"], tp1, "RR1 ✔", C["GREEN"], 1 if buy else -1))
-        if hits["exit"] and hits["exit"][0] is not None:
-            k, name = hits["exit"]
-            lvl = {"TP": tp2, "SL": sl, "BE": entry}[name]
-            col = {"TP": C["GREEN"], "SL": C["RED"], "BE": "#607d8b"}[name]
-            up = (name == "TP") == buy                    # TP / SL de l'autre côté du prix : étiquette du côté libre
-            marks.append((k, lvl, {"TP": "TP ✔", "SL": "SL ✘", "BE": "BE"}[name], col, 1 if up else -1))
-        for k, lvl, txt, col, dirn in marks:
-            ax.plot([k], [lvl], marker="o", ms=7, mfc="white", mec=col, mew=2.0, zorder=9, ls="none")
-            labels.append((ax.text(k, lvl, txt, fontsize=8, fontweight="bold", color=col, ha="center",
-                                   va="bottom" if dirn > 0 else "top", zorder=9,
-                                   bbox=dict(boxstyle="round,pad=0.18", fc="white", ec=col, lw=0.9, alpha=0.95)), dirn))
-
-        # --- pastilles de prix dans la marge de droite (positions déjà écartées par vcrt_layout_pills)
-        pill_artists = []
-        for (txt, y, col), yt in zip(pills, pos):
-            pill_artists.append(ax.annotate(
-                txt, xy=(x1, y), xycoords="data", xytext=(1.012, yt), textcoords=("axes fraction", "data"),
-                fontsize=8, fontweight="bold", color="white", va="center", ha="left", annotation_clip=False, zorder=10,
-                bbox=dict(boxstyle="round,pad=0.25", fc=col, ec="none"),
-                arrowprops=dict(arrowstyle="-", color=col, lw=1.0, shrinkA=0, shrinkB=0, relpos=(0, 0.5))))
-
-        # --- écartement des étiquettes du graphique : on les décale tant que leur zone touche une zone déjà posée
-        fig.canvas.draw()
-        rend = fig.canvas.get_renderer()
-        box = lambda t: t.get_window_extent(rend).expanded(1.06, 1.25)
-        placed = [p.get_bbox_patch().get_window_extent(rend) for p in pill_artists]
-        inv = ax.transData.inverted()
-        for t, dirn in labels:
-            for _ in range(60):
-                bb = box(t)
-                if not any(bb.overlaps(p) for p in placed):
-                    break
-                x, y = t.get_position()
-                px_, py_ = ax.transData.transform((x, y))
-                t.set_position(tuple(inv.transform((px_, py_ + dirn * 8))))
-            placed.append(box(t))
-        if sweep_txt is not None:                        # la flèche part de l'étiquette (déjà écartée) vers l'extrême balayé
-            tx, ty = sweep_txt.get_position()
-            ax.annotate("", xy=(tx, l2 if buy else h2), xytext=(tx, ty), zorder=8,
-                        arrowprops=dict(arrowstyle="-|>", color=C["SWEEP"], lw=1.6, shrinkA=0, shrinkB=0))
-        _VCRT_LAST_DRAW.clear()
-        _VCRT_LAST_DRAW["boxes"] = ([("pastille", p.get_bbox_patch().get_window_extent(rend)) for p in pill_artists]
-                                    + [(t.get_text(), box(t)) for t, _d in labels])
-        _VCRT_LAST_DRAW["pills"] = [(p[0], y) for p, y in zip(pills, pos)]
-
-        # --- axes, titre, résultat
-        step = max(1, m // 7)
-        ticks = list(range(0, m, step))
-        ax.set_xticks(ticks)
-        ax.set_xticklabels([_qmlc_time_label(view[i]["t"]) for i in ticks], fontsize=7, color="#607d8b")
-        ax.tick_params(axis="y", labelsize=7, colors="#607d8b")
-        for sp in ax.spines.values():
-            sp.set_color("#cfd8dc")
-        trig_lbl = VCRT_TRIGGER_LBL.get(ctx["trig"], "")
-        ax.set_title(f"{symbol} · Vrai CRT {_tf_lbl(ctx['tf'])} → {_tf_lbl(ctx['etf'])} · {side} · {trig_lbl}",
-                     fontsize=11, color="#263238", loc="left", pad=30)
-        res_txt, res_col = "", "#263238"
-        if is_result:
-            oc = ev_name if ev_name in ("TP", "SL", "BE") else (trade or {}).get("outcome")
-            r = (trade or {}).get("result_r")
-            rtxt = f"  {r:+.2f}R" if r is not None else ""
-            if oc == "TP":
-                res_txt, res_col = f"TP ✔{rtxt}", C["GREEN"]
-            elif oc == "SL":
-                res_txt, res_col = f"SL ✘{rtxt}", C["RED"]
-            elif oc == "BE":
-                res_txt, res_col = f"BE · SL à l'entrée{rtxt}", "#607d8b"
-            elif ev_name and ev_name.startswith("RR"):
-                res_txt, res_col = f"{ev_name} atteint" + (" · SL → BE" if (trade or {}).get("be_hit") else ""), C["GREEN"]
-            elif oc:
-                res_txt, res_col = f"Clôturé ({oc}){rtxt}", "#607d8b"
-        if res_txt:
-            ax.set_title(res_txt, fontsize=12, fontweight="bold", color=res_col, loc="right", pad=30)
-        _qmlc_purge()
-        path = path or os.path.join(CHART_DIR, f"{symbol}_vcrt_{ctx['t_sig']}{'_' + str(ev_name) if ev_name else ''}_"
-                                               f"{int(time.time() * 1000)}.png")
-        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        fig.savefig(path, facecolor="white", bbox_inches="tight")
-    finally:
-        plt.close(fig)
-    return path
-
-
-def vcrt_signal_chart(ctx, candles=None):
-    """Image d'ENTRÉE du vrai CRT (jusqu'à la bougie d'entrée comprise). None si le dessin est impossible."""
-    try:
-        cs = candles if candles is not None else _ctx_candles(ctx["symbol"], ctx["etf"])
-        cs = [c for c in (cs or []) if c["t"] <= ctx["t_sig"]]
-        return vcrt_draw(ctx, cs)
-    except Exception as e:
-        print(f"[{ctx.get('symbol')}] vrai CRT : image d'entrée impossible ({type(e).__name__})")
-        traceback.print_exc(limit=-3)
-        return None
-
-
-def vcrt_event_chart(trade, ev_name=None, candles=None):
-    """Image de RÉSULTAT d'un trade VCRT (RR1 / TP / SL / BE) : même dessin que l'entrée, sur les bougies récentes, avec le
-    niveau touché et le résultat en R. Contexte relu dans la base (signal_key). None si impossible -> image générique."""
-    ctx = vcrt_ctx_load(trade.get("signal_key"))
-    if not ctx:
-        return None
-    try:
-        cs = candles if candles is not None else get_candles(ctx["symbol"], minutes=ctx["etf"])
-        return vcrt_draw(ctx, cs or [], trade=trade, ev_name=ev_name or trade.get("outcome") or "RESULT")
-    except Exception as e:
-        print(f"[{ctx.get('symbol')}] vrai CRT : image de résultat impossible ({type(e).__name__})")
-        traceback.print_exc(limit=-3)
-        return None
 
 
 class TestVraiCRT(unittest.TestCase):
@@ -17558,134 +16569,15 @@ class TestVraiCRT(unittest.TestCase):
         self.assertFalse(STRAT_VCRT)
 
 
-class TestVcrtSuivi(unittest.TestCase):
-    """Suivi du vrai CRT par track_trade : RR1 = TP1 figé (+ BE), TP final, TP1 = extrême, niveaux figés."""
-
-    @staticmethod
-    def _vtr(tp, tp1, be_rr):
-        return dict(id=0, symbol="X", side="BUY", kind="VCRT", entry=101.0, sl=99.0, sl_initial=99.0, tp=tp, tp1=tp1,
-                    be_hit=0, be_rr=be_rr, status="OPEN", last_ts=0, closed_ts=None, filled_ts=None, result_r=None,
-                    pnl_usd=None, outcome=None, rr1_hit=0, rr2_hit=0, rr3_hit=0, risk_usd=1.0, part_cfg=None)
-
-    @staticmethod
-    def _up(t, h, l):
-        return {"t": t, "o": 101.0, "h": h, "l": l, "c": 101.0}
-
-    def test_rr1_au_tp1_puis_tp_final_et_reglages_sans_effet(self):
-        tr = self._vtr(tp=107.0, tp1=104.0, be_rr=1.5)          # RR1 = 1.5R (104), TP final = 3R (107)
-        _E.set_setting("vcrt_tp_mode", "FIXE")
-        _E.set_vcrt_rr(1, 2)                                    # réglages changés APRÈS l'ouverture : aucun effet
-        self.assertEqual(_E.track_trade(tr, [self._up(1, 103.9, 100.5)]), [])              # 1.45R : rien (pas de RR1 à 1R)
-        ev = _E.track_trade(tr, [self._up(2, 104.1, 100.5)])
-        self.assertEqual([(e["name"], e["be_moved"]) for e in ev], [("RR1", True)])
-        self.assertEqual(tr["sl"], 101.0)                                                   # SL -> BE avec RR1
-        ev = _E.track_trade(tr, [self._up(3, 107.2, 102.0)])
-        self.assertEqual(([e["name"] for e in ev], tr["outcome"], tr["result_r"]), (["RR2", "TP"], "TP", 3.0))   # RR2 annoncé en route
-        _E.set_setting("vcrt_tp_mode", "PROPOSE")
-
-    def test_tp1_extreme_tp_final_unique(self):
-        tr = self._vtr(tp=107.0, tp1=None, be_rr=1.0)           # TP1 = extrême : un seul TP (final)
-        _E.track_trade(tr, [self._up(1, 103.1, 100.5)])         # BE armé comme pour les autres stratégies
-        self.assertEqual(tr["sl"], 101.0)
-        _E.track_trade(tr, [self._up(2, 107.1, 102.0)])
-        self.assertEqual((tr["outcome"], tr["result_r"]), ("TP", 3.0))
-
-    def test_sl_avant_rr1(self):
-        tr = self._vtr(tp=107.0, tp1=104.0, be_rr=1.5)
-        ev = _E.track_trade(tr, [self._up(1, 102.0, 98.9)])
-        self.assertEqual(([e["name"] for e in ev], tr["outcome"], tr["result_r"]), (["SL"], "SL", -1.0))
-
-
-class TestVcrtSlBeRr(unittest.TestCase):
-    """SL plafonné x ATR, BE réglable (auto / OFF / RRn), TP final RR4 avec paliers RR1-RR2-RR3, CRT M5 -> entrée M1."""
-    CRT = dict(dir=1, atr=10.0, h1=120.0, l1=100.0, h2=105.0, l2=95.0, tf=5)
-
-    def tearDown(self):
-        for k in ("vcrt_sl_cap", "vcrt_be", "vcrt_tp_mode", "vcrt_rr1", "vcrt_rr2", "vcrt_sl_mode"):
-            _E._q("DELETE FROM settings WHERE key=?", (k,), commit=True)
-
-    def test_sl_plafonne(self):
-        _E.set_vcrt_sl_cap("0.8")
-        sl, capped = _E.vcrt_cap_sl(self.CRT, 110.0, 94.0)          # distance 16 > 0.8 x 10 = 8 -> SL ramené à 102
-        self.assertEqual((round(sl, 6), capped), (102.0, True))
-        sl, capped = _E.vcrt_cap_sl(self.CRT, 110.0, 105.0)         # distance 5 <= 8 : inchangé
-        self.assertEqual((sl, capped), (105.0, False))
-        sell = dict(self.CRT, dir=-1)
-        sl, capped = _E.vcrt_cap_sl(sell, 100.0, 120.0)             # SELL : plafond au-dessus de l'entrée
-        self.assertEqual((round(sl, 6), capped), (108.0, True))
-        _E.set_vcrt_sl_cap("off")
-        self.assertEqual(_E.vcrt_cap_sl(self.CRT, 110.0, 94.0), (94.0, False))
-        self.assertFalse(_E.set_vcrt_sl_cap("abc"))
-        self.assertFalse(_E.set_vcrt_sl_cap("9"))
-
-    def test_be_reglable(self):
-        tps = dict(tp1=104.0, tp2=108.0, rr1=1.0, rr2=3.0)
-        _E.set_vcrt_be("auto")
-        self.assertEqual(_E.vcrt_be_rr(tps), (1.0, False))
-        _E.set_vcrt_be("off")
-        be, off = _E.vcrt_be_rr(tps)
-        self.assertTrue(off and be >= tps["rr2"])
-        _E.set_vcrt_be("2")
-        self.assertEqual(_E.vcrt_be_rr(tps), (2.0, False))
-        self.assertFalse(_E.set_vcrt_be("n'importe quoi"))
-
-    def test_tp_final_rr4_calcule_depuis_le_sl(self):
-        self.assertTrue(_E.set_vcrt_rr_final(4))
-        self.assertEqual((_E.get_vcrt_rr(1), _E.get_vcrt_rr(2)), (1.0, 4.0))
-        r = _E.vcrt_build_tps(self.CRT, 110.0, 102.0, mode="FIXE")
-        self.assertEqual((r["tp1"], r["tp2"], r["rr2"]), (118.0, 142.0, 4.0))   # risque 8 : RR1 = +8, RR4 = +32
-
-    def test_paliers_rr1_rr2_rr3_jusqu_au_tp_rr4(self):
-        tr = dict(id=0, symbol="X", side="BUY", kind="VCRT", entry=101.0, sl=99.0, sl_initial=99.0, tp=109.0, tp1=103.0,
-                  be_hit=0, be_rr=1.0, status="OPEN", last_ts=0, closed_ts=None, filled_ts=None, result_r=None, pnl_usd=None,
-                  outcome=None, rr1_hit=0, rr2_hit=0, rr3_hit=0, risk_usd=1.0, part_cfg=None)    # risque 2 : RR1 103, RR2 105, RR3 107, RR4 109
-        names = []
-        for k, h in enumerate((103.1, 105.1, 107.1, 109.1), start=1):
-            names += [e["name"] for e in _E.track_trade(tr, [{"t": k, "o": 101.0, "h": h, "l": 101.5, "c": 101.5}])]   # low > entrée : le BE (SL = entrée) n'est pas touché
-        self.assertEqual(names, ["RR1", "RR2", "RR3", "TP"])
-        self.assertEqual((tr["outcome"], tr["result_r"]), ("TP", 4.0))
-
-    def test_be_off_jamais_arme(self):
-        tr = dict(id=0, symbol="X", side="BUY", kind="VCRT", entry=101.0, sl=99.0, sl_initial=99.0, tp=109.0, tp1=103.0,
-                  be_hit=0, be_rr=_E.VCRT_BE_OFF_RR, status="OPEN", last_ts=0, closed_ts=None, filled_ts=None, result_r=None,
-                  pnl_usd=None, outcome=None, rr1_hit=0, rr2_hit=0, rr3_hit=0, risk_usd=1.0, part_cfg=None)
-        _E.track_trade(tr, [{"t": 1, "o": 101.0, "h": 108.0, "l": 101.0, "c": 101.0}])
-        self.assertEqual((tr["be_hit"], tr["sl"]), (0, 99.0))                                   # jamais de SL -> entrée
-        _E.track_trade(tr, [{"t": 2, "o": 101.0, "h": 101.5, "l": 98.9, "c": 99.0}])
-        self.assertEqual((tr["outcome"], tr["result_r"]), ("SL", -1.0))                         # retour au SL initial : -1R
-
-    def test_menu_strategies_et_panneau_vrai_crt(self):
-        kb = str(_E._strategies_keyboard())
-        self.assertIn("str:vcrt", kb)
-        self.assertIn("vcrtm:home", kb)
-        self.assertIn("VRAI CRT", _E._strategies_text())
-        pk = str(_E._vcrt_tf_keyboard())
-        for d in ("vcrtm:toggle", "svcrt:M5", "svtp:FIXE", "svtp:PROPOSE", "svsl:0.8", "svbe:OFF", "svbe:AUTO", "str:home"):
-            self.assertIn(d, pk)
-        _E.handle_command("/vcrt on")
-        self.assertTrue(_E.get_strat_vcrt())
-        _E.handle_command("/vcrt off")
-        self.assertFalse(_E.get_strat_vcrt())
-        _E._q("DELETE FROM settings WHERE key='strat_vcrt'", commit=True)
-
-    def test_crt_m5_entree_m1(self):
-        _E.set_vcrt_tf("M5")
-        try:
-            self.assertEqual((_E.get_vcrt_tf(), _E.get_vcrt_tf_min(), _E.get_entry_tf()), ("M5", 5, 1))
-        finally:
-            _E.set_vcrt_tf("H4")
-            _E._q("DELETE FROM settings WHERE key IN ('vcrt_tf','vcrt_tfs')", commit=True)
-
-
 class TestVcrtTf(unittest.TestCase):
     """Réglage VCRT_TF (H4 / H1 / M15), UT d'entrée automatique, réinitialisation de l'état CRT."""
 
     def setUp(self):
-        _q("DELETE FROM settings WHERE key IN ('vcrt_tf','vcrt_tfs')", commit=True)
+        _q("DELETE FROM settings WHERE key='vcrt_tf'", commit=True)
         _E._VCRT_STATE.clear()
 
     def tearDown(self):
-        _q("DELETE FROM settings WHERE key IN ('vcrt_tf','vcrt_tfs')", commit=True)
+        _q("DELETE FROM settings WHERE key='vcrt_tf'", commit=True)
         _E._VCRT_STATE.clear()
 
     def test_table_ut_entree(self):
@@ -17722,6 +16614,152 @@ class TestVcrtTf(unittest.TestCase):
     def test_status_affiche_ut(self):
         txt, _kb = _E.handle_command("/status")
         self.assertIn("Vrai CRT", txt)
+
+
+class TestVcrtTp(unittest.TestCase):
+    """TP du vrai CRT : modes FIXE / MID / EXTREME / PROPOSE, repli, persistance, commandes, signal prêt pour le Risk Gate."""
+
+    BUY = {"dir": 1, "h1": 110.0, "l1": 100.0}
+    SELL = {"dir": -1, "h1": 110.0, "l1": 100.0}
+
+    def setUp(self):
+        for k in ("vcrt_tp", "vcrt_rr"):
+            _q("DELETE FROM settings WHERE key=?", (k,), commit=True)
+
+    def tearDown(self):
+        self.setUp()
+
+    def test_buy_quatre_modes(self):
+        f = _E.vcrt_plan(self.BUY, 103.0, 101.0, "FIXE", 2.0)
+        self.assertEqual((f["tp"], f["rr"], f["tp1"], f["fallback"]), (107.0, 2.0, None, False))
+        m = _E.vcrt_plan(self.BUY, 103.0, 101.0, "MID")
+        self.assertEqual((m["tp"], m["mode_used"]), (105.0, "MID"))
+        e = _E.vcrt_plan(self.BUY, 103.0, 101.0, "EXTREME")
+        self.assertEqual((e["tp"], e["rr"]), (110.0, 3.5))
+        p = _E.vcrt_plan(self.BUY, 103.0, 101.0, "PROPOSE")
+        self.assertEqual((p["tp1"], p["tp"], p["rr1"], p["rr"]), (105.0, 110.0, 1.0, 3.5))
+
+    def test_sell_quatre_modes(self):
+        f = _E.vcrt_plan(self.SELL, 107.0, 109.0, "FIXE", 2.0)
+        self.assertEqual(f["tp"], 103.0)
+        self.assertEqual(_E.vcrt_plan(self.SELL, 107.0, 109.0, "MID")["tp"], 105.0)
+        self.assertEqual(_E.vcrt_plan(self.SELL, 107.0, 109.0, "EXTREME")["tp"], 100.0)
+        p = _E.vcrt_plan(self.SELL, 107.0, 109.0, "PROPOSE")
+        self.assertEqual((p["tp1"], p["tp"]), (105.0, 100.0))
+
+    def test_repli_cible_depassee(self):
+        m = _E.vcrt_plan(self.BUY, 106.0, 104.0, "MID", 2.0)       # 50 % déjà dépassé -> RR fixe
+        self.assertTrue(m["fallback"])
+        self.assertEqual((m["mode_used"], m["tp"]), ("FIXE", 110.0))
+        p = _E.vcrt_plan(self.BUY, 106.0, 104.0, "PROPOSE")        # extrême OK, TP1 dépassé -> un seul TP à l'extrême
+        self.assertEqual((p["tp1"], p["tp"], p["mode_used"], p["fallback"]), (None, 110.0, "EXTREME", False))
+        x = _E.vcrt_plan(self.BUY, 109.5, 107.0, "EXTREME", 2.0)    # extrême trop proche (< TP_MIN_RR) -> RR fixe
+        self.assertTrue(x["fallback"])
+        self.assertAlmostEqual(x["tp"], 109.5 + 2 * 2.5)
+
+    def test_tp_toujours_du_bon_cote(self):
+        for crt, entry, sl in ((self.BUY, 103.0, 101.0), (self.SELL, 107.0, 109.0)):
+            for mode in _E.VCRT_TP_MODES:
+                pl = _E.vcrt_plan(crt, entry, sl, mode, 2.0)
+                self.assertGreater((pl["tp"] - entry) * crt["dir"], 0)
+                if pl["tp1"] is not None:
+                    self.assertGreater((pl["tp1"] - entry) * crt["dir"], 0)
+                    self.assertLess((pl["tp1"] - entry) * crt["dir"], (pl["tp"] - entry) * crt["dir"])
+
+    def test_reglages_persistes_et_alias(self):
+        self.assertEqual(_E.get_vcrt_tp(), _E.VCRT_TP_DEFAULT)
+        for raw, want in (("fixe", "FIXE"), ("50 %", "MID"), ("50", "MID"), ("extrême", "EXTREME"), ("proposé", "PROPOSE")):
+            self.assertTrue(_E.set_vcrt_tp(raw), raw)
+            self.assertEqual(_E.get_vcrt_tp(), want)
+        self.assertFalse(_E.set_vcrt_tp("n'importe quoi"))
+        self.assertEqual(_E.get_vcrt_tp(), "PROPOSE")              # refus : réglage inchangé
+        self.assertTrue(_E.set_vcrt_rr("1,5"))
+        self.assertEqual(_E.get_vcrt_rr(), 1.5)
+        self.assertFalse(_E.set_vcrt_rr("0"))
+        self.assertFalse(_E.set_vcrt_rr("abc"))
+        self.assertEqual(_E.get_vcrt_rr(), 1.5)
+
+    def test_commandes_telegram(self):
+        txt, _kb = _E.handle_command("/vcrt_tp mid")
+        self.assertEqual(_E.get_vcrt_tp(), "MID")
+        self.assertIn("50 %", txt)
+        txt, _kb = _E.handle_command("/vcrt_tp zzz")
+        self.assertIn("invalide", txt)
+        self.assertEqual(_E.get_vcrt_tp(), "MID")
+        _E.handle_command("/vcrt_rr 2.5")
+        self.assertEqual(_E.get_vcrt_rr(), 2.5)
+        txt, _kb = _E.handle_command("/vcrt_tf")
+        self.assertIn("TP", txt)
+
+    def _crt_and_candles(self, d=1):
+        crt = {"dir": d, "h1": 110.0, "l1": 100.0, "h2": 111.0 if d == -1 else 108.0, "l2": 98.0 if d == 1 else 105.0,
+               "sl": 101.0 if d == 1 else 109.0, "atr": 1.0, "tf": 60, "t2": 0, "t_entry": 3600}
+        ec = [{"t": 3600, "o": 102.0, "h": 103.5, "l": 101.5, "c": 103.0}]
+        if d == -1:
+            ec = [{"t": 3600, "o": 108.0, "h": 108.5, "l": 106.5, "c": 107.0}]
+        return crt, ec
+
+    def test_signal_pret_pour_publish_signal(self):
+        _E.set_vcrt_tp("PROPOSE")
+        crt, ec = self._crt_and_candles(1)
+        sig, why = _E.vcrt_build_signal("X", crt, 15, "a", ec, 0)
+        self.assertIsNone(why)
+        self.assertEqual((sig["side"], sig["type"], sig["key_suffix"], sig["order"]), ("BUY", "VCRT", "vcrt", "MARKET"))
+        self.assertEqual(_E.risk_strategy_label(sig), "VCRT")      # Risk Gate : même libellé que les autres stratégies
+        self.assertLess(sig["sl"], sig["entry"])
+        self.assertEqual(sig["t"], 3600 + 15 * 60 - 1)             # suivi seulement après la clôture de la bougie d'entrée
+        self.assertEqual(sig["tp"], 110.0)
+        self.assertEqual(sig["tp1"], 105.0)
+        self.assertGreater(sig["risk"], 0)
+        for k in ("dir", "side", "type", "order", "entry", "sl", "risk", "tp", "t", "rr", "be_rr", "tf", "crt"):
+            self.assertIn(k, sig)
+        txt = _E.group_signal("X", sig, 1, 2, lot=0.1)
+        self.assertIn("TP1", txt)
+        self.assertIn("TP2", txt)
+
+    def test_signal_sell_et_mode_fixe(self):
+        _E.set_vcrt_tp("FIXE")
+        _E.set_vcrt_rr(2)
+        crt, ec = self._crt_and_candles(-1)
+        sig, _why = _E.vcrt_build_signal("X", crt, 5, "b", ec, 0)
+        self.assertEqual(sig["side"], "SELL")
+        self.assertAlmostEqual(sig["rr"], 2.0)
+        self.assertIsNone(sig["tp1"])
+        self.assertLess(sig["tp"], sig["entry"])
+        self.assertNotIn("TP1", _E.group_signal("X", sig, 1, 2, lot=0.1))
+
+    def test_process_symbol_passe_par_publish_signal(self):
+        """Le signal du vrai CRT part par publish_signal (chemin commun : Risk Gate, /mm, news, suivi) et un seul par CRT."""
+        crt, ec = self._crt_and_candles(1)
+        crt.update(i=1, h2=108.0, c2=104.0)
+        saved = {k: getattr(_E, k) for k in ("get_strat_vcrt", "get_symbol_on", "get_bot_on", "vcrt_detect", "_ctx_candles",
+                                              "vcrt_entry_check", "publish_signal")}
+        calls = []
+        try:
+            _E.get_strat_vcrt = lambda: True
+            _E.get_symbol_on = lambda s: True
+            _E.get_bot_on = lambda: True
+            _E.vcrt_detect = lambda sym, tf: crt
+            _E._ctx_candles = lambda sym, tf: ec
+            _E.vcrt_entry_check = lambda *a, **k: ("signal", "a")
+            _E.publish_signal = lambda sym, c, evs, sig, companion=False: calls.append((sym, sig)) or True
+            _E._VCRT_STATE.clear()
+            _E.vcrt_process_symbol("X")
+            _E.vcrt_process_symbol("X")   # 2e passage : verrou « un trade par CRT »
+        finally:
+            for k, v in saved.items():
+                setattr(_E, k, v)
+            _E._VCRT_STATE.clear()
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], "X")
+        self.assertEqual(_E.risk_strategy_label(calls[0][1]), "VCRT")
+
+    def test_sl_trop_large_refuse(self):
+        crt, ec = self._crt_and_candles(1)
+        crt["sl"] = 103.0 - (_E.VCRT_MAX_SL_ATR + 1.0) * crt["atr"]
+        sig, why = _E.vcrt_build_signal("X", crt, 15, "a", ec, 0)
+        self.assertIsNone(sig)
+        self.assertIn("trop large", why)
 
 
 class TestVcrtEntry(unittest.TestCase):
@@ -17780,503 +16818,6 @@ class TestVcrtEntry(unittest.TestCase):
         crt2 = self._crt_buy(200_000)   # t2 différent = CRT suivant
         st = _E._VCRT_STATE.get("XTEST")
         self.assertNotEqual(st["t2"], crt2["t2"])  # vcrt_process_symbol détecterait le changement et recréerait l'état
-
-
-class TestVcrtImages(unittest.TestCase):
-    """Images du vrai CRT : zone d'entrée relue, aucune étiquette qui en chevauche une autre, image d'entrée ET de résultat
-    (TP / SL / BE), envoi dans le groupe ET dans le bot via _deliver_signal, contexte figé en base."""
-
-    @staticmethod
-    def _scenario(buy=True, etf=15, tf=240, trig="a", seed=1, base=4400.0):
-        """Série synthétique d'UT d'entrée : historique, bougie 1 (range exact), bougie 2 (sweep d'un seul côté), début de
-        bougie 3 jusqu'à l'entrée. Retourne (ctx, bougies jusqu'à l'entrée incluse, index d'entrée)."""
-        rnd = random.Random(seed)
-        sec, per = etf * 60, tf // etf
-        t0 = 1_760_000_000 - (1_760_000_000 % (tf * 60)) - 3 * tf * 60
-        s = 1 if buy else -1
-        pre, n3 = 12, 7
-        h1, l1 = base + 10, base - 10
-        ext = l1 - 7 if buy else h1 + 7
-        kp = [(0, base), (pre, base + 2 * s), (pre + per // 2, base - 6 * s), (pre + per - 1, base + 3 * s),
-              (pre + per + 5, ext + (2 if buy else -2)), (pre + 2 * per - 1, base - 3 * s),
-              (pre + 2 * per + 6, base + 6 * s), (pre + 2 * per + n3 - 1, base + 14 * s)]
-        closes = []
-        for (a, pa), (b, pb) in zip(kp, kp[1:]):
-            closes += [pa + (pb - pa) * (k - a) / (b - a) + rnd.uniform(-1.2, 1.2) for k in range(a, b)]
-        closes.append(kp[-1][1])
-        cs, prev = [], base
-        for i, c in enumerate(closes):
-            o = prev
-            cs.append({"t": t0 + i * sec, "o": o, "h": max(o, c) + rnd.random(), "l": min(o, c) - rnd.random(), "c": c})
-            prev = c
-        i1, i2, i3 = pre, pre + per, pre + 2 * per
-        for k in range(i1, i2):
-            cs[k]["h"], cs[k]["l"] = min(cs[k]["h"], h1 - 0.3), max(cs[k]["l"], l1 + 0.3)
-        cs[i1 + 3]["h"], cs[i1 + 9]["l"] = h1, l1
-        for k in range(i2, i3):
-            if buy:
-                cs[k]["h"] = min(cs[k]["h"], h1 - 0.5)
-            else:
-                cs[k]["l"] = max(cs[k]["l"], l1 + 0.5)
-        cs[i2 + 5]["l" if buy else "h"] = ext
-        h2, l2 = max(c["h"] for c in cs[i2:i3]), min(c["l"] for c in cs[i2:i3])
-        k = i3 + 6
-        entry = cs[k]["c"]
-        sl = (l2 - 0.8) if buy else (h2 + 0.8)
-        risk = abs(entry - sl)
-        zlo, zhi = sorted((cs[k - 2]["h" if buy else "l"], cs[k]["l" if buy else "h"]))
-        zhi = max(zhi, zlo + 0.5)
-        ctx = {"v": 1, "symbol": "XAUUSD", "d": s, "tf": tf, "etf": etf, "trig": trig, "t1": cs[i1]["t"], "t2": cs[i2]["t"],
-               "t3": cs[i3]["t"], "h1": h1, "l1": l1, "h2": h2, "l2": l2, "entry": entry, "sl": sl,
-               "tp1": entry + s * risk, "tp2": entry + s * 2 * risk, "rr1": 1.0, "rr2": 2.0, "t_sig": cs[k]["t"], "tp_mode": "t",
-               "zone": {"kind": "OB" if trig == "b" else "FVG", "lo": zlo, "hi": zhi, "t0": cs[k - 2]["t"], "t_react": cs[k]["t"]}}
-        if trig == "a":
-            ctx["mss"] = {"t_src": cs[k - 5]["t"], "t_brk": cs[k]["t"], "level": cs[k - 5]["h" if buy else "l"]}
-        return ctx, cs[:k + 1], k
-
-    @staticmethod
-    def _after(ctx, last, prices):
-        out, t, px = [], last["t"], last["c"]
-        for tgt in prices:
-            t += ctx["etf"] * 60
-            out.append({"t": t, "o": px, "h": max(px, tgt) + 0.4, "l": min(px, tgt) - 0.4, "c": tgt})
-            px = tgt
-        return out
-
-    def setUp(self):
-        self._old_dir = _E.CHART_DIR
-        _E.CHART_DIR = tempfile.mkdtemp()
-
-    def tearDown(self):
-        _E.CHART_DIR = self._old_dir
-
-    def _png(self, path):
-        self.assertTrue(path and os.path.exists(path))
-        with open(path, "rb") as f:
-            head = f.read(8)
-        self.assertEqual(head, b"\x89PNG\r\n\x1a\n")
-        self.assertGreater(os.path.getsize(path), 8000)
-
-    def _no_overlap(self, msg=""):
-        boxes = _E._VCRT_LAST_DRAW["boxes"]
-        self.assertGreaterEqual(len(boxes), 6)   # 6 pastilles de prix au minimum (entrée, SL, RR1, TP, CRH, CRL)
-        for a in range(len(boxes)):
-            for b in range(a + 1, len(boxes)):
-                self.assertFalse(boxes[a][1].overlaps(boxes[b][1]),
-                                 f"{msg} étiquettes qui se chevauchent : {boxes[a][0]!r} / {boxes[b][0]!r}")
-
-    # --- zone d'entrée relue -------------------------------------------------------------------------------------
-    def test_zone_mss_fvg_relue(self):
-        ev = TestVcrtEntry()
-        crt = ev._crt_buy(t_entry=540)
-        ec = [ev._candle(0, 100.0, 100.3, 99.8, 100.1), ev._candle(60, 100.1, 100.4, 99.9, 100.2),
-              ev._candle(120, 100.2, 100.6, 100.0, 100.3), ev._candle(180, 100.3, 100.9, 100.1, 100.5),
-              ev._candle(240, 100.5, 100.7, 100.2, 100.3), ev._candle(300, 100.3, 100.5, 100.0, 100.2),
-              ev._candle(360, 100.2, 100.4, 99.9, 100.1), ev._candle(420, 100.1, 100.6, 100.05, 100.5),
-              ev._candle(480, 100.5, 101.0, 100.45, 100.9), ev._candle(540, 100.9, 102.5, 100.85, 102.4)]
-        crt["l2"] = 99.0
-        z = _E.vcrt_entry_zone(crt, 1, "a", ec, len(ec) - 1)
-        self.assertEqual((z["kind"], z["i_react"]), ("FVG", len(ec) - 1))
-        self.assertLess(z["lo"], z["hi"])
-        self.assertEqual(z["mss"]["i_brk"], len(ec) - 1)
-        self.assertAlmostEqual(z["mss"]["level"], 100.9, places=6)
-        crt["atr"] = 5.0   # SL de 6.4 pts <= 1.5 x ATR (VCRT_MAX_RISK_ATR) : le signal se construit
-        sig = _E.vcrt_make_signal("XAUUSD", crt, 1, "a", ec[-1]["c"], crt["sl"], ec[-1]["t"])
-        self.assertIsNotNone(sig)
-        ctx = _E.vcrt_build_ctx("XAUUSD", crt, 1, "a", ec, len(ec) - 1, sig)
-        self.assertEqual(json.loads(json.dumps(ctx)), ctx)   # sérialisable tel quel (stocké en base)
-        self.assertEqual((ctx["zone"]["kind"], ctx["mss"]["t_brk"], ctx["t_sig"]), ("FVG", 540, 540))
-        self.assertEqual((ctx["entry"], ctx["tp"] if "tp" in ctx else ctx["tp2"]), (sig["entry"], sig["tp2"]))
-        self.assertTrue(_E.vcrt_draw(ctx, ec))   # même sur cette petite série : pas d'exception
-
-    def test_zone_introuvable_ne_bloque_pas(self):
-        ev = TestVcrtEntry()
-        crt = ev._crt_buy(t_entry=540)
-        ec = [ev._candle(60 * k, 100.0, 100.2, 99.9, 100.1) for k in range(10)]
-        self.assertIsNone(_E.vcrt_entry_zone(crt, 1, "a", ec, 9))
-        self.assertIsNone(_E.vcrt_entry_zone(crt, 1, "c", ec, 9))
-
-    # --- pastilles : pur calcul ----------------------------------------------------------------------------------
-    def test_layout_pastilles(self):
-        ys = [100.0, 100.1, 100.1, 100.15, 99.9, 120.0]
-        pos = _E.vcrt_layout_pills(ys, 1.0)
-        srt = sorted(pos)
-        self.assertTrue(all(b - a >= 1.0 - 1e-9 for a, b in zip(srt, srt[1:])))
-        order_in = sorted(range(len(ys)), key=lambda k: ys[k])
-        order_out = sorted(range(len(pos)), key=lambda k: pos[k])
-        self.assertEqual([ys[k] for k in order_in][0], min(ys))
-        self.assertEqual(order_out[-1], 5)           # la plus haute reste en haut
-        far = _E.vcrt_layout_pills([10.0, 50.0], 1.0)
-        self.assertEqual(far, [10.0, 50.0])          # déjà espacées : rien ne bouge
-
-    # --- image d'entrée : 3 déclencheurs x achat / vente x 3 UT d'entrée ----------------------------------------------
-    def test_image_entree_tous_cas_sans_chevauchement(self):
-        cases = [dict(buy=True, trig="a"), dict(buy=False, trig="b", seed=2), dict(buy=True, trig="c", etf=5, tf=60, seed=4),
-                 dict(buy=False, trig="a", etf=1, tf=15, seed=5), dict(buy=True, trig="b", etf=1, tf=15, seed=6),
-                 dict(buy=False, trig="c", seed=7)]
-        for kw in cases:
-            ctx, cs, _k = self._scenario(**kw)
-            path = _E.vcrt_draw(ctx, cs)
-            self._png(path)
-            self._no_overlap(str(kw))
-            self.assertIn("_vcrt_", os.path.basename(path))
-
-    def test_image_entree_prix_a_5_chiffres_et_niveaux_proches(self):
-        ctx, cs, _k = self._scenario(buy=True, trig="a", base=104_000.0, seed=9)
-        ctx["tp1"] = ctx["entry"] + 0.01 * abs(ctx["entry"] - ctx["sl"])      # niveaux quasi confondus : les pastilles doivent rester séparées
-        ctx["h1"] = ctx["entry"] + 0.005
-        _E.SYMBOLS["XAUUSD"]["decimals"], old = 2, _E.SYMBOLS["XAUUSD"]["decimals"]
-        try:
-            self._png(_E.vcrt_draw(ctx, cs))
-            self._no_overlap("niveaux proches")
-        finally:
-            _E.SYMBOLS["XAUUSD"]["decimals"] = old
-
-    def test_image_tp_final_unique_sans_rr1(self):
-        ctx, cs, _k = self._scenario(buy=False, trig="c", seed=11)
-        ctx["tp1"] = ctx["tp2"]          # TP1 = extrême du range : un seul TP
-        self._png(_E.vcrt_draw(ctx, cs))
-        labels = [t for t, _y in _E._VCRT_LAST_DRAW["pills"]]
-        self.assertTrue(any(t.startswith("TP ") for t in labels) and not any(t.startswith("RR1") for t in labels))
-        self._no_overlap("TP unique")
-
-    def test_donnees_insuffisantes_renvoie_none(self):
-        ctx, cs, _k = self._scenario()
-        self.assertIsNone(_E.vcrt_draw(ctx, cs[:5]))
-        self.assertIsNone(_E.vcrt_draw(ctx, []))
-        self.assertIsNone(_E.vcrt_draw(None, cs))
-        self.assertIsNone(_E.vcrt_draw(dict(ctx, t1=cs[-1]["t"] + 10_000), cs))   # bougie 1 hors données
-
-    # --- image de résultat ---------------------------------------------------------------------------------------
-    def test_image_resultat_tp_sl_be(self):
-        ctx, cs, _k = self._scenario(buy=True, trig="a", seed=1)
-        e, r = ctx["entry"], abs(ctx["entry"] - ctx["sl"])
-        last = cs[-1]
-        tp = cs + self._after(ctx, last, [e + 3, e + 9, ctx["tp1"] + 1, ctx["tp1"] - 4, ctx["tp2"] + 2])
-        sl = cs + self._after(ctx, last, [e - 4, e - 8, ctx["sl"] - 1])
-        be = cs + self._after(ctx, last, [e + 5, ctx["tp1"] + 1, ctx["tp1"] - 8, e - 1])
-        rr1 = cs + self._after(ctx, last, [e + 3, ctx["tp1"] + 1])
-        cases = [("TP", tp, dict(outcome="TP", result_r=2.0, be_rr=1.0, be_hit=1)),
-                 ("SL", sl, dict(outcome="SL", result_r=-1.0, be_rr=1.0, be_hit=0)),
-                 ("BE", be, dict(outcome="BE", result_r=0.0, be_rr=1.0, be_hit=1)),
-                 ("RR1", rr1, dict(outcome=None, result_r=None, be_rr=1.0, be_hit=1))]
-        for name, series, trade in cases:
-            path = _E.vcrt_draw(ctx, series, trade=trade, ev_name=name)
-            self._png(path)
-            self.assertIn(f"_{name}_", os.path.basename(path))
-            self._no_overlap(name)
-        view = tp[-40:]
-        h = _E._vcrt_hits(ctx, tp, dict(outcome="TP", be_rr=1.0))
-        self.assertEqual((h["exit"][1], tp[h["exit"][0]]["t"] > ctx["t_sig"], h["rr1"] is not None and h["rr1"] <= h["exit"][0]),
-                         ("TP", True, True))
-        self.assertEqual(_E._vcrt_hits(ctx, sl, dict(outcome="SL", be_rr=1.0))["exit"][1], "SL")
-        hb = _E._vcrt_hits(ctx, be, dict(outcome="BE", be_rr=1.0))
-        self.assertEqual(hb["exit"][1], "BE")
-        self.assertGreater(hb["exit"][0], hb["rr1"])                                   # BE après le contact RR1
-        self.assertEqual(_E._vcrt_hits(ctx, cs, dict(outcome="TP"))["exit"], None)     # rien après l'entrée : aucun marqueur inventé
-        self.assertEqual(_E._vcrt_hits(ctx, tp, None), {"rr1": None, "exit": None})
-
-    def test_image_resultat_vente(self):
-        ctx, cs, _k = self._scenario(buy=False, trig="b", seed=2)
-        e = ctx["entry"]
-        series = cs + self._after(ctx, cs[-1], [e - 3, ctx["tp1"] - 1, ctx["tp1"] + 3, ctx["tp2"] - 2])
-        self._png(_E.vcrt_draw(ctx, series, trade=dict(outcome="TP", result_r=2.0, be_rr=1.0), ev_name="TP"))
-        self._no_overlap("vente TP")
-
-    # --- câblage : contexte en base, make_event_chart, _deliver_signal --------------------------------------------------
-    def test_contexte_en_base_et_make_event_chart(self):
-        ctx, cs, _k = self._scenario()
-        key = "XAUUSD:TEST:123:vcrt"
-        _E.vcrt_ctx_save(key, ctx)
-        try:
-            self.assertEqual(_E.vcrt_ctx_load(key), ctx)
-            self.assertIsNone(_E.vcrt_ctx_load("XAUUSD:INCONNU:vcrt"))
-            full = cs + self._after(ctx, cs[-1], [ctx["entry"] + 2, ctx["tp1"] + 1, ctx["tp2"] + 1])
-            trade = dict(kind="VCRT", symbol="XAUUSD", side="BUY", signal_key=key, entry=ctx["entry"], sl=ctx["sl"],
-                         sl_initial=ctx["sl"], tp=ctx["tp2"], outcome="TP", result_r=2.0, be_rr=1.0, be_hit=1, order_type="MARKET")
-            saved = _E.get_candles
-            _E.get_candles = lambda *a, **k: full
-            try:
-                path = _E.make_event_chart("XAUUSD", full, [], trade, 2, ev_name="TP")
-                self._png(path)
-                self.assertIn("_vcrt_", os.path.basename(path))
-                self.assertIn("_TP_", os.path.basename(path))
-                # trade VCRT sans contexte en base (ancien signal) : image générique, jamais d'erreur
-                old = dict(trade, signal_key="XAUUSD:SANS:CONTEXTE:vcrt")
-                evs = _E.analyze(full)
-                self._png(_E.make_event_chart("XAUUSD", full, evs, old, 2, ev_name="TP"))
-            finally:
-                _E.get_candles = saved
-        finally:
-            _q("DELETE FROM meta WHERE key=?", (f"vcrtctx:{key}",), commit=True)
-
-    def test_le_reset_de_ut_garde_le_contexte_des_trades_ouverts(self):
-        ctx, _cs, _k = self._scenario()
-        key = "XAUUSD:TEST:456:vcrt"
-        _E.vcrt_ctx_save(key, ctx)
-        try:
-            _E.vcrt_reset_state("test")
-            self.assertEqual(_E.vcrt_ctx_load(key), ctx)   # un changement d'UT ne détruit jamais l'image de résultat d'un trade ouvert
-        finally:
-            _q("DELETE FROM meta WHERE key=?", (f"vcrtctx:{key}",), commit=True)
-
-    def test_deliver_signal_image_dans_groupe_et_bot(self):
-        sent, upd = [], []
-
-        class _Cur:
-            @staticmethod
-            def fetchone():
-                return {"sent_admin": 0, "sent_group": 0}
-        saved = (_E._q, _E.update_trade, _E.to_admin, _E.to_group, _E.send, _E._delivered)
-        _E._q = lambda *a, **k: _Cur()
-        _E.update_trade = lambda tid, **f: upd.append(f)
-        _E.to_admin = lambda txt, reply_markup=None, photo=None: sent.append(("admin", txt, photo)) or {"ok": True, "result": {"message_id": 1}}
-        _E.to_group = lambda txt, photo=None, reply_to_message_id=None: sent.append(("group", txt, photo)) or {"ok": True, "result": {"message_id": 77}}
-        _E.send = lambda chat, txt, photo=None, **k: sent.append(("send", txt, photo)) or {"ok": True}
-        _E._delivered = lambda chat, res: bool(res and res.get("ok"))
-        try:
-            _E._deliver_signal(1, "XAUUSD", "ADMIN court", "GROUPE", chart="/tmp/x.png", admin_chart="/tmp/x.png")
-            self.assertEqual(sent, [("admin", "ADMIN court", "/tmp/x.png"), ("group", "GROUPE", "/tmp/x.png")])
-            self.assertIn({"sent_admin": 1}, upd)
-            self.assertIn({"sent_group": 1, "signal_message_id": 77}, upd)
-            # texte admin trop long pour une légende photo (1000 car.) : texte complet d'abord, image juste après
-            sent.clear(), upd.clear()
-            _E._deliver_signal(1, "XAUUSD", "A" * 1500, "GROUPE", chart="/tmp/x.png", admin_chart="/tmp/x.png")
-            self.assertEqual([(w, len(t), p) for w, t, p in sent],
-                             [("admin", 1500, None), ("send", len("🕯 Graphique du signal"), "/tmp/x.png"), ("group", 6, "/tmp/x.png")])
-            # autres stratégies : comportement INCHANGÉ (image dans le groupe seulement)
-            sent.clear()
-            _E._deliver_signal(2, "XAUUSD", "ADMIN", "GROUPE", chart="/tmp/y.png")
-            self.assertEqual(sent, [("admin", "ADMIN", None), ("group", "GROUPE", "/tmp/y.png")])
-        finally:
-            _E._q, _E.update_trade, _E.to_admin, _E.to_group, _E.send, _E._delivered = saved
-
-class TestVcrtMultiUtRrSl(unittest.TestCase):
-    """Vrai CRT : plusieurs UT de CRT en même temps (M5 + M15), boutons TP / BE R1-R4 choisis par l'utilisateur,
-    SL serré juste derrière le MSS (jamais plus large que derrière le sweep)."""
-    _KEYS = ("vcrt_tf", "vcrt_tfs", "vcrt_sl_mode", "vcrt_rr1", "vcrt_rr2", "vcrt_tp_mode", "vcrt_be", "vcrt_sl_cap", "strat_vcrt")
-    CRT = dict(dir=1, atr=10.0, h1=120.0, l1=100.0, h2=105.0, l2=95.0, tf=5)
-
-    def _clean(self):
-        for k in self._KEYS:
-            _E._q("DELETE FROM settings WHERE key=?", (k,), commit=True)
-        _E._VCRT_STATE.clear()
-
-    def setUp(self):
-        self._clean()
-
-    def tearDown(self):
-        self._clean()
-
-    @staticmethod
-    def _c(t, o, h, l, c):
-        return {"t": t, "o": o, "h": h, "l": l, "c": c}
-
-    def _ec_mss(self, mirror=False):
-        """Même structure que TestVcrtEntry.test_mss_fvg_declenche_a : swing haut ~100.9 cassé par un déplacement avec FVG."""
-        rows = [(0, 100.0, 100.3, 99.8, 100.1), (60, 100.1, 100.4, 99.9, 100.2), (120, 100.2, 100.6, 100.0, 100.3),
-                (180, 100.3, 100.9, 100.1, 100.5), (240, 100.5, 100.7, 100.2, 100.3), (300, 100.3, 100.5, 100.0, 100.2),
-                (360, 100.2, 100.4, 99.9, 100.1), (420, 100.1, 100.6, 100.05, 100.5), (480, 100.5, 101.0, 100.45, 100.9),
-                (540, 100.9, 102.5, 100.85, 102.4)]
-        if mirror:   # miroir (200 - prix) : même scénario côté SELL
-            rows = [(t, 200 - o, 200 - l, 200 - h, 200 - c) for t, o, h, l, c in rows]
-        return [self._c(*r) for r in rows]
-
-    def _crt(self, d=1, tf=15, t_entry=540, l2=99.0, atr=3.0):
-        crt = dict(i=10, t2=t_entry - tf * 60, t_entry=t_entry, dir=d, h1=110.0, l1=100.0, h2=108.0, l2=l2, c2=102.0,
-                   sl=l2 - 1.0, atr=atr, tf=tf)
-        if d == -1:
-            crt.update(h1=100.0, l1=90.0, h2=200 - l2, l2=92.0, c2=98.0)
-        return crt
-
-    # --- plusieurs UT de CRT en même temps ---------------------------------------------------------------------------
-    def test_plusieurs_ut_actives_en_meme_temps(self):
-        _E.set_vcrt_tf("M5")
-        self.assertEqual(_E.get_vcrt_tfs(), ["M5"])
-        self.assertEqual(_E.toggle_vcrt_tf("M15")[:2], (True, ["M15", "M5"]))        # M5 ET M15 ensemble
-        self.assertEqual(_E.get_vcrt_tfs(), ["M15", "M5"])
-        self.assertEqual(_E.vcrt_active_lbl(), "M15→M1 + M5→M1")
-        kb = str(_E._vcrt_tf_keyboard())
-        self.assertIn("✅ M15", kb)
-        self.assertIn("✅ M5", kb)
-        self.assertNotIn("✅ H4", kb)
-        ok, acts, _m = _E.toggle_vcrt_tf("M5")                                       # on retire M5 : M15 reste
-        self.assertEqual((ok, acts, _E.get_vcrt_tf()), (True, ["M15"], "M15"))
-
-    def test_la_derniere_ut_ne_peut_pas_etre_retiree(self):
-        _E.set_vcrt_tf("M5")
-        ok, acts, msg = _E.toggle_vcrt_tf("M5")
-        self.assertFalse(ok)
-        self.assertEqual((acts, _E.get_vcrt_tfs()), (["M5"], ["M5"]))
-        self.assertIn("Au moins une", msg)
-        self.assertEqual(_E.toggle_vcrt_tf("D1")[0], False)                          # UT inconnue refusée
-
-    def test_retirer_une_ut_ne_vide_que_son_etat(self):
-        _E.set_vcrt_tfs("M5 M15")
-        _E._VCRT_STATE[("XAUUSD", "M5")] = {"locked": True}
-        _E._VCRT_STATE[("XAUUSD", "M15")] = {"locked": True}
-        _E.toggle_vcrt_tf("M5")
-        self.assertEqual(list(_E._VCRT_STATE), [("XAUUSD", "M15")])                  # l'autre UT garde son verrou
-        self.assertEqual(_E.set_vcrt_tfs("M15 H1"), (True, True))
-        self.assertEqual(_E.set_vcrt_tfs("M15 H1"), (True, False))
-        self.assertEqual(_E.set_vcrt_tfs("M15 D1"), (False, False))                  # une valeur invalide refuse tout
-        self.assertEqual(_E.get_vcrt_tfs(), ["H1", "M15"])
-
-    def test_commande_vcrt_tf_plusieurs_ut(self):
-        _E.handle_command("/vcrt_tf M5 M15")
-        self.assertEqual(_E.get_vcrt_tfs(), ["M15", "M5"])
-        _E.handle_command("/vcrt_tf M5+H1")
-        self.assertEqual(_E.get_vcrt_tfs(), ["H1", "M5"])
-        txt, _kb = _E.handle_command("/vcrt_tf M5 D1")
-        self.assertIn("invalide", txt)
-        self.assertEqual(_E.get_vcrt_tfs(), ["H1", "M5"])
-        _E.handle_command("/vcrt_tf M5")                                             # une seule UT : ancien comportement
-        self.assertEqual(_E.get_vcrt_tfs(), ["M5"])
-
-    def test_avertissement_positions_max(self):
-        _E.set_vcrt_tfs("M5 M15")
-        saved = _E.get_max_positions
-        try:
-            _E.get_max_positions = lambda: 1
-            self.assertIn("/maxpos 2", _E._vcrt_tf_text())
-            _E.get_max_positions = lambda: 2
-            self.assertNotIn("/maxpos", _E._vcrt_tf_text())
-        finally:
-            _E.get_max_positions = saved
-
-    def test_cle_de_signal_distincte_par_ut_de_crt(self):
-        a = _E.vcrt_make_signal("XAUUSD", dict(self.CRT, tf=5), 1, "a", 110.0, 102.0, 1234)
-        b = _E.vcrt_make_signal("XAUUSD", dict(self.CRT, tf=15), 1, "a", 110.0, 102.0, 1234)   # même bougie M1, autre CRT
-        self.assertEqual((a["key_suffix"], b["key_suffix"]), ("vcrt_M5", "vcrt_M15"))
-        self.assertEqual((_E.risk_strategy_label(a), _E.risk_strategy_label(b)), ("VCRT", "VCRT"))
-
-    # --- boutons R1 / R2 / R3 / R4 -------------------------------------------------------------------------------------
-    def test_boutons_tp_r1_a_r4(self):
-        kb = str(_E._vcrt_tf_keyboard())
-        for n in (1, 2, 3, 4):
-            self.assertIn(f"svrf:{n}", kb)
-            self.assertIn(f"svbe:{n}", kb)
-        for n in (2, 3, 4):
-            self.assertTrue(_E.set_vcrt_rr_pick(n))
-            self.assertEqual((_E.get_vcrt_tp_mode(), _E.get_vcrt_rr(1), _E.get_vcrt_rr(2)), ("FIXE", 1.0, float(n)))
-            r = _E.vcrt_build_tps(self.CRT, 110.0, 102.0, mode="FIXE")                # risque 8
-            self.assertEqual((r["tp1"], r["tp2"], r["rr2"]), (118.0, 110.0 + 8 * n, float(n)))
-            self.assertIn(f"✅ TP R{n}", str(_E._vcrt_tf_keyboard()))
-        self.assertTrue(_E.set_vcrt_rr_pick(1))                                       # R1 : TP unique, pas de palier intermédiaire
-        r = _E.vcrt_build_tps(self.CRT, 110.0, 102.0, mode="FIXE")
-        self.assertEqual((r["tp1"], r["tp2"]), (118.0, 118.0))
-        self.assertIn("TP unique", _E._vcrt_tp_txt())
-        self.assertFalse(_E.set_vcrt_rr_pick("abc"))
-        self.assertFalse(_E.set_vcrt_rr_pick(50))
-
-    def test_un_rr_choisi_passe_le_tp_en_fixe(self):
-        _E.set_choice("vcrt_tp_mode", "PROPOSE", _E.VCRT_TP_MODES)
-        _E.set_vcrt_rr_pick(3)
-        self.assertEqual(_E.get_vcrt_tp_mode(), "FIXE")
-        _E.handle_command("/vcrt_rr r4")
-        self.assertEqual((_E.get_vcrt_tp_mode(), _E.get_vcrt_rr(2)), ("FIXE", 4.0))
-
-    def test_be_r1_a_r4(self):
-        tps = dict(tp1=104.0, tp2=108.0, rr1=1.0, rr2=4.0)
-        for n in (1, 2, 3, 4):
-            self.assertTrue(_E.set_vcrt_be(str(n)))
-            self.assertEqual(_E.vcrt_be_rr(tps), (float(n), False))
-            self.assertIn(f"✅ BE R{n}", str(_E._vcrt_tf_keyboard()))
-
-    # --- SL serré derrière le MSS --------------------------------------------------------------------------------------
-    def test_sl_mss_buy_juste_derriere_le_mss_et_jamais_plus_large_que_le_sweep(self):
-        ec, crt = self._ec_mss(), self._crt()
-        idx = len(ec) - 1
-        self.assertEqual(_E.vcrt_entry_check("X", crt, 1, ec, idx), ("signal", "a"))
-        sl_sweep = _E.vcrt_sl_behind_sweep(crt, ec, idx)
-        sl_mss = _E.vcrt_sl_behind_mss(crt, 1, "a", ec, idx, sl_sweep)
-        leg_low = min(x["l"] for x in ec[3:idx + 1])                                  # bas de la jambe du MSS (99.9)
-        at = _E.atr_series(ec)[-1]
-        self.assertAlmostEqual(sl_mss, leg_low - _E.VCRT_MSS_SL_BUFFER_ATR * at, places=6)
-        self.assertGreater(sl_mss, sl_sweep)                                          # plus serré que derrière le sweep
-        self.assertLess(sl_mss, ec[idx]["c"])
-        self.assertEqual(_E.vcrt_sl_behind_mss(crt, 1, "a", ec, idx, sl_mss + 1.0), sl_mss + 1.0)   # borne : jamais plus large que le sweep
-        self.assertEqual(_E.vcrt_sl_behind_mss(crt, 1, "a", ec, idx, None), sl_mss)
-
-    def test_sl_mss_sell_miroir(self):
-        ec, crt = self._ec_mss(mirror=True), self._crt(d=-1)
-        idx = len(ec) - 1
-        crt["h2"] = 200 - 99.0
-        self.assertEqual(_E.vcrt_entry_check("X", crt, 1, ec, idx), ("signal", "a"))
-        sl_sweep = _E.vcrt_sl_behind_sweep(crt, ec, idx)
-        sl_mss = _E.vcrt_sl_behind_mss(crt, 1, "a", ec, idx, sl_sweep)
-        self.assertLess(sl_mss, sl_sweep)                                             # SELL : SL plus bas = plus serré
-        self.assertGreater(sl_mss, ec[idx]["c"])                                      # et toujours au-dessus du prix
-        self.assertAlmostEqual(sl_mss, 200 - (min(x["l"] for x in self._ec_mss()[3:]) - _E.VCRT_MSS_SL_BUFFER_ATR * _E.atr_series(ec)[-1]), places=6)
-
-    def test_sl_mss_repli_si_inexploitable(self):
-        ec = [self._c(0, 100.0, 100.0, 100.0, 100.0)] * 3                              # ATR nul -> None : l'appelant garde le SL sweep
-        self.assertIsNone(_E.vcrt_sl_behind_mss(self._crt(), 1, "a", ec, 2, 90.0))
-
-    def test_boutons_et_commande_du_mode_de_sl(self):
-        kb = str(_E._vcrt_tf_keyboard())
-        self.assertIn("svsm:MSS", kb)
-        self.assertIn("svsm:SWEEP", kb)
-        self.assertEqual(_E.get_vcrt_sl_mode(), _E.VCRT_SL_MODE_ENV)
-        _E.handle_command("/vcrt_sl sweep")
-        self.assertEqual(_E.get_vcrt_sl_mode(), "SWEEP")
-        self.assertIn("✅ SL derrière sweep", str(_E._vcrt_tf_keyboard()))
-        _E.handle_command("/vcrt_sl mss")
-        self.assertEqual(_E.get_vcrt_sl_mode(), "MSS")
-        self.assertIn("serré", _E._vcrt_sl_txt())
-        txt, _k = _E.handle_command("/vcrt_sl nimporte")
-        self.assertIn("invalide", txt)
-        self.assertIn("MSS", _E._SL_LBL)
-
-    # --- bout en bout : deux CRT (M15 + M5) sur la même bougie d'entrée M1 -------------------------------------------
-    def _run_process(self, sl_mode):
-        sym = next(iter(_E.SYMBOLS))
-        ec = self._ec_mss()
-        crts = {15: self._crt(tf=15, t_entry=540), 5: self._crt(tf=5, t_entry=540)}
-        crts[5]["t2"] = 540 - 300
-        got = []
-        saved = {n: getattr(_E, n) for n in ("vcrt_detect", "_ctx_candles", "publish_signal", "get_candles",
-                                             "get_strat_vcrt", "get_symbol_on", "get_bot_on")}
-        _E.vcrt_detect = lambda s_, tf: crts.get(tf)
-        _E._ctx_candles = lambda s_, tf: ec
-        _E.publish_signal = lambda s_, c, e, sig, companion=False: got.append(sig) or True
-        _E.get_candles = lambda *a, **k: []
-        _E.get_strat_vcrt, _E.get_symbol_on, _E.get_bot_on = (lambda: True), (lambda s_: True), (lambda: True)
-        try:
-            _E.set_vcrt_tfs("M5 M15")
-            _E.set_choice("vcrt_sl_mode", sl_mode, _E.VCRT_SL_MODES)
-            _E.set_vcrt_sl_cap("off")
-            _E.set_vcrt_rr_pick(3)
-            _E.vcrt_process_symbol(sym)
-            first = list(got)
-            _E.vcrt_process_symbol(sym)                                               # 2e passe : verrou « un seul trade par CRT »
-            return sym, ec, first, list(got)
-        finally:
-            for n, f in saved.items():
-                setattr(_E, n, f)
-
-    def test_deux_crt_m5_et_m15_donnent_deux_signaux_distincts_sl_mss(self):
-        sym, ec, first, after = self._run_process("MSS")
-        self.assertEqual(sorted(x["key_suffix"] for x in first), ["vcrt_M15", "vcrt_M5"])
-        self.assertEqual(len(after), 2)                                               # rien de plus à la 2e passe
-        self.assertEqual({k for k in _E._VCRT_STATE}, {(sym, "M5"), (sym, "M15")})
-        idx = len(ec) - 1
-        for sig in first:
-            self.assertEqual(sig["sl_mode"], "MSS")
-            self.assertAlmostEqual(sig["sl"], _E.vcrt_sl_behind_mss(self._crt(tf=sig["key_suffix"] == "vcrt_M15" and 15 or 5), 1, "a", ec, idx,
-                                   _E.vcrt_sl_behind_sweep(self._crt(), ec, idx)), places=6)
-            self.assertAlmostEqual(sig["rr2"], 3.0)                                   # TP final R3 choisi
-            self.assertGreater(sig["sl"], _E.vcrt_sl_behind_sweep(self._crt(), ec, idx))
-        keys = {f"{sym}:{_E.TF_LABEL}:{x['t']}:{x['key_suffix']}" for x in first}
-        self.assertEqual(len(keys), 2)                                                # publish_signal ne les prend pas pour un doublon
-
-    def test_mode_sweep_garde_le_sl_historique(self):
-        _sym, ec, first, _after = self._run_process("SWEEP")
-        idx = len(ec) - 1
-        self.assertEqual(len(first), 2)
-        for sig in first:
-            self.assertEqual(sig["sl_mode"], "SWEEP")
-            self.assertAlmostEqual(sig["sl"], _E.vcrt_sl_behind_sweep(self._crt(), ec, idx), places=6)
 
 
 if __name__ == "__main__":
