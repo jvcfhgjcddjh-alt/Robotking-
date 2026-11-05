@@ -6242,6 +6242,23 @@ def _head_line(symbol, sig, lot=None):
     return f"{'🟢🟢🟢' if buy else '🔴🔴🔴'} <b>{lbl} {symbol}{lot_txt}</b>"
 
 
+def strategy_tag(sig):
+    """Nom lisible de la stratégie qui a produit le signal (affiché sur chaque signal : BOS/CHoCH, CRT, VRAI CRT, QML...)."""
+    ks = str(sig.get("key_suffix") or "")
+    if sig.get("strategy") == "VCRT" or ks == "vcrt":
+        return "VRAI CRT"
+    if sig.get("strategy") == "CRT" or ks in ("crt", "crtpoi"):
+        return "CRT"
+    typ = sig.get("type")
+    if typ == "QML" or ks == "qml":
+        return "QML"
+    if typ == "FIBTREND" or ks == "ft":
+        return "FIBTREND"
+    if typ == "MANUAL":
+        return "Manuel"
+    return "BOS/CHoCH"
+
+
 def group_signal(symbol, sig, position_n, dec, tf=None, lot=None):
     """Message groupe court : 1re ligne sens + LOT (visible dans la notification), puis entrée, SL, TP et RR."""
     limit = sig.get("order") == "LIMIT"
@@ -6251,7 +6268,7 @@ def group_signal(symbol, sig, position_n, dec, tf=None, lot=None):
         tp_lines = f"🎯 TP : {_fmt(sig['tp'], dec)}\n"
     return (
         f"{_head_line(symbol, sig, lot)}\n"
-        f"⏱ {tf or (sig.get('tf') if sig.get('type') in ('QML', 'FIBTREND', 'VCRT') else None) or TF_LABEL} · RR {_sig_rr(sig):g}\n"
+        f"⏱ {tf or (sig.get('tf') if sig.get('type') in ('QML', 'FIBTREND', 'VCRT') else None) or TF_LABEL} · RR {_sig_rr(sig):g} · 🧩 {strategy_tag(sig)}\n"
         f"Entrée : {'limit ' if limit else '≈ '}{_fmt(sig['entry'], dec)}\n"
         f"🛡 SL : {_fmt(sig['sl'], dec)}\n"
         f"{tp_lines}"
@@ -6266,7 +6283,7 @@ def admin_signal(symbol, sig, risk_usd, leverage, lot_info, margin, dec):
     base = "ta limit" if sig.get("order") == "LIMIT" else "ton prix réel"
     txt = (
         f"{_head_line(symbol, sig, lot_info['lot'])}\n"
-        f"{icon} {label} · Entrée ≈ {_fmt(sig['entry'], dec)}\n"
+        f"{icon} {label} · 🧩 {strategy_tag(sig)} · Entrée ≈ {_fmt(sig['entry'], dec)}\n"
         f"🛡 SL {_fmt(sig['sl'], dec)} · " + (f"🎯 TP1 {_fmt(sig['tp1'], dec)} · TP2 " if sig.get("tp1") else "🎯 TP ")
         + f"{_fmt(sig['tp'], dec)} (RR{_sig_rr(sig):g})\n"
         f"📐 Depuis {base} : SL {_dist(sig, sig['sl'], dec)} pts / TP {_dist(sig, sig['tp'], dec)} pts\n"
@@ -8844,7 +8861,8 @@ def retry_unsent_signals():
         sig = {"side": t["side"], "type": t["kind"], "entry": t["entry"], "sl": t["sl_initial"],
                "tp": t["tp"], "risk": abs(t["entry"] - t["sl_initial"]),
                "order": t.get("order_type") or "MARKET", "ref_price": t.get("ref_price"), "tf": t["timeframe"],
-               "be_rr": t.get("be_rr"), "htf_mode": t.get("htf_mode")}
+               "be_rr": t.get("be_rr"), "htf_mode": t.get("htf_mode"),
+               "key_suffix": (str(t.get("signal_key") or "").split(":") + ["", "", "", ""])[3] or None}
         lot_info = {"lot": t["lot"], "real_risk": t["risk_usd"], "raised_to_min": False}
         lev = t["leverage"] or get_leverage()
         margin = calc_margin(sym, t["lot"], t["entry"], lev)
@@ -16800,6 +16818,15 @@ class TestVcrtTp(unittest.TestCase):
             self.assertFalse(_E.get_strat_vcrt())
         finally:
             _q("DELETE FROM settings WHERE key='strat_vcrt'", commit=True)
+
+    def test_etiquette_strategie_sur_les_signaux(self):
+        base = {"side": "BUY", "type": "CHOCH1", "entry": 100.0, "sl": 99.0, "tp": 102.0, "risk": 1.0, "rr": 2.0, "tf": "M5"}
+        cas = (({}, "BOS/CHoCH"), ({"key_suffix": "crt", "strategy": "CRT"}, "CRT"), ({"key_suffix": "crtpoi"}, "CRT"),
+               ({"key_suffix": "vcrt", "strategy": "VCRT", "type": "VCRT"}, "VRAI CRT"), ({"type": "QML"}, "QML"))
+        for extra, want in cas:
+            sig = dict(base, **extra)
+            self.assertEqual(_E.strategy_tag(sig), want)
+            self.assertIn(want, _E.group_signal("X", sig, 1, 2, lot=0.1))
 
     def test_sl_trop_large_refuse(self):
         crt, ec = self._crt_and_candles(1)
