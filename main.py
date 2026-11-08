@@ -2816,7 +2816,8 @@ def get_live_price(symbol):
             msg = _deriv_request({
                 "ticks_history": cfg["deriv_symbol"], "style": "ticks",
                 "count": 1, "end": "latest"})
-            return float(msg["history"]["prices"][-1])
+            _pr = (msg.get("history") or {}).get("prices") or []
+            return float(_pr[-1]) if _pr else None   # marché fermé : pas de tick
         raise ValueError(f"Source de prix inconnue pour {symbol} : {cfg['source']}")
     except Exception as e:
         print(f"[{symbol}] get_live_price indisponible : {e}")
@@ -15901,6 +15902,7 @@ QMLG_AGENTS = _env_on("QMLG_AGENTS", True)
 VERIFY_OUTCOME = _env_on("VERIFY_OUTCOME", True)
 VERIFY_MAX_TRIES = _env_int("VERIFY_MAX_TRIES", 3)       # refus consécutifs avant alerte admin (le trade reste ouvert)
 VERIFY_M1_COUNT = _env_int("VERIFY_M1_COUNT", 1000)
+VERIFY_HARD_CAP = _env_int("VERIFY_HARD_CAP", 6)           # butoir absolu : au-delà, le résultat est validé quoi qu'il arrive (fin de boucle garantie)
 _qmlg_fresh_cache = {}
 
 
@@ -16043,7 +16045,8 @@ def verify_outcome(trade, outcome):
     votes = []
     # 1) bougies M1 rejouées (source fine, indépendante du TF de suivi)
     try:
-        m1 = get_candles(trade["symbol"], minutes=1, count=VERIFY_M1_COUNT) or []
+        _age_min = int((time.time() - t0) / 60) + 10 if t0 else VERIFY_M1_COUNT
+        m1 = get_candles(trade["symbol"], minutes=1, count=min(max(VERIFY_M1_COUNT, _age_min), 5000)) or []
         rp = _vf_replay(trade, m1, t0) if m1 and m1[0]["t"] <= (t0 + 120) else None
         votes.append(("M1", None if rp is None else rp == outcome, f"M1 -> {rp}"))
     except Exception as e:
@@ -16117,11 +16120,24 @@ def track_trade_verified(trade, candles):
         return events
     tries = int(get_meta(f"vf_{trade['id']}", 0) or 0) + 1
     set_meta(f"vf_{trade['id']}", tries)
+    _contra = any(v[1] is False for v in votes)
+    # SORTIE GARANTIE : sans contradiction après VERIFY_MAX_TRIES, ou quoi qu'il arrive après VERIFY_HARD_CAP, on valide
+    if (tries >= VERIFY_MAX_TRIES and not _contra) or tries >= VERIFY_HARD_CAP:
+        print(f"[verif] #{trade['id']} {final['name']} VALIDÉ APRÈS {tries} ESSAIS (fin de boucle) — {note}")
+        if not get_meta(f"vf_forced_{trade['id']}", 0):
+            set_meta(f"vf_forced_{trade['id']}", 1)
+            try:
+                to_admin(f"⚠️ <b>{trade['symbol']} #{trade['id']}</b> : <b>{final['name']}</b> validé après {tries} essais "
+                         f"(contrôles incomplets{' + contradiction' if _contra else ''}).\n{note}")
+            except Exception:
+                pass
+        return events
     trade.update(snap)
     update_trade(trade["id"], **{k: (v if v is not None else 0) if k.startswith(("part_", "rr")) or k == "be_hit" else v
                                  for k, v in snap.items()})
     print(f"[verif] #{trade['id']} {final['name']} REFUSÉ ({tries}) — {note}")
-    if tries == VERIFY_MAX_TRIES:
+    if tries == VERIFY_MAX_TRIES and not get_meta(f"vf_alert_{trade['id']}", 0):
+        set_meta(f"vf_alert_{trade['id']}", 1)
         to_admin(f"⚠️ <b>{trade['symbol']} #{trade['id']}</b> : résultat <b>{final['name']}</b> non confirmé après "
                  f"{tries} contrôles — rien envoyé au groupe, le trade reste ouvert.\n{note}")
     return [e for e in events if e["name"] not in ("TP", "SL", "BE")]
