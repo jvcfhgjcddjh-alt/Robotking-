@@ -2,6 +2,7 @@
 
 
 
+
 #!/usr/bin/env python3
 """AlphaBot BOS + CHoCH — Gold & BTC — version en un seul fichier.
 
@@ -2279,6 +2280,17 @@ def set_poc_entry(on):
     set_setting("poc_entry", "1" if on else "0")
 
 
+def get_limit_react():
+    """Limit OB / FVG seulement APRÈS RÉACTION (clé « limit_react », bouton du menu Type d'entrée) : OFF par défaut -> comportement
+    inchangé. ON -> `poi_limit_signal` ne produit un signal que si `choch_entry_zone` trouve une zone (OB du sweep ou FVG du CHoCH,
+    la plus proche du prix) ET que `zone_reaction` est vraie (dernière clôture dans la zone + avalement / pin bar)."""
+    return _get_bool_setting("limit_react", False)
+
+
+def set_limit_react(on):
+    set_setting("limit_react", "1" if on else "0")
+
+
 def get_entry_direct():
     """Entrée directe (marché) active ? Dernier choix Telegram, sinon ENTRY_DIRECT."""
     return _get_bool_setting("entry_direct", ENTRY_DIRECT)
@@ -3921,6 +3933,18 @@ def poi_limit_signal(c, ev, symbol, tp_rr, be_rr, base, sl_anchor=None, apply_tp
     Retourne (signal | None, motif_de_refus | None)."""
     d, a, i = ev["dir"], ev["atr"], ev["i"]
     cur = c[i]["c"]
+    if get_limit_react():   # OFF par défaut. ON : seulement après réaction sur l'OB du sweep / le FVG du CHoCH (le POC proxy n'est pas utilisé)
+        zone_kind = get_limit_zone()
+        z = choch_entry_zone(c, ev, c[-1]["c"], kinds=None if zone_kind == "BOTH" else (zone_kind,))
+        if not z:
+            return None, f"aucun {'OB / FVG' if zone_kind == 'BOTH' else zone_kind} valable (non mitigé) créé par ce CHoCH"
+        pattern = zone_reaction(c, z, d)
+        if not pattern:
+            return None, f"pas de réaction (avalement / pin bar) dans l'{z['kind']} : signal non envoyé"
+        w = z["hi"] - z["lo"]
+        entry = (z["hi"] if d == 1 else z["lo"]) - d * POI_LIMIT_DEPTH * w   # même entrée que le limit habituel : bord proche de la zone retenue
+        p = {"kind": z["kind"], "tf": TIMEFRAME_MIN, "d": d, "lo": z["lo"], "hi": z["hi"], "f": i, "t_valid": c[i]["t"]}
+        return _poi_limit_build(c, ev, symbol, tp_rr, be_rr, base, sl_anchor, apply_tp, p, entry, react=pattern)
     try:
         pois = [p for p in find_pois(c[:i + 1], TIMEFRAME_MIN, d) if p["f"] > ev["src"]]
     except Exception as e:
@@ -3949,6 +3973,14 @@ def poi_limit_signal(c, ev, symbol, tp_rr, be_rr, base, sl_anchor=None, apply_tp
     if not cands:
         return None, "prix déjà dans la zone (ou le POC), ou zone trop éloignée : pas d'ordre limit"
     _, entry, p = min(cands, key=lambda x: x[0])
+    return _poi_limit_build(c, ev, symbol, tp_rr, be_rr, base, sl_anchor, apply_tp, p, entry)
+
+
+def _poi_limit_build(c, ev, symbol, tp_rr, be_rr, base, sl_anchor, apply_tp, p, entry, react=None):
+    """Signal LIMIT sur la zone `p` à l'entrée `entry` : SL derrière le bord lointain (ou le sweep) + buffer ATR, planchers de risque,
+    TP au RR réglé. `react` = motif de la réaction (mode « limit après réaction »), sinon None. Retourne (signal | None, refus | None)."""
+    d, a, i = ev["dir"], ev["atr"], ev["i"]
+    cur = c[i]["c"]
     dist = sl_anchor if sl_anchor is not None else (p["lo"] if d == 1 else p["hi"])   # bord lointain de la zone (CRT : le sweep)
     sl = dist - d * SL_BUFFER_ATR * a
     if (d == 1 and sl >= entry) or (d == -1 and sl <= entry):
@@ -3969,6 +4001,8 @@ def poi_limit_signal(c, ev, symbol, tp_rr, be_rr, base, sl_anchor=None, apply_tp
         "rr": tp_rr, "be_rr": be_rr, "tf": TF_LABEL,
         "key_suffix": "poi", "zone": p,   # signal_key distinct de l'entrée directe ; zone d'entrée affichée dans le message
     }
+    if react:
+        sig["zone_react"] = react   # réaction confirmée (avalement / pin bar) : affichée dans le message
     sig.update(base)
     # liquidité : affichage seulement, comme pour l'entrée directe
     sig["ext"], sig["sweep"] = liquidity_reading(symbol, c, ev, entry) if symbol else (None, None)
@@ -4093,6 +4127,59 @@ def choch_fvg(c, ev, dec=5):
         state = "non mitigé" if m is None or m < lo else ("mitigé" if m >= hi else "partiel")
     return {"ok": state != "mitigé", "state": state, "zone": (lo, hi),
             "txt": f"FVG {lo:.{dec}f}-{hi:.{dec}f} {state}"}
+
+
+def choch_entry_zone(c, ev, price, dec=5, kinds=None):
+    """Zone d'ENTRÉE d'un CHoCH `ev` : la plus proche de `price` entre l'OB qui a fait le sweep et le FVG de `choch_fvg`.
+
+    Fonction pure : ne lit ni la base ni les réglages, ne décide d'aucun signal, n'est branchée nulle part (voir `zone_reaction`
+    pour exiger la réaction). Réutilise `_turn_index` (point de retournement) et `_sweep_at` (balayage de liquidité).
+      - OB : seulement si le point de retournement a bien balayé de la liquidité (`_sweep_at`). C'est alors la dernière bougie
+        de couleur OPPOSÉE au sens du CHoCH (baissière si haussier, haussière si baissier), en partant du point de retournement
+        et en remontant d'au plus SWEEP_LOOKBACK bougies. Zone = mèche à mèche de cette bougie.
+      - FVG : celui de `choch_fvg`.
+    Chaque zone est jugée comme `choch_fvg` (« non mitigé » / « partiel » / « mitigé », sur les bougies APRÈS le retournement) ; une
+    zone « mitigée » (traversée de part en part) est écartée, « partiel » reste valable (c'est l'état d'une zone en cours de test).
+    Retourne {"kind": "OB" | "FVG", "lo": float, "hi": float} pour la zone dont le BORD est le plus proche de `price`
+    (0 si le prix est dans la zone ; égalité -> OB), ou None si aucune zone n'est valable.
+    `kinds` (optionnel) : ne garde que ces types, ex. ("OB",) ; None = les deux."""
+    d = ev["dir"]
+    e = _turn_index(c, ev)
+    zones = []
+    if _sweep_at(c, e, d)[1]:
+        k = next((j for j in range(e, max(-1, e - SWEEP_LOOKBACK - 1), -1) if (c[j]["c"] - c[j]["o"]) * d < 0), None)
+        if k is not None:
+            lo, hi = c[k]["l"], c[k]["h"]
+            later = c[e + 1:]
+            if d == 1:    # zone de demande : mitigée quand le prix REDESCEND de part en part
+                m = min((x["l"] for x in later), default=None)
+                mitigated = m is not None and m <= lo
+            else:         # zone d'offre : mitigée quand le prix REMONTE de part en part
+                m = max((x["h"] for x in later), default=None)
+                mitigated = m is not None and m >= hi
+            if not mitigated:
+                zones.append({"kind": "OB", "lo": lo, "hi": hi})
+    fvg = choch_fvg(c, ev, dec)
+    if fvg.get("ok") and fvg.get("zone"):
+        zones.append({"kind": "FVG", "lo": fvg["zone"][0], "hi": fvg["zone"][1]})
+    if kinds:
+        zones = [z for z in zones if z["kind"] in kinds]
+    if not zones:
+        return None
+    return min(zones, key=lambda z: 0.0 if z["lo"] <= price <= z["hi"] else min(abs(price - z["lo"]), abs(price - z["hi"])))
+
+
+def zone_reaction(candles, zone, d):
+    """Réaction du prix sur une zone d'entrée (celle de `choch_entry_zone`) : la DERNIÈRE bougie clôturée doit avoir sa clôture
+    DANS la zone (`zone` = {"lo", "hi", ...}) et être un rejet dans le sens du trade `d` (1 = achat, -1 = vente) : avalement ou
+    pin bar, comme `QMLG_DIRECT_PATTERNS` (le doji ne valide pas). Réutilise `qmlg_rejection`.
+    Fonction pure, branchée nulle part. Retourne le motif ("ENGULFING" | "PIN_BAR") ou None."""
+    if not candles or not zone:
+        return None
+    if not (zone["lo"] <= candles[-1]["c"] <= zone["hi"]):
+        return None
+    pattern = qmlg_rejection(candles, d == 1)
+    return pattern if pattern in QMLG_DIRECT_PATTERNS else None
 
 
 def poc_proxy(c, ev, bins=None):
@@ -6162,6 +6249,9 @@ def _limit_cancel_level(sig):
     return sig["entry"] + side * LIMIT_CANCEL_RR * sig["risk"]
 
 
+_REACT_FR = {"ENGULFING": "avalement", "PIN_BAR": "pin bar"}
+
+
 def _exec_block(sig, dec):
     """(texte d'exécution, libellé + valeur de l'entrée) — DIRECT ou LIMIT, toujours explicite."""
     if sig.get("order") == "LIMIT":
@@ -6170,8 +6260,12 @@ def _exec_block(sig, dec):
         mins = LIMIT_EXPIRY_CANDLES * TF_SEC // 60
         z = sig.get("zone")
         zone = f"\n📍 Zone d'entrée : {_poi_txt(z, dec)}" if z else ""
+        react = sig.get("zone_react")
+        if react:   # limit après réaction : le prix est déjà dans la zone, rien à attendre avant de placer l'ordre
+            zone += f"\n✅ Réaction confirmée : {_REACT_FR.get(react, react)} sur {z['kind'] if z else 'la zone'}"
+        wait = "" if react else ", puis attends le retour du prix"
         txt = (f"⏳ <b>{sig['side']} LIMIT</b> — <b>N'ENTRE PAS MAINTENANT</b>\n"
-               f"Place un ordre limit à {_fmt(sig['entry'], dec)}{now}, puis attends le retour du prix.{zone}\n"
+               f"Place un ordre limit à {_fmt(sig['entry'], dec)}{now}{wait}.{zone}\n"
                f"❌ Annulé si le prix atteint {_fmt(_limit_cancel_level(sig), dec)} sans toucher la limit, "
                f"ou après {mins} min : je te préviens.")
         return txt, f"Entrée (limit) : <b>{_fmt(sig['entry'], dec)}</b>"
@@ -6527,6 +6621,8 @@ def _signal_entry_text():
             f"🎯 POC proxy : {'ON' if get_poc_entry() else 'OFF'} — niveau d'entrée limit SUPPLÉMENTAIRE (jamais obligatoire "
             f"en plus de l'OB/FVG), calculé uniquement sur la jambe impulsive du CHoCH (paliers de prix les plus "
             f"traversés, sans volume réel — voir /pocinfo). OFF = comportement inchangé (limit sur OB/FVG seul).\n"
+            f"🔎 Limit après réaction : {'ON' if get_limit_react() else 'OFF'} — le limit OB/FVG ne part que si le prix a réagi dans la zone "
+            f"(dernière clôture dans l'OB du sweep ou le FVG du CHoCH, avec avalement ou pin bar). OFF = comportement inchangé.\n"
             f"Effet immédiat sur les NOUVEAUX signaux. Aussi : /entree direct | limit | both · /zone ob|fvg|both")
 
 
@@ -6535,7 +6631,8 @@ def _signal_entry_keyboard():
     return _signal_back([
         [_btn("⚡ Entrée directe", "sentd", d), _btn("⏳ Ordre limit", "sentl", l)],
         [_btn(f"Zone {k}", f"szone:{k}", get_limit_zone() == k) for k in LIMIT_ZONES],
-        [_btn("🎯 POC proxy", "sentpoc", get_poc_entry())]])
+        [_btn("🎯 POC proxy", "sentpoc", get_poc_entry())],
+        [_btn("🔎 Limit après réaction", "sentreact", get_limit_react())]])
 
 
 def _syms_txt():
@@ -6589,7 +6686,7 @@ def _signal_keyboard():
         [{"text": "⛓ SÉQUENCE SETUP50", "callback_data": "sig:seq"}],
         [{"text": "📥 ENTRÉE", "callback_data": "sig:entry"}, {"text": "🛡 SL / 🎯 TP", "callback_data": "sig:sltp"}],
         [{"text": "🧩 STRATÉGIES (CRT)", "callback_data": "sig:strat"}, {"text": "🕐 SESSION", "callback_data": "sig:sess"}],
-        [{"text": "⏸ PAUSE APRÈS SL", "callback_data": "sig:pause"}],
+        [{"text": "⏸ PAUSE APRÈS SL", "callback_data": "sig:pause"}, {"text": "🏁 OBJECTIF / DD", "callback_data": "sig:obj"}],
         [{"text": "🔬 FILTRES QUALITÉ", "callback_data": "sig:qf"}, {"text": "🌍 ACTIFS", "callback_data": "sig:sym"}],
         [{"text": "⚙️ QML", "callback_data": "qml:home"}, {"text": "⚙️ FIBTREND", "callback_data": "ft:home"}],
         [{"text": "⚙️ VRAI CRT", "callback_data": "vcrt:home"}],
@@ -7183,6 +7280,7 @@ def handle_command(text):
                "/signal — paramètres du signal (RR, timeframe, filtre HTF, BE, signaux max)\n"
                "/be [RR] — RR auquel le SL passe à l'entrée (ex. /be 1)\n"
                "/maxpos [n] — signaux ouverts max par actif (1 = pas de doublon)\n"
+               "/objectif [obj|dd|serie] [valeur|off] — objectif du jour en R, drawdown max, pertes consécutives\n"
                "/entree [direct|limit|both] — type d'entrée : direct, limit sur OB/FVG, ou les deux\n"
                "/session [all|londres|ny|both] — n'accepter que les CHoCH d'une session · /zone [ob|fvg|both] — zone du limit\n"
                "/modesl [struct|zone|sweep] — SL de l'entrée directe · /modetp [rr|target|swing] — mode du TP\n"
@@ -7419,6 +7517,22 @@ def handle_command(text):
             else:
                 return ("Valeur invalide. Exemples : /strategie main | crt | both  ·  /crt on|off|h1|h4|d1|range|mid|rr", None)
         return (_signal_strat_text(), _signal_strat_keyboard())
+    if cmd in ("/objectif", "/objective"):
+        if len(parts) > 1:
+            a = parts[1].lower()
+            try:
+                if a == "off":
+                    for c in "ods":
+                        _obj_set(c, 0)
+                elif a in ("obj", "dd", "serie") and len(parts) > 2:
+                    v = 0.0 if parts[2].lower() == "off" else float(parts[2].replace(",", "."))
+                    if not _obj_set({"obj": "o", "dd": "d", "serie": "s"}[a], v):
+                        raise ValueError
+                else:
+                    raise ValueError
+            except ValueError:
+                return ("Exemples : /objectif obj 3 (objectif +3R) · /objectif dd 2 (perte max 2R) · /objectif serie 3 · /objectif off", None)
+        return (_obj_text(), _obj_keyboard())
     if cmd in ("/maxpos", "/signauxmax"):
         if len(parts) > 1:
             try:
@@ -7623,6 +7737,8 @@ def _handle_update(u):
                 _edit(cq, _signal_be_text(), _signal_be_keyboard())
             elif page == "max":
                 _edit(cq, _signal_max_text(), _signal_max_keyboard())
+            elif page == "obj":
+                _edit(cq, _obj_text(), _obj_keyboard())
             elif page == "fib":
                 _edit(cq, _signal_fib_text(), _signal_fib_keyboard())
             elif page == "m15imp":
@@ -7734,6 +7850,10 @@ def _handle_update(u):
             set_poc_entry(not get_poc_entry())
             _edit(cq, _signal_entry_text(), _signal_entry_keyboard())
             ack = "POC proxy : " + ("ON" if get_poc_entry() else "OFF")
+        elif data == "sentreact":
+            set_limit_react(not get_limit_react())
+            _edit(cq, _signal_entry_text(), _signal_entry_keyboard())
+            ack = "Limit après réaction : " + ("ON" if get_limit_react() else "OFF")
         elif data.startswith("sent:"):
             arg = data[5:]
             modes = {"direct": (True, False), "limit": (False, True), "both": (True, True)}
@@ -7845,6 +7965,14 @@ def _handle_update(u):
                 set_be_rr(v)
                 _edit(cq, _signal_text(), _signal_keyboard())
                 ack = f"BE à RR{v:g}"
+        elif data.startswith("sobj:"):
+            try:
+                _, code, val = data.split(":")
+                if code != "noop" and _obj_set(code, float(val)):
+                    ack = "Enregistré"
+            except ValueError:
+                pass
+            _edit(cq, _obj_text(), _obj_keyboard())
         elif data.startswith("smax:"):
             n = int(data[5:])
             if n in MAX_POSITIONS_CHOICES:
@@ -8634,6 +8762,157 @@ def mm_command(args):
     return mm_status_text()
 
 
+# --- ISOLATION DES STRATÉGIES + PLAFOND JOURNALIER ---------------------------------------------------------------------------
+MAX_SIGNALS_DAY = _env_int("MAX_SIGNALS_DAY", 10)   # nouveaux signaux max par jour (UTC), toutes stratégies ; 0 = pas de plafond ; réglage « max_signals_day » prioritaire
+
+
+def get_max_signals_day():
+    try:
+        return max(0, int(float(get_setting("max_signals_day", MAX_SIGNALS_DAY))))
+    except (TypeError, ValueError):
+        return max(0, MAX_SIGNALS_DAY)
+
+
+def strategy_family(x):
+    """Famille de stratégie d'un signal (dict `sig`) ou d'un trade (ligne de la table) : QMLG / QML / VCRT / CRT / FIBTREND / MANUAL / MAIN
+    (BOS-CHoCH, machine à états, limit OB/FVG). Lecture seule."""
+    typ = str(x.get("type") or x.get("kind") or "")
+    suf = str(x.get("key_suffix") or "")
+    if not suf and x.get("signal_key"):
+        suf = (str(x["signal_key"]).split(":") + ["", "", "", ""])[3]
+    if typ == "QMLG":
+        return "QMLG"
+    if typ == "QML" or suf == "qml":
+        return "QML"
+    if typ == "VCRT" or suf == "vcrt" or x.get("strategy") == "VCRT":
+        return "VCRT"
+    if suf in ("crt", "crtpoi") or x.get("strategy") == "CRT":
+        return "CRT"
+    if typ == "FIBTREND" or suf == "ft":
+        return "FIBTREND"
+    if typ == "MANUAL":
+        return "MANUAL"
+    return "MAIN"
+
+
+# --- OBJECTIF / DRAWDOWN DU JOUR EN R (paramètres Telegram, tous OFF par défaut) -------------------------------------------
+def _num_setting(key, default=0.0):
+    try:
+        return max(0.0, float(str(get_setting(key, default)).replace(",", ".")))
+    except (TypeError, ValueError):
+        return default
+
+
+def get_day_obj_rr():
+    """Objectif du jour en R (0 = OFF) : atteint -> plus de nouveau signal jusqu'à minuit UTC."""
+    return _num_setting("day_obj_rr")
+
+
+def get_day_dd_rr():
+    """Perte max du jour en R (0 = OFF) : atteinte -> plus de nouveau signal jusqu'à minuit UTC."""
+    return _num_setting("day_dd_rr")
+
+
+def get_day_streak():
+    """Pertes consécutives max (0 = OFF) : atteintes -> plus de nouveau signal jusqu'à minuit UTC."""
+    return int(_num_setting("day_streak"))
+
+
+def rr_day_stats():
+    """(somme des R clôturés aujourd'hui UTC, pertes consécutives en cours). Un gain remet la série à 0 ; un BE (~0 R) ne la touche pas."""
+    day0 = now_ts() - now_ts() % 86400
+    rows = _q("SELECT result_r FROM trades WHERE closed_ts>=? AND result_r IS NOT NULL AND kind!='MANUAL' ORDER BY closed_ts, id", (day0,)).fetchall()
+    total, streak = 0.0, 0
+    for r in rows:
+        v = float(r["result_r"])
+        total += v
+        if v < -0.05:
+            streak += 1
+        elif v > 0.05:
+            streak = 0
+    return total, streak
+
+
+def day_limit_reason():
+    """Raison pour laquelle plus aucun NOUVEAU signal ne part aujourd'hui (objectif / drawdown / série atteints), sinon None.
+    Un message admin par jour et par limite. Les trades déjà ouverts restent suivis."""
+    obj, dd, ser = get_day_obj_rr(), get_day_dd_rr(), get_day_streak()
+    if not (obj or dd or ser):
+        return None
+    total, streak = rr_day_stats()
+    why = kind = None
+    if obj and total >= obj:
+        why, kind = f"objectif du jour atteint ({total:+.2f} R ≥ {obj:g} R)", "obj"
+    elif dd and total <= -dd:
+        why, kind = f"drawdown du jour atteint ({total:+.2f} R ≤ −{dd:g} R)", "dd"
+    elif ser and streak >= ser:
+        why, kind = f"{streak} pertes consécutives (limite {ser})", "serie"
+    if why:
+        nkey = f"rrday_notify:{now_ts() - now_ts() % 86400}:{kind}"
+        if not get_meta(nkey):
+            set_meta(nkey, 1)
+            to_admin(f"🏁 <b>Limite du jour</b> : {why}.\nPlus aucun nouveau signal jusqu'à minuit UTC (les trades ouverts restent suivis).")
+    return why
+
+
+def _obj_text():
+    total, streak = rr_day_stats()
+    f = lambda v, u: f"{v:g} {u}" if v else "OFF"
+    return (f"🏁 <b>Objectif / limites du jour</b>\n"
+            f"🎯 Objectif : <b>{f(get_day_obj_rr(), 'R')}</b>\n"
+            f"📉 Drawdown max : <b>{f(get_day_dd_rr(), 'R')}</b>\n"
+            f"🔁 Pertes consécutives : <b>{f(get_day_streak(), '')}</b>\n\n"
+            f"Aujourd'hui (UTC) : {total:+.2f} R · série de pertes {streak}\n"
+            f"Limite atteinte = plus aucun nouveau signal jusqu'à minuit UTC ; les trades ouverts restent suivis.\n"
+            f"Commande : /objectif obj 3 · /objectif dd 2 · /objectif serie 3 · /objectif off")
+
+
+def _obj_keyboard():
+    def row(lbl, code, cur, vals):
+        return [{"text": lbl, "callback_data": "sobj:noop"}] + [
+            {"text": ("✅ " if abs(cur - v) < 1e-9 else "") + (f"{v:g}" if v else "OFF"), "callback_data": f"sobj:{code}:{v:g}"} for v in vals]
+    return _signal_back([row("🎯 Objectif R", "o", get_day_obj_rr(), (0, 2, 3, 5)),
+                         row("📉 DD max R", "d", get_day_dd_rr(), (0, 1, 2, 3)),
+                         row("🔁 Série", "s", get_day_streak(), (0, 2, 3, 4))])
+
+
+def _obj_set(code, v):
+    key = {"o": "day_obj_rr", "d": "day_dd_rr", "s": "day_streak"}.get(code)
+    if key and 0 <= v <= 100:
+        set_setting(key, v)
+        return True
+    return False
+
+
+def strategy_block_reason(symbol, sig, companion=False):
+    """Raison de refus d'un NOUVEAU signal (ou None) :
+    1) QML GAGNANT ON = stratégie EXCLUSIVE : aucun signal d'une autre stratégie (CRT, VRAI CRT, FIBTREND, QML, BOS/CHoCH) ne part ;
+    2) jamais deux stratégies différentes ouvertes en même temps sur un actif (le « doublon CRT » voulu BOS/CHoCH + CRT reste permis s'il est ON) ;
+    3) plafond de nouveaux signaux par jour (MAX_SIGNALS_DAY) : filet anti-rafale. Le suivi des trades déjà ouverts n'est jamais touché."""
+    fam = strategy_family(sig)
+    if fam == "MANUAL":
+        return None
+    if get_qmlg_on() and fam != "QMLG":
+        return f"QML GAGNANT est actif : seule cette stratégie envoie des signaux ({fam} ignoré)"
+    if companion:
+        return None
+    lim = day_limit_reason()   # objectif / drawdown / série du jour (paramètres « 🏁 Objectif »)
+    if lim:
+        return lim
+    ok_mix = {"MAIN", "CRT"} if get_crt_dup() else set()
+    for r in _q("SELECT kind, signal_key FROM trades WHERE symbol=? AND status IN ('OPEN','PENDING','EXECUTING')", (symbol,)).fetchall():
+        other = strategy_family(dict(r))
+        if other not in (fam, "MANUAL") and not ({fam, other} <= ok_mix):
+            return f"une position {other} est déjà ouverte sur {symbol} : pas de mélange avec {fam}"
+    cap = get_max_signals_day()
+    if cap:
+        day0 = now_ts() - now_ts() % 86400
+        n = _q("SELECT COUNT(*) n FROM trades WHERE opened_ts>=? AND kind!='MANUAL'", (day0,)).fetchone()["n"]
+        if n >= cap:
+            return f"plafond de {cap} signaux par jour atteint ({n} déjà ouverts aujourd'hui)"
+    return None
+
+
 def publish_signal(symbol, candles, events, sig, companion=False):
     """Enregistre le trade puis envoie : signal (+ image) au groupe, lot en privé à l'admin.
     `companion` : 2e ordre du même CHoCH (limit OB/FVG à côté de l'entrée directe) -> ne compte pas dans « signaux max ».
@@ -8643,6 +8922,10 @@ def publish_signal(symbol, candles, events, sig, companion=False):
     if signal_exists(key):
         return False
     if not get_bot_on():   # bot arrêté depuis Telegram : aucun nouveau signal (le suivi des positions continue)
+        return False
+    st_why = strategy_block_reason(symbol, sig, companion)   # exclusivité QML GAGNANT, pas de mélange de stratégies, plafond du jour
+    if st_why:
+        print(f"[{symbol}] {sig['side']} {sig['type']} ignoré : {st_why}")
         return False
     mm_why = mm_block_reason(companion)   # /mm : objectif / perte du jour, limites de trades (module OFF -> None)
     if mm_why:
@@ -10048,6 +10331,92 @@ class TestSignauxSimultanes(unittest.TestCase):
             _E._q("DELETE FROM trades", commit=True)
             _E._q("DELETE FROM settings WHERE key='max_positions'", commit=True)
 
+    def test_exclusivite_et_pas_de_melange(self):
+        sent = []
+        saved = (_E._deliver_signal, _E.make_chart)
+        _E._q("DELETE FROM trades", commit=True)
+        try:
+            _E._deliver_signal = lambda trade_id, symbol, admin_txt, group_txt, **k: sent.append(trade_id)
+            _E.make_chart = lambda *a, **k: None
+            self.assertEqual(_E.strategy_family({"type": "CHOCH1", "key_suffix": "crt"}), "CRT")
+            self.assertEqual(_E.strategy_family({"kind": "CHOCH1", "signal_key": "XAUUSD:M5:100:crtpoi"}), "CRT")
+            self.assertEqual(_E.strategy_family({"kind": "VCRT", "signal_key": "XAUUSD:M5:100:vcrt"}), "VCRT")
+            self.assertEqual(_E.strategy_family({"kind": "QMLG", "signal_key": "QMLG:k:1"}), "QMLG")
+            self.assertEqual(_E.strategy_family({"type": "CHOCH1"}), "MAIN")
+            _E.handle_command("/maxpos 5")
+            _E.set_setting("max_signals_day", 100)
+            _E.publish_signal("XAUUSD", [], [], dict(self._sig(1000), key_suffix="crt"))
+            self.assertEqual(len(sent), 1)
+            _E.publish_signal("XAUUSD", [], [], self._sig(1060))   # BOS/CHoCH par-dessus un CRT ouvert : refusé (max = 5 n'y change rien)
+            self.assertEqual(len(sent), 1, "pas de mélange de stratégies sur un actif")
+            _E.publish_signal("XAUUSD", [], [], dict(self._sig(1120), key_suffix="crt"))   # même stratégie : permis
+            self.assertEqual(len(sent), 2)
+            _E.set_setting("qmlg_on", "1")   # QML GAGNANT ON = exclusif
+            _E.publish_signal("BTCUSD", [], [], self._sig(1000))
+            _E.publish_signal("BTCUSD", [], [], dict(self._sig(1060), type="VCRT", key_suffix="vcrt"))
+            self.assertEqual(len(sent), 2, "QML GAGNANT ON : aucun signal d'une autre stratégie")
+            _E.set_setting("qmlg_on", "0")
+            _E.set_setting("max_signals_day", 2)   # plafond du jour : 2 déjà ouverts
+            _E.publish_signal("BTCUSD", [], [], self._sig(1180))
+            self.assertEqual(len(sent), 2, "plafond journalier atteint")
+            _E.set_setting("max_signals_day", 0)    # 0 = pas de plafond
+            _E.publish_signal("BTCUSD", [], [], self._sig(1240))
+            self.assertEqual(len(sent), 3)
+        finally:
+            _E._deliver_signal, _E.make_chart = saved
+            _E._q("DELETE FROM trades", commit=True)
+            for k in ("max_positions", "max_signals_day", "qmlg_on"):
+                _E._q("DELETE FROM settings WHERE key=?", (k,), commit=True)
+
+    def test_objectif_drawdown_serie_du_jour(self):
+        sent = []
+        saved = (_E._deliver_signal, _E.make_chart, _E.to_admin)
+        _E._q("DELETE FROM trades", commit=True)
+        day0 = _E.now_ts() - _E.now_ts() % 86400
+        def closed(k, r):
+            _E._q("INSERT INTO trades(signal_key,symbol,side,kind,status,opened_ts,closed_ts,result_r) VALUES(?,?,?,?,?,?,?,?)",
+                  (f"Z:{k}", "EURUSD", "BUY", "CHOCH1", "CLOSED", day0 + k, day0 + k + 1, r), commit=True)
+        try:
+            _E._deliver_signal = lambda trade_id, symbol, admin_txt, group_txt, **k: sent.append(trade_id)
+            _E.make_chart = lambda *a, **k: None
+            _E.to_admin = lambda *a, **k: None
+            _E.set_setting("max_signals_day", 0)
+            for k in ("day_obj_rr", "day_dd_rr", "day_streak"):
+                _E._q("DELETE FROM settings WHERE key=?", (k,), commit=True)
+            self.assertEqual((_E.get_day_obj_rr(), _E.get_day_dd_rr(), _E.get_day_streak()), (0, 0, 0), "OFF par défaut")
+            closed(1, 2.0)
+            _E.publish_signal("XAUUSD", [], [], self._sig(1000))
+            self.assertEqual(len(sent), 1, "limites OFF : rien ne change")
+            _E._q("DELETE FROM trades WHERE symbol='XAUUSD'", commit=True)
+            _E.handle_command("/objectif obj 2")
+            _E.publish_signal("XAUUSD", [], [], self._sig(1060))
+            self.assertEqual(len(sent), 1, "objectif +2R atteint : plus de signal")
+            _E.handle_command("/objectif off")
+            _E.handle_command("/objectif dd 3")
+            closed(2, -1.0); closed(3, -1.0); closed(4, -1.5)   # total 2 - 3.5 = -1.5 R : DD pas encore atteint
+            _E.publish_signal("XAUUSD", [], [], self._sig(1120))
+            self.assertEqual(len(sent), 2)
+            _E._q("DELETE FROM trades WHERE symbol='XAUUSD'", commit=True)
+            closed(5, -1.6)                                      # -1.5 + -1.6 = -3.1 R <= -3 : drawdown atteint
+            _E.publish_signal("XAUUSD", [], [], self._sig(1180))
+            self.assertEqual(len(sent), 2, "drawdown du jour atteint")
+            _E.handle_command("/objectif off"); _E.handle_command("/objectif serie 3")
+            _E._q("DELETE FROM trades", commit=True)
+            closed(1, -1.0); closed(2, -1.0); closed(3, 0.0)    # BE ne casse pas la série : 2 pertes
+            self.assertEqual(_E.rr_day_stats()[1], 2)
+            _E.publish_signal("XAUUSD", [], [], self._sig(1240))
+            self.assertEqual(len(sent), 3)
+            closed(4, -1.0)
+            _E.publish_signal("BTCUSD", [], [], self._sig(1300))
+            self.assertEqual(len(sent), 3, "3 pertes consécutives : stop")
+            self.assertIn("sobj:o:3", str(_E._obj_keyboard()))
+            self.assertIn("sig:obj", str(_E._signal_keyboard()))
+        finally:
+            _E._deliver_signal, _E.make_chart, _E.to_admin = saved
+            _E._q("DELETE FROM trades", commit=True)
+            for k in ("day_obj_rr", "day_dd_rr", "day_streak", "max_signals_day"):
+                _E._q("DELETE FROM settings WHERE key=?", (k,), commit=True)
+
     def test_menu_htf(self):
         kb = str(_E._signal_htf_keyboard())
         for cb in ("shtf:M15", "shtf:FULL", "shtf:OFF"):
@@ -10541,6 +10910,147 @@ class TestFiltresQualite(unittest.TestCase):
         self.assertEqual(r["state"], "non mitigé")
         r = _E.choch_fvg(self._c(rows + [(101.8, 101.9, 99.7, 100.0)]), self._ev(3, d=1, level=99.0))
         self.assertEqual(r["state"], "partiel")
+
+    # --- choch_entry_zone : OB du sweep ou FVG du CHoCH, le plus proche du prix --------------------------------------------
+    _EZ = [(99.8, 100.2, 99.6, 100.0), (100.0, 100.4, 99.8, 100.2), (100.2, 100.5, 100.0, 100.3),   # 0-2 : bougies avant (2 = OB)
+           (100.3, 101.5, 99.8, 99.9),                                                              # 3 : balayage au-dessus de 100.5
+           (99.9, 99.95, 98.9, 99.0), (99.0, 99.1, 98.0, 98.2)]                                     # 4-5 : jambe (CHoCH = 5), FVG 99.1-99.8
+
+    @staticmethod
+    def _miroir(rows):
+        return [(200 - o, 200 - l, 200 - h, 200 - cl) for (o, h, l, cl) in rows]
+
+    def test_entry_zone_baissier_ob_et_fvg_le_plus_proche(self):
+        c, ev = self._c(self._EZ), self._ev(5, d=-1, src=1)
+        r = _E.choch_entry_zone(c, ev, 98.2)                       # sous les deux zones : le FVG (99.1) est plus proche que l'OB (100.0)
+        self.assertEqual(set(r), {"kind", "lo", "hi"})
+        self.assertEqual(r["kind"], "FVG")
+        self.assertAlmostEqual(r["lo"], 99.1); self.assertAlmostEqual(r["hi"], 99.8)
+        r = _E.choch_entry_zone(c, ev, 100.4)                      # dans l'OB
+        self.assertEqual(r["kind"], "OB")
+        self.assertAlmostEqual(r["lo"], 100.0); self.assertAlmostEqual(r["hi"], 100.5)
+
+    def test_entry_zone_haussier_symetrique(self):
+        c, ev = self._c(self._miroir(self._EZ)), self._ev(5, d=1, src=1, level=99.0)
+        r = _E.choch_entry_zone(c, ev, 201.8)
+        self.assertEqual(r["kind"], "FVG")
+        self.assertAlmostEqual(r["lo"], 200 - 99.8); self.assertAlmostEqual(r["hi"], 200 - 99.1)
+        r = _E.choch_entry_zone(c, ev, 99.6)
+        self.assertEqual(r["kind"], "OB")
+        self.assertAlmostEqual(r["lo"], 200 - 100.5); self.assertAlmostEqual(r["hi"], 200 - 100.0)
+
+    def test_entry_zone_ob_seul_fvg_seul_et_rien(self):
+        sans_fvg = self._EZ[:5] + [(99.0, 99.9, 98.0, 98.2)]        # la bougie 5 comble l'écart : plus de FVG
+        r = _E.choch_entry_zone(self._c(sans_fvg), self._ev(5, d=-1, src=1), 98.2)
+        self.assertEqual(r["kind"], "OB")
+        base = [(102, 103, 101, 101.5), (101.5, 101.6, 99.0, 99.2), (99.2, 99.6, 98.6, 98.8), (98.8, 98.9, 98.0, 98.1)]
+        r = _E.choch_entry_zone(self._c(base), self._ev(3), 99.0)   # aucun balayage (rien avant le retournement) : FVG seul
+        self.assertEqual(r["kind"], "FVG")
+        self.assertAlmostEqual(r["lo"], 99.6); self.assertAlmostEqual(r["hi"], 101.0)
+        rien = [(102, 103, 101, 101.5), (101.5, 101.6, 100.0, 100.2), (100.2, 101.2, 99.5, 99.7), (99.7, 100.5, 99.0, 99.2)]
+        self.assertIsNone(_E.choch_entry_zone(self._c(rien), self._ev(3), 99.0))
+
+    def test_entry_zone_ecarte_les_zones_mitigees(self):
+        ev = self._ev(5, d=-1, src=1)
+        r = _E.choch_entry_zone(self._c(self._EZ + [(98.2, 99.9, 98.1, 99.5)]), ev, 99.5)    # le FVG est traversé, l'OB reste
+        self.assertEqual(r["kind"], "OB")
+        r = _E.choch_entry_zone(self._c(self._EZ + [(98.2, 100.6, 98.1, 100.4)]), ev, 100.4)  # tout est traversé
+        self.assertIsNone(r)
+
+    # --- zone_reaction : dernière clôture dans la zone + avalement / pin bar dans le bon sens -------------------------------
+    def test_zone_reaction(self):
+        zone = {"kind": "OB", "lo": 99.0, "hi": 101.0}
+        eng = self._c([(100.5, 100.6, 99.8, 100.0), (99.9, 100.8, 99.8, 100.7)])       # avalement haussier, clôture 100.7 dans la zone
+        pin = self._c([(100.0, 100.6, 99.9, 100.5), (100.3, 100.5, 99.2, 100.4)])      # longue mèche basse, petit corps
+        doji = self._c([(100.0, 100.6, 99.9, 100.5), (100.0, 100.5, 99.5, 100.05)])    # doji : ne valide pas
+        self.assertEqual(_E.zone_reaction(eng, zone, 1), "ENGULFING")
+        self.assertEqual(_E.zone_reaction(pin, zone, 1), "PIN_BAR")
+        self.assertIsNone(_E.zone_reaction(doji, zone, 1))
+        self.assertIsNone(_E.zone_reaction(eng, zone, -1), "mauvais sens : un avalement haussier ne valide pas une vente")
+        self.assertIsNone(_E.zone_reaction(eng, {"lo": 101.5, "hi": 102.0}, 1), "clôture hors de la zone")
+        self.assertIsNone(_E.zone_reaction([], zone, 1))
+        self.assertIsNone(_E.zone_reaction(eng, None, 1))
+        zone_v = {"kind": "FVG", "lo": 200 - 101.0, "hi": 200 - 99.0}                  # symétrique : vente
+        self.assertEqual(_E.zone_reaction(self._c(self._miroir([(100.5, 100.6, 99.8, 100.0), (99.9, 100.8, 99.8, 100.7)])), zone_v, -1), "ENGULFING")
+        self.assertEqual(_E.zone_reaction(self._c(self._miroir([(100.0, 100.6, 99.9, 100.5), (100.3, 100.5, 99.2, 100.4)])), zone_v, -1), "PIN_BAR")
+
+    # --- limit POI « après réaction » (réglage limit_react, OFF par défaut) ----------------------------------------------------
+    def _react_ctx(self, rows=None):
+        """Scénario haussier de TestQmlGagnantZoneObFvg (OB 99.5-100.0, FVG 100.2-100.9) + repli + pin bar de réaction dans le FVG."""
+        base = self._miroir(self._EZ) + [(101.8, 101.85, 100.65, 100.7), (100.55, 100.65, 100.25, 100.6)]
+        return self._c(base if rows is None else rows), self._ev(5, d=1, src=1, level=99.0)
+
+    def _avec_reglages(self, **kw):
+        old = {k: _E.get_setting(k) for k in kw}
+        for k, v in kw.items():
+            _E.set_setting(k, v)
+        return old
+
+    def _restaure(self, old):
+        for k, v in old.items():
+            if v is None:
+                _E._q("DELETE FROM settings WHERE key=?", (k,), commit=True)
+            else:
+                _E.set_setting(k, v)
+
+    def test_limit_react_off_par_defaut_et_menu(self):
+        old = {k: _E.get_setting(k) for k in ("limit_react",)}
+        _E._q("DELETE FROM settings WHERE key='limit_react'", commit=True)
+        try:
+            self.assertFalse(_E.get_limit_react(), "OFF par défaut")
+            self.assertIn("sentreact", str(_E._signal_entry_keyboard()))
+            self.assertIn("Limit après réaction", _E._signal_entry_text())
+            _E.set_limit_react(True)
+            self.assertTrue(_E.get_limit_react())
+            _E.set_limit_react(False)
+            self.assertFalse(_E.get_limit_react())
+        finally:
+            self._restaure(old)
+
+    def test_limit_react_signal_sur_la_zone_retenue(self):
+        c, ev = self._react_ctx()
+        old = self._avec_reglages(limit_react="1", limit_zone="BOTH")
+        try:
+            sig, why = _E.poi_limit_signal(c, ev, None, 4.0, 1.0, {})
+        finally:
+            self._restaure(old)
+        self.assertIsNone(why)
+        self.assertEqual((sig["side"], sig["order"], sig["key_suffix"]), ("BUY", "LIMIT", "poi"))
+        self.assertEqual((sig["zone"]["kind"], sig["zone_react"]), ("FVG", "PIN_BAR"))
+        self.assertAlmostEqual(sig["entry"], 100.9, msg="entrée au bord proche de la zone retenue")
+        self.assertLess(sig["sl"], 100.2, "SL derrière le bord lointain de la zone, comme avant")
+        txt = _E._exec_block(sig, 2)[0]
+        self.assertIn("Réaction confirmée : pin bar sur FVG", txt)
+        self.assertIn("FVG bullish", txt, "le type de zone (OB ou FVG) figure dans le message")
+        self.assertNotIn("attends le retour du prix", txt)
+
+    def test_limit_react_refus_sans_reaction_ni_zone(self):
+        old = self._avec_reglages(limit_react="1", limit_zone="BOTH")
+        try:
+            sans, _ = self._react_ctx(self._miroir(self._EZ) + [(101.8, 101.85, 100.65, 100.7)])       # pas de bougie de réaction
+            sig, why = _E.poi_limit_signal(sans, self._ev(5, d=1, src=1, level=99.0), None, 4.0, 1.0, {})
+            self.assertIsNone(sig); self.assertIn("pas de réaction", why)
+            plate, ev = self._react_ctx(self._miroir(self._EZ) + [(101.8, 101.85, 100.65, 100.7), (100.6, 100.9, 100.55, 100.85)])
+            sig, why = _E.poi_limit_signal(plate, ev, None, 4.0, 1.0, {})
+            self.assertIsNone(sig, "dans la zone mais ni avalement ni pin bar")
+            traverse, ev = self._react_ctx(self._miroir(self._EZ) + [(101.8, 101.85, 100.65, 100.7), (100.7, 100.8, 99.2, 99.4)])
+            sig, why = _E.poi_limit_signal(traverse, ev, None, 4.0, 1.0, {})
+            self.assertIsNone(sig); self.assertIn("aucun", why)      # FVG et OB traversés de part en part
+        finally:
+            self._restaure(old)
+
+    def test_limit_react_respecte_le_reglage_zone(self):
+        c, ev = self._react_ctx()
+        self.assertEqual(_E.choch_entry_zone(c, ev, 100.6)["kind"], "FVG")
+        self.assertEqual(_E.choch_entry_zone(c, ev, 100.6, kinds=("OB",))["kind"], "OB")
+        self.assertIsNone(_E.choch_entry_zone(c, ev, 100.6, kinds=("XYZ",)))
+        old = self._avec_reglages(limit_react="1", limit_zone="OB")
+        try:
+            sig, why = _E.poi_limit_signal(c, ev, None, 4.0, 1.0, {})
+        finally:
+            self._restaure(old)
+        self.assertIsNone(sig, "zone OB seule : la réaction a eu lieu dans le FVG, pas dans l'OB")
+        self.assertIn("pas de réaction", why)
 
     def test_ind_entre_prix_et_zone(self):
         rows = [(109, 110, 108, 108.5), (106.0, 106.0, 105.0, 105.2), (105.2, 107.5, 105.1, 107.0),
@@ -11516,6 +12026,32 @@ class TestQmlGagnantHtfEtRegles(unittest.TestCase):
         self.assertIn("Biais H1", _E._qmlg_menu_text())
         self.assertFalse(_E.get_qmlg_htf_on())
 
+    def test_bos_apres_choch_reglage_et_regle(self):
+        old = _E.get_setting("qmlg_bos")
+        try:
+            _E._q("DELETE FROM settings WHERE key=?", ("qmlg_bos",), commit=True)
+            self.assertFalse(_E.get_qmlg_bos_on(), "OFF par défaut")
+            self.assertIn("qmlg:bos", str(_E._qmlg_keyboard()))
+            self.assertIn("BOS après CHoCH", _E._qmlg_menu_text())
+            cs = TestQmlSansLimiteAge._walk(2, n=1500, tf=900)
+            _E.get_candles = lambda symbol, minutes=None, count=None: list(cs)
+            _E.QMLG_AGENTS = False
+            off, _n = _E._qmlg_scan_one("XAUUSD", 15)
+            self.assertTrue(off and not any("bos_apres" in f["validation"]["reasons"] for f in off))
+            _E.set_setting("qmlg_bos", "1")
+            on, _n = _E._qmlg_scan_one("XAUUSD", 15)
+            for f in on:
+                if f["bos_apres"]:
+                    self.assertNotIn("bos_apres", f["validation"]["reasons"])
+                else:
+                    self.assertIn("bos_apres", f["validation"]["reasons"])
+                    self.assertFalse(f["validation"]["valid"])
+        finally:
+            if old is None:
+                _E._q("DELETE FROM settings WHERE key=?", ("qmlg_bos",), commit=True)
+            else:
+                _E.set_setting("qmlg_bos", old)
+
     def test_scan_marque_htf_les_formations_contre_biais(self):
         cs = TestQmlSansLimiteAge._walk(2, n=1500, tf=900)
         _E.get_candles = lambda symbol, minutes=None, count=None: list(cs)
@@ -11623,6 +12159,147 @@ class TestQmlGagnantHtfEtRegles(unittest.TestCase):
             self.assertIn("signal en cours", _E.qml_gagnant_text(r))
         finally:
             _E._qmlg_rules = orig
+
+
+class TestQmlGagnantZoneObFvg(unittest.TestCase):
+    """Réglage qmlg_zone_ob_fvg (OFF par défaut) : entrée directe et alertes sur l'OB du sweep / le FVG du CHoCH, après réaction."""
+    _KEYS = ("qmlg_zone_ob_fvg", "qmlg_tp_rr", "qmlg_alerts", "qmlg_alert_on", "qmlg_bos", "qmlg_htf")
+    # Scénario haussier (miroir de TestFiltresQualite._EZ) : 0-2 avant (2 = OB baissier 99.5-100.0), 3 = balayage du plus bas (tête 98.5),
+    # 4-5 = jambe (CHoCH = 5) qui laisse un FVG 100.2-100.9, 6 = repli baissier, 7 = pin bar de réaction dans le FVG.
+    _ROWS = [(100.2, 100.4, 99.8, 100.0), (100.0, 100.2, 99.6, 99.8), (99.8, 100.0, 99.5, 99.7), (99.7, 100.2, 98.5, 100.1),
+             (100.1, 101.1, 100.05, 101.0), (101.0, 102.0, 100.9, 101.8), (101.8, 101.85, 100.65, 100.7), (100.55, 100.65, 100.25, 100.6)]
+    _PRE = 20     # bougies plates avant le scénario (ATR calculable)
+    _T0, _STEP = 1000, 900
+
+    def setUp(self):
+        self._old = {k: _E.get_setting(k) for k in self._KEYS}
+        for k in ("qmlg_zone_ob_fvg", "qmlg_tp_rr", "qmlg_alerts", "qmlg_alert_on"):
+            _E._q("DELETE FROM settings WHERE key=?", (k,), commit=True)
+
+    def tearDown(self):
+        for k, v in self._old.items():
+            if v is None:
+                _E._q("DELETE FROM settings WHERE key=?", (k,), commit=True)
+            else:
+                _E.set_setting(k, v)
+
+    def _candles(self, rows=None):
+        rows = list(self._ROWS if rows is None else rows)
+        flat = [(100.0, 100.3, 99.7, 100.0)] * self._PRE
+        return [{"t": self._T0 + self._STEP * k, "o": o, "h": h, "l": l, "c": c} for k, (o, h, l, c) in enumerate(flat + rows)]
+
+    def _structure(self, cs):
+        return {"_series": {k: [x[k] for x in cs] for k in ("t", "o", "h", "l", "c")}, "swings": []}
+
+    def _qml(self, buy=True):
+        nk = self._PRE          # le neckline précède la jambe : src = nk + 1 = bougie 1 du scénario
+        return {"dir": "bull" if buy else "bear", "head": {"price": 98.5, "idx": nk + 3},
+                "choch": {"break_idx": nk + 5, "break_time": self._T0 + self._STEP * (nk + 5)}, "neckline": {"idx": nk},
+                "zone": {"top": 98.0, "bottom": 97.0},   # zone HEAD / SHOULDER ailleurs : seule la zone OB / FVG peut réagir
+                "criteres": {"tendance_avant": True, "sweep": True, "choch_cloture": True, "zone_epaule": True, "zone_fraiche": True},
+                "mitigated_idx": None, "statut": "non mitigé", "bos_apres": False}
+
+    def _alert(self, **kw):
+        nk = self._PRE
+        return dict({"key": "k", "symbol": "XAUUSD", "tf": 15, "dir": "bull", "zone": {"top": 98.0, "bottom": 97.0}, "sl": 98.4,
+                     "tp1": 110.0, "tp1_kind": "SWING", "tp2": None, "tp2_kind": None, "entered": False,
+                     "last_t": self._T0 + self._STEP * (nk + 5), "choch_t": self._T0 + self._STEP * (nk + 5),
+                     "src_t": self._T0 + self._STEP * (nk + 1)}, **kw)
+
+    # --- réglage, bouton, menu, callback
+    def test_reglage_off_par_defaut_bouton_et_callback(self):
+        self.assertFalse(_E.get_qmlg_zone_ob_fvg_on(), "OFF par défaut")
+        self.assertIn("qmlg:zone", str(_E._qmlg_keyboard()))
+        self.assertIn("Zone OB / FVG", _E._qmlg_menu_text())
+        _E.set_setting("qmlg_alerts", '{"x": {"key": "x"}}')
+        edits, old_edit = [], _E._edit
+        _E._edit = lambda cq, txt, kb=None: edits.append(txt)
+        try:
+            self.assertEqual(_E._qmlg_callback({}, "zone"), "Zone OB / FVG : ON")
+            self.assertTrue(_E.get_qmlg_zone_ob_fvg_on())
+            self.assertEqual(_E._qmlg_alerts_load(), {}, "les alertes sont effacées au changement de règle")
+            self.assertEqual(_E._qmlg_callback({}, "zone"), "Zone OB / FVG : OFF")
+            self.assertFalse(_E.get_qmlg_zone_ob_fvg_on())
+        finally:
+            _E._edit = old_edit
+        self.assertIn("Zone OB / FVG", edits[-1])
+
+    # --- entrée directe
+    def test_entree_directe_off_ignore_l_ob_et_le_fvg(self):
+        cs = self._candles()
+        self.assertIsNone(_E.qmlg_direct_entry(self._qml(), self._structure(cs), cs), "OFF : seule la zone HEAD / SHOULDER compte")
+
+    def test_entree_directe_on_sur_le_fvg(self):
+        _E.set_setting("qmlg_zone_ob_fvg", "1")
+        _E.set_setting("qmlg_tp_rr", "2")
+        cs = self._candles()
+        d = _E.qmlg_direct_entry(self._qml(), self._structure(cs), cs)
+        self.assertIsNotNone(d)
+        self.assertEqual((d["pattern"], d["entry"], d["zone"]["kind"]), ("PIN_BAR", 100.6, "FVG"), "entrée = clôture de la réaction")
+        self.assertAlmostEqual(d["zone"]["lo"], 100.2); self.assertAlmostEqual(d["zone"]["hi"], 100.9)
+        tr = d["trade"]
+        self.assertEqual((tr["order"], tr["side"]), ("DIRECT", "BUY"))
+        self.assertLess(tr["sl"], 98.5, "SL derrière le sweep (tête 98.5)")
+        self.assertGreater(tr["tp1"], 100.6)
+
+    def test_entree_directe_on_refus(self):
+        _E.set_setting("qmlg_zone_ob_fvg", "1")
+        _E.set_setting("qmlg_tp_rr", "2")
+        hors = self._candles(self._ROWS[:7] + [(100.55, 101.65, 100.5, 101.6)])    # clôture hors de toute zone
+        self.assertIsNone(_E.qmlg_direct_entry(self._qml(), self._structure(hors), hors))
+        doji = self._candles(self._ROWS[:7] + [(100.6, 100.9, 100.3, 100.62)])      # dans le FVG mais sans avalement ni pin bar
+        self.assertIsNone(_E.qmlg_direct_entry(self._qml(), self._structure(doji), doji))
+        cs = self._candles()
+        self.assertIsNone(_E.qmlg_direct_entry(self._qml(buy=False), self._structure(cs), cs), "mauvais sens")
+        sans_o = self._structure(cs)
+        del sans_o["_series"]["o"]
+        self.assertIsNone(_E.qmlg_direct_entry(self._qml(), sans_o, cs), "structure sans ouvertures : pas de zone")
+        self.assertIsNone(_E.qmlg_direct_entry(self._qml(), self._structure(cs), []))
+
+    # --- alertes
+    def test_alerte_off_ne_reagit_pas_hors_de_sa_zone(self):
+        cs = self._candles()
+        a, evs = _E.qmlg_alert_eval(self._alert(), cs)
+        self.assertEqual(evs, [], "OFF : la zone HEAD / SHOULDER (97-98) n'est jamais touchée")
+        self.assertIsNotNone(a)
+
+    def test_alerte_on_reaction_sur_le_fvg(self):
+        _E.set_setting("qmlg_zone_ob_fvg", "1")
+        cs = self._candles()
+        a, evs = _E.qmlg_alert_eval(self._alert(), cs)
+        self.assertIsNone(a, "réaction envoyée : l'alerte est terminée")
+        self.assertEqual([e["type"] for e in evs], ["reaction"])
+        e = evs[0]
+        self.assertEqual((e["pattern"], e["close"], e["entry_zone"]["kind"]), ("PIN_BAR", 100.6, "FVG"))
+        self.assertGreaterEqual(e["rr1"], _E.QMLG_ALERT_MIN_RR)
+        li = {"lot": 0.1, "real_risk": 10.0}
+        self.assertIn("zone FVG", _E.qmlg_alert_text(e, li))
+
+    def test_alerte_on_attend_sans_reaction_et_s_invalide_si_tout_est_traverse(self):
+        _E.set_setting("qmlg_zone_ob_fvg", "1")
+        sans_reaction = self._candles(self._ROWS[:7])
+        a, evs = _E.qmlg_alert_eval(self._alert(), sans_reaction)
+        self.assertIsNotNone(a); self.assertEqual(evs, [])
+        traverse = self._candles(self._ROWS[:7] + [(100.7, 100.8, 99.0, 99.2)])     # traverse le FVG et l'OB de part en part
+        a, evs = _E.qmlg_alert_eval(self._alert(), traverse)
+        self.assertIsNone(a)
+        self.assertEqual([e["type"] for e in evs], ["invalid"])
+
+    def test_alerte_ancienne_sans_contexte_garde_la_zone_d_origine(self):
+        _E.set_setting("qmlg_zone_ob_fvg", "1")
+        vieille = self._alert()
+        del vieille["choch_t"], vieille["src_t"]
+        a, evs = _E.qmlg_alert_eval(vieille, self._candles())
+        self.assertEqual(evs, [], "pas de contexte : règle HEAD / SHOULDER, zone 97-98 jamais touchée")
+
+    def test_pose_des_alertes_garde_le_contexte_du_choch(self):
+        rec = {"symbol": "XAUUSD", "tf": 15, "dir": "bull", "statut": "non mitigé", "bars_ago": 3, "direct": None, "last_t": 500,
+               "zone": {"top": 98.0, "bottom": 97.0}, "validation": {"valid": True, "reasons": []}, "choch_time": 123, "src_time": 45,
+               "plan": {"side": "BUY", "entry": 98.0, "sl": 96.9, "tp1": 115.0, "tp1_kind": "SWING", "tp2": None, "tp2_kind": None,
+                        "rr1": 2.5, "rr2": None}}
+        _E.qmlg_place_alerts({"formations": [rec]})
+        a = next(iter(_E._qmlg_alerts_load().values()))
+        self.assertEqual((a["choch_t"], a["src_t"]), (123, 45))
 
 
 class TestQmlGagnantAlertes(unittest.TestCase):
@@ -11965,6 +12642,14 @@ class TestQmlGagnantAlertes(unittest.TestCase):
         self.assertEqual(_E.qmlg_alert_tick(), 0)
         self.assertEqual(len(_E._q("SELECT id FROM trades WHERE kind='QMLG'").fetchall()), 1, "aucun doublon")
 
+    def test_pas_de_chevauchement_qml_gagnant(self):
+        """Une position déjà ouverte sur l'actif (ici un QMLG, mais aussi CRT / BOS-CHoCH) bloque une 2e réaction : max positions respecté."""
+        self._mock_io()
+        ev = self._ev()
+        self.assertTrue(_E.qmlg_alert_deliver(ev))
+        self.assertFalse(_E.qmlg_alert_deliver(dict(ev, t=ev["t"] + 900)), "position déjà ouverte : pas de 2e trade")
+        self.assertEqual(len(_E._q("SELECT id FROM trades WHERE kind='QMLG'").fetchall()), 1)
+
     def test_be_desactivable_qml_gagnant(self):
         ev = self._ev()
         self.assertTrue(_E.get_qmlg_be_on(), "BE actif par défaut")
@@ -12147,7 +12832,7 @@ def _selftest():
     suite, loader = unittest.TestSuite(), unittest.TestLoader()
     for cls in (TestRetracement, TestContinuation, TestInvalidationHTF, TestChop, TestGetExtTf,
                 TestLiquiditePure, TestM1NeDecidePasSeul, TestLogs, TestEntreeM5, TestNonRegression, TestVraiCRT, TestVcrtTf, TestVcrtTp,
-                TestHtfM15, TestBE, TestEntreeOBFVG, TestSLTPCRT, TestSignauxSimultanes, TestLectureExtInt, TestModifyPositionGardeSLTP, TestBEDoubleVerif, TestClientId, TestLogVolumeReel, TestRiskGateUniversel, TestFiltresQualite, TestActifsEtEntrees, TestAjoutsNewsStopUS30, TestQmlSansLimiteAge, TestQmlMemoireEtHistoriqueProfond, TestSetupEngineEntreeEtPause, TestMoteurSmc, TestQmlGagnant, TestComputeTrade, TestQmlGagnantBoutons, TestQmlGagnantHtfEtRegles, TestQmlGagnantAlertes, TestFibtrendBosChoch, TestOrdresMt5EtStickers):
+                TestHtfM15, TestBE, TestEntreeOBFVG, TestSLTPCRT, TestSignauxSimultanes, TestLectureExtInt, TestModifyPositionGardeSLTP, TestBEDoubleVerif, TestClientId, TestLogVolumeReel, TestRiskGateUniversel, TestFiltresQualite, TestActifsEtEntrees, TestAjoutsNewsStopUS30, TestQmlSansLimiteAge, TestQmlMemoireEtHistoriqueProfond, TestSetupEngineEntreeEtPause, TestMoteurSmc, TestQmlGagnant, TestComputeTrade, TestQmlGagnantBoutons, TestQmlGagnantHtfEtRegles, TestQmlGagnantZoneObFvg, TestQmlGagnantAlertes, TestFibtrendBosChoch, TestOrdresMt5EtStickers):
         suite.addTests(loader.loadTestsFromTestCase(cls))
     return 0 if unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful() else 1
 
@@ -14218,6 +14903,9 @@ def detect_qml(structure, min_rr=SMC_QML_MIN_RR, zone_mode=None):
             "deplacement_net": _impulse_from(k, d) or _fvg_from(k, d),
             "rr_ok": rr is not None and rr >= min_rr,
         }
+        # BOS dans le sens du CHoCH, après celui-ci (et avant mitigation éventuelle)
+        nxt = next((x for x in events[i + 1:] if x["type"] == "BOS" and x["dir"] == e["dir"]), None)
+        bos_apres = nxt is not None and (mit is None or nxt["break_idx"] < mit)
         qmls.append({
             "type": "retournement",
             "dir": e["dir"],
@@ -14230,6 +14918,7 @@ def detect_qml(structure, min_rr=SMC_QML_MIN_RR, zone_mode=None):
             "statut": "mitigé" if mit is not None else "non mitigé",
             "mitigated_idx": mit, "mitigated_time": None if mit is None else T[mit],
             "entry": entry, "sl": sl, "tp": tp, "rr": rr,
+            "bos_apres": bos_apres, "bos_apres_time": None if nxt is None else nxt.get("break_time"),
             "criteres": crit, "valide": all(crit.values()),
             "bars_ago": last - k,
         })
@@ -14451,6 +15140,18 @@ def get_qmlg_htf_on():
     return _get_bool_setting("qmlg_htf", _env_on("QMLG_HTF_FILTER", False))
 
 
+def get_qmlg_bos_on():
+    """Exige un BOS après le CHoCH (clé « qmlg_bos ») ? OFF par défaut. N'affecte pas le module QML (section 12)."""
+    return _get_bool_setting("qmlg_bos", _env_on("QMLG_BOS_AFTER", False))
+
+
+def get_qmlg_zone_ob_fvg_on():
+    """Entrée sur l'OB du sweep ou le FVG du CHoCH (clé « qmlg_zone_ob_fvg ») ? OFF par défaut : la zone reste alors HEAD / SHOULDER.
+    ON : `qmlg_direct_entry` et `qmlg_alert_eval` prennent `choch_entry_zone` (zone la plus proche du prix) + `zone_reaction`
+    (clôture dans la zone + avalement / pin bar). N'affecte pas le module QML (section 12) ni les autres stratégies."""
+    return _get_bool_setting("qmlg_zone_ob_fvg", _env_on("QMLG_ZONE_OB_FVG", False))
+
+
 def qmlg_htf_ok(symbol, buy):
     """True si le filtre est OFF, si le biais H1 est indisponible, ou si le QML va dans le sens du biais H1."""
     if not get_qmlg_htf_on():
@@ -14496,7 +15197,8 @@ def _qmlg_rules(ctx):
         tr, z = v["trade"], q["zone"]
         a = {"key": "analyse", "symbol": ctx.get("symbol"), "tf": tf_sec // 60, "dir": q["dir"],
              "zone": {"top": z["top"], "bottom": z["bottom"]}, "sl": tr["sl"], "tp1": tr["tp1"], "tp1_kind": tr["tp1_kind"],
-             "tp2": tr["tp2"], "tp2_kind": tr["tp2_kind"], "last_t": q["choch"]["break_time"], "entered": False}
+             "tp2": tr["tp2"], "tp2_kind": tr["tp2_kind"], "last_t": q["choch"]["break_time"], "entered": False,
+             "choch_t": q["choch"]["break_time"], "src_t": _qmlg_src_time(q, structure)}
         _, evs = qmlg_alert_eval(a, candles, now=now)
         ev = next((e for e in evs if e["type"] == "reaction"), None)
         if not ev:
@@ -14689,7 +15391,7 @@ def qml_gagnant_text(res):
 # --- REJET, VALIDATION, SCAN MULTI-MARCHÉS / MULTI-TF, JSON ----------------------------------------------
 _QMLG_REASON_LBL = {"tendance_avant": "pas de BOS avant", "sweep": "pas de sweep", "choch_cloture": "CHoCH non clôturé",
                     "zone_epaule": "zone ≠ épaule", "zone_fraiche": "zone mitigée", "plan": "plan de trade impossible",
-                    "rr1": f"RR1 < {QMLG_MIN_RR:g}", "htf": "contre biais H1"}
+                    "rr1": f"RR1 < {QMLG_MIN_RR:g}", "htf": "contre biais H1", "bos_apres": "pas de BOS après CHoCH"}
 
 
 def qmlg_rejection(candles, buy):
@@ -14728,6 +15430,8 @@ def qmlg_validate(qml, structure, direct=False, entry_price=None):
     reasons = [k for k in ("tendance_avant", "sweep", "choch_cloture", "zone_epaule") if not cr.get(k)]
     if not direct and not cr.get("zone_fraiche"):
         reasons.append("zone_fraiche")
+    if get_qmlg_bos_on() and not qml.get("bos_apres"):   # BOS après CHoCH exigé (OFF par défaut)
+        reasons.append("bos_apres")
     tr = compute_trade(qml, structure, entry_price=entry_price)
     if not tr["ok"]:
         reasons.append("plan")
@@ -14736,10 +15440,58 @@ def qmlg_validate(qml, structure, direct=False, entry_price=None):
     return {"valid": not reasons, "reasons": reasons, "trade": tr}
 
 
+def _qmlg_src_time(qml, structure):
+    """Horodatage de la 1re bougie de la jambe du CHoCH (= `src` de `_turn_index`, le lendemain du neckline). None si absent."""
+    try:
+        return structure["_series"]["t"][qml["neckline"]["idx"] + 1]
+    except (KeyError, IndexError, TypeError):
+        return None
+
+
+def _qmlg_zone_ctx(qml, structure):
+    """(bougies, ev) pour `choch_entry_zone`, relus depuis la structure du QML (mêmes indices que detect_qml : le point de retournement
+    de `_turn_index` est exactement la tête du QML). None si la structure ne porte pas les ouvertures ou si le CHoCH est incomplet."""
+    try:
+        ser = structure["_series"]
+        t, o, h, l, c = (ser[k] for k in ("t", "o", "h", "l", "c"))
+        if not (len(t) == len(o) == len(h) == len(l) == len(c)):
+            return None
+        i, nk = qml["choch"]["break_idx"], qml["neckline"]["idx"]
+        if not (0 <= nk < i < len(c)):
+            return None
+        cs = [{"t": t[k], "o": o[k], "h": h[k], "l": l[k], "c": c[k]} for k in range(len(c))]
+        return cs, {"dir": 1 if qml["dir"] == "bull" else -1, "i": i, "src": nk + 1, "atr": _qmlg_atr(ser)}
+    except (KeyError, TypeError, IndexError):
+        return None
+
+
+def _qmlg_direct_entry_zone(qml, structure, candles):
+    """Entrée directe en mode OB / FVG (réglage qmlg_zone_ob_fvg ON) : zone = `choch_entry_zone` la plus proche de la dernière clôture,
+    réaction = `zone_reaction` (clôture dans la zone + avalement / pin bar). Entrée = clôture de la bougie de réaction, SL derrière le
+    sweep (compute_trade). La formation doit rester valide (critères du QML, plan, RR1). Retourne {pattern, entry, time, trade, zone}."""
+    if not candles:
+        return None
+    ctx = _qmlg_zone_ctx(qml, structure)
+    if not ctx:
+        return None
+    last = candles[-1]
+    zone = choch_entry_zone(ctx[0], ctx[1], last["c"])
+    pattern = zone_reaction(candles, zone, ctx[1]["dir"]) if zone else None
+    if not pattern:
+        return None
+    qz = dict(qml, zone={"top": zone["hi"], "bottom": zone["lo"], "mode": zone["kind"]})
+    v = qmlg_validate(qz, structure, direct=True, entry_price=last["c"])
+    if not v["valid"]:
+        return None
+    return {"pattern": pattern, "entry": last["c"], "time": last["t"], "trade": v["trade"], "zone": zone}
+
+
 def qmlg_direct_entry(qml, structure, candles):
     """ENTRÉE DIRECTE : seulement si le prix (clôture de la dernière bougie clôturée) est DANS la zone ET que cette bougie est
     un rejet dans le sens du QML. Entrée = cette clôture. La zone doit être fraîche jusqu'à cette bougie (1re touche) et la
     formation valide. Retourne {pattern, entry, time, trade} ou None. Compte rendu seulement : aucun ordre n'est envoyé."""
+    if get_qmlg_zone_ob_fvg_on():   # OB du sweep / FVG du CHoCH + réaction (OFF par défaut : zone HEAD / SHOULDER ci-dessous)
+        return _qmlg_direct_entry_zone(qml, structure, candles)
     if not candles or not qml.get("zone"):
         return None
     z, last = qml["zone"], candles[-1]
@@ -14775,6 +15527,7 @@ def _qmlg_record(symbol, tf, q, structure, candles):
             "dir": q["dir"], "type": q["type"], "statut": q["statut"], "mitigated_time": q.get("mitigated_time"),
             "bars_ago": q.get("bars_ago"), "zone": q["zone"], "head": q["head"], "shoulder": q["shoulder"],
             "neckline": q["neckline"], "choch_time": q["choch"]["break_time"], "criteres": q.get("criteres"),
+            "bos_apres": q.get("bos_apres"), "src_time": _qmlg_src_time(q, structure),
             "validation": {"valid": v["valid"], "reasons": v["reasons"]}, "plan": v["trade"],
             "direct": direct, "last_t": candles[-1]["t"]}
 
@@ -14905,6 +15658,8 @@ def qmlg_place_alerts(data):
                           "zone": {"top": f["zone"]["top"], "bottom": f["zone"]["bottom"]},
                           "sl": p["sl"], "tp1": p["tp1"], "tp1_kind": p["tp1_kind"], "tp2": p["tp2"], "tp2_kind": p["tp2_kind"],
                           "last_t": f["last_t"], "entered": False, "created_ts": time.time()}
+            if f.get("src_time") is not None and f.get("choch_time") is not None:   # lu par qmlg_alert_eval en mode OB / FVG
+                store[key].update(choch_t=f["choch_time"], src_t=f["src_time"])
             placed += 1
         if placed:
             _qmlg_alerts_save(store)
@@ -14971,6 +15726,65 @@ def _qmlg_alert_rr(a, close):
     return risk, rr(a.get("tp1")), rr(a.get("tp2"))
 
 
+def _qmlg_alert_react(a, c, pattern):
+    """Réaction de la bougie `c` : TP fixe recalculé sur la vraie entrée (clôture), RR1 >= QMLG_ALERT_MIN_RR (sauf TP fixe).
+    Retourne (alerte, événement « reaction » ou None)."""
+    buy = a["dir"] == "bull"
+    fixed = get_qmlg_tp_rr()
+    if fixed:   # TP fixe recalculé sur la VRAIE entrée (clôture de la réaction) et le SL derrière le sweep
+        sgn = 1 if buy else -1
+        risk = (c["c"] - a["sl"]) * sgn
+        if risk > 0:
+            a = dict(a, tp1=c["c"] + sgn * risk * fixed, tp1_kind="RR fixe", tp2=None, tp2_kind=None)
+            rr1, rr2 = fixed, None
+        else:
+            risk, rr1, rr2 = 0.0, None, None
+    else:
+        risk, rr1, rr2 = _qmlg_alert_rr(a, c["c"])
+    if rr1 is not None and (fixed or rr1 >= QMLG_ALERT_MIN_RR):
+        return a, {"type": "reaction", "alert": dict(a), "pattern": pattern, "close": c["c"], "t": c["t"],
+                   "risk": risk, "rr1": rr1, "rr2": rr2}
+    return a, None
+
+
+def _qmlg_alert_eval_zone(a, candles, now):
+    """Branche OB / FVG de qmlg_alert_eval (réglage qmlg_zone_ob_fvg ON, alerte posée avec le contexte du CHoCH `choch_t` / `src_t`).
+    Pour chaque nouvelle bougie clôturée : zone = `choch_entry_zone` (la plus proche de la clôture) ; plus aucune zone valable
+    (OB et FVG tous deux traversés, ou ni l'un ni l'autre) -> alerte supprimée (« invalid ») ; sinon réaction = `zone_reaction`
+    (clôture dans la zone + avalement / pin bar), mêmes garde-fous de fraîcheur et de RR1 que la zone HEAD / SHOULDER.
+    CHoCH introuvable dans les bougies reçues : pas de réaction (l'alerte attend, puis expire)."""
+    d = 1 if a["dir"] == "bull" else -1
+    tf_sec = a["tf"] * 60
+    ts = [x["t"] for x in candles]
+    if a["choch_t"] not in ts or a["src_t"] not in ts:
+        return a, []
+    i, src = ts.index(a["choch_t"]), ts.index(a["src_t"])
+    atr = _qmlg_atr({"h": [x["h"] for x in candles], "l": [x["l"] for x in candles], "c": [x["c"] for x in candles]})
+    ev = {"dir": d, "i": i, "src": src, "atr": atr}
+    for k, c in enumerate(candles):
+        if c["t"] <= a["last_t"]:
+            continue
+        if k <= i:   # avant la cassure du CHoCH : rien à juger
+            a["last_t"] = c["t"]
+            continue
+        cs = candles[:k + 1]
+        zone = choch_entry_zone(cs, ev, c["c"])
+        if zone is None:
+            return None, [{"type": "invalid", "alert": a, "close": c["c"]}]
+        if c["l"] <= zone["hi"] and c["h"] >= zone["lo"]:
+            a["entered"] = True
+            a["touch_t"] = c["t"]
+        pattern = zone_reaction(cs, zone, d)
+        fresh = now is None or now - (c["t"] + tf_sec) <= QMLG_ALERT_STALE_BARS * tf_sec
+        if pattern and fresh:
+            a, rev = _qmlg_alert_react(a, c, pattern)
+            if rev:
+                rev["entry_zone"] = zone
+                return None, [rev]
+        a["last_t"] = c["t"]
+    return a, []
+
+
 def qmlg_alert_eval(a, candles, now=None):
     """Fait avancer UNE alerte (fonction pure, sans réseau). candles : bougies clôturées (la plus récente en dernier).
     Aucun message quand le prix ENTRE dans la zone. Une RÉACTION = bougie qui touche la zone, ne l'invalide pas et forme un
@@ -14982,6 +15796,8 @@ def qmlg_alert_eval(a, candles, now=None):
     tf_sec = a["tf"] * 60
     if now is not None and a.get("created_ts") and now - a["created_ts"] > QMLG_ALERT_MAX_BARS * tf_sec:
         return None, [{"type": "expired", "alert": a}]
+    if get_qmlg_zone_ob_fvg_on() and a.get("choch_t") and a.get("src_t"):   # OB du sweep / FVG du CHoCH (OFF par défaut)
+        return _qmlg_alert_eval_zone(a, candles, now)
     for k, c in enumerate(candles):
         if c["t"] <= a["last_t"]:
             continue
@@ -14997,20 +15813,9 @@ def qmlg_alert_eval(a, candles, now=None):
             pattern = qmlg_rejection(candles[:k + 1], buy)
             fresh = now is None or now - (c["t"] + tf_sec) <= QMLG_ALERT_STALE_BARS * tf_sec
             if pattern in QMLG_ALERT_PATTERNS and fresh:
-                fixed = get_qmlg_tp_rr()
-                if fixed:   # TP fixe recalculé sur la VRAIE entrée (clôture de la réaction) et le SL derrière le sweep
-                    sgn = 1 if buy else -1
-                    risk = (c["c"] - a["sl"]) * sgn
-                    if risk > 0:
-                        a = dict(a, tp1=c["c"] + sgn * risk * fixed, tp1_kind="RR fixe", tp2=None, tp2_kind=None)
-                        rr1, rr2 = fixed, None
-                    else:
-                        risk, rr1, rr2 = 0.0, None, None
-                else:
-                    risk, rr1, rr2 = _qmlg_alert_rr(a, c["c"])
-                if rr1 is not None and (fixed or rr1 >= QMLG_ALERT_MIN_RR):
-                    evs.append({"type": "reaction", "alert": dict(a), "pattern": pattern, "close": c["c"], "t": c["t"],
-                                "risk": risk, "rr1": rr1, "rr2": rr2})
+                a, rev = _qmlg_alert_react(a, c, pattern)
+                if rev:
+                    evs.append(rev)
                     return None, evs   # réaction envoyée : l'alerte est terminée
         a["last_t"] = c["t"]
     return a, evs
@@ -15025,7 +15830,8 @@ def qmlg_alert_text(ev, li, be_rr=None):
     def tp(k, rr):
         return "—" if a.get(k) is None or rr is None else f"{px(a[k])} ({a.get(k + '_kind') or 'liquidité'}) · RR {rr:.2f}"
     txt = (f"{'🟢' if buy else '🔴'} <b>{a['symbol']} {_tf_lbl(a['tf'])}</b> — QML {'ACHAT' if buy else 'VENTE'} · "
-           f"réaction {_QMLG_PAT_FR.get(ev['pattern'], ev['pattern'])}\n"
+           f"réaction {_QMLG_PAT_FR.get(ev['pattern'], ev['pattern'])}"
+           + (f" · zone {ev['entry_zone']['kind']}" if ev.get("entry_zone") else "") + "\n"
            f"📍 Entrée {px(ev['close'])}\n🛡 SL {px(a['sl'])}\n"
            f"🎯 TP1 {tp('tp1', ev['rr1'])}\n🎯 TP2 {tp('tp2', ev['rr2'])}\n"
            + (f"🔒 BE → RR{be_rr:g}\n" if be_rr else "🔓 BE désactivé\n")
@@ -15152,6 +15958,19 @@ def qmlg_alert_deliver(ev):
         return False
     key = f"QMLG:{a['key']}:{ev['t']}"
     if signal_exists(key):   # déjà livrée (anti-doublon)
+        return False
+    if not get_bot_on():   # bot arrêté : aucun nouveau signal (comme publish_signal)
+        return False
+    st_why = strategy_block_reason(sym, {"type": "QMLG"})   # pas de mélange avec une autre stratégie ouverte, plafond du jour
+    if st_why:
+        print(f"[qmlg-alertes] {sym} {_tf_lbl(a['tf'])} : réaction ignorée ({st_why})")
+        return False
+    if mm_block_reason() or news_block_info(sym):   # money management et filtre news : comme publish_signal
+        print(f"[qmlg-alertes] {sym} {_tf_lbl(a['tf'])} : réaction ignorée (money management / news)")
+        return False
+    n_open, max_pos = count_open(sym), get_max_positions()
+    if n_open >= max_pos:   # même garde que publish_signal : jamais de chevauchement avec une autre position (QML, CRT, BOS/CHoCH...) du même actif
+        print(f"[qmlg-alertes] {sym} {_tf_lbl(a['tf'])} : réaction ignorée ({n_open}/{max_pos} signal(s) encore ouvert(s) : pas de chevauchement)")
         return False
     li = calc_lot(sym, get_risk(), ev["risk"], price=ev["close"])
     if li["lot"] <= 0:
@@ -15439,6 +16258,8 @@ def _qmlg_menu_text():
             f"{', '.join(_tf_lbl(t) for t in get_qmlg_alert_tfs())} · {len(qmlg_alert_symbols())} marché(s) (menu 🌍 ACTIFS)\n"
             f"🔒 <b>BE</b> : {'🟢 ON' if get_qmlg_be_on() else '🔴 OFF'} (SL → entrée à RR{get_be_rr():g}) · SL toujours derrière le sweep\n"
             f"📈 <b>Biais H1</b> : {'🟢 ON (QML contre le biais ignorés)' if get_qmlg_htf_on() else '🔴 OFF (aucun filtre de tendance)'}\n"
+            f"🧱 <b>BOS après CHoCH</b> : {'🟢 ON (QML sans BOS de confirmation ignorés)' if get_qmlg_bos_on() else '🔴 OFF (BOS non exigé)'}\n"
+            f"🧩 <b>Zone OB / FVG</b> : {'🟢 ON (entrée sur l’OB du sweep ou le FVG du CHoCH, après réaction)' if get_qmlg_zone_ob_fvg_on() else '🔴 OFF (zone HEAD / SHOULDER)'}\n"
             f"🎯 <b>TP</b> : {'AUTO (prochaines liquidités)' if get_qmlg_tp_rr() is None else 'FIXE RR%g (pas de TP2)' % get_qmlg_tp_rr()}\n"
             f"C'est toi qui l'actives. Elle alerte seulement sur une RÉACTION dans une zone QML (avalement ou pin bar), pas quand le prix "
             f"y entre. Entrée, SL, TP1 / TP2 (RR), BE, lot, image et stickers partent au groupe, puis RR / BE / TP / SL en réponse. "
@@ -15455,6 +16276,8 @@ def _qmlg_keyboard():
         [{"text": f"🔔 Alerte réaction : {'ON ✅' if get_qmlg_alert_on() else 'OFF'}", "callback_data": "qmlg:alert"}],
         [{"text": f"🔒 BE : {'ON ✅' if get_qmlg_be_on() else 'OFF'}", "callback_data": "qmlg:be"},
          {"text": f"📈 Biais H1 : {'ON ✅' if get_qmlg_htf_on() else 'OFF'}", "callback_data": "qmlg:htf"}],
+        [{"text": f"🧱 BOS après CHoCH : {'ON ✅' if get_qmlg_bos_on() else 'OFF'}", "callback_data": "qmlg:bos"}],
+        [{"text": f"🧩 Zone OB / FVG : {'ON ✅' if get_qmlg_zone_ob_fvg_on() else 'OFF'}", "callback_data": "qmlg:zone"}],
         [{"text": f"{'✅ ' if get_qmlg_tp_rr() is None else ''}TP auto", "callback_data": "qmlg:tp:auto"}]
         + [{"text": f"{'✅ ' if get_qmlg_tp_rr() == float(r) else ''}RR{r}", "callback_data": f"qmlg:tp:{r}"} for r in QMLG_TP_CHOICES],
         [{"text": f"{'✅ ' if t in tfs else ''}{_tf_lbl(t)}", "callback_data": f"qmlg:tf:{t}"} for t in QMLG_ALERT_TF_CHOICES],
@@ -15521,6 +16344,16 @@ def _qmlg_callback(cq, arg):
         _qmlg_htf_cache.clear()
         qmlg_alerts_clear()
         toast = "Biais H1 QML GAGNANT : " + ("ON" if on else "OFF")
+    elif arg == "bos":   # 🧱 BOS après CHoCH ON / OFF : alertes effacées, reposées au prochain scan avec la nouvelle règle
+        on = not get_qmlg_bos_on()
+        set_setting("qmlg_bos", "1" if on else "0")
+        qmlg_alerts_clear()
+        toast = "BOS après CHoCH : " + ("ON" if on else "OFF")
+    elif arg == "zone":   # 🧩 Zone OB / FVG ON / OFF : alertes effacées, reposées au prochain scan avec la nouvelle règle
+        on = not get_qmlg_zone_ob_fvg_on()
+        set_setting("qmlg_zone_ob_fvg", "1" if on else "0")
+        qmlg_alerts_clear()
+        toast = "Zone OB / FVG : " + ("ON" if on else "OFF")
     elif arg.startswith("tp:"):   # 🎯 TP auto / RR fixe : ne touche que les NOUVEAUX signaux
         v = arg[3:]
         if v == "auto":
