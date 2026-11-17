@@ -2697,6 +2697,9 @@ def _okx(symbol, minutes=None):
              "l": float(k[3]), "c": float(k[4])} for k in j["data"]]
 
 
+_btc_last_src = {}   # symbole -> dernière source utilisée (on ne logge que les changements)
+
+
 def _binance(symbol, minutes=None):
     """Bougies BTC : Binance si dispo, sinon Bybit, sinon OKX (ordre chronologique dans tous les cas)."""
     errors = []
@@ -2708,8 +2711,12 @@ def _binance(symbol, minutes=None):
         try:
             raw = sorted(fn(symbol, minutes), key=lambda c: c["t"])
             if raw:
-                if name != "Binance":
-                    print(f"[BTC] source de secours utilisée : {name}")
+                if _btc_last_src.get(symbol) != name:
+                    if name != "Binance":
+                        print(f"[BTC] source de secours utilisée : {name}")
+                    elif symbol in _btc_last_src:
+                        print("[BTC] retour à la source principale : Binance")
+                    _btc_last_src[symbol] = name
                 return raw
         except Exception as e:
             errors.append(f"{name} : {e}")
@@ -2725,17 +2732,28 @@ _deriv_ws = None      # connexion WebSocket publique, réutilisée d'un appel à
 _deriv_req_id = 0
 
 
+_deriv_down_until = 0.0     # disjoncteur : après un échec complet, on n'insiste pas pendant quelques secondes
+DERIV_RETRIES = 4           # 1 essai + 3 nouvelles tentatives (connexion neuve à chaque fois)
+DERIV_BACKOFF = (1, 2, 4)   # secondes d'attente avant chaque nouvelle tentative
+DERIV_COOLDOWN = 15         # secondes de pause après un échec complet
+
+
 def _deriv_request(payload):
     """Envoie une requête sur le WebSocket public Deriv et retourne la réponse (bougies).
 
-    La connexion est réutilisée ; si elle est tombée (inactivité, réseau), une reconnexion
-    est tentée une fois avant d'abandonner.
+    La connexion est réutilisée ; si elle est tombée (inactivité, réseau) ou si Deriv renvoie une réponse vide /
+    non-JSON, on repart sur une connexion neuve, DERIV_RETRIES fois avec une attente croissante. Après un échec
+    complet, les appels suivants échouent aussitôt pendant DERIV_COOLDOWN s (évite d'empiler les attentes sur
+    chaque actif du scan).
     """
-    global _deriv_ws, _deriv_req_id
+    global _deriv_ws, _deriv_req_id, _deriv_down_until
     if websocket is None:
         raise RuntimeError("module manquant : pip install websocket-client")
+    if time.time() < _deriv_down_until:
+        raise RuntimeError("Deriv indisponible : en pause après des échecs répétés")
     last_err = None
-    for _ in range(2):
+    for attempt in range(DERIV_RETRIES):
+        raw = None
         try:
             if _deriv_ws is None:
                 _deriv_ws = websocket.create_connection(DERIV_WS_URL, timeout=15)
@@ -2743,7 +2761,10 @@ def _deriv_request(payload):
             rid = _deriv_req_id
             _deriv_ws.send(json.dumps({**payload, "req_id": rid}))
             while True:
-                msg = json.loads(_deriv_ws.recv())
+                raw = _deriv_ws.recv()
+                if not raw or not str(raw).strip():
+                    raise ConnectionError("réponse vide (connexion fermée par Deriv ?)")
+                msg = json.loads(raw)
                 if msg.get("req_id", rid) != rid:
                     continue  # réponse tardive d'une requête précédente
                 if "error" in msg:
@@ -2753,14 +2774,19 @@ def _deriv_request(payload):
                     return msg
         except DerivError:
             raise
-        except Exception as e:  # connexion morte / timeout : on repart sur une connexion neuve
+        except Exception as e:  # connexion morte / timeout / réponse invalide : on repart sur une connexion neuve
             last_err = e
+            extrait = f" · reçu : {str(raw)[:200]!r}" if raw else ""
+            print(f"[Deriv] tentative {attempt + 1}/{DERIV_RETRIES} échouée ({type(e).__name__} : {e}){extrait}")
             try:
                 if _deriv_ws is not None:
                     _deriv_ws.close()
             except Exception:
                 pass
             _deriv_ws = None
+            if attempt < DERIV_RETRIES - 1:
+                time.sleep(DERIV_BACKOFF[min(attempt, len(DERIV_BACKOFF) - 1)])
+    _deriv_down_until = time.time() + DERIV_COOLDOWN
     raise RuntimeError(f"Deriv indisponible : {last_err}")
 
 
@@ -2866,6 +2892,23 @@ def _binance_long(symbol, minutes, count):
     return out
 
 
+_candles_cache = {}                 # (symbole, minutes, count) -> (heure, bougies brutes) : dernier appel Deriv réussi
+CANDLES_CACHE_MAX_AGE = 600         # s : au-delà, on ne ressert plus de bougies périmées (l'erreur remonte)
+_deriv_fail = {}                    # symbole -> nombre d'échecs consécutifs (pour n'alerter qu'à partir de 3)
+
+
+def _log_deriv_fallback(symbol, err, cached=True):
+    n = _deriv_fail[symbol] = _deriv_fail.get(symbol, 0) + 1
+    if n == 1 or n % 10 == 0:
+        print(f"[{symbol}] Deriv indisponible ({type(err).__name__}) : "
+              f"{'dernières bougies en cache utilisées' if cached else 'aucun cache'} (échec n°{n})")
+    if n == 3:   # alerte admin une seule fois, au 3e échec consécutif ; le compteur repart à zéro à la récupération
+        try:
+            to_admin(f"⚠️ {symbol} : Deriv indisponible depuis 3 passages consécutifs")
+        except Exception:
+            pass
+
+
 def get_candles(symbol, minutes=None, count=None):
     """Retourne la liste des bougies clôturées (plus ancienne -> plus récente).
     count : historique long (analyse QML) ; absent = CANDLES_LIMIT comme avant. Si l'historique long est
@@ -2876,7 +2919,18 @@ def get_candles(symbol, minutes=None, count=None):
     cfg = SYMBOLS[symbol]
     raw = None
     if cfg["source"] == "deriv":
-        raw = _deriv(cfg["deriv_symbol"], minutes, count)
+        ckey = (symbol, minutes, count)
+        try:
+            raw = _deriv(cfg["deriv_symbol"], minutes, count)
+            _candles_cache[ckey] = (time.time(), raw)
+            _deriv_fail.pop(symbol, None)
+        except Exception as e:
+            hit = _candles_cache.get(ckey)
+            if not hit or time.time() - hit[0] > CANDLES_CACHE_MAX_AGE:
+                _log_deriv_fallback(symbol, e, cached=False)
+                raise
+            _log_deriv_fallback(symbol, e)   # dernières bougies valides : pas de nouvelle bougie ce passage, rien de plus
+            raw = hit[1]
     elif cfg["source"] == "binance":
         if count and count > CANDLES_LIMIT:
             order = ["deriv", "binance"] if os.getenv("LONG_HISTORY_BTC", "deriv").strip().lower() != "binance" else ["binance", "deriv"]
@@ -4569,7 +4623,7 @@ class SetupEngine:
         line = f"[{self.symbol} {self.tf}] {msg}"
         self.log.append(line)
         del self.log[:-500]
-        if self.verbose:
+        if self.verbose and not self.quiet:
             print(line)
 
     def _ev(self, tag, ok, msg):
@@ -4647,10 +4701,15 @@ class SetupEngine:
     # ------------------------------------------------------------------ flux de bougies
     def feed(self, candles):
         out, first = [], self.last_t is None
-        self.quiet = first
+        # Rattrapage : si le moteur reçoit d'un coup beaucoup de bougies (premier passage, symbole réactivé, retour
+        # d'une panne réseau), tout ce qui est plus ancien que SIGNAL_MAX_AGE bougies est rejoué en silence : l'état
+        # est reconstruit, mais aucun log ni signal. Seules les bougies récentes sont affichées normalement.
+        step = (candles[-1]["t"] - candles[-2]["t"]) if len(candles) >= 2 else 0
+        quiet_before = (candles[-1]["t"] - SIGNAL_MAX_AGE * step) if candles and step > 0 else None
         for x in candles:
             if self.last_t is not None and x["t"] <= self.last_t:
                 continue
+            self.quiet = first or (quiet_before is not None and x["t"] < quiet_before)
             self._push(x)
             self.last_t = x["t"]
             sig = self._step(self.base + len(self.c) - 1)
@@ -9337,6 +9396,12 @@ def _trading_loop():
                 try:
                     with _tf_lock:   # un changement de timeframe attend la fin du passage en cours
                         process_symbol(symbol)
+                except RuntimeError as e:
+                    if "indisponible" in str(e):   # Deriv / source de prix en panne : une ligne, pas de traceback
+                        print(f"[{symbol}] {e}")
+                    else:
+                        print(f"[{symbol}] erreur :")
+                        traceback.print_exc()
                 except Exception:
                     print(f"[{symbol}] erreur :")
                     traceback.print_exc()
