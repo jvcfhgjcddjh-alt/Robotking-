@@ -2730,63 +2730,81 @@ class DerivError(RuntimeError):
 
 _deriv_ws = None      # connexion WebSocket publique, réutilisée d'un appel à l'autre
 _deriv_req_id = 0
+_deriv_lock = threading.Lock()   # un seul thread à la fois sur le socket partagé : send + recv atomiques
 
 
 _deriv_down_until = 0.0     # disjoncteur : après un échec complet, on n'insiste pas pendant quelques secondes
 DERIV_RETRIES = 4           # 1 essai + 3 nouvelles tentatives (connexion neuve à chaque fois)
 DERIV_BACKOFF = (1, 2, 4)   # secondes d'attente avant chaque nouvelle tentative
 DERIV_COOLDOWN = 15         # secondes de pause après un échec complet
+DERIV_LOG_EVERY = _env_int("DERIV_LOG_EVERY", 120)   # s : au plus UNE ligne de log Deriv par intervalle (résumé des échecs)
+_deriv_log_last = 0.0
+_deriv_log_skipped = 0
+
+
+def _deriv_log_failure(err):
+    """Une seule ligne de log toutes les DERIV_LOG_EVERY s (avec le nombre d'échecs passés sous silence)."""
+    global _deriv_log_last, _deriv_log_skipped
+    now = time.time()
+    if now - _deriv_log_last < DERIV_LOG_EVERY:
+        _deriv_log_skipped += 1
+        return
+    extra = f" (+{_deriv_log_skipped} échec(s) identique(s) masqué(s))" if _deriv_log_skipped else ""
+    print(f"[Deriv] indisponible après {DERIV_RETRIES} tentatives ({type(err).__name__} : {err}){extra}")
+    _deriv_log_last, _deriv_log_skipped = now, 0
 
 
 def _deriv_request(payload):
     """Envoie une requête sur le WebSocket public Deriv et retourne la réponse (bougies).
 
-    La connexion est réutilisée ; si elle est tombée (inactivité, réseau) ou si Deriv renvoie une réponse vide /
-    non-JSON, on repart sur une connexion neuve, DERIV_RETRIES fois avec une attente croissante. Après un échec
-    complet, les appels suivants échouent aussitôt pendant DERIV_COOLDOWN s (évite d'empiler les attentes sur
-    chaque actif du scan).
+    Le socket est PARTAGÉ entre les threads (scan, suivi, alertes QML) : tout le cycle send + recv est donc
+    protégé par _deriv_lock, sinon un thread lit la réponse d'un autre ou ferme le socket sous ses pieds
+    (cause des cascades « Connection is closed »). Le verrou est relâché pendant l'attente entre deux tentatives.
+    Si la connexion est tombée ou si Deriv renvoie une réponse vide / non-JSON, on repart sur une connexion neuve,
+    DERIV_RETRIES fois avec une attente croissante (jitter). Après un échec complet, les appels suivants échouent
+    aussitôt pendant DERIV_COOLDOWN s. Les échecs sont journalisés en une seule ligne résumée (pas une par tentative).
     """
     global _deriv_ws, _deriv_req_id, _deriv_down_until
     if websocket is None:
         raise RuntimeError("module manquant : pip install websocket-client")
-    if time.time() < _deriv_down_until:
-        raise RuntimeError("Deriv indisponible : en pause après des échecs répétés")
     last_err = None
     for attempt in range(DERIV_RETRIES):
-        raw = None
-        try:
-            if _deriv_ws is None:
-                _deriv_ws = websocket.create_connection(DERIV_WS_URL, timeout=15)
-            _deriv_req_id += 1
-            rid = _deriv_req_id
-            _deriv_ws.send(json.dumps({**payload, "req_id": rid}))
-            while True:
-                raw = _deriv_ws.recv()
-                if not raw or not str(raw).strip():
-                    raise ConnectionError("réponse vide (connexion fermée par Deriv ?)")
-                msg = json.loads(raw)
-                if msg.get("req_id", rid) != rid:
-                    continue  # réponse tardive d'une requête précédente
-                if "error" in msg:
-                    err = msg["error"]
-                    raise DerivError(err.get("message", err) if isinstance(err, dict) else err)
-                if "candles" in msg or "history" in msg:
-                    return msg
-        except DerivError:
-            raise
-        except Exception as e:  # connexion morte / timeout / réponse invalide : on repart sur une connexion neuve
-            last_err = e
-            extrait = f" · reçu : {str(raw)[:200]!r}" if raw else ""
-            print(f"[Deriv] tentative {attempt + 1}/{DERIV_RETRIES} échouée ({type(e).__name__} : {e}){extrait}")
+        with _deriv_lock:
+            if time.time() < _deriv_down_until:
+                raise RuntimeError("Deriv indisponible : en pause après des échecs répétés")
             try:
-                if _deriv_ws is not None:
-                    _deriv_ws.close()
-            except Exception:
-                pass
-            _deriv_ws = None
-            if attempt < DERIV_RETRIES - 1:
-                time.sleep(DERIV_BACKOFF[min(attempt, len(DERIV_BACKOFF) - 1)])
-    _deriv_down_until = time.time() + DERIV_COOLDOWN
+                if _deriv_ws is None:
+                    _deriv_ws = websocket.create_connection(DERIV_WS_URL, timeout=15)
+                _deriv_req_id += 1
+                rid = _deriv_req_id
+                _deriv_ws.send(json.dumps({**payload, "req_id": rid}))
+                while True:
+                    raw = _deriv_ws.recv()
+                    if not raw or not str(raw).strip():
+                        raise ConnectionError("réponse vide (connexion fermée par Deriv ?)")
+                    msg = json.loads(raw)
+                    if msg.get("req_id", rid) != rid:
+                        continue  # réponse tardive d'une requête précédente
+                    if "error" in msg:
+                        err = msg["error"]
+                        raise DerivError(err.get("message", err) if isinstance(err, dict) else err)
+                    if "candles" in msg or "history" in msg:
+                        return msg
+            except DerivError:
+                raise
+            except Exception as e:  # connexion morte / timeout / réponse invalide : connexion neuve au prochain essai
+                last_err = e
+                try:
+                    if _deriv_ws is not None:
+                        _deriv_ws.close()
+                except Exception:
+                    pass
+                _deriv_ws = None
+        if attempt < DERIV_RETRIES - 1:   # attente HORS verrou, avec jitter pour désynchroniser les threads
+            time.sleep(DERIV_BACKOFF[min(attempt, len(DERIV_BACKOFF) - 1)] * random.uniform(0.7, 1.3))
+    with _deriv_lock:
+        _deriv_down_until = time.time() + DERIV_COOLDOWN
+    _deriv_log_failure(last_err)
     raise RuntimeError(f"Deriv indisponible : {last_err}")
 
 
@@ -2895,6 +2913,8 @@ def _binance_long(symbol, minutes, count):
 _candles_cache = {}                 # (symbole, minutes, count) -> (heure, bougies brutes) : dernier appel Deriv réussi
 CANDLES_CACHE_MAX_AGE = 600         # s : au-delà, on ne ressert plus de bougies périmées (l'erreur remonte)
 _deriv_fail = {}                    # symbole -> nombre d'échecs consécutifs (pour n'alerter qu'à partir de 3)
+_deriv_alert_last = 0.0             # heure de la dernière alerte Telegram Deriv (tous actifs confondus)
+DERIV_ALERT_COOLDOWN = _env_int("DERIV_ALERT_COOLDOWN", 1800)   # s entre deux alertes Telegram Deriv
 
 
 def _log_deriv_fallback(symbol, err, cached=True):
@@ -2902,9 +2922,14 @@ def _log_deriv_fallback(symbol, err, cached=True):
     if n == 1 or n % 10 == 0:
         print(f"[{symbol}] Deriv indisponible ({type(err).__name__}) : "
               f"{'dernières bougies en cache utilisées' if cached else 'aucun cache'} (échec n°{n})")
-    if n == 3:   # alerte admin une seule fois, au 3e échec consécutif ; le compteur repart à zéro à la récupération
+    global _deriv_alert_last
+    if n >= 3 and time.time() - _deriv_alert_last >= DERIV_ALERT_COOLDOWN:
+        # UNE seule alerte admin pour tous les actifs, puis silence pendant DERIV_ALERT_COOLDOWN (30 min par défaut),
+        # même si la connexion « clignote » (échecs / récupérations en boucle).
+        _deriv_alert_last = time.time()
         try:
-            to_admin(f"⚠️ {symbol} : Deriv indisponible depuis 3 passages consécutifs")
+            to_admin("⚠️ Deriv instable : prix indisponibles par intermittence (dernières bougies en cache utilisées). "
+                     f"Prochaine alerte dans {DERIV_ALERT_COOLDOWN // 60} min au plus tôt.")
         except Exception:
             pass
 
@@ -6522,6 +6547,94 @@ def daily_report():
     return _stats_line("📊", "Rapport du jour", query_stats(since_ts=day))
 
 
+# --- 📑 RAPPORT DÉTAILLÉ (bouton Rapport : jour / semaine / mois) --------------------------------------------------
+def _rep_since(period):
+    d, w, mo = _period_starts()
+    return {"day": (d, "du jour"), "week": (w, "de la semaine"), "month": (mo, "du mois")}.get(period)
+
+
+def _rep_group(rows, key):
+    g = {}
+    for r in rows:
+        g.setdefault(r.get(key) or "?", []).append(r)
+    return g
+
+
+def _rep_line(label, rs):
+    cl = [r for r in rs if r["status"] == "CLOSED"]
+    w = sum(1 for r in cl if (r["result_r"] or 0) > 0)
+    l = sum(1 for r in cl if (r["result_r"] or 0) < 0)
+    be = len(cl) - w - l
+    tot = sum((r["result_r"] or 0) for r in cl)
+    wr = 100.0 * w / (w + l) if (w + l) else 0.0
+    return f"• <b>{label}</b> : {len(cl)} fermés · TP {w} · SL {l} · BE {be} · WR {wr:.0f}% · {tot:+.2f}R"
+
+
+def build_report(period):
+    """Rapport détaillé (liste de messages HTML < 4000 caractères) : stats globales, par marché / stratégie / TF / sens,
+    analyse des SL (distance du SL en % du prix, SL après BE) et liste des trades avec point d'entrée, SL, TP et résultat."""
+    ps = _rep_since(period)
+    if not ps:
+        return ["Période inconnue."]
+    since, label = ps
+    rows = [dict(r) for r in _q("SELECT * FROM trades WHERE opened_ts>=? ORDER BY opened_ts", (since,)).fetchall()]
+    rows = [r for r in rows if r["status"] != "CANCELLED"]
+    if not rows:
+        return [f"📑 <b>RAPPORT {label.upper()}</b>\n\nAucun trade sur la période."]
+    s = query_stats(since_ts=since)
+    head = [f"📑 <b>RAPPORT {label.upper()}</b>", "", _stats_line("📊", "Global", s),
+            f"Résultat : <b>{s['total_r']:+.2f}R</b> · {s['open']} en cours", ""]
+    for title, key in (("Par marché", "symbol"), ("Par stratégie", "kind"), ("Par timeframe", "timeframe"),
+                       ("Par sens", "side"), ("Alignement (mode HTF)", "htf_mode")):
+        g = _rep_group(rows, key)
+        head.append(f"<b>{title}</b>")
+        head.extend(_rep_line(str(k), v) for k, v in sorted(g.items(), key=lambda kv: -len(kv[1])))
+        head.append("")
+    # analyse des SL
+    losses = [r for r in rows if r["status"] == "CLOSED" and (r["result_r"] or 0) < 0]
+    sl_txt = ["<b>Analyse des SL</b>"]
+    if losses:
+        dists = [abs(r["entry"] - (r["sl_initial"] or r["sl"])) / r["entry"] * 100 for r in losses if r["entry"]]
+        small = [d for d in dists if d < 0.15]
+        sl_txt.append(f"• {len(losses)} SL · distance moyenne {sum(dists) / len(dists):.3f}% du prix")
+        sl_txt.append(f"• {len(small)} SL avec un stop très serré (< 0.15%) : zones infimes à filtrer")
+        for k, v in sorted(_rep_group(losses, "kind").items(), key=lambda kv: -len(kv[1])):
+            sl_txt.append(f"• {k} : {len(v)} SL")
+    else:
+        sl_txt.append("• Aucun SL sur la période 🎉")
+    head.extend(sl_txt)
+    msgs, cur = [], ""
+    for ln in head:
+        if len(cur) + len(ln) + 1 > 3800:
+            msgs.append(cur); cur = ""
+        cur += ln + "\n"
+    msgs.append(cur)
+    # détail des trades (second bloc)
+    lines = [f"🧾 <b>DÉTAIL DES TRADES {label.upper()}</b>", ""]
+    for r in rows:
+        dt = datetime.fromtimestamp(r["opened_ts"], timezone.utc).strftime("%d/%m %H:%M")
+        res = (f"{r['result_r']:+.2f}R" + (" (BE)" if r.get("be_hit") else "")) if r["status"] == "CLOSED" else r["status"]
+        lines.append(f"{dt} · {r['symbol']} {r['side']} {r.get('kind') or ''} {r.get('timeframe') or ''}\n"
+                     f"   entrée {r['entry']:g} · SL {r['sl_initial'] or r['sl']:g} · TP {r['tp'] or 0:g} → <b>{res}</b>")
+    cur = ""
+    for ln in lines:
+        if len(cur) + len(ln) + 1 > 3800:
+            msgs.append(cur); cur = ""
+        cur += ln + "\n"
+    msgs.append(cur)
+    return msgs
+
+
+def _rapport_text():
+    return "📑 <b>RAPPORT</b>\n\nChoisis la période : le rapport détaillé arrive dans un nouveau message."
+
+
+def _rapport_keyboard():
+    return _with_back({"inline_keyboard": [[
+        {"text": "📅 Jour", "callback_data": "rap:day"}, {"text": "🗓 Semaine", "callback_data": "rap:week"},
+        {"text": "📆 Mois", "callback_data": "rap:month"}]]})
+
+
 # --- commandes (admin uniquement) ----------------------------------------------------
 def _risk_keyboard():
     return {"inline_keyboard": [[
@@ -7246,7 +7359,8 @@ def _menu_keyboard():
         [{"text": "💰 Risque", "callback_data": "menu:risque"}, {"text": "⚙️ Levier", "callback_data": "menu:levier"}],
         [{"text": "⏱ Timeframe", "callback_data": "menu:timeframe"}, {"text": "🎭 Médias", "callback_data": "menu:medias"}],
         [{"text": "📊 Stats", "callback_data": "menu:stats"}, {"text": "📈 Positions", "callback_data": "menu:trades"}],
-        [{"text": "📊 Analyse", "callback_data": "ana:home"}, {"text": "📰 News", "callback_data": "news:home"}],
+        [{"text": "📑 Rapport", "callback_data": "rap:home"}, {"text": "📊 Analyse", "callback_data": "ana:home"}],
+        [{"text": "📰 News", "callback_data": "news:home"}],
         [{"text": "⚙️ Paramètres signal", "callback_data": "menu:signal"}, {"text": "💰 Money management", "callback_data": "mm:home"}],
         [{"text": "🏦 Compte", "callback_data": "acc:home"}, {"text": "👤 Manuel", "callback_data": "man:home"}],
         [{"text": "📈 Trade", "callback_data": "mtr:home"}, {"text": "📌 Positions broker", "callback_data": "mpos:home"}],
@@ -8134,6 +8248,14 @@ def _handle_update(u):
                     set_setting("strat_vcrt", "0" if get_strat_vcrt() else "1")
                     ack = "VRAI CRT : " + ("ON" if get_strat_vcrt() else "OFF")
                 _edit(cq, _vcrt_tf_text(), _vcrt_tf_keyboard())
+        elif data.startswith("rap:"):
+            arg = data[4:]
+            if arg == "home":
+                _edit(cq, _rapport_text(), _rapport_keyboard())
+            else:
+                for m in build_report(arg):
+                    send(cq["message"]["chat"]["id"], m)
+                ack = "Rapport envoyé"
         elif data.startswith("qml:"):
             ack = _qml_callback(cq, data[4:])
         elif data.startswith("qmlg:"):
@@ -15131,6 +15253,7 @@ QMLG_MIN_BARS = _env_int("QMLG_MIN_BARS", 50)            # en dessous : « NO_DA
 QMLG_ATR_PERIOD = _env_int("QMLG_ATR_PERIOD", 14)        # ATR (Wilder) du TF analysé, pour le buffer du SL et la tolérance EQH / EQL
 QMLG_SL_MODE = os.getenv("QMLG_SL_MODE", "BUFFER").strip().upper()   # BUFFER : SL = derrière le sweep (tête) + buffer ; EXTREME : pile sur le sweep
 QMLG_SL_BUFFER_ATR = _env_float("QMLG_SL_BUFFER_ATR", 0.05)          # buffer derrière le sweep, en ATR
+QMLG_MAX_SL_ATR = _env_float("QMLG_MAX_SL_ATR", 3.0)              # SL maximum, en ATR du TF analysé : au-delà, le QML est refusé (0 = pas de limite)
 QMLG_EQ_TOL_ATR = _env_float("QMLG_EQ_TOL_ATR", 0.10)    # deux sommets / creux à moins de N x ATR forment un EQH / EQL
 QMLG_TFS = tuple(int(x) for x in re.findall(r"\d+", os.getenv("QMLG_TFS", "5,15,30,60"))) or (5, 15, 30, 60)   # TF scannés (minutes)
 QMLG_KEEP = _env_int("QMLG_KEEP", 300)                   # événements / swings gardés par detect_structure (historique des formations)
@@ -15215,6 +15338,43 @@ def get_qmlg_zone_ob_fvg_on():
     ON : `qmlg_direct_entry` et `qmlg_alert_eval` prennent `choch_entry_zone` (zone la plus proche du prix) + `zone_reaction`
     (clôture dans la zone + avalement / pin bar). N'affecte pas le module QML (section 12) ni les autres stratégies."""
     return _get_bool_setting("qmlg_zone_ob_fvg", _env_on("QMLG_ZONE_OB_FVG", False))
+
+
+# --- ZONE INFIME + CONFLUENCE OB / FVG (anti-SL) ----------------------------------------------------------------
+# OFF par défaut (bouton 🔬 Zone infime de QML GAGNANT, ou QMLG_TINY_ZONE=1).
+# ON : une zone QML plus petite que QMLG_TINY_ATR x ATR n'est valide QUE si elle chevauche l'OB du sweep ou le FVG du CHoCH
+# (c'est la confluence qui en fait une vraie zone d'offre / de demande). Et si l'impulsion qui a lancé le CHoCH a laissé un OB
+# ET un FVG collés à la zone, le BOS après CHoCH n'est plus exigé. La zone et le plan (SL derrière le sweep) restent ceux du QML.
+QMLG_TINY_ATR = _env_float("QMLG_TINY_ATR", 0.5)
+
+
+def get_qmlg_tiny_on():
+    """Règle « zone infime + confluence » activée ? (clé « qmlg_tiny »). OFF par défaut. N'affecte pas le module QML (section 12)."""
+    return _get_bool_setting("qmlg_tiny", _env_on("QMLG_TINY_ZONE", False))
+
+
+def qmlg_zone_confluence(qml, structure):
+    """{tiny, ob, fvg, known} : la zone du QML est-elle infime (< QMLG_TINY_ATR x ATR) et chevauche-t-elle l'OB du sweep / le FVG du CHoCH ?
+    known=False si la structure ne permet pas de le calculer (la règle ne bloque alors jamais)."""
+    out = {"tiny": False, "ob": False, "fvg": False, "known": False}
+    z = qml.get("zone")
+    ctx = _qmlg_zone_ctx(qml, structure)
+    if not z or not ctx:
+        return out
+    cs, ev = ctx
+    atr = ev.get("atr") or 0.0
+    if atr <= 0:
+        return out
+    out["known"] = True
+    out["tiny"] = (z["top"] - z["bottom"]) < QMLG_TINY_ATR * atr
+    mid = (z["top"] + z["bottom"]) / 2.0
+    for kind, key in (("OB", "ob"), ("FVG", "fvg")):
+        try:
+            zz = choch_entry_zone(cs, ev, mid, kinds=(kind,))
+        except Exception:
+            zz = None
+        out[key] = bool(zz and zz["lo"] <= z["top"] and zz["hi"] >= z["bottom"])
+    return out
 
 
 def qmlg_htf_ok(symbol, buy):
@@ -15368,6 +15528,9 @@ def compute_trade(qml, structure=None, entry_price=None):
         t["reason"] = "zone inexploitable (risque nul : entrée au-delà du sweep)"
         return t
     t["risk"] = risk
+    if QMLG_MAX_SL_ATR > 0 and atr and risk > QMLG_MAX_SL_ATR * atr:   # SL derrière le sweep trop éloigné : on ne prend pas le trade
+        t["reason"] = f"SL trop large : {risk / atr:.1f} x ATR > {QMLG_MAX_SL_ATR:g} x ATR"
+        return t
     fixed = get_qmlg_tp_rr()
     if fixed:   # TP FIXE choisi dans le menu : TP = entrée +/- risque x RR, pas de TP2, aucune liquidité requise
         t["tp1"], t["tp1_kind"], t["rr1"] = (entry + risk * fixed) if buy else (entry - risk * fixed), "RR fixe", fixed
@@ -15495,7 +15658,10 @@ def qmlg_validate(qml, structure, direct=False, entry_price=None):
     reasons = [k for k in ("tendance_avant", "sweep", "choch_cloture", "zone_epaule") if not cr.get(k)]
     if not direct and not cr.get("zone_fraiche"):
         reasons.append("zone_fraiche")
-    if get_qmlg_bos_on() and not qml.get("bos_apres"):   # BOS après CHoCH exigé (OFF par défaut)
+    conf = qmlg_zone_confluence(qml, structure) if get_qmlg_tiny_on() else None
+    if conf and conf["known"] and conf["tiny"] and not (conf["ob"] or conf["fvg"]):
+        reasons.append("zone_infime")   # zone minuscule sans OB / FVG collé : SL quasi certain
+    if get_qmlg_bos_on() and not qml.get("bos_apres") and not (conf and conf["ob"] and conf["fvg"]):   # BOS après CHoCH exigé (OFF par défaut) ; inutile si OB + FVG collés
         reasons.append("bos_apres")
     tr = compute_trade(qml, structure, entry_price=entry_price)
     if not tr["ok"]:
@@ -16343,6 +16509,7 @@ def _qmlg_keyboard():
          {"text": f"📈 Biais H1 : {'ON ✅' if get_qmlg_htf_on() else 'OFF'}", "callback_data": "qmlg:htf"}],
         [{"text": f"🧱 BOS après CHoCH : {'ON ✅' if get_qmlg_bos_on() else 'OFF'}", "callback_data": "qmlg:bos"}],
         [{"text": f"🧩 Zone OB / FVG : {'ON ✅' if get_qmlg_zone_ob_fvg_on() else 'OFF'}", "callback_data": "qmlg:zone"}],
+        [{"text": f"🔬 Zone infime + confluence : {'ON ✅' if get_qmlg_tiny_on() else 'OFF'}", "callback_data": "qmlg:tiny"}],
         [{"text": f"{'✅ ' if get_qmlg_tp_rr() is None else ''}TP auto", "callback_data": "qmlg:tp:auto"}]
         + [{"text": f"{'✅ ' if get_qmlg_tp_rr() == float(r) else ''}RR{r}", "callback_data": f"qmlg:tp:{r}"} for r in QMLG_TP_CHOICES],
         [{"text": f"{'✅ ' if t in tfs else ''}{_tf_lbl(t)}", "callback_data": f"qmlg:tf:{t}"} for t in QMLG_ALERT_TF_CHOICES],
@@ -16419,6 +16586,11 @@ def _qmlg_callback(cq, arg):
         set_setting("qmlg_zone_ob_fvg", "1" if on else "0")
         qmlg_alerts_clear()
         toast = "Zone OB / FVG : " + ("ON" if on else "OFF")
+    elif arg == "tiny":   # 🔬 Zone infime + confluence OB / FVG ON / OFF : alertes effacées, reposées au prochain scan
+        on = not get_qmlg_tiny_on()
+        set_setting("qmlg_tiny", "1" if on else "0")
+        qmlg_alerts_clear()
+        toast = "Zone infime + confluence : " + ("ON" if on else "OFF")
     elif arg.startswith("tp:"):   # 🎯 TP auto / RR fixe : ne touche que les NOUVEAUX signaux
         v = arg[3:]
         if v == "auto":
