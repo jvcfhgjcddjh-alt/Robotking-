@@ -2,7 +2,6 @@
 
 
 
-
 #!/usr/bin/env python3
 """AlphaBot BOS + CHoCH — Gold & BTC — version en un seul fichier.
 
@@ -16483,6 +16482,106 @@ def qmlg_direct_deliver(chat_id, data, max_items=5):
     return n
 
 
+def _qmlg_limit_chart(f):
+    """Image d'un QML EN ATTENTE de mitigation (point d'entrée non mitigé) : mêmes bougies/structure que le scan, zone +
+    entrée / SL / TP tracés via draw_chart. None si le dessin est impossible (ex. prix momentanément indisponible)."""
+    sym, tf = f["symbol"], f["tf"]
+    candles = get_candles(sym, minutes=tf, count=QMLG_HISTORY_BARS) or []
+    if len(candles) < QMLG_MIN_BARS:
+        return None
+    structure = detect_structure(candles, f"M{tf}", n=QMLG_FRACTAL_N, keep=QMLG_KEEP)
+    res = detect_qml(structure, min_rr=QMLG_MIN_RR)
+    tol = max(1e-6, abs(f["zone"]["top"]) * 1e-7)
+    q = next((x for x in reversed(res["qmls"]) if x["dir"] == f["dir"] and abs(x["zone"]["top"] - f["zone"]["top"]) <= tol
+              and abs(x["zone"]["bottom"] - f["zone"]["bottom"]) <= tol), None)
+    if q is None:
+        return None
+    return draw_chart(candles, q, f["plan"], symbol=sym, tf=tf, structure=structure, others=[q])
+
+
+def qmlg_limit_caption(f):
+    """Légende d'un ordre limite en attente (zone QML non mitigée) : sens, entrée / SL / TP1 / TP2 (RR), rappel du statut."""
+    p = f["plan"]
+    dec = SYMBOLS.get(f["symbol"], {}).get("decimals", 2)
+    buy = p["side"] == "BUY"
+    f2 = lambda k: "—" if p[k] is None else f"{_fmt(p[k], dec)} · RR {p['rr' + k[-1]]:.2f}"
+    age = f"il y a {f['bars_ago']} bougie(s)" if f.get("bars_ago") is not None else "à l'instant"
+    return (f"{'🟢' if buy else '🔴'} <b>{f['symbol']} M{f['tf']}</b> — QML {'ACHAT' if buy else 'VENTE'} · "
+            f"⏳ NON MITIGÉ ({age})\n"
+            f"📍 Entrée {_fmt(p['entry'], dec)}\n🛡 SL {_fmt(p['sl'], dec)}\n🎯 TP1 {f2('tp1')}\n🎯 TP2 {f2('tp2')}\n"
+            f"(information seulement : aucun ordre envoyé)")
+
+
+QMLG_IMG_MAX = _env_int("QMLG_IMG_MAX", 15)   # nb max d'images envoyées par clic sur 🔍 Analyse (évite d'inonder Telegram)
+
+
+def _qmlg_formation_chart(f):
+    """Image d'UNE formation du scan complet (🔍 Analyse) : bougies/structure + zone, entrée/SL/TP tracés. None si impossible."""
+    sym, tf = f["symbol"], f["tf"]
+    candles = get_candles(sym, minutes=tf, count=QMLG_HISTORY_BARS) or []
+    if len(candles) < QMLG_MIN_BARS:
+        return None
+    structure = detect_structure(candles, f"M{tf}", n=QMLG_FRACTAL_N, keep=QMLG_KEEP)
+    res = detect_qml(structure, min_rr=QMLG_MIN_RR)
+    tol = max(1e-6, abs(f["zone"]["top"]) * 1e-7)
+    q = next((x for x in reversed(res["qmls"]) if x["dir"] == f["dir"] and abs(x["zone"]["top"] - f["zone"]["top"]) <= tol
+              and abs(x["zone"]["bottom"] - f["zone"]["bottom"]) <= tol), None)
+    if q is None:
+        return None
+    return draw_chart(candles, q, f["plan"], symbol=sym, tf=tf, structure=structure, others=[q])
+
+
+def qmlg_formation_caption(f):
+    """Légende d'une formation du scan complet : marché/TF, sens, statut (mitigé / non mitigé), valide ou motif de rejet,
+    puis entrée / SL / TP1 / TP2 (RR)."""
+    p = f["plan"]
+    dec = SYMBOLS.get(f["symbol"], {}).get("decimals", 2)
+    buy = p["side"] == "BUY"
+    f2 = lambda k: "—" if p[k] is None else f"{_fmt(p[k], dec)} · RR {p['rr' + k[-1]]:.2f}"
+    statut = f.get("statut") or "—"
+    badge = "⏳ NON MITIGÉ" if statut == "non mitigé" else f"✅ {statut.upper()}"
+    tag = "VALIDE" if f["validation"]["valid"] else "rejeté : " + ", ".join(
+        _QMLG_REASON_LBL.get(r, r) for r in f["validation"]["reasons"])
+    return (f"{'🟢' if buy else '🔴'} <b>{f['symbol']} M{f['tf']}</b> — QML {'ACHAT' if buy else 'VENTE'} · {badge} · {tag}\n"
+            f"📍 Entrée {_fmt(p['entry'], dec)}\n🛡 SL {_fmt(p['sl'], dec)}\n🎯 TP1 {f2('tp1')}\n🎯 TP2 {f2('tp2')}")
+
+
+def qmlg_formation_deliver(chat_id, data, max_items=QMLG_IMG_MAX, valid_only=True):
+    """Après 🔍 Analyse : une IMAGE par formation (zone + entrée/SL/TP tracés) + sa légende, la plus récente d'abord — au
+    lieu d'un seul message texte. `valid_only` ne garde que les formations VALIDES (celles réellement exploitables)."""
+    forms = [f for f in data["formations"] if f.get("plan") and f["plan"].get("ok")]
+    if valid_only:
+        forms = [f for f in forms if f["validation"]["valid"]]
+    forms.sort(key=lambda f: f.get("bars_ago") if f.get("bars_ago") is not None else 10 ** 9)
+    n = 0
+    for f in forms[:max_items]:
+        path = None
+        try:
+            path = _qmlg_formation_chart(f)
+        except Exception:
+            traceback.print_exc(limit=-3)
+        send(chat_id, qmlg_formation_caption(f), photo=path)
+        n += 1
+    if len(forms) > max_items:
+        send(chat_id, f"… + {len(forms) - max_items} autre(s) formation(s) (voir le JSON pour le détail complet).")
+    return n
+
+
+def qmlg_limit_deliver(chat_id, data, max_items=8):
+    """Pour chaque QML valide EN ATTENTE de mitigation (point d'entrée non mitigé) : envoie l'IMAGE (zone + entrée / SL / TP
+    tracés) + légende. Aucun ordre MT5. Retourne le nombre d'envois."""
+    n = 0
+    for f in qmlg_pending_limits(data)[:max_items]:
+        path = None
+        try:
+            path = _qmlg_limit_chart(f)
+        except Exception:
+            traceback.print_exc(limit=-3)
+        send(chat_id, qmlg_limit_caption(f), photo=path)
+        n += 1
+    return n
+
+
 def _qmlg_menu_text():
     return (f"🏆 <b>QML GAGNANT</b> — {'🟢 ON' if get_qmlg_on() else '🔴 OFF'}\n\n"
             f"🔔 <b>Alerte réaction</b> : {'🟢 ON' if get_qmlg_alert_on() else '🔴 OFF'} · TF "
@@ -16497,7 +16596,7 @@ def _qmlg_menu_text():
             f"Seuls les TF cochés ci-dessous sont scannés (chaque TF à chaque clôture de bougie : M1 = 1 min, M5 = 5 min, M15 = 15 min).\n\n"
             f"🔍 <b>Analyse</b> : scanne tous les marchés sur les TF cochés ({', '.join(_tf_lbl(t) for t in get_qmlg_alert_tfs())}), enregistre toutes les "
             f"formations QML dans le JSON et valide chacune.\n"
-            f"⏳ <b>Ordre limite</b> : QML valides non mitigés, EN ATTENTE de mitigation.\n"
+            f"⏳ <b>Ordre limite</b> : QML valides non mitigés, EN ATTENTE de mitigation (texte + image de chaque zone).\n"
             f"⚡ <b>Entrée directe</b> : prix dans la zone + dernière bougie clôturée en rejet.")
 
 
@@ -16528,15 +16627,17 @@ def _qmlg_job(chat_id, kind):
         send(chat_id, "⏳ Un scan QML GAGNANT est déjà en cours, patiente un instant.", reply_markup=_qmlg_keyboard())
         return
     direct_data = None
+    limit_data = None
+    analyse_data = None
     try:
         if kind == "analyse":
-            data = qmlg_scan()
-            txt = qmlg_analyse_text(data)   # les alertes se règlent avec le bouton 🔔 Alerte réaction
+            analyse_data = qmlg_scan()
+            txt = qmlg_analyse_text(analyse_data)   # les alertes se règlent avec le bouton 🔔 Alerte réaction
         elif kind == "limit":
-            ldata = qmlg_data(QMLG_MAX_AGE_MIN * 60)
-            txt = qmlg_limit_text(ldata)
+            limit_data = qmlg_data(QMLG_MAX_AGE_MIN * 60)
+            txt = qmlg_limit_text(limit_data)
             try:
-                txt += "\n\n" + qmlg_arm_alerts(ldata)
+                txt += "\n\n" + qmlg_arm_alerts(limit_data)
             except Exception:
                 traceback.print_exc(limit=-3)
         else:
@@ -16551,6 +16652,16 @@ def _qmlg_job(chat_id, kind):
     if kind == "direct" and direct_data:   # chaque entrée directe : image + entrée / SL / TP + lot calculé sur le SL
         try:
             qmlg_direct_deliver(chat_id, direct_data)
+        except Exception:
+            traceback.print_exc(limit=-3)
+    elif kind == "limit" and limit_data:   # chaque point d'entrée NON MITIGÉ : image avec la zone QML tracée + entrée/SL/TP
+        try:
+            qmlg_limit_deliver(chat_id, limit_data)
+        except Exception:
+            traceback.print_exc(limit=-3)
+    elif kind == "analyse" and analyse_data:   # chaque formation valide trouvée par le scan : image + entrée/SL/TP, pas de message unique
+        try:
+            qmlg_formation_deliver(chat_id, analyse_data)
         except Exception:
             traceback.print_exc(limit=-3)
 
@@ -17984,5 +18095,6 @@ if __name__ == "__main__":
     if "--selftest" in sys.argv:
         sys.exit(_selftest())
     main()
+
 
 
