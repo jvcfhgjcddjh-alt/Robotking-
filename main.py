@@ -2,6 +2,7 @@
 
 
 
+
 #!/usr/bin/env python3
 """AlphaBot BOS + CHoCH — Gold & BTC — version en un seul fichier.
 
@@ -2068,6 +2069,7 @@ _ensure_column("trades", "order_type", "TEXT DEFAULT 'MARKET'")
 _ensure_column("trades", "placed_ts", "INTEGER")
 _ensure_column("trades", "filled_ts", "INTEGER")
 _ensure_column("trades", "ref_price", "REAL")
+_ensure_column("trades", "qmlg_ttl_min", "INTEGER")   # QML GAGNANT : durée de validité (minutes) de l'ordre LIMIT avant annulation auto
 # RR d'armement du BE et mode du filtre HTF FIGÉS à la création du signal (changer le réglage n'affecte pas un trade ouvert).
 _ensure_column("trades", "be_rr", "REAL")
 _ensure_column("trades", "htf_mode", "TEXT")
@@ -5506,6 +5508,11 @@ def track_trade(trade, candles):
                 reason = None
                 if (favorable - entry) * side >= LIMIT_CANCEL_RR * risk:
                     reason = "Le prix est reparti sans toucher ta limit : trop tard, on ne court pas après."
+                elif trade.get("kind") == "QMLG" and trade.get("qmlg_ttl_min"):
+                    # QML GAGNANT : expiration en MINUTES RÉELLES (paramètre réglé au scan), pas en bougies du
+                    # TF principal — un scan QMLG peut tourner sur M5/M15/M30/H1, différent de TF_SEC.
+                    if c["t"] - (trade.get("placed_ts") or 0) >= trade["qmlg_ttl_min"] * 60:
+                        reason = f"Ordre LIMIT expiré : pas touché après {trade['qmlg_ttl_min']} min."
                 elif c["t"] - (trade.get("placed_ts") or 0) >= LIMIT_EXPIRY_CANDLES * TF_SEC:
                     reason = f"Ordre expiré : pas exécuté après {LIMIT_EXPIRY_CANDLES} bougies."
                 if reason:
@@ -9147,9 +9154,10 @@ def publish_signal(symbol, candles, events, sig, companion=False):
         order_type=sig.get("order", "MARKET"), placed_ts=sig["t"], ref_price=sig.get("ref_price"),
         sent_admin=0, sent_group=0,   # passent à 1 seulement quand Telegram a confirmé l'envoi
         signal_key=key, symbol=symbol, side=sig["side"], kind=sig["type"],
-        timeframe=(sig["tf"] if sig.get("type") in ("FIBTREND", "VCRT") and sig.get("tf") else TF_LABEL),
+        timeframe=(sig["tf"] if sig.get("type") in ("FIBTREND", "VCRT", "QMLG") and sig.get("tf") else TF_LABEL),
         entry=sig["entry"], sl=sig["sl"], sl_initial=sig["sl"], tp=sig["tp"],
         be_rr=sig.get("be_rr"), htf_mode=sig.get("htf_mode"),
+        qmlg_ttl_min=sig.get("qmlg_ttl_min"),   # QML GAGNANT LIMIT : durée de validité (paramètre bref du scan)
         risk_usd=lot_info["real_risk"],  # risque réel du lot pris (= risque demandé sauf lot minimum)
         lot=lot_info["lot"], leverage=leverage, opened_ts=now_ts(), last_ts=sig["t"],
         exec_status="PENDING" if (is_market and mt5_enabled) else None,
@@ -9162,10 +9170,18 @@ def publish_signal(symbol, candles, events, sig, companion=False):
           f"(bougie {_ts_str(sig['t'])})")
 
     # 1) ENVOI IMMÉDIAT du signal (admin + groupe), AVANT toute tentative d'exécution MT5.
+    chart_ctx = sig.get("_qmlg_chart_ctx")   # (q, tf_min) posé par qmlg_build_limit_signal : même tracé que QML GAGNANT
     try:
-        chart = make_chart(symbol, candles, events, sig, dec)
+        if sig.get("type") == "QMLG" and chart_ctx:
+            q, tf_min = chart_ctx
+            trade_plan = {"ok": True, "side": sig["side"], "order": "LIMIT", "entry": sig["entry"], "sl": sig["sl"],
+                          "risk": sig["risk"], "tp1": sig.get("tp"), "tp1_kind": None, "rr1": sig.get("rr"),
+                          "tp2": None, "tp2_kind": None, "rr2": None}
+            chart = qmlg_signal_chart(symbol, tf_min, q, candles, trade_plan)
+        else:
+            chart = make_chart(symbol, candles, events, sig, dec)
     except Exception as e:   # un souci de graphique ne doit JAMAIS empêcher l'envoi du signal
-        print(f"[{symbol}] make_chart a échoué ({type(e).__name__}) : signal envoyé sans image")
+        print(f"[{symbol}] graphique du signal a échoué ({type(e).__name__}) : signal envoyé sans image")
         if isinstance(e, RecursionError):
             print("[chart] matplotlib incompatible avec cette version de Python -> "
                   "fixer PYTHON_VERSION=3.13.x sur Render (ou mettre matplotlib à jour)")
@@ -15280,6 +15296,23 @@ QMLG_BE_OFF_RR = 99.0                         # RR « inatteignable » enregistr
 
 QMLG_TP_CHOICES = (1, 2, 3, 4)   # RR fixes proposés dans le menu (AUTO = TP1 / TP2 sur la liquidité)
 
+# --- SCAN -> ORDRE LIMIT DIRECT (bouton 🔎 Scanner) ------------------------------------------------------
+# Contrairement à l'alerte de réaction (qmlg_alert_eval, qui attend un avalement / pin bar dans la zone),
+# le bouton Scanner envoie IMMÉDIATEMENT un ordre LIMIT dès qu'un QML est validé, au niveau du PLAN (bord de
+# la zone QML — exactement le tracé de l'image QML GAGNANT). Seul paramètre réglable : sa durée de validité.
+QMLG_LIMIT_TTL_CHOICES = (30, 60, 120, 240, 480)   # minutes, proposées dans le menu
+QMLG_LIMIT_TTL_DEFAULT = _env_int("QMLG_LIMIT_TTL_MIN", 120)   # défaut : 2h si jamais touché -> annulé
+
+
+def get_qmlg_limit_ttl():
+    """Durée de validité (minutes) d'un ordre LIMIT envoyé par le bouton 🔎 Scanner (clé « qmlg_limit_ttl »).
+    Passé ce délai sans que le prix touche l'entrée, l'ordre est annulé automatiquement (voir update_trade_loop)."""
+    try:
+        v = int(get_setting("qmlg_limit_ttl", QMLG_LIMIT_TTL_DEFAULT) or QMLG_LIMIT_TTL_DEFAULT)
+    except (TypeError, ValueError):
+        return QMLG_LIMIT_TTL_DEFAULT
+    return v if v > 0 else QMLG_LIMIT_TTL_DEFAULT
+
 
 def get_qmlg_tp_rr():
     """TP fixe de QML GAGNANT (clé « qmlg_tp_rr ») : un RR (ex. 2.0 ou 3.0), ou None = AUTO (TP1 / TP2 = prochaines liquidités)."""
@@ -15613,6 +15646,73 @@ def qml_gagnant_text(res):
                   f"🎯 TP1 {f2('tp1')} · RR1 {r2('rr1')}\n"
                   f"🎯 TP2 {f2('tp2')} · RR2 {r2('rr2')}\n"
                   f"(information seulement)")
+
+
+def qmlg_build_limit_signal(symbol, tf_min, q, trade):
+    """Signal LIMIT compatible publish_signal, construit À PARTIR DU PLAN compute_trade de QML GAGNANT :
+    entrée = bord de la zone QML (jamais une entrée au marché), SL derrière le sweep, TP = TP1 (ou TP2 si TP1 absent).
+    C'est EXACTEMENT le schéma dessiné sur l'image QML GAGNANT (zone + tête/liquidité + cassure L1 + entrée/SL/TP)."""
+    d = 1 if q["dir"] == "bull" else -1
+    z = q["zone"]
+    tp = trade["tp1"] if trade.get("tp1") is not None else trade.get("tp2")
+    rr = trade["rr1"] if trade.get("rr1") is not None else trade.get("rr2")
+    return {
+        "dir": d, "side": trade["side"], "type": "QMLG", "order": "LIMIT", "ref_price": trade["entry"],
+        "entry": trade["entry"], "sl": trade["sl"], "risk": trade.get("risk") or abs(trade["entry"] - trade["sl"]),
+        "tp": tp, "t": q["choch"]["break_time"], "rr": rr or 0,
+        "tf": f"M{tf_min}", "htf_mode": "OFF", "be_rr": get_be_rr() if get_qmlg_be_on() else QMLG_BE_OFF_RR,
+        "setup": f"QML GAGNANT M{tf_min}", "poi": None, "mtf_fib_on": False, "mtf_fib": None, "qf": {},
+        "ext": None, "sweep": None, "sl_mode": "STRUCT", "key_suffix": "qmlg",
+        "zone": {"tf": tf_min, "kind": "QMLG", "d": d, "lo": z["bottom"], "hi": z["top"]},
+        "qmlg_ttl_min": get_qmlg_limit_ttl(),   # paramètre bref : durée de validité de l'ordre avant annulation auto
+        "_qmlg_chart_ctx": (q, tf_min),         # consommé par publish_signal pour l'image (jamais écrit en base)
+    }
+
+
+def qmlg_signal_chart(symbol, tf_min, q, candles, trade):
+    """Image du signal envoyé par le bouton 🔎 Scanner : EXACTEMENT le même tracé que les images QML GAGNANT
+    habituelles (zone QML, tête / liquidité balayée, cassure L1, puis entrée LIMIT / SL / TP du plan) — dessiné
+    par draw_chart (la même fonction que _qmlg_alert_chart / qmlg_event_chart), pas le graphique générique CHoCH."""
+    try:
+        structure = detect_structure(candles, f"M{tf_min}", n=QMLG_FRACTAL_N, keep=QMLG_KEEP)
+        return draw_chart(candles, q, trade, symbol=symbol, tf=tf_min, structure=structure, others=[q])
+    except Exception:
+        traceback.print_exc(limit=-3)
+        return None
+
+
+def qmlg_run_scan_and_signal(symbols=None, tfs=None):
+    """🔎 SCANNER : contrairement à l'alerte de réaction (qmlg_alert_eval, qui attend un avalement / pin bar DANS la
+    zone), ceci envoie un ordre LIMIT dès qu'un QML est validé, directement au niveau du plan (bord de la zone —
+    même entrée que celle dessinée sur l'image). Passe par publish_signal : toutes les barrières habituelles
+    s'appliquent (bot ON, exclusivité QML GAGNANT, anti-doublon, news, money management, Risk Gate...).
+    Retourne la liste des (symbole, TF, côté) effectivement envoyés."""
+    syms = [s for s in (symbols or SYMBOLS.keys()) if s in SYMBOLS]
+    tfs = list(tfs or QMLG_TFS)
+    sent = []
+    for sym in syms:
+        for tf in tfs:
+            try:
+                candles = get_candles(sym, minutes=tf, count=QMLG_HISTORY_BARS) or []
+                if len(candles) < QMLG_MIN_BARS:
+                    continue
+                structure = detect_structure(candles, f"M{tf}", n=QMLG_FRACTAL_N, keep=QMLG_KEEP)
+                res = detect_qml(structure, min_rr=QMLG_MIN_RR)
+                q = res.get("last_qml")
+                if not q:
+                    continue
+                v = qmlg_validate(q, structure)
+                if not (v["valid"] and v["trade"].get("ok")):
+                    continue
+                if not qmlg_htf_ok(sym, q["dir"] == "bull"):
+                    continue
+                sig = qmlg_build_limit_signal(sym, tf, q, v["trade"])
+                if publish_signal(sym, candles, [], sig):
+                    sent.append((sym, tf, sig["side"]))
+            except Exception:
+                print(f"[qmlg-scan] {sym} M{tf} : erreur pendant le scan")
+                traceback.print_exc(limit=-3)
+    return sent
 
 
 # --- REJET, VALIDATION, SCAN MULTI-MARCHÉS / MULTI-TF, JSON ----------------------------------------------
@@ -16614,11 +16714,22 @@ def _qmlg_keyboard():
         [{"text": f"{'✅ ' if t in tfs else ''}{_tf_lbl(t)}", "callback_data": f"qmlg:tf:{t}"} for t in QMLG_ALERT_TF_CHOICES],
         [{"text": "🔍 Analyse", "callback_data": "qmlg:analyse"}],
         [{"text": "⏳ Ordre limite", "callback_data": "qmlg:limit"}, {"text": "⚡ Entrée directe", "callback_data": "qmlg:direct"}],
+        [{"text": f"⏱ Validité LIMIT : {get_qmlg_limit_ttl()} min", "callback_data": "qmlg:ttlmenu"}],
+        [{"text": "🔎 Scanner (envoie les ordres LIMIT)", "callback_data": "qmlg:scan"}],
     ]})
 
 
+def _qmlg_ttl_keyboard():
+    """Sous-menu : choix du seul paramètre réglable de l'ordre LIMIT envoyé par 🔎 Scanner (sa durée de validité)."""
+    cur = get_qmlg_limit_ttl()
+    rows = [[{"text": f"{'✅ ' if cur == m else ''}{m} min" if m < 60 else f"{'✅ ' if cur == m else ''}{m // 60} h",
+              "callback_data": f"qmlg:ttl:{m}"} for m in QMLG_LIMIT_TTL_CHOICES]]
+    rows.append([{"text": "⬅️ Retour", "callback_data": "qmlg:home"}])
+    return {"inline_keyboard": rows}
+
+
 _qmlg_lock = threading.Lock()   # un seul scan à la fois
-_QMLG_JOBS = {"analyse": "Analyse", "limit": "Ordre limite", "direct": "Entrée directe"}
+_QMLG_JOBS = {"analyse": "Analyse", "limit": "Ordre limite", "direct": "Entrée directe", "scan": "Scanner (LIMIT)"}
 
 
 def _qmlg_job(chat_id, kind):
@@ -16629,6 +16740,7 @@ def _qmlg_job(chat_id, kind):
     direct_data = None
     limit_data = None
     analyse_data = None
+    scan_sent = None
     try:
         if kind == "analyse":
             analyse_data = qmlg_scan()
@@ -16640,6 +16752,19 @@ def _qmlg_job(chat_id, kind):
                 txt += "\n\n" + qmlg_arm_alerts(limit_data)
             except Exception:
                 traceback.print_exc(limit=-3)
+        elif kind == "scan":
+            # 🔎 SCANNER : envoie VRAIMENT les ordres LIMIT (via publish_signal), sur les marchés/TF cochés du
+            # menu. Chaque ordre part avec le MÊME tracé que l'image QML GAGNANT (zone, tête, cassure L1,
+            # entrée/SL/TP) et expire tout seul après `get_qmlg_limit_ttl()` minutes si non touché.
+            scan_sent = qmlg_run_scan_and_signal(symbols=qmlg_alert_symbols(), tfs=get_qmlg_alert_tfs())
+            if scan_sent:
+                lst = "\n".join(f"• {s} {_tf_lbl(t)} {side}" for s, t, side in scan_sent)
+                txt = (f"🏆 QML GAGNANT — 🔎 Scan terminé : {len(scan_sent)} ordre(s) LIMIT envoyé(s) "
+                       f"(validité {get_qmlg_limit_ttl()} min)\n{lst}\n\n"
+                       f"Image + entrée/SL/TP déjà envoyés au groupe/admin pour chacun.")
+            else:
+                txt = ("🏆 QML GAGNANT — 🔎 Scan terminé : aucun ordre envoyé (aucun QML valide en ce moment, "
+                       "ou bloqué par une barrière — bot OFF, exclusivité, risk gate, news, plafond du jour...).")
         else:
             direct_data = qmlg_data(QMLG_CACHE_SEC)
             txt = qmlg_direct_text(direct_data)
@@ -16664,6 +16789,7 @@ def _qmlg_job(chat_id, kind):
             qmlg_formation_deliver(chat_id, analyse_data)
         except Exception:
             traceback.print_exc(limit=-3)
+    # kind == "scan" : rien à faire ici, publish_signal a déjà envoyé image + texte pour chaque ordre
 
 
 def _qmlg_callback(cq, arg):
@@ -16713,6 +16839,16 @@ def _qmlg_callback(cq, arg):
     elif arg.startswith("tf:") and arg[3:].isdigit():
         tfs = toggle_qmlg_alert_tf(int(arg[3:]))
         toast = "TF : " + ", ".join(_tf_lbl(t) for t in tfs)
+    elif arg == "ttlmenu":   # ⏱ sous-menu : seul paramètre réglable de l'ordre LIMIT envoyé par 🔎 Scanner
+        _edit(cq, "⏱ <b>Validité de l'ordre LIMIT</b>\n\nAu-delà de ce délai sans que le prix touche l'entrée, "
+                  "l'ordre est annulé automatiquement (le suivi s'arrête, rien n'est exécuté).", _qmlg_ttl_keyboard())
+        return ""
+    elif arg.startswith("ttl:") and arg[4:].isdigit():   # ⏱ choix du TTL (minutes)
+        v = int(arg[4:])
+        set_setting("qmlg_limit_ttl", str(v))
+        _edit(cq, "⏱ <b>Validité de l'ordre LIMIT</b>\n\nAu-delà de ce délai sans que le prix touche l'entrée, "
+                  "l'ordre est annulé automatiquement (le suivi s'arrête, rien n'est exécuté).", _qmlg_ttl_keyboard())
+        return f"Validité LIMIT : {v} min"
     _edit(cq, _qmlg_menu_text(), _qmlg_keyboard())
     return toast
 
@@ -18095,6 +18231,5 @@ if __name__ == "__main__":
     if "--selftest" in sys.argv:
         sys.exit(_selftest())
     main()
-
 
 
